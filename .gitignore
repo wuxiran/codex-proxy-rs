@@ -30,6 +30,9 @@ Thumbs.db
 *.swo
 *~
 
+__pycache__/
+*.py[cod]
+
 # Local tools and worktrees
 /.codegraph/
 /.codex-ws-audit/
