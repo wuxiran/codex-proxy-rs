@@ -1,0 +1,33 @@
+# 89 与 sub2api 同机覆盖。
+# 不要单独使用本文件；必须叠在官方 compose 上：
+#   docker compose -f deploy/compose.yaml -f deploy/compose.89.yaml up -d --no-build --wait
+#
+# 约束：
+# - 宿主机 8080 已被 sub2api 占用，应用改绑 127.0.0.1:18080
+# - 不向宿主机暴露 PostgreSQL / Redis，避免和 sub2api 内部库端口混淆
+# - 镜像来自本 fork 构建，禁止在线更新拉回 zyycn 正式包
+# - 限制内存，避免挤占同机 sub2api
+
+name: codex-proxy-rs
+
+services:
+  postgres:
+    ports: !override []
+    mem_limit: 512m
+    cpus: 1.0
+
+  redis:
+    ports: !override []
+    mem_limit: 128m
+    cpus: 0.5
+
+  codex-proxy-rs:
+    image: ${CPR_IMAGE:-codex-proxy-rs:89-fork}
+    ports: !override
+      - '127.0.0.1:18080:8080'
+    mem_limit: 1536m
+    cpus: 2.0
+    environment:
+      CPR_UPDATE_REPOSITORY: wuxiran/codex-proxy-rs
+      CPR_UPDATE_CHANNEL: stable
+      CPR_ENABLE_SELF_RESTART: 'false'

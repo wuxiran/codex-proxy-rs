@@ -8,6 +8,7 @@
 
 - `config.yaml`：应用行为与真实凭据，由 `config.example.yaml` 复制得到并被 Git 忽略。
 - `compose.yaml`：镜像、容器网络、端口、目录映射、健康检查和资源限制。
+- `compose.89.yaml`：本 fork 在 89 与 sub2api 同机部署的覆盖文件；步骤见 [89 生产部署](89.md)。
 
 项目不使用 `.env` 配置文件。Compose 环境变量用于容器地址、镜像选择和构建发布；
 应用设置与凭据保存在 `config.yaml` 中。已有部署不要重新复制模板覆盖配置。
