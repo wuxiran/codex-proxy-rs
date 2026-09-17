@@ -23,6 +23,7 @@ services:
 
   codex-proxy-rs:
     image: ${CPR_IMAGE:-codex-proxy-rs:89-fork}
+    pull_policy: never
     ports: !override
       - '127.0.0.1:18080:8080'
     mem_limit: 1536m
