@@ -4,6 +4,7 @@ mod admin;
 mod affinity;
 mod api_key;
 mod catalog;
+mod cdk;
 mod cookie;
 mod oauth;
 mod profile_statistics;
@@ -11,6 +12,7 @@ mod quota;
 mod recovery_log;
 mod refresh;
 mod repository;
+mod revive;
 mod security;
 mod selector;
 pub mod token_client;
@@ -39,6 +41,7 @@ pub use catalog::{
     CodexCatalogScope, CodexCredentialCatalogError, CodexCredentialCatalogService,
     CodexCredentialCatalogSnapshot, CodexPlanCatalog,
 };
+pub use cdk::{CodexCdkClient, CodexCdkError, extract_cdk_codes, is_cdk_code};
 pub use cookie::{CodexCookiePolicy, CookiePolicyError};
 pub use oauth::{
     CodexOAuthAdmin, CodexOAuthAdminError, CodexOAuthAdminService, CodexOAuthAuthorizationStarted,
@@ -59,6 +62,7 @@ pub use refresh::{
     DueCodexCredential,
 };
 pub use repository::{CodexCredentialRepository, CredentialRepositoryError};
+pub use revive::{CodexReviveCycleSummary, CodexReviveError, CodexReviveService};
 pub use security::{
     CodexCredentialCodec, CodexCredentialDataError, CodexRuntimeAuthentication,
     CodexRuntimeCredential,

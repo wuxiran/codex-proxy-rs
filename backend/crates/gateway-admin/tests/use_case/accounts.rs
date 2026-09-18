@@ -244,6 +244,7 @@ impl FakeProviderAdmin {
                 email: account.email.clone(),
                 plan_type: account.plan_type.clone(),
                 preserve_profile: false,
+                preserve_credential_state: false,
                 provider_material: document(),
                 has_refresh_token: account.has_refresh_token,
                 access_token_expires_at: account
@@ -2066,6 +2067,57 @@ async fn api_key_list_and_detail_should_accumulate_local_usage_without_subscript
     assert_eq!(detail.usage, page.items[0].usage);
     assert!(detail.quota.windows.is_empty());
     assert_eq!(store.quota_window_queries()[0].range.start, added_at);
+}
+
+#[tokio::test]
+async fn unobserved_quota_should_preserve_local_cost_in_list_detail_and_refresh() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let mut account = account_record("openai");
+    account.created_at = Utc::now() - TimeDelta::days(60);
+    let added_at = account.created_at;
+    let store = FakeAccountStore::with_account(account, events());
+    let services = accounts_service(provider, store.clone()).await;
+    let account_id = ProviderAccountId::new("acct_test").unwrap();
+
+    // 金额未知、已知零和已有消费都不依赖上游额度；统计范围也不能缩为最近 24 小时。
+    for amount in [None, Some("0"), Some("12.34")] {
+        let mut expected = quota_local_usage("acct_test", 4_330_000);
+        expected.costs = amount
+            .map(|value| gateway_admin::model::accounts::AccountCost {
+                currency: "USD".to_owned(),
+                amount: value.parse().unwrap(),
+            })
+            .into_iter()
+            .collect();
+        store.set_quota_window_usage(vec![AccountUsageWindowResult {
+            account_id: account_id.to_string(),
+            key: "account-lifetime".to_owned(),
+            usage: expected.clone(),
+        }]);
+        let page = services
+            .accounts()
+            .list(AccountListQuery {
+                page: 1,
+                page_size: gateway_admin::model::PageSize::new(20).unwrap(),
+                provider_kind: None,
+                group_filter: None,
+                search: None,
+                status: None,
+                sort: None,
+            })
+            .await
+            .unwrap();
+        let detail = services.accounts().quota(&account_id, false).await.unwrap();
+        let refreshed = services.accounts().quota(&account_id, true).await.unwrap();
+        for item in [&page.items[0], &detail, &refreshed] {
+            assert_eq!(item.usage.as_ref(), Some(&expected));
+            assert!(item.quota.windows.is_empty());
+        }
+        let queries = store.quota_window_queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].range.start, added_at);
+        assert!(queries[0].range.end > added_at + TimeDelta::days(59));
+    }
 }
 
 #[tokio::test]

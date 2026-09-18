@@ -11,6 +11,8 @@ pub(super) const QUOTA_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DESKTOP_RELEASE_WORKER_OWNER: &str = "openai-desktop-release";
 pub(super) const MODEL_ETAG_WORKER_OWNER: &str = "openai-model-etag";
 pub(super) const MODEL_CATALOG_WORKER_OWNER: &str = "openai-model-catalog";
+pub(super) const OAUTH_REVIVE_WORKER_OWNER: &str = "openai-oauth-revive";
+pub(super) const OAUTH_REVIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) fn worker_contributions(
     refresh: Arc<CodexCredentialRefreshService>,
@@ -19,6 +21,7 @@ pub(crate) fn worker_contributions(
     quota_refresh_policy: CodexQuotaRefreshPolicy,
     oauth_refresh_enabled: bool,
     desktop_release: Arc<CodexDesktopReleaseService>,
+    revive: Arc<crate::credential::CodexReviveService>,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -32,6 +35,14 @@ pub(crate) fn worker_contributions(
             refresh_id,
             OAUTH_REFRESH_INTERVAL,
             Box::new(OpenAiOAuthRefreshTask { service: refresh }),
+        )?));
+    }
+    if revive.enabled() {
+        let revive_id = WorkerId::try_new(WorkerKind::OAuthRefresh, OAUTH_REVIVE_WORKER_OWNER)?;
+        contributions.push(WorkerContribution::Registration(scheduled_registration(
+            revive_id,
+            OAUTH_REVIVE_INTERVAL,
+            Box::new(OpenAiOAuthReviveTask { service: revive }),
         )?));
     }
     contributions.extend([
@@ -160,6 +171,41 @@ impl ScheduledTask for OpenAiOAuthRefreshTask {
                 );
             }
             Ok(())
+        })
+    }
+}
+
+pub(super) struct OpenAiOAuthReviveTask {
+    service: Arc<crate::credential::CodexReviveService>,
+}
+
+impl ScheduledTask for OpenAiOAuthReviveTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            if context.cancellation().is_cancelled() {
+                return Ok(());
+            }
+            match self.service.run_cycle().await {
+                Ok(summary)
+                    if summary.applied > 0
+                        || summary.failed > 0
+                        || summary.skipped_unsigned > 0 =>
+                {
+                    tracing::info!(
+                        applied = summary.applied,
+                        failed = summary.failed,
+                        skipped_unsigned = summary.skipped_unsigned,
+                        cooled_down = summary.cooled_down,
+                        "OpenAI signed-export 401 revive cycle completed"
+                    );
+                    Ok(())
+                }
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    tracing::warn!(error = %error, "OpenAI signed-export 401 revive cycle failed");
+                    Err(WorkerTaskError::safe("OpenAI 401 revive failed"))
+                }
+            }
         })
     }
 }
