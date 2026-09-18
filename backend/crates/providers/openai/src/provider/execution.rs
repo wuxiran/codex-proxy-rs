@@ -503,7 +503,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             }
         }
 
-        let response_meta =
+        let mut response_meta =
             ResponseMeta::for_provider_endpoint(request.context.request_id().as_str());
         yield ProviderEvent::canonical(GatewayEvent::Started(response_meta.clone()));
         if matches!(request.endpoint_path, CODEX_IMAGE_GENERATIONS_PATH | CODEX_IMAGE_EDITS_PATH)
@@ -511,6 +511,9 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
         {
             yield ProviderEvent::canonical(GatewayEvent::Usage(usage));
             if let Some(cost) = cost {
+                let billing_model = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok().and_then(|body| body.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
+                response_meta = response_meta.with_billing_model(billing_model);
                 yield ProviderEvent::canonical(GatewayEvent::CalculatedCost(cost));
             }
         }

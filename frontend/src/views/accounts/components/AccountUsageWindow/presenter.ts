@@ -2,6 +2,7 @@ import type { AccountQuotaWindow } from '../../constants'
 import { clamp } from 'es-toolkit'
 import { formatInteger } from '@/utils/number'
 import { isRecord } from '@/utils/object'
+import { formatUsd } from '@/views/usage/utils/format'
 
 export type AccountUsageWindowVariant = 'compact' | 'detail' | 'metric'
 
@@ -19,11 +20,17 @@ export interface AccountRequestBar {
   title: string
 }
 
+export interface AccountUsdCost {
+  amount: number
+  display: string
+}
+
 interface AccountLocalUsage {
   requestCount?: number
   requestCountDisplay?: string
   totalTokens?: number
   totalTokensDisplay?: string
+  usd?: AccountUsdCost
   requestBuckets?: AccountRequestBucket[]
 }
 
@@ -187,7 +194,24 @@ function accountLocalUsage(value: unknown): AccountLocalUsage | null {
     localUsage.totalTokens = value.totalTokens
   if (typeof value.totalTokensDisplay === 'string')
     localUsage.totalTokensDisplay = value.totalTokensDisplay
+  const usd = readModelPriceUsd(value.billing)
+  if (usd)
+    localUsage.usd = usd
   return localUsage
+}
+
+function readModelPriceUsd(value: unknown): AccountUsdCost | null {
+  if (!isRecord(value) || value.modelPriceAmountUsd == null)
+    return null
+  const amount = typeof value.modelPriceAmountUsd === 'string'
+    ? Number(value.modelPriceAmountUsd)
+    : value.modelPriceAmountUsd
+  if (!finiteNumber(amount) || amount < 0)
+    return null
+  const display = typeof value.modelPriceAmountUsdDisplay === 'string'
+    ? value.modelPriceAmountUsdDisplay
+    : formatUsd(amount)
+  return { amount, display }
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -240,6 +264,10 @@ function localTokenDisplay(localUsage: AccountLocalUsage | null) {
 export function quotaWindowLocalUsageDisplay(window: AccountQuotaWindow) {
   const localUsage = accountLocalUsage(window.localUsage)
   return localTokenDisplay(localUsage) || null
+}
+
+export function quotaWindowLocalUsd(window: AccountQuotaWindow | undefined) {
+  return accountLocalUsage(window?.localUsage)?.usd ?? null
 }
 
 function requestCountDisplay(localUsage: AccountLocalUsage | null) {

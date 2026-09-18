@@ -44,7 +44,25 @@ export interface AccountCurrencyCost {
   estimatedAmountDisplay: string
 }
 
+export interface AccountBilling {
+  modelPriceAmountUsd: string | null
+  modelPriceAmountUsdDisplay: string
+  upstreamCostAmountUsd: string | null
+  upstreamCostAmountUsdDisplay: string
+  differenceAmountUsd: string | null
+  differenceAmountUsdDisplay: string
+  modelPriceCount: number
+  upstreamCostCount: number
+}
+
 export interface AccountModelUsage {
+  key: string
+  requestedModelId: string | null
+  upstreamModelId: string | null
+  responseModel: string | null
+  billingModel: string | null
+  mismatch: boolean
+  billing: AccountBilling
   model: string
   requestCount: number
   requestCountDisplay: string
@@ -78,6 +96,7 @@ export interface AccountModelUsage {
 }
 
 export interface AccountUsage {
+  billing: AccountBilling
   windowLabelDisplay: string
   requestCount: number | null
   requestCountDisplay: string

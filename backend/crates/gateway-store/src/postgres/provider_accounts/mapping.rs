@@ -79,6 +79,7 @@ pub(crate) fn admin_account_usage(
     usage: ProviderAccountUsageObservation,
 ) -> AdminStoreResult<AccountUsage> {
     Ok(AccountUsage {
+        billing: usage.billing,
         account_id: usage.account_id,
         request_count: usage.request_count,
         success_count: usage.success_count,
@@ -121,6 +122,8 @@ pub(crate) fn admin_account_usage_window(
         account_id: window_usage_value(row, "account_id")?,
         key: window_usage_value(row, "window_key")?,
         usage: AccountUsage {
+            billing: crate::postgres::observability::account_billing_amounts(row)
+                .map_err(|error| admin_store_error(ENTITY, error))?,
             account_id: window_usage_value(row, "account_id")?,
             request_count: window_usage_count(row, "request_count")?,
             success_count: window_usage_count(row, "success_count")?,
@@ -159,8 +162,16 @@ pub(crate) fn admin_account_usage_window_model(
     let calculated_count = window_usage_count(row, "calculated_count")?;
     let unavailable_count = window_usage_count(row, "unavailable_count")?;
     Ok((
-        (account_id, window_key, model.clone()),
+        (
+            account_id,
+            window_key,
+            window_usage_value(row, "model_key")?,
+        ),
         AccountModelUsage {
+            identity: crate::postgres::observability::account_model_identity(row)
+                .map_err(|error| admin_store_error(ENTITY, error))?,
+            billing: crate::postgres::observability::account_billing_amounts(row)
+                .map_err(|error| admin_store_error(ENTITY, error))?,
             model,
             request_count: window_usage_count(row, "request_count")?,
             success_count: window_usage_count(row, "success_count")?,
@@ -193,7 +204,7 @@ pub(crate) fn admin_account_usage_window_model_cost(
     let key = (
         window_usage_value(row, "account_id")?,
         window_usage_value(row, "window_key")?,
-        window_usage_value(row, "model")?,
+        window_usage_value(row, "model_key")?,
     );
     let amount = window_usage_value::<String>(row, "amount")?;
     let amount = AdminDecimalAmount::from_str(&amount).map_err(|_| {
@@ -276,6 +287,8 @@ pub(crate) fn admin_account_model_usage(
     usage: ProviderAccountModelUsageObservation,
 ) -> AdminStoreResult<AccountModelUsage> {
     Ok(AccountModelUsage {
+        billing: usage.billing,
+        identity: usage.identity,
         model: usage.model,
         request_count: usage.request_count,
         success_count: usage.success_count,

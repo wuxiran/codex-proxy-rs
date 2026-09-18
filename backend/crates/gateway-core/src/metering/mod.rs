@@ -292,9 +292,17 @@ pub struct CalculatedCost {
     total: Money,
 }
 
+/// 与最终扣费来源分开保留的模型计价事实；未知模型不从路由名称推断。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelBillingObservation {
+    pub response_model: Option<String>,
+    pub billing_model: Option<String>,
+    pub calculated_cost: Option<Money>,
+}
+
 /// Provider 受控价格规则计算出的运行时费用明细。
 ///
-/// 该值只用于生成事件和管理端展示，不是持久化模型；数据库仍只保存最终总额、货币和来源。
+/// 该值用于生成事件和管理端展示；数据库分别保存模型计算总额与最终费用来源，不持久化价格明细。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculatedCostBreakdown {
     input_amount: Money,

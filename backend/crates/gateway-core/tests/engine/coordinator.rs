@@ -84,6 +84,7 @@ struct FinalState {
     first_token_ms: Option<u64>,
     provider_processing_ms: Option<u64>,
     provider_metadata_json: Option<String>,
+    billing: gateway_core::metering::ModelBillingObservation,
     cost_source: CostSource,
     cost_ticks: Option<u128>,
 }
@@ -250,6 +251,7 @@ impl ExecutionStore for FakeStore {
                 first_token_ms: finalization.timings.first_token_ms,
                 provider_processing_ms: finalization.timings.provider_processing_ms,
                 provider_metadata_json: finalization.provider_metadata_json,
+                billing: finalization.billing,
                 cost_source: finalization.cost.source(),
                 cost_ticks: finalization
                     .cost
@@ -2161,6 +2163,15 @@ fn calculated_cost_is_persisted_when_provider_does_not_report_cost() {
 
     assert_eq!(state.finalizations[0].cost_source, CostSource::Calculated);
     assert_eq!(state.finalizations[0].cost_ticks, Some(123));
+    assert_eq!(
+        state.finalizations[0]
+            .billing
+            .calculated_cost
+            .unwrap()
+            .amount()
+            .scaled(),
+        123
+    );
 }
 
 #[test]
@@ -2170,7 +2181,7 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
     let events = vec![
         Ok(GatewayEvent::Started(ResponseMeta::new(
             "reported-cost",
-            "grok-4.5",
+            "gpt-5.6-luna",
         ))),
         Ok(GatewayEvent::CalculatedCost(
             CalculatedCost::from_usd_ticks(10).expect("first calculated cost"),
@@ -2181,10 +2192,10 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
         Ok(GatewayEvent::CalculatedCost(
             CalculatedCost::from_usd_ticks(999).expect("later calculated cost"),
         )),
-        Ok(GatewayEvent::Completed(ResponseMeta::new(
-            "reported-cost",
-            "grok-4.5",
-        ))),
+        Ok(GatewayEvent::Completed(
+            ResponseMeta::new("reported-cost", "gpt-5.6-luna")
+                .with_billing_model(Some("gpt-5.6-luna".to_owned())),
+        )),
     ];
     let (coordinator, store, _) = coordinator(vec![Script::Stream {
         account_id: "acct_one",
@@ -2209,6 +2220,23 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
             state.finalizations[0].cost_ticks
         ),
         (CostSource::ProviderReported, Some(25))
+    );
+    assert_eq!(
+        state.finalizations[0]
+            .billing
+            .calculated_cost
+            .unwrap()
+            .amount()
+            .scaled(),
+        999
+    );
+    assert_eq!(
+        state.finalizations[0].billing.response_model.as_deref(),
+        Some("gpt-5.6-luna")
+    );
+    assert_eq!(
+        state.finalizations[0].billing.billing_model.as_deref(),
+        Some("gpt-5.6-luna")
     );
 }
 
@@ -2255,6 +2283,8 @@ fn discarded_attempt_cost_never_leaks_into_retry_result() {
     let state = store.state.lock().expect("store lock");
     assert_eq!(state.finalizations[0].cost_source, CostSource::Unavailable);
     assert_eq!(state.finalizations[0].cost_ticks, None);
+    assert!(state.finalizations[0].billing.calculated_cost.is_none());
+    assert!(state.finalizations[0].billing.billing_model.is_none());
     assert_eq!(
         session.budget_charge().amount_usd.scaled(),
         999,

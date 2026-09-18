@@ -3,13 +3,14 @@
 use super::ModelRequestTimings;
 use crate::event::GatewayEvent;
 use crate::event::ProviderResponseObservation;
-use crate::metering::{CostEstimate, CostSource, Usage};
+use crate::metering::{CostEstimate, CostSource, ModelBillingObservation, Usage};
 use std::time::Instant;
 
 pub(super) struct ResponseObservation {
     pub(super) timing_started_at: Instant,
     pub(super) usage: Usage,
     pub(super) cost: CostEstimate,
+    pub(super) billing: ModelBillingObservation,
     pub(super) timings: ModelRequestTimings,
     pub(super) client_response_id: Option<String>,
     pub(super) upstream_response_id: Option<String>,
@@ -21,6 +22,7 @@ impl ResponseObservation {
             timing_started_at,
             usage: Usage::new(),
             cost: CostEstimate::unavailable(),
+            billing: ModelBillingObservation::default(),
             timings: ModelRequestTimings::default(),
             client_response_id: None,
             upstream_response_id: None,
@@ -41,10 +43,11 @@ impl ResponseObservation {
         if let GatewayEvent::Usage(observed) = event {
             self.usage.merge(observed);
         }
-        if let GatewayEvent::CalculatedCost(observed) = event
-            && self.cost.source() != CostSource::ProviderReported
-        {
-            self.cost = observed.into_estimate();
+        if let GatewayEvent::CalculatedCost(observed) = event {
+            self.billing.calculated_cost = Some(observed.total());
+            if self.cost.source() != CostSource::ProviderReported {
+                self.cost = observed.into_estimate();
+            }
         }
         if let GatewayEvent::ProviderCost(observed) = event {
             self.cost = observed.into_estimate();
@@ -56,6 +59,12 @@ impl ResponseObservation {
             GatewayEvent::Started(metadata) | GatewayEvent::Completed(metadata) => metadata,
             _ => return,
         };
+        if let Some(model) = metadata.observed_model() {
+            self.billing.response_model = Some(model.to_owned());
+        }
+        if let Some(model) = metadata.billing_model() {
+            self.billing.billing_model = Some(model.to_owned());
+        }
         let response_id = metadata.response_id().to_owned();
         self.client_response_id = Some(response_id.clone());
         self.upstream_response_id = Some(response_id);
@@ -64,6 +73,7 @@ impl ResponseObservation {
     pub(super) fn reset_for_attempt(&mut self) {
         self.usage = Usage::new();
         self.cost = CostEstimate::unavailable();
+        self.billing = ModelBillingObservation::default();
         self.client_response_id = None;
         self.upstream_response_id = None;
         self.timings.transport_decision_wait_ms = None;

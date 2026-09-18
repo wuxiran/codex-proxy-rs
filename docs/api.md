@@ -394,6 +394,27 @@ OpenAI 主动额度刷新和正常响应携带的明确套餐会同步到账号�
 浏览器打开的第三方 OAuth 授权页仍使用浏览器自身网络。
 账号出口与连接隔离见 [架构说明](architecture.md#账号出站代理)。
 
+### 账号用量与费用来源
+
+账号列表、详情的 `usage.billing` 和逐模型 `usage.models[].billing` 使用相同时间窗口，提供以下 USD 字段：
+
+| 字段 | 语义 |
+| --- | --- |
+| `modelPriceAmountUsd` / `modelPriceAmountUsdDisplay` | 按计费模型价格和已记录用量计算的金额；不是上游实际扣费 |
+| `upstreamCostAmountUsd` / `upstreamCostAmountUsdDisplay` | 仅聚合上游明确返回的费用；未返回时为 `null` / “未提供”，明确零值为 `0` |
+| `modelPriceCount` / `upstreamCostCount` | 对应费用已提供的请求数；未覆盖全部请求时展示部分覆盖数 |
+| `differenceAmountUsd` / `differenceAmountUsdDisplay` | 模型计价减真实上游费用；仅当同一组所有请求的两类 USD 费用均已提供时计算，否则为 `null` / “不可计算” |
+
+`usage.models[]` 按 `requestedModelId`、`upstreamModelId`、`responseModel`、`billingModel` 四元组分行；
+`key` 为该组合的稳定行标识。分别表示请求模型、路由模型、上游实际响应模型、实际采用的价格模型。
+请求模型与任一已知路由、响应或计费模型不一致时，`mismatch=true`。未知身份为 `null`，不把协议回退
+模型或历史请求名称猜作响应/计费模型。相同 Astra 请求、不同 Luna 响应或计价不会合并成一行。
+
+旧 `costs` 字段保留其原有的来源混合聚合，仅供兼容；账号费用展示应使用 `billing`。
+`billingAmountUsd` 是逐模型计价金额的兼容字段。历史记录中明确为 `calculated` 的金额迁入模型计价列，
+历史响应模型与计费模型保持未知；历史 `provider_reported` 金额可显示为真实费用，不反推模型计价。
+上游未返回支持的明确费用字段时，系统无法确认其实际扣费；当前支持精确 USD ticks，站外消耗不在统计内。
+
 ### 账号模型限制
 
 账号列表和详情返回 `modelAccess: { mode, models }`，模型 ID 区分大小写并精确匹配：

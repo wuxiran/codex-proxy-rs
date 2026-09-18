@@ -2496,6 +2496,7 @@ fn empty_quota() -> ProviderQuota {
 
 fn quota_local_usage(account_id: &str, total_tokens: u64) -> AccountUsage {
     AccountUsage {
+        billing: Default::default(),
         account_id: account_id.to_owned(),
         request_count: 1,
         success_count: 1,

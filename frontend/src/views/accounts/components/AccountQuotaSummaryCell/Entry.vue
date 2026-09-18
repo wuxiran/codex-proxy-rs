@@ -7,7 +7,7 @@ import BasePopover from '@/components/base/BasePopover.vue'
 import { useUiClock } from '@/composables/useUiClock'
 import AccountRequestTimeline from '../AccountUsageWindow/AccountRequestTimeline.vue'
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'
-import { resolveAccountUsageWindowPresentation } from '../AccountUsageWindow/presenter'
+import { quotaWindowLocalUsd, resolveAccountUsageWindowPresentation } from '../AccountUsageWindow/presenter'
 import AccountQuotaWindowGroup from './WindowGroup.vue'
 
 const props = withDefaults(defineProps<{
@@ -46,6 +46,7 @@ const detailItems = computed(() =>
       usedPercentDisplay: window.usedPercentDisplay,
       resetAtDisplay: window.resetAtDisplay,
       localUsageDisplay: view.quota.localUsageVisible ? view.quota.localUsageDisplay : '—',
+      localUsdDisplay: quotaWindowLocalUsd(window)?.display ?? '—',
       percentTextClass: view.quota.percentTextClass,
       barClass: view.quota.barClass,
       barStyle: view.quota.barStyle,
@@ -174,6 +175,12 @@ function quotaWindowCode(windowSeconds: number | null, role: AccountQuotaWindow[
               </dt>
               <dd class="m-0 text-right font-mono font-heavy tabular-nums text-cp-text">
                 {{ item.localUsageDisplay }}
+              </dd>
+              <dt class="font-emphasis text-cp-text-tertiary">
+                按模型价格计费
+              </dt>
+              <dd class="m-0 text-right font-mono font-heavy tabular-nums text-cp-text">
+                {{ item.localUsdDisplay }}
               </dd>
               <dt class="font-emphasis text-cp-text-tertiary">
                 重置时间

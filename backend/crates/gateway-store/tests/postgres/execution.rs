@@ -480,6 +480,7 @@ async fn expired_image_request_should_be_recovered_as_failed() {
 
 fn successful_core_finalization(id: &str) -> CoreModelRequestFinalization {
     CoreModelRequestFinalization {
+        billing: Default::default(),
         diagnostic_trace_json: None,
         request_id: ModelRequestId::new(id).expect("request id"),
         outcome: ExecutionOutcome::Succeeded,
@@ -1217,6 +1218,7 @@ pub(super) fn early_failure(request: &CoreNewModelRequest) -> CoreModelRequestFi
         json!({"outcome": "failed", "errorKind": "no_available_provider", "attemptCount": 0}),
     );
     CoreModelRequestFinalization {
+        billing: Default::default(),
         request_id: request.id.clone(),
         outcome: ExecutionOutcome::Failed,
         send_state: UpstreamSendState::NotSent,
@@ -1757,5 +1759,69 @@ async fn zero_attempt_failure_does_not_enter_successful_usage_or_cost_aggregates
         .await
         .expect("observations do not settle budgets");
     assert_eq!(charges, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn model_billing_identity_and_both_costs_survive_finalization() {
+    use gateway_core::metering::{ModelBillingObservation, ProviderReportedCost};
+    let Some(database) = TestDatabase::create("billing_identity_persistence").await else {
+        return;
+    };
+    seed_running_request(&database.pool, "req_billing_identity")
+        .await
+        .unwrap();
+    sqlx::query("update model_requests set requested_model_id = 'gpt-6-astra', upstream_model_id = 'gpt-6-astra' where id = 'req_billing_identity'")
+        .execute(&database.pool).await.unwrap();
+    let store = PgExecutionStore::new(database.pool.clone());
+    let mut finalization = successful_core_finalization("req_billing_identity");
+    finalization.cost = ProviderReportedCost::from_usd_ticks(0)
+        .unwrap()
+        .into_estimate();
+    finalization.billing = ModelBillingObservation {
+        response_model: Some("gpt-5.6-luna".to_owned()),
+        billing_model: Some("gpt-5.6-luna".to_owned()),
+        calculated_cost: Some(CalculatedCost::from_usd_ticks(12345).unwrap().total()),
+    };
+    ExecutionStore::finalize_model_request(&store, finalization)
+        .await
+        .unwrap();
+    let row: Value = sqlx::query_scalar("select jsonb_build_object('requested', requested_model_id, 'upstream', upstream_model_id, 'response', response_model, 'billing', billing_model, 'calculated', calculated_cost_amount::text, 'actual', cost_amount::text, 'source', cost_source) from model_requests where id = 'req_billing_identity'")
+        .fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        row,
+        json!({"requested":"gpt-6-astra","upstream":"gpt-6-astra","response":"gpt-5.6-luna","billing":"gpt-5.6-luna","calculated":"0.0000012345","actual":"0.0000000000","source":"provider_reported"})
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn billing_migration_preserves_historical_cost_provenance_without_guessing_models() {
+    let Some(database) = TestDatabase::create("billing_history_migration").await else {
+        return;
+    };
+    for id in ["req_history_calculated", "req_history_reported"] {
+        seed_running_request(&database.pool, id).await.unwrap();
+    }
+    sqlx::query("update model_requests set cost_source = case when id = 'req_history_calculated' then 'calculated' else 'provider_reported' end, cost_amount = 1.25, cost_currency = 'USD'")
+        .execute(&database.pool).await.unwrap();
+    sqlx::raw_sql("alter table model_requests drop column response_model, drop column billing_model, drop column calculated_cost_amount, drop column calculated_cost_currency")
+        .execute(&database.pool).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0012_model_billing_observations.sql"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let rows: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id', id, 'price', calculated_cost_amount::text, 'amount', cost_amount::text, 'source', cost_source, 'response', response_model, 'billing', billing_model) from model_requests order by id")
+        .fetch_all(&database.pool).await.unwrap();
+    assert_eq!(
+        rows[0],
+        json!({"id":"req_history_calculated","price":"1.2500000000","amount":"1.2500000000","source":"calculated","response":null,"billing":null})
+    );
+    assert_eq!(
+        rows[1],
+        json!({"id":"req_history_reported","price":null,"amount":"1.2500000000","source":"provider_reported","response":null,"billing":null})
+    );
     database.close().await;
 }

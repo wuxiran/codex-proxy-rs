@@ -25,6 +25,7 @@ fn window(key: &str, days: u64) -> ProviderQuotaWindow {
         reset_at: Some(now() + Duration::days(1)),
         limit_reached: false,
         local_usage: Some(AccountUsage {
+            billing: Default::default(),
             account_id: "acct_forecast".to_owned(),
             request_count: 10,
             success_count: 10,
