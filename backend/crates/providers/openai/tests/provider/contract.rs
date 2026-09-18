@@ -121,7 +121,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
 
 const OFFICIAL_FIXTURE: &[u8] =
     include_bytes!("../transport/fixtures/official_models_snapshot.json");
-const CAPTURE_COMPLETED_SSE: &str = concat!(
+pub(super) const CAPTURE_COMPLETED_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_scope_capture\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 );
@@ -207,7 +207,10 @@ fn provider_with_affinity(
     provider_with_affinity_and_base_url(store, session_affinity, OFFICIAL_CODEX_BASE_URL.to_owned())
 }
 
-fn provider_with_base_url(store: &Arc<MemoryAccountStore>, base_url: String) -> CodexProvider {
+pub(super) fn provider_with_base_url(
+    store: &Arc<MemoryAccountStore>,
+    base_url: String,
+) -> CodexProvider {
     provider_with_base_url_and_retry_budget(
         store,
         base_url,
@@ -352,7 +355,7 @@ fn provider_and_quota_with_runtime_ports(
     (provider, quota, websocket_pool)
 }
 
-async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {
+pub(super) async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {
     create_account_with_enabled(store, id, true).await;
 }
 
@@ -435,9 +438,17 @@ fn http_generate_operation() -> Operation {
     Operation::Generate(GenerateRequest::from_protocol_payload(payload))
 }
 
-fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
+pub(super) fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
+    planned_request_for_model(provider_name, operation, "gpt-5.4")
+}
+
+pub(super) fn planned_request_for_model(
+    provider_name: &str,
+    operation: Operation,
+    model: &str,
+) -> ProviderRequest {
     let provider = ProviderKind::new(provider_name).expect("provider");
-    let upstream_model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
+    let upstream_model = UpstreamModelId::new(model).expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
     let account_scope = Arc::new(FrozenAccountScope::new(
         Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([(
@@ -500,7 +511,7 @@ fn planned_provider_endpoint_request(provider_name: &str, operation: Operation) 
     ProviderRequest::new(operation, plan.candidates()[0].clone())
 }
 
-fn contract_account_scope() -> Arc<FrozenAccountScope> {
+pub(super) fn contract_account_scope() -> Arc<FrozenAccountScope> {
     let provider = ProviderKind::new("openai").expect("provider");
     let accounts = [
         "acct_abrupt_disconnect",
@@ -572,7 +583,7 @@ fn global_request_location() -> gateway_core::account::RequestLocation {
     }
 }
 
-fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
+pub(super) fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new(request_id).expect("request id"),
@@ -613,7 +624,7 @@ fn diagnostic_context(request_id: &str, account_id: &str) -> AttemptContext {
     )
 }
 
-fn context_with_state_owner(request_id: &str, owner_account_id: &str) -> AttemptContext {
+pub(super) fn context_with_state_owner(request_id: &str, owner_account_id: &str) -> AttemptContext {
     context_with_state_owner_and_location(
         request_id,
         owner_account_id,
@@ -892,7 +903,7 @@ fn captured_header_values(request: &wiremock::Request, name: &str) -> Vec<Vec<u8
         .collect()
 }
 
-fn captured_request_body(request: &wiremock::Request) -> serde_json::Value {
+pub(super) fn captured_request_body(request: &wiremock::Request) -> serde_json::Value {
     let body = if request
         .headers
         .get("content-encoding")

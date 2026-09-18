@@ -164,6 +164,7 @@ struct RawJsonEndpointRequest {
     session_affinity: Option<CodexSessionAffinity>,
 }
 
+#[derive(Clone)]
 pub(super) struct ColdResponse {
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
@@ -179,6 +180,7 @@ pub(super) struct ColdResponse {
     pub(super) session_affinity_key: Option<ProviderSessionAffinityKey>,
     pub(super) session_affinity_key_hash: Option<String>,
     pub(super) session_transport_recovery: CodexSessionTransportRecovery,
+    pub(super) invalid_encrypted_content: InvalidEncryptedContentCache,
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
@@ -220,6 +222,7 @@ pub(super) enum OpenAiContinuationScope {
     ReplayRequired,
 }
 
+#[derive(Clone)]
 pub(super) struct OpenAiSessionCapture {
     pub(super) account_id: String,
     pub(super) credential_revision: Option<u64>,
@@ -553,6 +556,76 @@ fn image_response_metering(
 }
 
 pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
+    if !can_recover(&response.request) {
+        return cold_response_stream_once(response);
+    }
+    Box::pin(async_stream::try_stream! {
+        let mut response = response;
+        let scope = recovery_scope(&response.request, response.lease.account(), response.context.client_api_key_ref());
+        let known = response.invalid_encrypted_content.known(scope);
+        let removed = strip_encrypted_reasoning(&mut response.request, Some(&known));
+        if removed > 0 {
+            tracing::info!(request_id = response.context.request_id().as_str(), removed_items = removed,
+                recovery = "invalid_encrypted_content", recovery_action = "preclean", "OpenAI invalid reasoning history cleaned");
+        }
+        let mut retried = false;
+        'recovery: loop {
+            // 仅候选恢复请求保留一份快照；重试沿用同一个 lease/client，不刷新或换号。
+            let mut events = cold_response_stream_once(response.clone());
+            let mut delivered = false;
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(event) => {
+                        delivered |= event.has_client_event() || !event.canonical_facts().is_empty();
+                        yield event;
+                    }
+                    Err(mut error) => {
+                        if !delivered && !retried && is_encrypted_content_rejection(&error)
+                            && (error.client_visible_upstream_response().is_some() || error.has_atomic_client_events())
+                            && can_recover(&response.request) {
+                            let pending = error.take_atomic_client_events();
+                            if pending.iter().all(encrypted_recovery_prelude) {
+                                response.invalid_encrypted_content.remember(scope, &response.request);
+                                let removed = strip_encrypted_reasoning(&mut response.request, None);
+                                if removed > 0 {
+                                    retried = true;
+                                    tracing::info!(request_id = response.context.request_id().as_str(), removed_items = removed,
+                                        recovery = "invalid_encrypted_content", recovery_attempt = 1,
+                                        "OpenAI rejected reasoning history recovered on the same credential");
+                                    continue 'recovery;
+                                }
+                            }
+                            error = error.with_atomic_client_events(pending);
+                        }
+                        Err(error)?;
+                    }
+                }
+            }
+            break;
+        }
+    })
+}
+
+fn encrypted_recovery_prelude(event: &ProviderEvent) -> bool {
+    // 即使工具结构帧尚未交付，也不能在未知服务端副作用后重试。只放行空前导帧。
+    event
+        .canonical_facts()
+        .iter()
+        .all(|fact| matches!(fact, GatewayEvent::Started(_)))
+        && event.wire_event().is_none_or(|wire| {
+            let data = wire.data();
+            matches!(
+                wire.event_type()
+                    .or_else(|| data.get("type").and_then(Value::as_str)),
+                Some("response.created" | "response.in_progress" | "response.failed" | "error")
+            ) && data
+                .pointer("/response/output")
+                .is_none_or(|output| output.as_array().is_some_and(Vec::is_empty))
+                && data.pointer("/response/usage").is_none_or(Value::is_null)
+        })
+}
+
+fn cold_response_stream_once(response: ColdResponse) -> EventStream {
     let ColdResponse {
         client,
         response_origin,
@@ -568,6 +641,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         session_affinity_key,
         session_affinity_key_hash,
         session_transport_recovery,
+        invalid_encrypted_content: _,
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,

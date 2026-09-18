@@ -95,11 +95,13 @@ use crate::transport::{
     endpoint_url,
 };
 
+mod encrypted_content;
 mod execution;
 mod failure;
 mod observation;
 mod workers;
 
+use encrypted_content::*;
 use execution::*;
 #[doc(hidden)]
 pub use failure::openai_failure_affects_account_score;
@@ -148,6 +150,7 @@ pub struct CodexProvider {
     search_url: Url,
     session_identity: Option<CodexSessionIdentity>,
     session_transport_recovery: CodexSessionTransportRecovery,
+    invalid_encrypted_content: InvalidEncryptedContentCache,
     stream_max_retries: u32,
 }
 
@@ -188,6 +191,7 @@ impl CodexProvider {
             search_url,
             session_identity: None,
             session_transport_recovery: CodexSessionTransportRecovery::default(),
+            invalid_encrypted_content: InvalidEncryptedContentCache::default(),
             stream_max_retries,
         })
     }
@@ -606,6 +610,7 @@ impl Provider for CodexProvider {
             session_affinity_key,
             session_affinity_key_hash,
             session_transport_recovery: self.session_transport_recovery.clone(),
+            invalid_encrypted_content: self.invalid_encrypted_content.clone(),
             websocket_retry_count,
             stream_max_retries: self.stream_max_retries,
             session_capture,
