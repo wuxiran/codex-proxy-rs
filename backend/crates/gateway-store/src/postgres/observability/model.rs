@@ -364,6 +364,7 @@ pub struct ProviderAccountRequestBucket {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountUsageObservation {
+    pub billing: gateway_admin::model::accounts::AccountBillingAmounts,
     pub account_id: String,
     pub provider_kind: String,
     pub authentication_kind: String,
@@ -391,6 +392,8 @@ pub struct ProviderAccountUsageObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountModelUsageObservation {
+    pub identity: gateway_admin::model::accounts::AccountModelIdentity,
+    pub billing: gateway_admin::model::accounts::AccountBillingAmounts,
     pub model: String,
     pub request_count: u64,
     pub success_count: u64,
@@ -415,6 +418,7 @@ pub struct ProviderAccountUsageQuery {
     pub account_ids: Option<Vec<String>>,
     pub limit: u16,
     pub(crate) include_hourly_request_buckets: bool,
+    pub(crate) split_model_identity: bool,
 }
 
 impl ProviderAccountUsageQuery {
@@ -431,6 +435,7 @@ impl ProviderAccountUsageQuery {
                 .map_err(|_| invalid("account usage query is too large"))?,
             account_ids: Some(account_ids),
             include_hourly_request_buckets: false,
+            split_model_identity: false,
         })
     }
 
@@ -443,7 +448,13 @@ impl ProviderAccountUsageQuery {
             account_ids: None,
             limit,
             include_hourly_request_buckets: false,
+            split_model_identity: false,
         })
+    }
+
+    pub(crate) fn with_model_identity(mut self) -> Self {
+        self.split_model_identity = true;
+        self
     }
 
     pub fn with_hourly_request_buckets(mut self) -> StoreResult<Self> {

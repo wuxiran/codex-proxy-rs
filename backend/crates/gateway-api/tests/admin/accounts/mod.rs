@@ -434,6 +434,10 @@ mod response {
     #[test]
     fn account_usage_view_should_keep_unobserved_numbers_null() {
         let view = AccountUsageView {
+            billing: gateway_api::admin::accounts::AccountBillingView::from((
+                &Default::default(),
+                0,
+            )),
             window_label_display: "周/月额度窗口".to_owned(),
             request_count: None,
             request_count_display: "-".to_owned(),

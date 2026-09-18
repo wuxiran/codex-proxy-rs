@@ -456,7 +456,10 @@ impl CodexCanonicalDecoder {
             .to_owned();
         self.response_id = Some(response_id.clone());
         self.started = true;
-        output.push(GatewayEvent::Started(ResponseMeta::new(response_id, model)));
+        output.push(GatewayEvent::Started(
+            ResponseMeta::new(response_id, model)
+                .with_observed_model(response.get("model").and_then(Value::as_str)),
+        ));
         Ok(())
     }
 
@@ -855,6 +858,7 @@ impl CodexCanonicalDecoder {
             output.push(GatewayEvent::Usage(core_usage(usage)));
             self.usage_emitted = true;
         }
+        let mut billing_model = None;
         let model = response
             .get("model")
             .and_then(Value::as_str)
@@ -877,7 +881,17 @@ impl CodexCanonicalDecoder {
                 )
             })
         {
+            billing_model = Some(model.clone());
             output.push(GatewayEvent::CalculatedCost(breakdown.calculated_cost()));
+        }
+        // 仅接受上游明确返回的精确 USD ticks；零费用也属于已提供。
+        if let Some(ticks) = response
+            .pointer("/usage/cost_in_usd_ticks")
+            .and_then(Value::as_u64)
+            && let Ok(cost) =
+                gateway_core::metering::ProviderReportedCost::from_usd_ticks(u128::from(ticks))
+        {
+            output.push(GatewayEvent::ProviderCost(cost));
         }
         let finish_reason = if event_type == "response.incomplete"
             || response.get("status").and_then(Value::as_str) == Some("incomplete")
@@ -887,7 +901,10 @@ impl CodexCanonicalDecoder {
             FinishReason::Stop
         };
         output.push(GatewayEvent::Completed(
-            ResponseMeta::new(response_id, model).with_finish_reason(finish_reason),
+            ResponseMeta::new(response_id, model)
+                .with_observed_model(response.get("model").and_then(Value::as_str))
+                .with_billing_model(billing_model)
+                .with_finish_reason(finish_reason),
         ));
         self.completed = true;
         Ok(())

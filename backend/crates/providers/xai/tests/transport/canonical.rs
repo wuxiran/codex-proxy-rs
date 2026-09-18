@@ -243,7 +243,8 @@ fn decoder_should_price_official_grok_45_build_free_variant() {
 fn zero_provider_cost_should_remain_an_authoritative_zero() {
     let events = terminal_cost_events("grok-4.5", 1, 0, 1, Some(0));
 
-    assert_eq!(calculated_cost_ticks(&events), None);
+    // 每百万输入 $2、输出 $6；各一个 Token 的模型计价与真实零费用同时保留。
+    assert_eq!(calculated_cost_ticks(&events), Some(80_000));
     assert_eq!(provider_cost_ticks(&events), Some(0));
 }
 
@@ -318,8 +319,8 @@ fn billing_should_use_the_final_response_tier_and_preserve_provider_cost() {
         ("priority", None, Some(400_000_000), None),
         ("default", None, Some(200_000_000), None),
         ("future", None, None, None),
-        ("priority", Some(0), None, Some(0)),
-        ("priority", Some(123), None, Some(123)),
+        ("priority", Some(0), Some(400_000_000), Some(0)),
+        ("priority", Some(123), Some(400_000_000), Some(123)),
     ] {
         let mut response = serde_json::json!({"service_tier": tier, "output": [], "usage": {"input_tokens": 10_000, "output_tokens": 0}});
         if let Some(ticks) = ticks {
@@ -374,7 +375,7 @@ fn nonzero_provider_cost_should_take_priority_over_calculated_cost() {
     let events = terminal_cost_events("grok-4.5", 100, 25, 10, Some(123));
 
     assert_eq!(provider_cost_ticks(&events), Some(123));
-    assert_eq!(calculated_cost_ticks(&events), None);
+    assert_eq!(calculated_cost_ticks(&events), Some(2_175_000));
 }
 
 #[test]

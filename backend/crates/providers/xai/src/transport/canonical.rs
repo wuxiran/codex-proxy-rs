@@ -446,7 +446,10 @@ impl GrokCanonicalDecoder {
             .to_owned();
         self.response_id = Some(response_id.clone());
         self.started = true;
-        output.push(GatewayEvent::Started(ResponseMeta::new(response_id, model)));
+        output.push(GatewayEvent::Started(
+            ResponseMeta::new(response_id, model)
+                .with_observed_model(response.get("model").and_then(Value::as_str)),
+        ));
         Ok(())
     }
 
@@ -645,6 +648,7 @@ impl GrokCanonicalDecoder {
             output.push(GatewayEvent::Usage(core_usage(usage)));
             self.usage_emitted = true;
         }
+        let mut billing_model = None;
         let model = response
             .get("model")
             .and_then(Value::as_str)
@@ -653,11 +657,13 @@ impl GrokCanonicalDecoder {
             .to_owned();
         if let Some(cost) = provider_reported_cost(response)? {
             output.push(GatewayEvent::ProviderCost(cost));
-        } else if !self.requires_provider_cost
+        }
+        if !self.requires_provider_cost
             && let Some(cost) = usage.and_then(|usage| {
                 calculated_cost(response, &model, usage, self.response_service_tier())
             })
         {
+            billing_model = Some(model.clone());
             output.push(GatewayEvent::CalculatedCost(cost));
         }
         let incomplete = event_type == "response.incomplete"
@@ -674,7 +680,10 @@ impl GrokCanonicalDecoder {
             FinishReason::Stop
         };
         output.push(GatewayEvent::Completed(
-            ResponseMeta::new(response_id, model).with_finish_reason(finish_reason),
+            ResponseMeta::new(response_id, model)
+                .with_observed_model(response.get("model").and_then(Value::as_str))
+                .with_billing_model(billing_model)
+                .with_finish_reason(finish_reason),
         ));
         self.completed = true;
         Ok(())

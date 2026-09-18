@@ -128,9 +128,30 @@ pub struct AccountCost {
     pub amount: super::observability::DecimalAmount,
 }
 
-/// 账号在一个模型上的历史用量。
+/// 模型价格与真实上游费用的独立 USD 聚合，计数用于标明部分覆盖。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountBillingAmounts {
+    pub model_price_usd: Option<super::observability::DecimalAmount>,
+    pub upstream_cost_usd: Option<super::observability::DecimalAmount>,
+    pub model_price_count: u64,
+    pub upstream_cost_count: u64,
+}
+
+/// 保留完整模型身份，不能按请求名或路由名合并不同的计价模型。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountModelIdentity {
+    pub key: String,
+    pub requested_model_id: Option<String>,
+    pub upstream_model_id: Option<String>,
+    pub response_model: Option<String>,
+    pub billing_model: Option<String>,
+}
+
+/// 账号在一个模型组合上的历史用量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountModelUsage {
+    pub identity: AccountModelIdentity,
+    pub billing: AccountBillingAmounts,
     pub model: String,
     pub request_count: u64,
     pub success_count: u64,
@@ -159,6 +180,7 @@ pub struct AccountRequestBucket {
 /// 账号历史用量聚合。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountUsage {
+    pub billing: AccountBillingAmounts,
     pub account_id: String,
     pub request_count: u64,
     pub success_count: u64,

@@ -296,6 +296,7 @@ pub struct ModelRequestFinalization {
     pub retry_after_ms: Option<u64>,
     pub usage: ModelRequestUsage,
     pub image_generation_succeeded: Option<bool>,
+    pub billing: gateway_core::metering::ModelBillingObservation,
     pub cost_source: CostSource,
     pub cost_amount: Option<DecimalAmount>,
     pub cost_currency: Option<String>,
@@ -735,7 +736,9 @@ impl ModelRequestRepository for PgExecutionStore {
                  upstream_connection_id = $44,
                  upstream_connection_exit_reason = $45,
                  upstream_connection_age_ms = $46,
-                 upstream_connection_idle_ms = $47, diagnostic_trace_json = $48
+                 upstream_connection_idle_ms = $47, diagnostic_trace_json = $48,
+                 response_model = $49, billing_model = $50,
+                 calculated_cost_amount = $51::numeric, calculated_cost_currency = $52
              where id = $1 and outcome = 'running'
              returning id, client_api_key_ref, continuation_affinity_hash,
                        continuation_requested, provider_kind, upstream_transport,
@@ -927,6 +930,20 @@ impl ModelRequestRepository for PgExecutionStore {
             "upstream_connection_idle_ms",
         )?)
         .bind(finalization.diagnostic_trace_json.map(sqlx::types::Json))
+        .bind(finalization.billing.response_model)
+        .bind(finalization.billing.billing_model)
+        .bind(
+            finalization
+                .billing
+                .calculated_cost
+                .map(|cost| cost.amount().to_string()),
+        )
+        .bind(
+            finalization
+                .billing
+                .calculated_cost
+                .map(|cost| cost.currency().as_str().to_owned()),
+        )
         .fetch_one(&self.pool)
         .await
         .map_err(|_| postgres_unavailable("finalize model request"))?;
@@ -1242,6 +1259,7 @@ impl ExecutionStore for PgExecutionStore {
                 retry_after_ms: finalization.retry_after_ms,
                 usage: usage_from_core(finalization.usage),
                 image_generation_succeeded: finalization.image_generation_succeeded,
+                billing: finalization.billing,
                 cost_source,
                 cost_amount,
                 cost_currency,

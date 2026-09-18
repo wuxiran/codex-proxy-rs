@@ -107,6 +107,7 @@ fn usage_window(key: &str, group: &str, seconds: u64) -> ProviderQuotaWindow {
         reset_at: Some(chrono::Utc::now()),
         limit_reached: false,
         local_usage: Some(gateway_admin::model::accounts::AccountUsage {
+            billing: Default::default(),
             account_id: "acct_test".to_owned(),
             request_count: 0,
             success_count: 0,

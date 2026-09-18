@@ -1508,6 +1508,7 @@ where
             usage: self.observation.usage.clone(),
             image_generation_succeeded: self.image_generation_succeeded(),
             cost: self.observation.cost.clone(),
+            billing: self.observation.billing.clone(),
             timings: self.observation.timings.clone(),
             completed_at,
         })
@@ -1669,6 +1670,7 @@ where
             usage: self.observation.usage.clone(),
             image_generation_succeeded: self.image_generation_succeeded(),
             cost: self.observation.cost.clone(),
+            billing: self.observation.billing.clone(),
             timings: self.observation.timings.clone(),
             completed_at,
         })
