@@ -2,14 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::detect::{document_user_ids, looks_signed};
+use super::detect::{document_accounts, document_user_ids, looks_signed, recovered_oauth_tokens};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReviveStoreError {
@@ -17,16 +18,21 @@ pub enum ReviveStoreError {
     Io,
     #[error("revive export index is invalid")]
     InvalidIndex,
+    #[error("signed export integrity check failed; import the original Guanlan file again")]
+    InvalidDocument,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct ReviveIndex {
     #[serde(default)]
     users: BTreeMap<String, String>,
+    #[serde(default)]
+    identities: BTreeMap<String, String>,
 }
 
 pub struct ReviveExportStore {
     root: PathBuf,
+    index_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for ReviveExportStore {
@@ -42,7 +48,10 @@ impl ReviveExportStore {
     pub fn new(root: PathBuf) -> Result<Self, ReviveStoreError> {
         fs::create_dir_all(root.join("exports")).map_err(|_| ReviveStoreError::Io)?;
         fs::create_dir_all(root.join("state")).map_err(|_| ReviveStoreError::Io)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            index_lock: Mutex::new(()),
+        })
     }
 
     /// 仅归档带签名的原文。无签名时静默跳过，不改变索引。
@@ -53,17 +62,37 @@ impl ReviveExportStore {
         if !looks_signed(payload) {
             return Ok(None);
         }
-        let bytes = serde_json::to_vec(payload).map_err(|_| ReviveStoreError::InvalidIndex)?;
-        let digest = hex::encode(Sha256::digest(&bytes));
+        let (_, bytes) = super::document::validated_bytes(payload)?;
+        self.record_raw_document(&bytes)
+    }
+
+    pub(crate) fn record_raw_document(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<String>, ReviveStoreError> {
+        let _guard = self.index_lock.lock().map_err(|_| ReviveStoreError::Io)?;
+        let payload: Value =
+            serde_json::from_slice(bytes).map_err(|_| ReviveStoreError::InvalidDocument)?;
+        super::document::validated_bytes(&payload)?;
+        let digest = hex::encode(Sha256::digest(bytes));
         let export_path = self.export_path(&digest);
         if !export_path.exists() {
-            atomic_write(&export_path, &bytes)?;
+            atomic_write(&export_path, bytes)?;
         }
-        let user_ids = document_user_ids(payload);
+        let user_ids = document_user_ids(&payload);
         if !user_ids.is_empty() {
             let mut index = self.load_index()?;
             for user_id in user_ids {
                 index.users.insert(user_id, digest.clone());
+            }
+            for tokens in document_accounts(&payload)
+                .iter()
+                .filter_map(recovered_oauth_tokens)
+            {
+                index.identities.insert(
+                    identity_key(&tokens.user_id, tokens.workspace_id.as_deref()),
+                    digest.clone(),
+                );
             }
             self.save_index(&index)?;
         }
@@ -73,13 +102,21 @@ impl ReviveExportStore {
     pub fn export_for_user(
         &self,
         user_id: &str,
+        workspace_id: Option<&str>,
     ) -> Result<Option<(String, Vec<u8>)>, ReviveStoreError> {
         let index = self.load_index()?;
-        let Some(digest) = index.users.get(user_id) else {
+        let Some(digest) = index
+            .identities
+            .get(&identity_key(user_id, workspace_id))
+            .or_else(|| index.users.get(user_id))
+        else {
             return Ok(None);
         };
         let bytes = fs::read(self.export_path(digest)).map_err(|_| ReviveStoreError::Io)?;
-        Ok(Some((digest.clone(), bytes)))
+        let document: Value =
+            serde_json::from_slice(&bytes).map_err(|_| ReviveStoreError::InvalidDocument)?;
+        let (_, validated) = super::document::validated_bytes(&document)?;
+        Ok(Some((digest.clone(), validated)))
     }
 
     pub fn state_path(&self, digest: &str) -> PathBuf {
@@ -109,18 +146,27 @@ impl ReviveExportStore {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ReviveStoreError> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ReviveStoreError> {
     let tmp = path.with_extension("tmp");
     {
-        let mut file = fs::File::create(&tmp).map_err(|_| ReviveStoreError::Io)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).map_err(|_| ReviveStoreError::Io)?;
         file.write_all(bytes).map_err(|_| ReviveStoreError::Io)?;
         file.sync_all().map_err(|_| ReviveStoreError::Io)?;
     }
-    fs::rename(tmp, path).map_err(|error| {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            ReviveStoreError::Io
-        } else {
-            ReviveStoreError::Io
-        }
-    })
+    fs::rename(tmp, path).map_err(|_| ReviveStoreError::Io)
+}
+
+fn identity_key(user: &str, workspace: Option<&str>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(user.as_bytes());
+    hash.update([0]);
+    hash.update(workspace.unwrap_or_default().as_bytes());
+    hex::encode(hash.finalize())
 }

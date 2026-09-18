@@ -617,6 +617,23 @@ rotation 可选携带 `settings`，字段与 `POST /api/admin/accounts/update` �
 `GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`，不回显密钥。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游。
 
+OpenAI OAuth 的账号编辑页提供「观澜自动复活」，默认不勾选。`rotate` 可提交
+`{ provider: "openai", accountId, guanlanAutoRevive: true | false, pinTurnState?: boolean, settings? }`；
+这些偏好可原子保存，不可同时携带 token 或 API Key，且不清除当前凭据失效状态。
+开启前必须存在与上游用户及工作空间匹配的观澜签名原件；总服务停用或原件无效时拒绝开启。
+只持久化开关，不允许客户端自行声明账号来源。
+
+`credentialConfiguration.guanlanRevive` 返回 `source`（`guanlan` 或 null）、`eligible`、`enabled`、
+`serviceEnabled`、`status`、`reason`、`lastAttemptAt`、`nextAttemptAt`。时间为 Unix 秒或 null。
+状态包括 `unavailable`、`disabled`、`service_disabled`、`paused`、`waiting`、`running`、`recovered`、`failed`。
+来源基于签名原件的归档和账号身份匹配；真正的签名验真由观澜服务执行，不以本地哈希代替服务端验签。
+不返回 token、签名原文或原件路径。
+
+观澜 CDK 和原始 JSON 导入可使用 `data: { guanlan_signed_export: "原始 JSON 字符串" }`。
+浏览器必须保留原始文本，避免 `1.0` 被 JSON 序列化为 `1` 后破坏签名。
+原件包装的完整性校验失败会拒绝导入；普通兼容导入的归档失败会记录日志，且不能启用自动复活。
+旧归档仅允许在原签名清单的 SHA-256 完全匹配时恢复 `rate_multiplier` 的小数表示。
+
 OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。通过 `rotate` 提交
 `{ provider: "openai", accountId, pinTurnState: true | false, settings? }`，此分支不能混入 token、API Key
 或外部 state。开关使用现有管理员鉴权、账号 CAS 和审计事务，保留凭据健康状态、错误及额度；

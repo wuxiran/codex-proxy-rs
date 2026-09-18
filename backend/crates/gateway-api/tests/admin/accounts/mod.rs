@@ -2,6 +2,36 @@ mod handlers;
 mod import_tasks;
 mod presenter;
 
+#[test]
+fn guanlan_opt_in_wire_supports_combined_settings_and_rejects_credentials() {
+    use gateway_api::admin::accounts::RotateAccountRequest;
+    use serde_json::json;
+    for enabled in [true, false] {
+        let value = json!({"provider":"openai","accountId":"acct_revive","guanlanAutoRevive":enabled,"pinTurnState":true});
+        serde_json::from_value::<RotateAccountRequest>(value.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        for key in [
+            "accessToken",
+            "refreshToken",
+            "idToken",
+            "apiKey",
+            "baseUrl",
+            "transport",
+        ] {
+            let mut mixed = value.clone();
+            mixed[key] = json!("untrusted");
+            assert!(
+                serde_json::from_value::<RotateAccountRequest>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+}
+
 mod personal_info {
     use chrono::{TimeZone as _, Utc};
     use gateway_admin::model::{

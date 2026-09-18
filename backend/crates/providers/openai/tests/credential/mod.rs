@@ -7,6 +7,6 @@ mod oauth;
 mod profile_statistics;
 mod quota;
 mod refresh;
-mod revive;
+pub(crate) mod revive;
 mod token_client;
 mod types;

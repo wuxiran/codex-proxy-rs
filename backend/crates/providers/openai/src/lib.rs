@@ -163,7 +163,7 @@ pub async fn initialize(
         config.revive_settings().clone(),
         repository.clone(),
     )
-    .map(|service| Arc::new(service))
+    .map(Arc::new)
     .map_err(|_| OpenAiInitializeError::Transport)?;
     let cdk = CodexCdkClient::new(
         config.cdk_data_dir().to_path_buf(),

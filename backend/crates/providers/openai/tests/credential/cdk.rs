@@ -37,7 +37,7 @@ fn test_jwt(user_id: &str) -> String {
 }
 
 fn signed_export(user_id: &str) -> serde_json::Value {
-    json!({
+    super::revive::signed_fixture(json!({
         "exported_at": "2026-09-17T00:00:00Z",
         "proxies": [],
         "x_revive_manifest": {
@@ -55,7 +55,7 @@ fn signed_export(user_id: &str) -> serde_json::Value {
                 "plan_type": "self_serve_business_prolite"
             }
         }]
-    })
+    }))
 }
 
 #[test]

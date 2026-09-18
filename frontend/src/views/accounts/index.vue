@@ -166,6 +166,8 @@ const {
 
 const {
   apiKey: editingApiKey,
+  guanlanAutoRevive: editingGuanlanAutoRevive,
+  guanlanRevive: editingGuanlanRevive,
   pinTurnState: editingPinTurnState,
   recaptureTurnState: editingRecaptureTurnState,
   turnStatePins: editingTurnStatePins,
@@ -409,6 +411,7 @@ const {
     <AccountEditModal
       v-model="showEditModal"
       v-model:api-key="editingApiKey"
+      v-model:guanlan-auto-revive="editingGuanlanAutoRevive"
       v-model:pin-turn-state="editingPinTurnState"
       v-model:recapture-turn-state="editingRecaptureTurnState"
       v-model:notes="editingNotes"
@@ -419,6 +422,7 @@ const {
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
+      :guanlan-revive="editingGuanlanRevive"
       :turn-state-pins="editingTurnStatePins"
       :turn-state-capture-rule="editingTurnStateCaptureRule"
       :configuration-loading="configurationLoading"

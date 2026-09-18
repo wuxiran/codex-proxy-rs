@@ -427,12 +427,32 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
                 .with_public_message("账号凭据已被更新，请刷新账号列表后重试"));
         }
-        if command
+        let settings_material = command
             .provider_material
             .expose_to_provider()
-            .expose_to_provider()
-            .contains_key("pin_turn_state")
+            .expose_to_provider();
+        if settings_material.contains_key("pin_turn_state")
+            || settings_material.contains_key("guanlan_auto_revive")
         {
+            if settings_material
+                .get("guanlan_auto_revive")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                let service = self
+                    .credentials
+                    .revive_service()
+                    .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unavailable))?;
+                let status = service.account_status(&current.account, false);
+                if !status.eligible {
+                    return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                        .with_public_message("缺少匹配的观澜签名原件，请重新导入原始文件"));
+                }
+                if !status.service_enabled {
+                    return Err(provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                        .with_public_message("服务器已停用观澜自动复活服务"));
+                }
+            }
             return prepare_turn_state_pin_rotation(
                 current,
                 command.provider_material,
@@ -534,6 +554,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     "hits": pin.hits,
                 })).collect::<Vec<_>>();
                 let value = serde_json::json!({
+                    "guanlanRevive": self.credentials.revive_service().map(|service| service.account_status(&current.account, data.guanlan_auto_revive)),
                     "pinTurnState": data.turn_state_pin.is_some(),
                     "turnStatePins": pins,
                     "turnStateCaptureRule": rule,
@@ -878,7 +899,8 @@ fn prepared_rotation(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TurnStatePinDocument {
-    pin_turn_state: bool,
+    pin_turn_state: Option<bool>,
+    guanlan_auto_revive: Option<bool>,
 }
 
 fn prepare_turn_state_pin_rotation(
@@ -890,7 +912,11 @@ fn prepare_turn_state_pin_rotation(
         serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
     let prepared = CodexCredentialAdmin
-        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
+        .prepare_oauth_settings_rotation(
+            current,
+            document.pin_turn_state,
+            document.guanlan_auto_revive,
+        )
         .map_err(map_credential_admin_error)?;
     prepared_rotation(prepared, provider_kind)
         .map(PreparedCredentialRotation::preserving_credential_state)

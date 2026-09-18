@@ -2,6 +2,7 @@
 
 mod client;
 mod detect;
+pub(crate) mod document;
 mod service;
 mod store;
 

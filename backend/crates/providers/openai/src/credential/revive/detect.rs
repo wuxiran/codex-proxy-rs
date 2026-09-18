@@ -51,10 +51,10 @@ fn nonempty_str(value: Option<&Value>) -> Option<&str> {
 pub fn document_user_ids(value: &Value) -> Vec<String> {
     let mut ids = Vec::new();
     for account in document_accounts(value) {
-        if let Some(user_id) = account_user_id(account) {
-            if !ids.iter().any(|existing| existing == &user_id) {
-                ids.push(user_id);
-            }
+        if let Some(user_id) = account_user_id(account)
+            && !ids.iter().any(|existing| existing == &user_id)
+        {
+            ids.push(user_id);
         }
     }
     ids
@@ -87,11 +87,11 @@ pub fn recovered_oauth_tokens(account: &Value) -> Option<RecoveredOAuthTokens> {
     let access_token = nonempty_str(credentials.get("access_token"))
         .or_else(|| nonempty_str(credentials.get("accessToken")))?
         .to_owned();
-    let user_id = parse_chatgpt_jwt_claims(&access_token)
-        .ok()
-        .and_then(|metadata| metadata.chatgpt_user_id)?;
+    let metadata = parse_chatgpt_jwt_claims(&access_token).ok()?;
+    let user_id = metadata.chatgpt_user_id?;
     Some(RecoveredOAuthTokens {
         user_id,
+        workspace_id: metadata.chatgpt_account_id,
         access_token,
         refresh_token: nonempty_str(credentials.get("refresh_token"))
             .or_else(|| nonempty_str(credentials.get("refreshToken")))
@@ -102,9 +102,10 @@ pub fn recovered_oauth_tokens(account: &Value) -> Option<RecoveredOAuthTokens> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveredOAuthTokens {
     pub user_id: String,
+    pub workspace_id: Option<String>,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,

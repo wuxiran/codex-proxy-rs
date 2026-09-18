@@ -84,13 +84,16 @@ async function downloadExport(
         'x-cdk-download-token': ticket.downloadToken,
       },
     },
+    true,
   )
+  if ('guanlan_signed_export' in data)
+    return data
   if (!Array.isArray(data.accounts) || data.accounts.length === 0)
     throw new GuanlanCdkError('观澜未返回可导入的账号文件')
   return data
 }
 
-async function guanlanRequest<T>(path: string, init: RequestInit): Promise<T> {
+async function guanlanRequest<T>(path: string, init: RequestInit, preserveSigned = false): Promise<T> {
   let response: Response
   try {
     response = await fetch(`${GUANLAN_BASE}${path}`, init)
@@ -100,8 +103,9 @@ async function guanlanRequest<T>(path: string, init: RequestInit): Promise<T> {
   }
 
   let data: unknown = null
+  const raw = await response.text()
   try {
-    data = await response.json()
+    data = JSON.parse(raw)
   }
   catch {
     data = null
@@ -120,6 +124,11 @@ async function guanlanRequest<T>(path: string, init: RequestInit): Promise<T> {
     )
   }
 
+  if (preserveSigned) {
+    if (!isRecord(data) || !Array.isArray(data.accounts) || data.accounts.length === 0 || !isRecord(data.x_revive_manifest))
+      throw new GuanlanCdkError('观澜未返回有效的原始签名文件')
+    return { guanlan_signed_export: raw } as T
+  }
   return data as T
 }
 

@@ -697,10 +697,11 @@ impl CodexCredentialAdmin {
     }
 
     /// 仅修改本账号的实验开关，复用既有 CAS/audit 事务，不接受外部 state。
-    pub(crate) fn prepare_turn_state_pin_rotation(
+    pub(crate) fn prepare_oauth_settings_rotation(
         &self,
         current: LoadedCredential,
-        enabled: bool,
+        pin_turn_state: Option<bool>,
+        guanlan_auto_revive: Option<bool>,
     ) -> Result<PreparedCodexCredentialRotation, CodexCredentialAdminError> {
         if current.account.provider().as_str() != PROVIDER_NAME
             || current.account.authentication_kind() != CODEX_AUTHENTICATION_KIND_OAUTH
@@ -709,9 +710,15 @@ impl CodexCredentialAdmin {
         }
         let mut data = CodexCredentialCodec::decode_complete(&current.credential)
             .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
-        data.oauth_mut()
-            .ok_or(CodexCredentialAdminError::InvalidCredential)?
-            .turn_state_pin = enabled.then(|| uuid::Uuid::new_v4().to_string());
+        let oauth = data
+            .oauth_mut()
+            .ok_or(CodexCredentialAdminError::InvalidCredential)?;
+        if let Some(enabled) = pin_turn_state {
+            oauth.turn_state_pin = enabled.then(|| uuid::Uuid::new_v4().to_string());
+        }
+        if let Some(enabled) = guanlan_auto_revive {
+            oauth.guanlan_auto_revive = enabled;
+        }
         let credential = CodexCredentialCodec::encode_complete(data)
             .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
         let profile = ProviderAccountUpdate {
@@ -897,6 +904,9 @@ impl fmt::Debug for CodexCredentialAdminService {
 }
 
 impl CodexCredentialAdminService {
+    pub(crate) fn revive_service(&self) -> Option<&CodexReviveService> {
+        self.revive.as_deref()
+    }
     pub fn new(
         refresher: Arc<dyn TokenRefresher>,
         leases: Arc<dyn ProviderLeasePort>,
@@ -1073,8 +1083,13 @@ impl CodexCredentialAdminService {
             return Err(CodexCredentialAdminError::InvalidInput);
         }
         let payload = self.expand_cdk_document(payload).await?;
+        let (payload, raw_signed) = super::revive::document::unpack(payload)
+            .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
         if let Some(revive) = &self.revive
-            && let Err(error) = revive.record_signed_document(&payload)
+            && let Err(error) = raw_signed.as_deref().map_or_else(
+                || revive.record_signed_document(&payload),
+                |raw| revive.record_raw_document(raw),
+            )
         {
             tracing::warn!(
                 error = %error,

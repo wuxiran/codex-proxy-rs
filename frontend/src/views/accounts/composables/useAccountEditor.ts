@@ -1,5 +1,5 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
+import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, GuanlanReviveStatus, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { computed, ref, shallowRef, watch } from 'vue'
 import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountTurnState } from '@/api'
@@ -19,6 +19,9 @@ export function useAccountEditor(options: {
 }) {
   const showEditModal = shallowRef(false)
   const editingAccountId = shallowRef<string | null>(null)
+  const guanlanAutoRevive = shallowRef(false)
+  const savedGuanlanAutoRevive = shallowRef(false)
+  const guanlanRevive = ref<GuanlanReviveStatus | null>(null)
   const pinTurnState = shallowRef(false)
   const savedPinTurnState = shallowRef(false)
   const recaptureTurnState = shallowRef(false)
@@ -50,6 +53,9 @@ export function useAccountEditor(options: {
       if (!configuration)
         throw new Error('该账号没有可读取的上游设置')
       if ('pinTurnState' in configuration) {
+        guanlanRevive.value = configuration.guanlanRevive ?? null
+        guanlanAutoRevive.value = guanlanRevive.value?.enabled ?? false
+        savedGuanlanAutoRevive.value = guanlanAutoRevive.value
         pinTurnState.value = configuration.pinTurnState
         savedPinTurnState.value = configuration.pinTurnState
         turnStatePins.value = configuration.turnStatePins
@@ -80,6 +86,9 @@ export function useAccountEditor(options: {
     configurationRequest.invalidate()
     editingAccountId.value = account.id
     notes.value = account.notes ?? ''
+    guanlanAutoRevive.value = false
+    savedGuanlanAutoRevive.value = false
+    guanlanRevive.value = null
     pinTurnState.value = false
     savedPinTurnState.value = false
     recaptureTurnState.value = false
@@ -149,8 +158,13 @@ export function useAccountEditor(options: {
       if (connectionChanged) {
         await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
       }
-      else if (isOpenAi && !isApiKey && configurationReady.value && (pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value)) {
-        await updateAccountTurnState({ accountId, pinTurnState: pinTurnState.value, settings })
+      else if (isOpenAi && !isApiKey && configurationReady.value && (pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value || guanlanAutoRevive.value !== savedGuanlanAutoRevive.value)) {
+        await updateAccountTurnState({
+          accountId,
+          pinTurnState: pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value ? pinTurnState.value : undefined,
+          guanlanAutoRevive: guanlanAutoRevive.value !== savedGuanlanAutoRevive.value ? guanlanAutoRevive.value : undefined,
+          settings,
+        })
       }
       else {
         await updateAccount(settings)
@@ -180,6 +194,8 @@ export function useAccountEditor(options: {
   })
 
   return {
+    guanlanAutoRevive,
+    guanlanRevive,
     apiKey,
     pinTurnState,
     recaptureTurnState,

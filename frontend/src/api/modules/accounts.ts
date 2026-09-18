@@ -657,14 +657,26 @@ export interface TurnStateCaptureRule {
   modelLengths: Record<string, number>
 }
 
+export interface GuanlanReviveStatus {
+  source: 'guanlan' | null
+  eligible: boolean
+  enabled: boolean
+  serviceEnabled: boolean
+  status: string
+  reason: string | null
+  lastAttemptAt: number | null
+  nextAttemptAt: number | null
+}
+
 export interface OAuthStateConfiguration {
+  guanlanRevive?: GuanlanReviveStatus | null
   pinTurnState: boolean
   turnStatePins: TurnStatePinStatus[]
   turnStateCaptureRule?: TurnStateCaptureRule
   maxAgeSeconds: number
 }
 
-export function updateAccountTurnState(data: { accountId: string, pinTurnState: boolean, settings?: AccountUpdateParam }) {
+export function updateAccountTurnState(data: { accountId: string, pinTurnState?: boolean, guanlanAutoRevive?: boolean, settings?: AccountUpdateParam }) {
   return request<{ accountId: string }>({
     url: '/api/admin/accounts/rotate',
     method: 'POST',

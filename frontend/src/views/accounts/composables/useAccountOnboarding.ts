@@ -91,7 +91,7 @@ export function useAccountOnboarding(options: {
           return
         }
         const documents = createForm.value.provider === 'batch'
-          ? parseMixedImportDocuments(parseImportJson(createForm.value.importTexts.json))
+          ? parseMixedImportText(createForm.value.importTexts.json)
           : await accountImportDocuments(
               requireImportProvider(createForm.value.provider),
               mode,
@@ -305,7 +305,13 @@ async function accountImportDocuments(
   if (provider === 'openai' && isOpenAiTokenImportMode(mode)) {
     return parseOpenAiTokenImport(value, mode).map(document => ({ provider, document }))
   }
-  return providerImportDocuments(parseImportJson(value), provider)
+  const parsed = parseImportJson(value)
+  if (isRecord(parsed) && isRecord(parsed.x_revive_manifest)) {
+    if (provider !== 'openai')
+      throw new Error('观澜签名文件请选择 OpenAI 导入')
+    return [{ provider, document: { guanlan_signed_export: value } }]
+  }
+  return providerImportDocuments(parsed, provider)
 }
 
 async function redeemGuanlanImport(value: string) {
@@ -358,6 +364,13 @@ function providerImportDocuments(value: unknown, provider: ImportProvider): Mixe
   if (!isRecord(value))
     throw new Error('导入文件必须是 JSON object')
   return [{ provider, document: value }]
+}
+
+function parseMixedImportText(raw: string): MixedImportDocument[] {
+  const value = parseImportJson(raw)
+  if (isRecord(value) && isRecord(value.x_revive_manifest))
+    return [{ provider: 'openai', document: { guanlan_signed_export: raw } }]
+  return parseMixedImportDocuments(value)
 }
 
 function parseMixedImportDocuments(value: unknown): MixedImportDocument[] {

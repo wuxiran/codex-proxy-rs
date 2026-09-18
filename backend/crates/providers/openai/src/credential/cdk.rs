@@ -159,14 +159,16 @@ impl CodexCdkClient {
                 "CDK 账号文件下载失败或已过期".to_owned(),
             ));
         }
-        let document = response
-            .json::<Value>()
+        let raw = response
+            .text()
             .await
             .map_err(|_| CodexCdkError::InvalidResponse)?;
+        let document: Value =
+            serde_json::from_str(&raw).map_err(|_| CodexCdkError::InvalidResponse)?;
         if document.get("accounts").and_then(Value::as_array).is_none() {
             return Err(CodexCdkError::InvalidResponse);
         }
-        Ok(document)
+        Ok(serde_json::json!({"guanlan_signed_export": raw}))
     }
 }
 

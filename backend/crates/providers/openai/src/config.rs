@@ -287,7 +287,7 @@ impl CodexAuthSettings {
     }
 }
 
-/// 401 签名号池自动复活。默认关闭；未归档签名原文的账号不会提交第三方。
+/// 观澜自动复活服务总闸；逐账号勾选仍默认关闭，未授权账号不会提交第三方。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CodexReviveSettings {
@@ -300,7 +300,7 @@ pub struct CodexReviveSettings {
 impl Default for CodexReviveSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             base_url: "https://zzledu.kdns.fr/api/revive/v1".to_owned(),
             verify_workers: 50,
             task_workers: 10,

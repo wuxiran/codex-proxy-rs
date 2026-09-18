@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
-import type { AccountGroup, AccountModelAccess, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
+import type { AccountGroup, AccountModelAccess, GuanlanReviveStatus, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { ref, useId, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -11,6 +11,7 @@ import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import AccountApiKeyFields from './AccountApiKeyFields.vue'
+import AccountGuanlanRevive from './AccountGuanlanRevive.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
 import AccountSettingsFields from './AccountSettingsFields.vue'
@@ -23,6 +24,7 @@ defineProps<{
   saving: boolean
   configurationLoading: boolean
   configurationReady: boolean
+  guanlanRevive: GuanlanReviveStatus | null
   turnStatePins: TurnStatePinStatus[]
   turnStateCaptureRule: TurnStateCaptureRule | null
 }>()
@@ -39,6 +41,7 @@ watch(open, (value) => {
     showStateHistory.value = false
 })
 const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
+const guanlanAutoRevive = defineModel<boolean>('guanlanAutoRevive', { required: true })
 const pinTurnState = defineModel<boolean>('pinTurnState', { required: true })
 const recaptureTurnState = defineModel<boolean>('recaptureTurnState', { required: true })
 const notes = defineModel<string>('notes', { required: true })
@@ -88,6 +91,15 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         </p>
         <AccountApiKeyFields v-else v-model="apiKey" editing :disabled="saving" />
       </section>
+
+      <AccountGuanlanRevive
+        v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'"
+        v-model="guanlanAutoRevive"
+        :status="guanlanRevive"
+        :loading="configurationLoading"
+        :ready="configurationReady"
+        :saving="saving"
+      />
 
       <section v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'" class="grid gap-3 rounded-cp bg-cp-fill-quaternary p-4" aria-label="固定自身 state">
         <div class="flex flex-wrap items-center justify-between gap-3">

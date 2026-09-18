@@ -74,7 +74,7 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    assert_eq!(contributions.len(), 5);
+    assert_eq!(contributions.len(), 6);
     assert!(
         contributions
             .iter()
@@ -2245,6 +2245,99 @@ async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status
         })
         .await;
     assert!(mixed.is_err());
+}
+
+#[tokio::test]
+async fn guanlan_opt_in_requires_matching_archive_and_preserves_expired_state() {
+    let store = Arc::new(MemoryAccountStore::default());
+    let cfg = valid_config();
+    let identity = profile("workspace-revive");
+    let token = format!("header.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
+        "https://api.openai.com/auth":{"chatgpt_user_id":identity.chatgpt_user_id,"chatgpt_account_id":identity.chatgpt_account_id}
+    })).unwrap()));
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_revive_admin".to_owned(),
+            name: "revive".to_owned(),
+            secret: secret(&token),
+            verified_account: identity,
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let id = ProviderAccountId::new("acct_revive_admin").unwrap();
+    let account = store.get_account(&id).await.unwrap().unwrap();
+    store
+        .apply_state_change(gateway_core::account::AccountStateChange {
+            account_id: id.clone(),
+            expected_revision: account.revision(),
+            credential_state: CredentialState::Expired,
+            observed_at: SystemTime::now(),
+            error_reason: Some(gateway_core::account::AccountErrorReason::AccessTokenExpired),
+            message: Some("expired".to_owned()),
+        })
+        .await
+        .unwrap();
+    let account = store.get_account(&id).await.unwrap().unwrap();
+    let bundle = provider_openai::initialize(
+        cfg.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let command = |value: Value| PrepareCredentialRotation {
+        account: account_record(&account),
+        provider_material: ProviderDocument::new(OpaqueProviderData::new(
+            value.as_object().unwrap().clone(),
+        )),
+    };
+    assert!(
+        admin
+            .prepare_rotation(command(json!({"guanlan_auto_revive":true})))
+            .await
+            .is_err()
+    );
+    let archive = provider_openai::credential::CodexReviveService::new(
+        cfg.config.revive_data_dir().to_path_buf(),
+        cfg.config.revive_settings().clone(),
+        store.repository(),
+    )
+    .unwrap();
+    archive
+        .record_signed_document(&crate::credential::revive::signed_fixture(
+            json!({"accounts":[{"credentials":{"access_token":token},"rate_multiplier":1.0}]}),
+        ))
+        .unwrap();
+    let view = admin.account_configuration(&id).await.unwrap().unwrap();
+    let data = view.expose_to_provider().expose_to_provider();
+    assert_eq!(data["guanlanRevive"]["source"], "guanlan");
+    assert_eq!(data["guanlanRevive"]["enabled"], false);
+    let prepared = admin
+        .prepare_rotation(command(
+            json!({"guanlan_auto_revive":true,"pin_turn_state":true}),
+        ))
+        .await
+        .unwrap();
+    assert!(prepared.facts().preserve_credential_state);
+    let material = prepared
+        .facts()
+        .provider_material
+        .expose_to_provider()
+        .expose_to_provider();
+    assert_eq!(material["guanlan_auto_revive"], true);
+    assert_eq!(material["access_token"], token);
+    assert!(material["turn_state_pin"].is_string());
+    assert_eq!(
+        store
+            .get_account(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_state(),
+        CredentialState::Expired
+    );
+    assert!(!serde_json::to_string(data).unwrap().contains(&token));
 }
 
 #[tokio::test]

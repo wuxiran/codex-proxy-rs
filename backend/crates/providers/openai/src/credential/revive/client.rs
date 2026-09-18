@@ -78,7 +78,14 @@ impl ReviveApiClient {
         if job.unauthorized_count.unwrap_or(0) == 0 {
             return Ok(serde_json::json!({ "accounts": [] }));
         }
-        let preflight_id = job
+        // result 视图可能不带统计计数，因此保留 summary 的最终 unauthorized_count。
+        let detail_url = format!(
+            "{}/verify/{}?result=1",
+            self.settings.base_url.trim_end_matches('/'),
+            job.job_id
+        );
+        let detail = self.get_json(&detail_url, &token).await?;
+        let preflight_id = detail
             .preflight_id
             .clone()
             .ok_or(ReviveClientError::InvalidResponse)?;
@@ -133,7 +140,7 @@ impl ReviveApiClient {
     ) -> Result<JobView, ReviveClientError> {
         let url = if path_prefix == "/verify/" {
             format!(
-                "{}{path_prefix}{id}?result=1",
+                "{}{path_prefix}{id}?summary=1",
                 self.settings.base_url.trim_end_matches('/')
             )
         } else {

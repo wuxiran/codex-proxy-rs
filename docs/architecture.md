@@ -508,7 +508,9 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 - Admin：S3/R2 备份 daemon，负责调度、执行、删除收敛与保留清理；
   以及账号冻结恢复 worker（容量熔断的自适应并发下调与到期探测解冻）；
 - Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查；
-  OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，默认关闭。
+  OpenAI 观澜 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，逐账号授权默认关闭；
+  Provider 同时拥有签名原件、用户/工作空间绑定、冷却及恢复状态，Admin 只传递安全状态和开关。
+  恢复写回使用开始时的凭据世代与当前授权复核，不能覆盖并发的换凭据、取消授权或停调操作。
 
 账号容量熔断默认关闭。启用后，仅普通请求收到的容量类上游错误（`server_is_overloaded` 等与
 5xx 不可用）按滑动窗口计数，并把当时观测到的在途并发并入峰值证据；本地连接保护与诊断探测
