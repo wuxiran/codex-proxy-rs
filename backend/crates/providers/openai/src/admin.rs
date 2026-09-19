@@ -431,6 +431,47 @@ impl ProviderAdmin for OpenAiAdminProvider {
             .provider_material
             .expose_to_provider()
             .expose_to_provider()
+            .contains_key("guanlan_revive")
+        {
+            let material = command
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider();
+            if material.len() != 1 || material.get("guanlan_revive") != Some(&Value::Bool(true)) {
+                return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+            }
+            let revive = self.credentials.revive_service().ok_or_else(|| {
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message("观澜复活服务未配置")
+            })?;
+            let (mut secret, guard) = revive
+                .prepare_manual_revival(&current.account)
+                .await
+                .map_err(map_revive_error)?;
+            let runtime = CodexCredentialCodec::decode(&current.credential)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            if let Some(oauth) = runtime.authentication.oauth() {
+                secret.refresh_token = secret.refresh_token.or_else(|| oauth.refresh_token.clone());
+                secret.id_token = secret.id_token.or_else(|| oauth.id_token.clone());
+            }
+            let expires_at = parse_access_token_expiration(secret.access_token.expose_secret());
+            let prepared = CodexCredentialAdmin
+                .prepare_refreshed_oauth_rotation(current, secret, expires_at, None)
+                .map_err(map_credential_admin_error)?;
+            let (facts, credential_guard) =
+                prepared_rotation(prepared, command.account.provider_kind)?.into_parts();
+            return Ok(PreparedCredentialRotation::new(
+                facts,
+                Box::new(GuanlanReviveCommitGuard {
+                    _operation: guard,
+                    _credential: credential_guard,
+                }),
+            ));
+        }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
             .contains_key("pin_turn_state")
         {
             return prepare_turn_state_pin_rotation(
@@ -533,7 +574,15 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
                     "hits": pin.hits,
                 })).collect::<Vec<_>>();
+                let guanlan_revive_available = self.credentials.revive_service()
+                    .map(|service| service.supports_account(&current.account))
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "Guanlan revival availability could not be read");
+                        None
+                    }).unwrap_or(false);
                 let value = serde_json::json!({
+                    "guanlanReviveAvailable": guanlan_revive_available,
                     "pinTurnState": data.turn_state_pin.is_some(),
                     "turnStatePins": pins,
                     "turnStateCaptureRule": rule,
@@ -830,6 +879,44 @@ fn prepared_create(
         credential_state: account.credential_state(),
         credential_observed_at: observed_at,
     })
+}
+
+struct GuanlanReviveCommitGuard {
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    _credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for GuanlanReviveCommitGuard {
+    fn finish(self: Box<Self>) {
+        self._credential.finish();
+    }
+}
+
+fn map_revive_error(error: crate::credential::CodexReviveError) -> ProviderAdminError {
+    use crate::credential::CodexReviveError;
+    let (kind, message) = match error {
+        CodexReviveError::Unsupported => (
+            ProviderAdminErrorKind::Invalid,
+            "该账号没有可用的观澜签名导入记录",
+        ),
+        CodexReviveError::Busy => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活任务正在执行，请稍后重试",
+        ),
+        CodexReviveError::Cooldown => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活失败冷却中，请稍后重试",
+        ),
+        CodexReviveError::NoRecovery => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜未返回该账号的恢复凭据，账号可能无需复活或暂不可恢复",
+        ),
+        _ => (
+            ProviderAdminErrorKind::Unavailable,
+            "观澜复活失败，请稍后重试",
+        ),
+    };
+    provider_admin_error(kind).with_public_message(message)
 }
 
 fn prepared_rotation(

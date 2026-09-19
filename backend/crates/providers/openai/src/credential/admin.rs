@@ -925,6 +925,10 @@ impl CodexCredentialAdminService {
         self
     }
 
+    pub(crate) fn revive_service(&self) -> Option<&Arc<CodexReviveService>> {
+        self.revive.as_ref()
+    }
+
     #[must_use]
     pub fn with_cdk_client(mut self, cdk: Arc<CodexCdkClient>) -> Self {
         self.cdk = Some(cdk);

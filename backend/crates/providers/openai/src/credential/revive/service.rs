@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
@@ -11,6 +12,7 @@ use gateway_core::routing::ProviderKind;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::client::{ReviveApiClient, ReviveClientError};
 use super::detect::{RecoveredOAuthTokens, document_accounts, recovered_oauth_tokens};
@@ -30,6 +32,14 @@ pub enum CodexReviveError {
     Client(#[from] ReviveClientError),
     #[error("revive credential store is unavailable")]
     Repository,
+    #[error("account has no signed Guanlan export")]
+    Unsupported,
+    #[error("revive operation is already running")]
+    Busy,
+    #[error("revive operation is cooling down")]
+    Cooldown,
+    #[error("Guanlan returned no recovered credentials for this account")]
+    NoRecovery,
 }
 
 pub struct CodexReviveService {
@@ -37,6 +47,7 @@ pub struct CodexReviveService {
     store: ReviveExportStore,
     client: ReviveApiClient,
     repository: CodexCredentialRepository,
+    operation: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for CodexReviveService {
@@ -61,6 +72,7 @@ impl CodexReviveService {
             settings,
             client,
             repository,
+            operation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -76,6 +88,7 @@ impl CodexReviveService {
             settings,
             client,
             repository,
+            operation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -89,11 +102,77 @@ impl CodexReviveService {
         Ok(())
     }
 
+    pub fn supports_account(&self, account: &ProviderAccount) -> Result<bool, CodexReviveError> {
+        if account.provider().as_str() != PROVIDER_NAME || account.authentication_kind() != "oauth"
+        {
+            return Ok(false);
+        }
+        let Some(user_id) = account.upstream_user_id() else {
+            return Ok(false);
+        };
+        Ok(self.store.export_for_user(user_id)?.is_some())
+    }
+
+    /// 手动复活只准备目标账号的凭据，写回与审计沿用管理端 CAS 事务。
+    pub async fn prepare_manual_revival(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<(CodexOAuthSecret, OwnedMutexGuard<()>), CodexReviveError> {
+        let guard = self
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| CodexReviveError::Busy)?;
+        if !self.supports_account(account)? {
+            return Err(CodexReviveError::Unsupported);
+        }
+        let user_id = account
+            .upstream_user_id()
+            .ok_or(CodexReviveError::Unsupported)?;
+        let (digest, bytes) = self
+            .store
+            .export_for_user(user_id)?
+            .ok_or(CodexReviveError::Unsupported)?;
+        if !self.due_for_attempt(&digest) {
+            return Err(CodexReviveError::Cooldown);
+        }
+        let recovered = match self.client.recover_signed_export(&bytes).await {
+            Ok(document) => document,
+            Err(error) => {
+                let error = CodexReviveError::Client(error);
+                self.write_state(&digest, "failed", Some(error_class(&error)));
+                return Err(error);
+            }
+        };
+        let tokens = recovered_accounts(&recovered)
+            .into_iter()
+            .find(|tokens| tokens.user_id == user_id)
+            .ok_or(CodexReviveError::NoRecovery)?;
+        let metadata = crate::credential::types::parse_chatgpt_jwt_claims(&tokens.access_token)
+            .map_err(|_| CodexReviveError::NoRecovery)?;
+        if metadata
+            .chatgpt_account_id
+            .as_deref()
+            .is_some_and(|id| Some(id) != account.upstream_account_id())
+        {
+            return Err(CodexReviveError::NoRecovery);
+        }
+        let secret = CodexOAuthSecret {
+            access_token: SecretString::from(tokens.access_token),
+            refresh_token: tokens.refresh_token.map(SecretString::from),
+            id_token: tokens.id_token.map(SecretString::from),
+        };
+        Ok((secret, guard))
+    }
+
     pub async fn run_cycle(&self) -> Result<CodexReviveCycleSummary, CodexReviveError> {
         let mut summary = CodexReviveCycleSummary::default();
         if !self.settings.enabled {
             return Ok(summary);
         }
+        let Ok(_guard) = self.operation.try_lock() else {
+            return Ok(summary);
+        };
         let provider =
             ProviderKind::new(PROVIDER_NAME).map_err(|_| CodexReviveError::Repository)?;
         let accounts = self

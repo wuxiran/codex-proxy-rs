@@ -37,6 +37,9 @@ export const accountColumns = defineTableColumns<AccountRow>([
     format: value => accountProviderLabel(typeof value === 'string' ? value : null),
   },
   { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true },
+  { key: 'enabled', label: '调度', kind: 'custom', size: 'sm' },
+  { key: 'turnState', label: 'State', kind: 'custom', size: 'sm' },
+  { key: 'stateBinding', label: 'State 绑定 / 到期', kind: 'custom', size: '2xl' },
   { key: 'planType', label: '套餐', kind: 'status', sortable: true },
   { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
   { key: 'groups', label: '账号分组', kind: 'status' },
@@ -55,7 +58,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     format: value => optionalAccountCell(value),
     emptyText: '',
   },
-  { key: 'actions', label: '操作', kind: 'actions', size: 'lg', hideable: false },
+  { key: 'actions', label: '操作', kind: 'actions', size: '2xl', hideable: false },
 ])
 
 export const statusLabels: Record<AccountStatus, string> = {

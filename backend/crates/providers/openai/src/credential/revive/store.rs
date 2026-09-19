@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -116,11 +116,5 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ReviveStoreError> {
         file.write_all(bytes).map_err(|_| ReviveStoreError::Io)?;
         file.sync_all().map_err(|_| ReviveStoreError::Io)?;
     }
-    fs::rename(tmp, path).map_err(|error| {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            ReviveStoreError::Io
-        } else {
-            ReviveStoreError::Io
-        }
-    })
+    fs::rename(tmp, path).map_err(|_| ReviveStoreError::Io)
 }

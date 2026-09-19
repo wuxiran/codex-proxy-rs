@@ -317,6 +317,7 @@ impl AccountDeletionRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateAccountRequest {
+    pub guanlan_revive: Option<bool>,
     pub pin_turn_state: Option<bool>,
     pub provider: String,
     pub account_id: String,
@@ -340,6 +341,21 @@ impl RotateAccountRequest {
             if settings.account_id != self.account_id {
                 return Err(WireValidationError::new("settings.accountId"));
             }
+        }
+        if self.guanlan_revive.is_some() {
+            if self.guanlan_revive != Some(true)
+                || self.pin_turn_state.is_some()
+                || self.access_token.is_some()
+                || self.refresh_token.is_some()
+                || self.id_token.is_some()
+                || self.base_url.is_some()
+                || self.api_key.is_some()
+                || self.transport.is_some()
+                || self.settings.is_some()
+            {
+                return Err(WireValidationError::new("guanlanRevive"));
+            }
+            return Ok(());
         }
         if self.pin_turn_state.is_some() {
             if self.access_token.is_some()
@@ -389,7 +405,9 @@ impl RotateAccountRequest {
     ) -> Result<RotateCredential, WireValidationError> {
         self.validate()?;
         let mut material = Map::new();
-        if let Some(enabled) = self.pin_turn_state {
+        if self.guanlan_revive == Some(true) {
+            material.insert("guanlan_revive".to_owned(), Value::Bool(true));
+        } else if let Some(enabled) = self.pin_turn_state {
             material.insert("pin_turn_state".to_owned(), Value::Bool(enabled));
         } else if let Some(base_url) = self.base_url {
             material.insert("base_url".to_owned(), Value::String(base_url));

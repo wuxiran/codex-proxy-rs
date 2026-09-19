@@ -658,6 +658,7 @@ export interface TurnStateCaptureRule {
 }
 
 export interface OAuthStateConfiguration {
+  guanlanReviveAvailable?: boolean
   pinTurnState: boolean
   turnStatePins: TurnStatePinStatus[]
   turnStateCaptureRule?: TurnStateCaptureRule
@@ -669,6 +670,15 @@ export function updateAccountTurnState(data: { accountId: string, pinTurnState: 
     url: '/api/admin/accounts/rotate',
     method: 'POST',
     data: { provider: 'openai', ...data },
+  })
+}
+
+export function reviveGuanlanAccount(data: AccountIdParam) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/rotate',
+    method: 'POST',
+    data: { provider: 'openai', ...data, guanlanRevive: true },
+    timeout: 65 * 60 * 1000,
   })
 }
 

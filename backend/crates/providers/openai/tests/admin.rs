@@ -2193,6 +2193,7 @@ async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status
         .unwrap();
     let view = view.expose_to_provider().expose_to_provider();
     assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+    assert_eq!(view.get("guanlanReviveAvailable"), Some(&json!(false)));
     assert_eq!(view.get("turnStatePins"), Some(&json!([])));
     assert_eq!(
         view.get("turnStateCaptureRule"),
@@ -2233,6 +2234,22 @@ async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status
         }
     }
     assert_ne!(generations[0], generations[1]);
+    for material in [
+        json!({"guanlan_revive":true}),
+        json!({"guanlan_revive":false}),
+        json!({"guanlan_revive":true, "pin_turn_state":true}),
+        json!({"guanlan_revive":true, "access_token":"injected"}),
+    ] {
+        let result = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    material.as_object().unwrap().clone(),
+                )),
+            })
+            .await;
+        assert!(result.is_err());
+    }
     let mixed = admin
         .prepare_rotation(PrepareCredentialRotation {
             account: account_record(&account),

@@ -4,11 +4,15 @@ import type { RequestOptions } from '@/api/request'
 import dayjs from 'dayjs'
 import { ref, watch } from 'vue'
 import {
+  batchUpdateAccounts,
   deleteAccounts,
   exportAccounts,
+  getAccountDetail,
   recoverAccount,
   refreshAccount,
   refreshAccountQuota,
+  reviveGuanlanAccount,
+  updateAccountTurnState,
 } from '@/api'
 import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
@@ -26,6 +30,7 @@ export function useAccountMutations(options: {
   onImportTaskCreated: (task: AccountImportTask) => void
   reload: () => Promise<unknown>
   replaceAccount: (account: AccountRow) => Promise<boolean>
+  reloadConfigurations: () => Promise<void>
 }) {
   const loadAccounts = options.reload
   const { downloadJson } = useDownload()
@@ -40,12 +45,18 @@ export function useAccountMutations(options: {
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
+  const updatingSchedulingAccounts = useIdSet<string>()
+  const updatingTurnStateAccounts = useIdSet<string>()
+  const revivingAccounts = useIdSet<string>()
   const deletingAccountAction = useAsyncAction()
   const batchDeletingAction = useAsyncAction()
   const exportingAccountsAction = useAsyncAction()
   const recoveringAccountIds = recoveringAccounts.ids
   const refreshingAccountIds = refreshingAccounts.ids
   const refreshingQuotaAccountIds = refreshingQuotaAccounts.ids
+  const updatingSchedulingAccountIds = updatingSchedulingAccounts.ids
+  const updatingTurnStateAccountIds = updatingTurnStateAccounts.ids
+  const revivingAccountIds = revivingAccounts.ids
   const deletingAccount = deletingAccountAction.loading
   const batchDeleting = batchDeletingAction.loading
   const exportingAccounts = exportingAccountsAction.loading
@@ -186,6 +197,54 @@ export function useAccountMutations(options: {
     })
   }
 
+  async function handleToggleTurnState(accountId: string, pinTurnState: boolean) {
+    await updatingTurnStateAccounts.run(accountId, async () => {
+      try {
+        await updateAccountTurnState({ accountId, pinTurnState })
+        toast.success(pinTurnState ? '已开启 state 绑定' : '已关闭 state 绑定')
+        await options.reloadConfigurations()
+      }
+      catch {}
+    })
+  }
+
+  async function handleReviveGuanlan(accountId: string) {
+    await revivingAccounts.run(accountId, async () => {
+      try {
+        await reviveGuanlanAccount({ accountId })
+        toast.success('guanlan 复活成功')
+        await loadAccounts()
+      }
+      catch {}
+    })
+  }
+
+  async function handleToggleScheduling(account: AccountRow, enabled: boolean) {
+    await updatingSchedulingAccounts.run(account.id, async () => {
+      try {
+        // 局部更新只提交调度字段，避免覆盖其他管理员刚修改的账号配置。
+        await batchUpdateAccounts({ accountIds: [account.id], enabled })
+      }
+      catch {
+        return
+      }
+
+      toast.success(enabled ? '已开启调度' : '已关闭调度')
+      try {
+        const result = await getAccountDetail({ accountId: account.id })
+        const remainsVisible = await options.replaceAccount(result.account)
+        if (!remainsVisible) {
+          const selectedIds = new Set(options.selectedIds.value)
+          selectedIds.delete(account.id)
+          options.selectedIds.value = selectedIds
+        }
+      }
+      catch {
+        await loadAccounts()
+      }
+    })
+  }
+
   async function handleRecover(accountId: string) {
     await recoveringAccounts.run(accountId, async () => {
       try {
@@ -247,6 +306,9 @@ export function useAccountMutations(options: {
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,
+    updatingSchedulingAccountIds,
+    updatingTurnStateAccountIds,
+    revivingAccountIds,
     deletingAccount,
     batchDeleting,
     exportingAccounts,
@@ -257,5 +319,8 @@ export function useAccountMutations(options: {
     handleRecover,
     handleRefresh,
     handleRefreshQuota,
+    handleToggleScheduling,
+    handleToggleTurnState,
+    handleReviveGuanlan,
   }
 }

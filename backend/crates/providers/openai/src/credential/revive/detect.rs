@@ -51,10 +51,10 @@ fn nonempty_str(value: Option<&Value>) -> Option<&str> {
 pub fn document_user_ids(value: &Value) -> Vec<String> {
     let mut ids = Vec::new();
     for account in document_accounts(value) {
-        if let Some(user_id) = account_user_id(account) {
-            if !ids.iter().any(|existing| existing == &user_id) {
-                ids.push(user_id);
-            }
+        if let Some(user_id) = account_user_id(account)
+            && !ids.iter().any(|existing| existing == &user_id)
+        {
+            ids.push(user_id);
         }
     }
     ids

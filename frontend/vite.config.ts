@@ -28,7 +28,7 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    assetsDir: 'assets',
+    assetsDir: 'assets/account-controls-20260919',
     chunkSizeWarningLimit: 600,
     rolldownOptions: {
       checks: {

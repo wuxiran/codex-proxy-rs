@@ -621,8 +621,15 @@ OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。�
 `{ provider: "openai", accountId, pinTurnState: true | false, settings? }`，此分支不能混入 token、API Key
 或外部 state。开关使用现有管理员鉴权、账号 CAS 和审计事务，保留凭据健康状态、错误及额度；
 再次提交 `true` 表示重新捕获。普通账号更新和令牌刷新保留开关，其他 Provider / API Key 不支持。
-详情的 `credentialConfiguration` 返回 `{ pinTurnState, maxAgeSeconds, turnStatePins, turnStateCaptureRule }`；每条缓存摘要仅含
+详情的 `credentialConfiguration` 返回 `{ pinTurnState, maxAgeSeconds, turnStatePins, turnStateCaptureRule, guanlanReviveAvailable }`；每条缓存摘要仅含
 `model`、`length`、`capturedAt`、`expiresAt` 和 `hits`，不包含原始 state 或令牌。
+
+`guanlanReviveAvailable` 表示该 OAuth 账号存在可用的观澜签名导入原文。管理员可向 `rotate` 提交
+`{ provider: "openai", accountId, guanlanRevive: true }` 手动复活，不可混入其他凭据、state 或设置字段。
+服务端使用归档签名文件完成观澜验证和恢复，只将返回结果中匹配目标身份的凭据通过原有 CAS / 审计事务写回。
+没有匹配恢复结果、签名记录缺失、任务执行中或失败冷却期间返回错误，不将普通「恢复状态」当作复活。
+手动任务与自动复活互斥；失败使用现有 30 分钟冷却。该请求可能包含两段最长各 30 分钟的上游轮询，
+调用方及反向代理需要容纳相应超时；请求失败后应先回读账号，不自动重放。手动复活不改变账号调度开关。
 
 开启后，从该账号普通生成请求的成功完整响应中捕获首个符合套餐规则的候选，按账号、上游模型及客户端密钥隔离。
 `turnStateCaptureRule` 返回 `defaultLength`（字节数或 null）和 `modelLengths`（上游模型 ID 到字节数）。
