@@ -17,6 +17,7 @@ export * from './modules/backups'
 export * from './modules/dashboard'
 
 export * from './modules/proxies'
+export * from './modules/public-import'
 
 // 设置管理
 export * from './modules/settings'

@@ -2,7 +2,12 @@
 //!
 //! 本 crate 不包含 HTTP wire、数据库实现或具体 Provider 实现。
 
-use std::{fmt, path::Path, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use gateway_core::{
     engine::execution::ClientKeyVerifier,
@@ -30,7 +35,8 @@ pub use use_case::{
     backup::BackupService, client_distribution::ClientDistributionService,
     client_keys::ClientKeyService, import_tasks::ImportTasksService,
     observability::ObservabilityService, openai::OpenAiService, proxies::ProxiesService,
-    settings::SettingsService, system::SystemService, xai::XaiService,
+    public_import::PublicImportService, settings::SettingsService, system::SystemService,
+    xai::XaiService,
 };
 
 use model::{AdminError, AdminErrorKind};
@@ -196,9 +202,15 @@ pub struct AdminServices {
     xai: Arc<dyn XaiService>,
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
+    public_import: Arc<dyn PublicImportService>,
 }
 
 impl AdminServices {
+    #[must_use]
+    pub fn public_import(&self) -> &dyn PublicImportService {
+        self.public_import.as_ref()
+    }
+
     #[must_use]
     pub fn import_tasks(&self) -> &dyn ImportTasksService {
         self.import_tasks.as_ref()
@@ -303,6 +315,8 @@ pub struct AdminRuntimePorts {
     pub client_distribution: Arc<dyn ClientDistributionResolver>,
     pub system: Arc<dyn SystemOperations>,
     pub client_key_verifier: Arc<dyn ClientKeyVerifier>,
+    /// 免登录导入入口的配置目录，位于 runtime 数据目录下。
+    pub public_import_dir: PathBuf,
 }
 
 /// 校验配置、建立动态 Provider 注册表并完成默认管理员幂等初始化。
@@ -324,6 +338,7 @@ pub async fn initialize(
         client_distribution,
         system,
         client_key_verifier,
+        public_import_dir,
     } = runtime;
     config
         .resolve_and_validate(Path::new("."))
@@ -388,21 +403,29 @@ pub async fn initialize(
     let import_tasks =
         use_case::import_tasks::DefaultImportTasksService::new(openai.clone(), xai.clone());
     let import_task = use_case::import_tasks::ImportTaskWorker(import_tasks.clone());
+    let proxies: Arc<dyn ProxiesService> = Arc::new(use_case::proxies::DefaultProxiesService::new(
+        store.proxies(),
+        proxy_probe,
+        snapshot.clone(),
+        registry.clone(),
+    ));
+    let account_groups: Arc<dyn AccountGroupService> = Arc::new(DefaultAccountGroupService::new(
+        store.account_groups(),
+        store.account_runtime(),
+        snapshot.clone(),
+    ));
     let services = AdminServices {
         key_usage,
-        proxies: Arc::new(use_case::proxies::DefaultProxiesService::new(
-            store.proxies(),
-            proxy_probe,
-            snapshot.clone(),
-            registry.clone(),
+        public_import: Arc::new(use_case::public_import::DefaultPublicImportService::new(
+            public_import_dir,
+            openai.clone(),
+            proxies.clone(),
+            account_groups.clone(),
         )),
+        proxies,
         auth,
         accounts: accounts.clone(),
-        account_groups: Arc::new(DefaultAccountGroupService::new(
-            store.account_groups(),
-            store.account_runtime(),
-            snapshot.clone(),
-        )),
+        account_groups,
         client_keys: Arc::new(DefaultClientKeyService::new(
             store.client_keys(),
             snapshot.clone(),

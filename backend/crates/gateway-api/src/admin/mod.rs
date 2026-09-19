@@ -19,6 +19,7 @@ mod extract;
 pub mod observability;
 pub mod presenter;
 pub mod proxies;
+pub mod public_import;
 pub mod settings;
 pub mod system;
 pub mod wire;
@@ -38,6 +39,7 @@ where
     Router::new()
         .merge(account_groups::router::<S>())
         .merge(proxies::router::<S>())
+        .merge(public_import::router::<S>())
         .merge(accounts::router::<S>())
         .merge(backups::router::<S>())
         .merge(client_keys::router::<S>())

@@ -73,6 +73,7 @@ pub(super) struct FakeProviderAdmin {
     retry_authorization_after_abort: Mutex<bool>,
     export_inputs: Mutex<Vec<ProviderExportCredentialInput>>,
     import_account_ids: Mutex<Vec<String>>,
+    import_documents: Mutex<Vec<serde_json::Value>>,
     quota_requests: Mutex<Vec<ProviderQuotaRequest>>,
     quota_started: tokio::sync::Notify,
     quota_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -97,6 +98,7 @@ impl FakeProviderAdmin {
             retry_authorization_after_abort: Mutex::new(false),
             export_inputs: Mutex::new(Vec::new()),
             import_account_ids: Mutex::new(vec!["acct_prepared".to_owned()]),
+            import_documents: Mutex::new(Vec::new()),
             quota_requests: Mutex::new(Vec::new()),
             quota_started: tokio::sync::Notify::new(),
             quota_gate: Mutex::new(None),
@@ -147,6 +149,14 @@ impl FakeProviderAdmin {
 
     pub(super) fn fail_next_quota(&self, kind: ProviderAdminErrorKind) {
         *self.quota_failure.lock().expect("provider quota failure") = Some(kind);
+    }
+
+    /// 依次返回 Provider 收到的导入文档，供断言入口改写后的内容。
+    pub(super) fn import_documents(&self) -> Vec<serde_json::Value> {
+        self.import_documents
+            .lock()
+            .expect("provider import documents")
+            .clone()
     }
 
     pub(super) fn set_import_account_ids(&self, account_ids: &[&str]) {
@@ -338,9 +348,19 @@ impl ProviderAdmin for FakeProviderAdmin {
 
     async fn prepare_import(
         &self,
-        _command: PrepareCredentialImport,
+        command: PrepareCredentialImport,
     ) -> Result<PreparedCredentialImport, ProviderAdminError> {
         self.record("provider.prepare_import");
+        self.import_documents
+            .lock()
+            .expect("provider import documents")
+            .push(serde_json::Value::Object(
+                command
+                    .document
+                    .expose_to_provider()
+                    .expose_to_provider()
+                    .clone(),
+            ));
         let gate = self.import_gate.lock().expect("import gate").clone();
         if let Some(gate) = gate {
             gate.acquire().await.expect("import permit").forget();

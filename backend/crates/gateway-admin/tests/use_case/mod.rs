@@ -9,6 +9,7 @@ mod import_tasks;
 mod observability;
 mod openai;
 mod proxies;
+mod public_import;
 mod settings;
 mod system;
 mod xai;
@@ -250,6 +251,9 @@ impl AdminHarness {
                 client_distribution: Arc::new(NoopClientDistribution),
                 system: self.system,
                 client_key_verifier: self.client_key_verifier,
+                // 每个 harness 独占目录，避免用例之间共享入口配置。
+                public_import_dir: std::env::temp_dir()
+                    .join(format!("cpr-public-import-{}", uuid::Uuid::now_v7())),
             },
         )
         .await
