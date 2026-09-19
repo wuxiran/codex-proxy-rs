@@ -185,6 +185,8 @@ const {
 const {
   apiKey: editingApiKey,
   pinTurnState: editingPinTurnState,
+  savedPinTurnState: editingSavedPinTurnState,
+  afterTurnStateHunt,
   recaptureTurnState: editingRecaptureTurnState,
   turnStatePins: editingTurnStatePins,
   turnStateCaptureRule: editingTurnStateCaptureRule,
@@ -477,12 +479,14 @@ const {
       v-model:selected-group-ids="editingGroupIds"
       :turn-state-pins="editingTurnStatePins"
       :turn-state-capture-rule="editingTurnStateCaptureRule"
+      :saved-pin-turn-state="editingSavedPinTurnState"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
+      @turn-state-hunted="afterTurnStateHunt"
       @save="saveAccountEdit"
     />
 

@@ -11,6 +11,7 @@ mod openai;
 mod proxies;
 mod settings;
 mod system;
+mod turn_state_hunt;
 mod xai;
 
 use std::{

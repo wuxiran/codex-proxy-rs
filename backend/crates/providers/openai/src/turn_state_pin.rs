@@ -57,7 +57,8 @@ struct Scope {
     account: String,
     binding: String,
     model: String,
-    client: String,
+    /// `None` 是管理员遍历代理后钉住的账号级 state，对该账号该模型的全部客户端生效。
+    client: Option<String>,
     expected_length: usize,
 }
 
@@ -83,6 +84,15 @@ pub(crate) struct PinStatus {
     pub(crate) length: usize,
     pub(crate) captured_at: SystemTime,
     pub(crate) hits: u64,
+    pub(crate) account_wide: bool,
+}
+
+/// 账号级钉住被拒的原因；不携带 state 值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinRejected {
+    Length,
+    Expired,
+    Full,
 }
 
 impl TurnStatePins {
@@ -99,12 +109,22 @@ impl TurnStatePins {
             account: account.to_owned(),
             binding,
             model: model.to_owned(),
-            client: client.to_owned(),
+            client: Some(client.to_owned()),
             expected_length,
         };
         let value = self.0.lock().ok().and_then(|mut pins| {
             pins.retain(|_, pin| pin.active(now));
-            let pin = pins.get_mut(&scope)?;
+            // 客户端自己的 state 优先；没有时回退到账号级 state。
+            let account_wide = Scope {
+                client: None,
+                ..scope.clone()
+            };
+            let key = if pins.contains_key(&scope) {
+                &scope
+            } else {
+                &account_wide
+            };
+            let pin = pins.get_mut(key)?;
             pin.hits = pin.hits.saturating_add(1);
             Some(pin.value.clone())
         });
@@ -130,10 +150,59 @@ impl TurnStatePins {
                         length: pin.value.len(),
                         captured_at: pin.captured_at,
                         hits: pin.hits,
+                        account_wide: scope.client.is_none(),
                     })
                     .collect()
             },
         )
+    }
+
+    /// 管理员显式钉住一个刚在目标出口上观测到的 state。它替换该账号该模型下的全部旧
+    /// state（旧值来自换绑前的出口，是否仍有效未知）；被动捕获仍然永不覆盖。
+    // 作用域的每个分量都是独立事实，打包成结构体只会多一层无意义的搬运。
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn pin_account_wide(
+        &self,
+        account: &str,
+        binding: String,
+        model: &str,
+        expected_length: usize,
+        value: &str,
+        captured_at: SystemTime,
+        now: SystemTime,
+    ) -> Result<(), PinRejected> {
+        if value.len() != expected_length || !value.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(PinRejected::Length);
+        }
+        if !now
+            .duration_since(captured_at)
+            .is_ok_and(|age| age < MAX_PIN_AGE)
+        {
+            return Err(PinRejected::Expired);
+        }
+        let mut pins = self.0.lock().map_err(|_| PinRejected::Full)?;
+        pins.retain(|scope, pin| {
+            pin.active(now)
+                && !(scope.account == account && scope.binding == binding && scope.model == model)
+        });
+        if pins.len() >= MAX_PINS {
+            return Err(PinRejected::Full);
+        }
+        pins.insert(
+            Scope {
+                account: account.to_owned(),
+                binding,
+                model: model.to_owned(),
+                client: None,
+                expected_length,
+            },
+            PinnedState {
+                value: value.to_owned(),
+                captured_at,
+                hits: 0,
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn clear(&self, account: &str) {
@@ -168,6 +237,10 @@ impl PinAttempt {
     }
 
     pub(crate) fn completed(&mut self, now: SystemTime) {
+        // 本次请求已经复用了一个 state（含账号级回退）时不再另立客户端级 state。
+        if self.value.is_some() {
+            return;
+        }
         let Some(value) = self.candidate.take() else {
             return;
         };

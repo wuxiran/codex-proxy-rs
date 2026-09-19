@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
+import { API_BASE_URL } from '../constants'
 import request from '../request'
 
 export type AccountStatus
@@ -650,6 +651,51 @@ export interface TurnStatePinStatus {
   capturedAt: string
   expiresAt: string
   hits: number
+  /** account：遍历代理后钉住，对全部客户端生效；client：按客户端密钥被动捕获。 */
+  scope?: 'account' | 'client'
+}
+
+export interface TurnStateHuntProxy {
+  /** null 表示直连 */
+  proxyId: string | null
+  name: string
+  endpoint: string | null
+}
+
+export interface TurnStateHuntAttemptError {
+  code: string
+  source: 'gateway' | 'provider' | 'upstream'
+  upstreamStatus: number | null
+  message: string
+}
+
+/** 遍历代理找 state 的 SSE 事件；只有 state 的字节数，没有值。 */
+export type TurnStateHuntEvent
+  = | { type: 'hunt_start', model: string, expectedLength: number, attempts: number, proxies: TurnStateHuntProxy[] }
+    | ({ type: 'proxy_start', index: number, total: number } & TurnStateHuntProxy)
+    | { type: 'attempt', proxyId: string | null, index: number, length: number | null, matched: boolean, error: TurnStateHuntAttemptError | null }
+    | { type: 'proxy_done', proxyId: string | null, attempts: number, matched: boolean, skipped: 'unavailable' | 'unreachable' | null }
+    | { type: 'hit', proxyId: string | null, attemptIndex: number, length: number }
+    | { type: 'bound', proxyId: string | null, changed: boolean }
+    | { type: 'pinned', model: string, length: number, expiresAt: string }
+    | { type: 'hunt_complete', success: boolean, requests: number }
+    | { type: 'error', code: string, message: string }
+
+export interface TurnStateHuntParam {
+  accountId: string
+  modelId: string
+  attempts: number
+  includeDirect: boolean
+}
+
+export function turnStateHuntStreamUrl(params: TurnStateHuntParam) {
+  const query = new URLSearchParams({
+    accountId: params.accountId,
+    modelId: params.modelId,
+    attempts: String(params.attempts),
+    includeDirect: String(params.includeDirect),
+  })
+  return `${API_BASE_URL}/api/admin/accounts/turn-state-hunt?${query}`
 }
 
 export interface TurnStateCaptureRule {

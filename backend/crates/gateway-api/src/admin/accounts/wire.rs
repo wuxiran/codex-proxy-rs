@@ -664,6 +664,150 @@ impl AccountTestQuery {
     }
 }
 
+/// 遍历代理找 state 的 query。EventSource 只能发 GET，所以参数走 query。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateHuntQuery {
+    pub account_id: String,
+    pub model_id: String,
+    #[serde(default = "default_hunt_attempts")]
+    pub attempts: u8,
+    #[serde(default)]
+    pub include_direct: bool,
+}
+
+const fn default_hunt_attempts() -> u8 {
+    5
+}
+
+impl TurnStateHuntQuery {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.attempts == 0
+            || self.attempts > gateway_admin::model::accounts::TurnStateHuntCommand::MAX_ATTEMPTS
+        {
+            return Err(WireValidationError::new("attempts"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::accounts::TurnStateHuntCommand, WireValidationError> {
+        self.validate()?;
+        Ok(gateway_admin::model::accounts::TurnStateHuntCommand {
+            account_id: ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            upstream_model: UpstreamModelId::new(self.model_id)
+                .map_err(|_| WireValidationError::new("modelId"))?,
+            attempts: self.attempts,
+            include_direct: self.include_direct,
+            context,
+        })
+    }
+}
+
+/// 遍历事件的管理端 wire。只有字节数，没有 state 值。
+pub fn turn_state_hunt_event_data(
+    event: gateway_admin::model::accounts::TurnStateHuntEvent,
+) -> serde_json::Value {
+    use gateway_admin::model::accounts::{TurnStateHuntEgress, TurnStateHuntEvent as Event};
+    use serde_json::json;
+
+    fn egress(egress: TurnStateHuntEgress) -> serde_json::Value {
+        json!({ "proxyId": egress.proxy_id, "name": egress.name, "endpoint": egress.endpoint })
+    }
+    match event {
+        Event::Started {
+            model,
+            expected_length,
+            attempts,
+            egresses,
+        } => json!({
+            "type": "hunt_start",
+            "model": model,
+            "expectedLength": expected_length,
+            "attempts": attempts,
+            "proxies": egresses.into_iter().map(egress).collect::<Vec<_>>(),
+        }),
+        Event::EgressStarted {
+            egress: started,
+            index,
+            total,
+        } => {
+            let mut data = egress(started);
+            data["type"] = json!("proxy_start");
+            data["index"] = json!(index);
+            data["total"] = json!(total);
+            data
+        }
+        Event::Attempt {
+            proxy_id,
+            index,
+            length,
+            matched,
+            error,
+        } => json!({
+            "type": "attempt",
+            "proxyId": proxy_id,
+            "index": index,
+            "length": length,
+            "matched": matched,
+            "error": error.map(|error| json!({
+                "code": error.code.as_str(),
+                "source": error.source.as_str(),
+                "upstreamStatus": error.upstream_status,
+                "message": error.message,
+            })),
+        }),
+        Event::EgressFinished {
+            proxy_id,
+            attempts,
+            matched,
+            skipped,
+        } => json!({
+            "type": "proxy_done",
+            "proxyId": proxy_id,
+            "attempts": attempts,
+            "matched": matched,
+            "skipped": skipped,
+        }),
+        Event::Hit {
+            proxy_id,
+            attempt_index,
+            length,
+        } => json!({
+            "type": "hit",
+            "proxyId": proxy_id,
+            "attemptIndex": attempt_index,
+            "length": length,
+        }),
+        Event::Bound { proxy_id, changed } => {
+            json!({ "type": "bound", "proxyId": proxy_id, "changed": changed })
+        }
+        Event::Pinned {
+            model,
+            length,
+            expires_at,
+        } => json!({
+            "type": "pinned",
+            "model": model,
+            "length": length,
+            "expiresAt": expires_at,
+        }),
+        Event::Completed { success, requests } => {
+            json!({ "type": "hunt_complete", "success": success, "requests": requests })
+        }
+        Event::Failed { code, message } => {
+            json!({ "type": "error", "code": code, "message": message })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountModelView {
     pub id: String,

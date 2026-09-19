@@ -525,9 +525,17 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        // 管理端遍历代理时只替换本次请求的出口；租约、额度与故障归属仍是原账号。
+        let egress_account = context.diagnostic_egress().map(|egress| {
+            lease
+                .account()
+                .clone()
+                .with_outbound_proxy(egress.proxy().cloned())
+                .with_request_location(egress.location().cloned())
+        });
+        let egress_account = egress_account.as_ref().unwrap_or_else(|| lease.account());
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
-        if let Some(location) = lease
-            .account()
+        if let Some(location) = egress_account
             .request_location()
             .or(context.request_location())
         {
@@ -599,15 +607,16 @@ impl Provider for CodexProvider {
             AttemptTransport::Retry(retry_index) => retry_index.get(),
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
+        let client = self
+            .client
+            .for_account(egress_account)
+            .map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+            .with_authentication(lease.authentication());
         let events = cold_response_stream(ColdResponse {
             turn_state_pins: self.turn_state_pins.clone(),
-            client: self
-                .client
-                .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication()),
+            client,
             response_origin: self.responses_url.clone(),
             request: upstream_request,
             upstream_model: upstream_model.clone(),

@@ -69,6 +69,19 @@ export function useAccountEditor(options: {
     }
   }
 
+  /** 遍历命中后服务端已改了绑定并钉住 state：刷新展示，并防止随后的「保存」把它们冲掉。 */
+  async function afterTurnStateHunt(boundChanged: boolean) {
+    const accountId = editingAccountId.value
+    if (!accountId)
+      return
+    proxyMode.value = 'preserve'
+    proxyId.value = ''
+    recaptureTurnState.value = false
+    if (boundChanged)
+      void options.reloadAccounts()
+    await loadConfiguration(accountId)
+  }
+
   const editingAccount = computed(() => {
     const accountId = editingAccountId.value
     return accountId
@@ -182,6 +195,8 @@ export function useAccountEditor(options: {
   return {
     apiKey,
     pinTurnState,
+    savedPinTurnState,
+    afterTurnStateHunt,
     recaptureTurnState,
     turnStatePins,
     turnStateCaptureRule,
