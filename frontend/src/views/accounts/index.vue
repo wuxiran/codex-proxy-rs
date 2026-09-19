@@ -166,6 +166,9 @@ const {
 
 const {
   apiKey: editingApiKey,
+  pinTurnState: editingPinTurnState,
+  recaptureTurnState: editingRecaptureTurnState,
+  turnStatePins: editingTurnStatePins,
   configurationLoading,
   configurationReady,
   showEditModal,
@@ -405,6 +408,8 @@ const {
     <AccountEditModal
       v-model="showEditModal"
       v-model:api-key="editingApiKey"
+      v-model:pin-turn-state="editingPinTurnState"
+      v-model:recapture-turn-state="editingRecaptureTurnState"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
       v-model:concurrency-limit="editingConcurrencyLimit"
@@ -413,6 +418,7 @@ const {
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
+      :turn-state-pins="editingTurnStatePins"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"

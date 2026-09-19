@@ -969,3 +969,38 @@ mod import_settings {
         }
     }
 }
+
+#[test]
+fn turn_state_pin_wire_rejects_external_state_and_mixed_credentials() {
+    use gateway_api::admin::accounts::RotateAccountRequest;
+    use serde_json::json;
+    for enabled in [true, false] {
+        let value = json!({"provider":"openai", "accountId":"acct_pin", "pinTurnState":enabled});
+        assert!(
+            serde_json::from_value::<RotateAccountRequest>(value.clone())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for key in [
+            "accessToken",
+            "refreshToken",
+            "idToken",
+            "baseUrl",
+            "apiKey",
+            "transport",
+        ] {
+            let mut mixed = value.clone();
+            mixed[key] = json!("untrusted");
+            assert!(
+                serde_json::from_value::<RotateAccountRequest>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut raw = value;
+        raw["turnState"] = json!("not-accepted");
+        assert!(serde_json::from_value::<RotateAccountRequest>(raw).is_err());
+    }
+}

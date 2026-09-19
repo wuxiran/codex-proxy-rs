@@ -278,6 +278,7 @@ pub(super) fn quota_local_usage(usage: &AccountUsage) -> Value {
         "imageRequestFailedCount": usage.image_request_failed_count,
         "totalTokens": total_tokens,
         "totalTokensDisplay": format_compact_number(total_tokens),
+        "costs": usage.costs.iter().map(account_currency_cost_view).collect::<Vec<_>>(),
         "requestBuckets": usage.request_buckets.iter().map(|bucket| serde_json::json!({
             "bucketStart": bucket.bucket_start,
             "requestCount": bucket.request_count,

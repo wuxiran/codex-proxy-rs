@@ -114,6 +114,19 @@ impl MemoryAccountStore {
             .map(|stored| stored.account.clone())
     }
 
+    pub(crate) fn set_turn_state_pin(&self, id: &str, enabled: bool) {
+        let id = ProviderAccountId::new(id).expect("account ID");
+        let mut accounts = self.accounts.lock().expect("store lock");
+        let stored = accounts.get_mut(&id).expect("account");
+        let mut data =
+            provider_openai::credential::CodexCredentialCodec::decode_complete(&stored.credential)
+                .unwrap();
+        data.oauth_mut().unwrap().turn_state_pin =
+            enabled.then(|| uuid::Uuid::new_v4().to_string());
+        stored.credential =
+            provider_openai::credential::CodexCredentialCodec::encode_complete(data).unwrap();
+    }
+
     pub(crate) fn set_scheduling(
         &self,
         id: &str,
