@@ -11,6 +11,7 @@ pub mod key_usage;
 pub mod observability;
 pub mod openai;
 pub mod proxies;
+pub mod public_import;
 pub mod settings;
 pub mod system;
 mod turn_state_hunt;

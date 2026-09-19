@@ -67,6 +67,7 @@ pub async fn run() -> Result<(), BootstrapError> {
         xai,
     } = config;
 
+    let public_import_dir = host.runtime_data_dir().join("public_import");
     let host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
     let mut store = gateway_store::initialize(store).await?;
@@ -91,6 +92,7 @@ pub async fn run() -> Result<(), BootstrapError> {
             client_distribution: host.client_distribution_resolver(),
             system: host.system_operations(),
             client_key_verifier: core.client_key_verifier(),
+            public_import_dir,
         },
     )
     .await?;

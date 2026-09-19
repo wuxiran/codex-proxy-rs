@@ -46,7 +46,7 @@ where
 /// request-id 层按配置的 header 名注入，同时写入与名字无关的扩展；
 /// 优先读扩展，使自定义 header 名不会让管理请求失去请求上下文。
 /// header 回退覆盖未装配该层的调用方。
-fn admin_request_id(parts: &Parts) -> Option<String> {
+pub(crate) fn admin_request_id(parts: &Parts) -> Option<String> {
     parts
         .extensions
         .get::<RequestId>()

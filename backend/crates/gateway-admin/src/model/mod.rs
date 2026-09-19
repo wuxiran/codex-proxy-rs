@@ -13,6 +13,7 @@ pub mod key_usage;
 pub mod observability;
 pub mod provider_credentials;
 pub mod proxies;
+pub mod public_import;
 pub mod quota_forecast;
 pub mod quota_forecast_sampling;
 pub mod settings;

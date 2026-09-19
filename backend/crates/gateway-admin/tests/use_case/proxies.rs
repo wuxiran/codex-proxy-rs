@@ -14,6 +14,8 @@ pub(super) struct TestProxies {
     pub accounts: Option<Vec<ProxyAccountRef>>,
     /// 设置后 `list`/`get` 返回这些记录；用于遍历代理找 state 的用例。
     pub records: Option<std::sync::Arc<std::sync::Mutex<Vec<ProxyRecord>>>>,
+    /// 记录每次导入预留的代理 ID。
+    pub reserved: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -46,6 +48,9 @@ impl ProxyStore for TestProxies {
             .as_ref()
             .ok_or_else(|| super::unavailable("proxy"))?;
         events.lock().unwrap().push("proxy.reserve");
+        if let Some(reserved) = &self.reserved {
+            reserved.lock().unwrap().push(id.to_owned());
+        }
         Ok(gateway_admin::ports::proxy::ProxyImportReservation {
             binding: ImportProxyBinding {
                 id: id.to_owned(),
