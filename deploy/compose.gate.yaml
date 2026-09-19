@@ -1,0 +1,70 @@
+# 89：CPR 固定入口（cpr-gate）。单独成一个 compose 项目，发版不会碰它。
+#
+#   docker compose -f deploy/compose.gate.yaml up -d --wait
+#
+# 约束：
+# - 别名 cpr-green 是 sub2api 账号 base_url（http://cpr-green:8080/v1）在用的名字，
+#   只能挂在本容器上；CPR 槽位容器不得再带这个别名
+# - .runtime/gate/upstream.conf 由 deploy/rollout.py 维护；挂目录而不是挂单文件，
+#   原子改写（rename）后容器内才看得到新内容
+# - 改 nginx.conf 用 `docker exec cpr-gate nginx -s reload`，不要 recreate 本容器
+
+name: codex-proxy-rs-gate
+
+services:
+  gate:
+    image: nginx:1.27-alpine
+    container_name: cpr-gate
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    ports:
+      - '127.0.0.1:${CPR_GATE_HOST_PORT:-18083}:8080'
+    volumes:
+      - type: bind
+        source: ./gate/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: ../.runtime/gate
+        target: /etc/nginx/cpr
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      default: {}
+      cpr-sub2-internal:
+        aliases:
+          - cpr-green
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/gate-healthz]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    mem_limit: 128m
+    cpus: 1.0
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+networks:
+  default:
+    external: true
+    name: codex-proxy-rs_default
+  cpr-sub2-internal:
+    external: true
+    name: cpr-sub2-internal

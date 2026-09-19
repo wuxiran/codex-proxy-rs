@@ -22,6 +22,7 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 - 代码注释使用中文，解释原因与边界；提交信息使用英文，沿用历史中的 Conventional Commits 格式。
 - 按变更范围执行验证，记录命令、结果和缺口。跳过的测试不算通过；界面与集成行为需要对应运行证据，构建通过不能替代实际验收。
 - 审查请求默认只读。修复、提交、推送和合并按用户当前授权执行；“本地验证通过”不等于用户已经审阅批准。
+- 89 生产发版一律走 `deploy/rollout.py`（见 [deploy/89.md](deploy/89.md#发版)），不得对 CPR 槽位容器或 `cpr-gate` 原地 recreate / restart。
 - 不读取或输出无关凭据，不把真实密钥、代理认证、账号令牌或请求转储放入提交、截图及审查报告。
 
 ## Code Review Rules
