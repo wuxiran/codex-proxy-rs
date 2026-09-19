@@ -166,6 +166,7 @@ struct RawJsonEndpointRequest {
 
 #[derive(Clone)]
 pub(super) struct ColdResponse {
+    pub(super) turn_state_pins: crate::turn_state_pin::TurnStatePins,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -627,9 +628,10 @@ fn encrypted_recovery_prelude(event: &ProviderEvent) -> bool {
 
 fn cold_response_stream_once(response: ColdResponse) -> EventStream {
     let ColdResponse {
+        turn_state_pins,
         client,
         response_origin,
-        request,
+        mut request,
         upstream_model,
         transport_policy,
         context,
@@ -669,6 +671,23 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                     UpstreamSendState::NotSent,
                 )
             })?;
+        let mut pin_attempt = if request.generate() && !context.is_diagnostic_required_account()
+            && allows_account_state_mutation
+            && let Some(generation) = lease.turn_state_pin()
+            && let Some(oauth) = lease.authentication().oauth()
+            && let Some(expected_length) = crate::turn_state_pin::CaptureRule::for_plan(active_account.plan_type())
+                .expected_length(upstream_model.as_str())
+        {
+            let binding = crate::turn_state_pin::credential_binding(generation, oauth.access_token.expose_secret());
+            Some(turn_state_pins.attempt(
+                active_account.id().as_str(), binding, upstream_model.as_str(),
+                context.client_api_key_ref().as_str(), expected_length, SystemTime::now(),
+            ))
+        } else { None };
+        if let Some(value) = pin_attempt.as_ref().and_then(crate::turn_state_pin::PinAttempt::value) {
+            request.turn_state = Some(value.to_owned());
+            request.passthrough_headers.remove("x-codex-turn-state");
+        }
         let request_id = context.request_id().as_str().to_owned();
         let cancellation = context.cancellation().clone();
         let account_selection = CodexAccountSelectionTelemetry::new(
@@ -748,6 +767,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        if let Some(pin) = pin_attempt.as_mut() {
+            pin.observe(response.turn_state.as_deref());
         }
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {
@@ -876,6 +898,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         turn_state_updates.as_ref(),
                         &mut session_capture,
                         &mut observation_state,
+                        pin_attempt.as_mut(),
                     )
                     .await;
                     let observation_event = if rate_limits_changed || turn_state_merge.is_some() {
@@ -935,6 +958,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 turn_state_updates.as_ref(),
                 &mut session_capture,
                 &mut observation_state,
+                pin_attempt.as_mut(),
             )
             .await;
             let turn_state_changed = turn_state_merge.unwrap_or(false);
@@ -1003,6 +1027,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 apply_failure(&failure_context, &active_account, failure)
                 .await;
             }
+            if completed && terminal_failure.is_none() && !terminal_response_is_incomplete(&events)
+                && let Some(pin) = pin_attempt.as_mut()
+            { pin.completed(SystemTime::now()); }
             attach_openai_session_update(&mut events, &mut session_capture);
             if allows_account_state_mutation && completed && terminal_failure.is_none() {
                 // 完成事件一旦交给下游，Core 可以立刻停止轮询 Provider stream；
@@ -1112,6 +1139,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             turn_state_updates.as_ref(),
             &mut session_capture,
             &mut observation_state,
+            pin_attempt.as_mut(),
         )
         .await
         .unwrap_or(false);
@@ -1120,6 +1148,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .iter()
             .flat_map(ProviderEvent::canonical_facts)
             .any(|event| matches!(event, GatewayEvent::Completed(_)));
+        if completed && terminal_failure.is_none() && !terminal_response_is_incomplete(&events)
+            && let Some(pin) = pin_attempt.as_mut()
+        { pin.completed(SystemTime::now()); }
         let terminal_changed = completed
             && observation_state.mark_completed(terminal_response_is_incomplete(&events));
         if response_transport == CodexBackendTransport::WebSocket
@@ -1179,9 +1210,13 @@ async fn merge_turn_state_update(
     updates: Option<&CodexTurnStateUpdate>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
+    pin: Option<&mut crate::turn_state_pin::PinAttempt>,
 ) -> Option<bool> {
     let updates = updates?;
     let turn_state = updates.lock().await.take()?;
+    if let Some(pin) = pin {
+        pin.observe(Some(&turn_state));
+    }
     if let Some(capture) = session_capture.as_mut() {
         capture.turn_state = Some(turn_state.clone());
     }

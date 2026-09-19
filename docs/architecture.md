@@ -427,6 +427,7 @@ PostgreSQL 周期对账才是正确性基础。
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | OpenAI upstream | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
+| OpenAI 实验 state 固定开关 / 候选 | PostgreSQL 凭据 JSON / Provider 进程内有界缓存 | 开关持久化；候选不落盘，最多 2048 条、固定一小时，按账号、令牌指纹、捕获代次、模型和客户端密钥隔离 |
 | Provider 公开模型与请求画像 | Provider/runtime cache | 由官方目录或发布源刷新，不写成第二份业务配置 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
@@ -514,7 +515,8 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 - Core：`runtime` owner 的 RuntimeSnapshot 周期对账和 Redis change 订阅；
 - Admin：S3/R2 备份 daemon，负责调度、执行、删除收敛与保留清理；
   以及账号冻结恢复 worker（容量熔断的自适应并发下调与到期探测解冻）；
-- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查。
+- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查；
+  OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，默认关闭。
 
 账号容量熔断默认关闭。启用后，仅普通请求收到的容量类上游错误（`server_is_overloaded` 等与
 5xx 不可用）按滑动窗口计数，并把当时观测到的在途并发并入峰值证据；本地连接保护与诊断探测
