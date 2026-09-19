@@ -2163,3 +2163,133 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         ProviderAdminErrorKind::Unsupported
     );
 }
+
+#[tokio::test]
+async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_pin_admin".to_owned(),
+            name: "pin".to_owned(),
+            secret: secret("test-pin-token"),
+            verified_account: profile("chatgpt-pin-admin"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_pin_admin").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let view = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let view = view.expose_to_provider().expose_to_provider();
+    assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+    assert_eq!(view.get("turnStatePins"), Some(&json!([])));
+    assert_eq!(
+        view.get("turnStateCaptureRule"),
+        Some(&json!({"defaultLength":292,"modelLengths":{}}))
+    );
+    assert!(
+        !serde_json::to_string(view)
+            .unwrap()
+            .contains("test-pin-token")
+    );
+    let mut generations = Vec::new();
+    for enabled in [true, true, false] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"pin_turn_state":enabled})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let data = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(data.get("access_token"), Some(&json!("test-pin-token")));
+        assert_eq!(prepared.facts().account_id, *account.id());
+        assert!(prepared.facts().preserve_profile);
+        assert!(prepared.facts().preserve_credential_state);
+        if enabled {
+            generations.push(data["turn_state_pin"].as_str().unwrap().to_owned());
+        } else {
+            assert!(!data.contains_key("turn_state_pin"));
+        }
+    }
+    assert_ne!(generations[0], generations[1]);
+    let mixed = admin
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"pin_turn_state":true, "access_token":"injected"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await;
+    assert!(mixed.is_err());
+}
+
+#[tokio::test]
+async fn turn_state_pin_team_admin_exposes_model_rules_without_enabling_capture() {
+    for plan in [
+        "team",
+        "business",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let mut account_profile = profile("chatgpt-team-pin");
+        account_profile.plan_type = Some(plan.to_owned());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: "acct_team_pin".to_owned(),
+                name: "team-pin".to_owned(),
+                secret: secret("team-pin-test-token"),
+                verified_account: account_profile,
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let account = store.account("acct_team_pin").unwrap();
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        let view = bundle
+            .admin_provider()
+            .account_configuration(account.id())
+            .await
+            .unwrap()
+            .unwrap();
+        let view = view.expose_to_provider().expose_to_provider();
+        assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+        assert_eq!(
+            view.get("turnStateCaptureRule"),
+            Some(&json!({
+                "defaultLength":null,
+                "modelLengths":{"gpt-5.5":332,"gpt-5.6-sol":332,"gpt-5.6-terra":356,"gpt-6-astra":332}
+            }))
+        );
+    }
+}
