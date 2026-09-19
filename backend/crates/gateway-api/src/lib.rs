@@ -33,6 +33,7 @@ pub mod auth;
 mod health;
 mod key_usage;
 pub mod openai;
+mod public_import;
 mod session_cookie;
 
 /// API-owned HTTP 与静态资源配置。
@@ -144,6 +145,7 @@ pub fn initialize(
         .merge(admin::router::<ApiState>())
         .merge(auth::router::<ApiState>())
         .merge(key_usage::router::<ApiState>())
+        .merge(public_import::router::<ApiState>())
         .fallback_service(ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)));
     if !config.cors_allowed_origins.is_empty() {
         let origins = config

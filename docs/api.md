@@ -518,6 +518,33 @@ JSON 文件按 Provider 文档分项，不拆解内部代理引用或改变 Prov
 终态结果保留 1 小时后自动清理。服务重启会丢失任务与未执行输入，已提交的账号不受影响；
 任务记录仍在保留期内时，可通过列表接口查询当前管理员的任务及进度。
 
+### 免登录账号导入
+
+管理员在「系统设置」开启后，把 `https://<host>/import/<token>` 发给上游；对方无需账号密码即可导入 sub2api
+格式的 OpenAI 账号。入口默认关闭，配置保存在 runtime 数据目录的 `public_import/config.json`，蓝绿槽位共享，
+不进入数据库和备份。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/admin/public-import` | 管理员 | 返回 `{ enabled, token, groupIds, pinTurnState, expiresAt, updatedAt }`，首次读取时生成令牌 |
+| `POST` | `/api/admin/public-import/update` | 管理员 | `{ enabled, groupIds, pinTurnState, expiresAt }`；开启时至少一个已存在的分组。`expiresAt` 必填，RFC 3339 时间或 `null`（长期有效），开启时必须晚于当前时间 |
+| `POST` | `/api/admin/public-import/rotate-token` | 管理员 | 更换令牌，旧链接立即失效；不改变 `expiresAt` |
+| `GET` | `/api/public-import/entry` | `X-Import-Token` | 返回 `{ groupNames, pinTurnState, expiresAt, maxAccounts }` |
+| `POST` | `/api/public-import/accounts` | `X-Import-Token` | `{ data }`，请求体上限 8 MiB |
+
+令牌缺失、错误、已过期和入口关闭统一返回 404，不区分原因。有效期在每次请求时校验，到期无需任何后台任务。`data` 接受 sub2api 导出（含 `{ code, message, data }` 响应信封）、
+`accounts` 数组或单账号文档，单次最多 200 个账号，不接受观澜 CDK。服务端把文档拆成单账号条目逐个导入：
+
+- 出站代理从「已通过连通性测试」的已保存代理中逐账号随机抽取；文档自带的 `proxies`、`proxy_key`、
+  `outboundProxyUrl` 一律丢弃。没有可用代理时整次请求返回 409，不回退直连；
+- 账号以启用状态、默认权重和并发加入配置的目标分组，审计主体为 `system`，`request_id` 为本次请求 ID；
+- `pinTurnState` 开启时，导入成功的账号随后开启「固定自身 state」。API Key 账号不支持该开关，
+  条目仍算导入成功，`statePinned` 为 `false`。
+
+响应为 `{ total, imported, failed, items: [{ index, name, status, importedAccounts, proxyName, statePinned, message }] }`，
+`status` 为 `imported` 或 `failed`，不回显账号 ID 和凭据。单个条目失败不影响其余条目。
+管理端页面按单账号分批提交并展示进度；直接调用接口批量提交时，整次请求受部署的 `api.request_timeout_seconds` 约束。
+
 ### 账号导入与 OAuth
 
 导入的 `data` 必须是 JSON object，Admin API 请求上限为 64 MiB；Provider 可以收紧限制，

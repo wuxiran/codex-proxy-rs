@@ -7,6 +7,12 @@ export const routes: RouteRecordRaw[] = [
     component: () => import('@/views/login/index.vue'),
   },
   {
+    // 免登录密链页面；令牌在路径里，接口调用时改放请求头。
+    path: '/import/:token',
+    name: 'public-import',
+    component: () => import('@/views/public-import/index.vue'),
+  },
+  {
     path: '/key-usage',
     name: 'key-usage',
     component: () => import('@/views/key-usage/index.vue'),

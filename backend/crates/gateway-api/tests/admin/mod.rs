@@ -85,6 +85,7 @@ mod client_keys;
 mod errors;
 mod observability;
 mod proxies;
+mod public_import;
 mod settings;
 mod system;
 mod wire;
@@ -183,6 +184,9 @@ impl AdminTestFixture {
                 client_distribution: Arc::new(StaticClientDistribution),
                 system,
                 client_key_verifier: verifier.unwrap_or_else(|| Arc::new(UnusedClientKeyVerifier)),
+                // 每个 harness 独占目录，避免用例之间共享入口配置。
+                public_import_dir: std::env::temp_dir()
+                    .join(format!("cpr-public-import-{}", uuid::Uuid::now_v7())),
             },
         )
         .await

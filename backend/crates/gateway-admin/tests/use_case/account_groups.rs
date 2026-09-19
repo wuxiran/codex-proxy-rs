@@ -88,7 +88,7 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
 }
 
 #[derive(Default)]
-struct FakeGroupStore {
+pub(super) struct FakeGroupStore {
     requested_groups: Mutex<Vec<String>>,
 }
 
@@ -245,7 +245,7 @@ fn member(account_id: &str, total_slots: u64) -> AccountGroupMemberFact {
     }
 }
 
-fn group_id() -> AccountGroupId {
+pub(super) fn group_id() -> AccountGroupId {
     AccountGroupId::new(GROUP_ID).expect("group ID")
 }
 
