@@ -5,7 +5,7 @@ import { parseAccountSchedulingForm } from '../../utils/schedulingForm'
 import { emptyApiKeyAccountForm } from '../../utils/upstreamApiKey'
 
 export type AccountCreateProvider = 'batch' | 'openai' | 'xai'
-export type AccountImportMode = 'oauth' | 'api_key' | 'access_token' | 'refresh_token' | 'json'
+export type AccountImportMode = 'oauth' | 'api_key' | 'access_token' | 'refresh_token' | 'json' | 'cdk'
 export type AccountImportInputMode = Exclude<AccountImportMode, 'oauth' | 'api_key'>
 
 export interface AccountCreateForm {
@@ -38,7 +38,7 @@ export function emptyAccountCreateForm(): AccountCreateForm {
     groupIds: [],
     step: 'settings',
     mode: 'oauth',
-    importTexts: { access_token: '', refresh_token: '', json: '' },
+    importTexts: { access_token: '', refresh_token: '', json: '', cdk: '' },
     oauthFlowId: '',
     oauthAuthUrl: '',
     oauthCallback: '',

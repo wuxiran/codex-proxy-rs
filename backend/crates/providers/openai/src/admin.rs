@@ -1505,11 +1505,30 @@ fn map_credential_admin_error(error: CodexCredentialAdminError) -> ProviderAdmin
             Kind::Ambiguous,
             "令牌刷新结果未知，请先核对账号状态，不要立即重复刷新",
         ),
+        Error::CdkRedeem { message } => (Kind::Invalid, cdk_redeem_public_message(&message)),
     };
     let error = provider_admin_error(kind).with_public_message(public_message);
     match upstream_message {
         Some(message) => error.with_message(message),
         None => error,
+    }
+}
+
+fn cdk_redeem_public_message(message: &str) -> &'static str {
+    if message.contains("格式") {
+        "CDK 格式不正确，请检查卡密"
+    } else if message.contains("不存在") || message.contains("无效") {
+        "CDK 不存在或无效"
+    } else if message.contains("已兑换") {
+        "CDK 已兑换且无法再次取回，请改用已下载的 JSON 导入"
+    } else if message.contains("未启用") || message.contains("未配置") {
+        "未启用 CDK 兑换"
+    } else if message.contains("限流") {
+        "CDK 兑换被限流，请稍后重试"
+    } else if message.contains("连接") || message.contains("身份") {
+        "暂时无法连接 CDK 兑换服务，请稍后重试"
+    } else {
+        "CDK 兑换失败，请稍后重试或改用账号 JSON 导入"
     }
 }
 
@@ -1541,6 +1560,7 @@ const fn credential_admin_error_code(error: &CodexCredentialAdminError) -> &'sta
         CodexCredentialAdminError::RefreshUnavailable => "refresh_unavailable",
         CodexCredentialAdminError::RefreshUpstream { .. } => "refresh_upstream_failed",
         CodexCredentialAdminError::RefreshAmbiguous { .. } => "refresh_ambiguous",
+        CodexCredentialAdminError::CdkRedeem { .. } => "cdk_redeem_failed",
     }
 }
 

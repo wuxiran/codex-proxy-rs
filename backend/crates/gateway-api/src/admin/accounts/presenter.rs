@@ -74,6 +74,8 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
     let mut usage = account_usage_view(usage, usage_period, now);
     if account.authentication_kind == "api_key" {
         usage.window_label_display = "通用额度".to_owned();
+    } else if quota.windows.is_empty() && usage.request_count.is_some() {
+        usage.window_label_display = "本地累计".to_owned();
     }
     let (quota, refresh_token_expires_at) = account_quota_view(quota, cooldown, now);
     AccountView {
@@ -278,6 +280,7 @@ pub(super) fn quota_local_usage(usage: &AccountUsage) -> Value {
         "imageRequestFailedCount": usage.image_request_failed_count,
         "totalTokens": total_tokens,
         "totalTokensDisplay": format_compact_number(total_tokens),
+        "costs": usage.costs.iter().map(account_currency_cost_view).collect::<Vec<_>>(),
         "requestBuckets": usage.request_buckets.iter().map(|bucket| serde_json::json!({
             "bucketStart": bucket.bucket_start,
             "requestCount": bucket.request_count,
