@@ -15,7 +15,7 @@ use gateway_core::{
         DiagnosticEgress,
         probe::{AccountProbeError, AccountProbeRequest},
     },
-    error::GatewayErrorKind,
+    error::{GatewayErrorKind, ProviderErrorKind},
     event::ProviderResponseHeader,
     upstream::UpstreamSendState,
 };
@@ -26,9 +26,9 @@ use super::{
 };
 use crate::{
     model::{
-        AdminError, PageSize,
+        AdminError, PageSize, Revision,
         accounts::{
-            BatchUpdateAccounts, TurnStateHuntAttemptError, TurnStateHuntCommand,
+            BatchUpdateAccounts, CredentialState, TurnStateHuntAttemptError, TurnStateHuntCommand,
             TurnStateHuntEgress, TurnStateHuntEvent, TurnStateHuntEventStream,
         },
         proxies::{AccountProxySelection, ProxyListQuery},
@@ -77,6 +77,14 @@ struct Hunt {
 enum Outcome {
     Continue,
     Stop,
+}
+
+/// 实际发出探测的那个出口。命中后要绑定的必须就是它：同一个代理 ID 在探测之后
+/// 可能已被改了地址，账号也可能已被管理员改绑。
+struct ProbedEgress {
+    proxy_id: Option<String>,
+    revision: Option<Revision>,
+    proxy: Option<OutboundProxy>,
 }
 
 impl DefaultAccountsService {
@@ -247,15 +255,49 @@ impl Hunt {
         .await;
     }
 
+    /// 续期是系统替管理员发请求：账号已被停用或凭据已失效时必须立刻停手。
+    /// 手动遍历不受此限（管理员可以对停用账号做诊断）。
+    async fn still_schedulable(&self) -> bool {
+        if !self.command.require_schedulable {
+            return true;
+        }
+        self.service
+            .provider_for_account(&self.command.account_id)
+            .await
+            .is_ok_and(|(item, _)| {
+                item.account.enabled && item.account.credential_state == CredentialState::Ready
+            })
+    }
+
     async fn try_egress(&mut self, egress: Egress, index: usize, total: usize) -> Outcome {
         let proxy_id = egress.view.proxy_id.clone();
+        if !self.still_schedulable().await {
+            self.fail(
+                "account_unschedulable",
+                "账号已停用或凭据已失效，续期已停止",
+            )
+            .await;
+            return Outcome::Stop;
+        }
         // 列表之后代理可能被删除、改地址或测试失效，逐个重新读取。
-        let (proxy, location) = match &proxy_id {
-            None => (None, None),
+        let (probed, location) = match &proxy_id {
+            None => (
+                ProbedEgress {
+                    proxy_id: None,
+                    revision: None,
+                    proxy: None,
+                },
+                None,
+            ),
             Some(id) => match self.service.proxies.get(id).await {
-                Ok(record) if record.last_test.as_ref().is_some_and(|test| test.success) => {
-                    (Some(record.proxy), record.location)
-                }
+                Ok(record) if record.last_test.as_ref().is_some_and(|test| test.success) => (
+                    ProbedEgress {
+                        proxy_id: Some(record.id),
+                        revision: Some(record.revision),
+                        proxy: Some(record.proxy),
+                    },
+                    record.location,
+                ),
                 _ => {
                     self.emit(TurnStateHuntEvent::EgressFinished {
                         proxy_id,
@@ -286,7 +328,10 @@ impl Hunt {
                 .service
                 .probe
                 .probe(AccountProbeRequest {
-                    egress: Some(DiagnosticEgress::new(proxy.clone(), location.clone())),
+                    egress: Some(DiagnosticEgress::new(
+                        probed.proxy.clone(),
+                        location.clone(),
+                    )),
                     ..self.request.clone()
                 })
                 .await;
@@ -316,7 +361,7 @@ impl Hunt {
                             skipped: None,
                         })
                         .await;
-                        self.finalize(&egress, used, &result.response_headers, captured_at)
+                        self.finalize(&probed, used, &result.response_headers, captured_at)
                             .await;
                         return Outcome::Stop;
                     }
@@ -334,12 +379,13 @@ impl Hunt {
                 tokio::time::sleep(BUSY_RETRY_DELAY).await;
                 continue;
             }
-            self.requests += 1;
+            // 只有真的发往上游的才算一次请求；在本地就失败的尝试不计。
+            if !matches!(error.send_state(), None | Some(UpstreamSendState::NotSent)) {
+                self.requests += 1;
+            }
             used += 1;
             lengths.push(None);
-            let upstream_status = error
-                .upstream_response()
-                .map(gateway_core::engine::probe::AccountProbeUpstreamResponse::status);
+            let class = FailureClass::of(&error);
             self.emit(TurnStateHuntEvent::Attempt {
                 proxy_id: proxy_id.clone(),
                 index: used,
@@ -348,12 +394,15 @@ impl Hunt {
                 error: Some(TurnStateHuntAttemptError {
                     code: error.kind(),
                     source: error.source(),
-                    upstream_status,
-                    message: error.client_message().to_owned(),
+                    upstream_status: error
+                        .upstream_response()
+                        .map(gateway_core::engine::probe::AccountProbeUpstreamResponse::status),
+                    // 上游原文可能回显请求材料，事件里只放按分类给出的固定文案。
+                    message: class.message().to_owned(),
                 }),
             })
             .await;
-            if is_account_level_failure(&error, upstream_status) {
+            if class == FailureClass::Account {
                 self.log_egress(&egress.view, &lengths, false);
                 // 这些失败换出口也不会好，继续只会白耗额度。
                 self.fail("account_rejected", "上游拒绝了该账号的请求，遍历已中止")
@@ -377,22 +426,40 @@ impl Hunt {
         Outcome::Continue
     }
 
+    /// 账号当前保存的出口是否就是刚探测的这个。
+    async fn bound_to(&self, probed: &ProbedEgress) -> Result<bool, AdminError> {
+        let (item, _) = self
+            .service
+            .provider_for_account(&self.command.account_id)
+            .await?;
+        Ok(item.account.outbound_proxy == probed.proxy)
+    }
+
     /// 先绑后钉：state 是在这个出口上观测到的，只有账号确实走这个出口之后才值得钉。
     async fn finalize(
         &mut self,
-        egress: &Egress,
+        probed: &ProbedEgress,
         attempt_index: u8,
         response_headers: &[ProviderResponseHeader],
         captured_at: SystemTime,
     ) {
         let account_id = self.command.account_id.clone();
-        let proxy_id = egress.view.proxy_id.clone();
-        self.emit(TurnStateHuntEvent::Hit {
+        let proxy_id = probed.proxy_id.clone();
+        // 提交边界：命中事件送达之后才进入不可取消的收尾。页面在探测途中已经断开
+        // （用户点了取消）时事件送不出去，此时什么都不改，兑现「取消不改动账号」。
+        let hit = TurnStateHuntEvent::Hit {
             proxy_id: proxy_id.clone(),
             attempt_index,
             length: self.ticket.expected_length(),
-        })
-        .await;
+        };
+        if self.events.send(hit).await.is_err() {
+            tracing::info!(
+                target: "turn_state_hunt",
+                account_id = account_id.as_str(),
+                "遍历命中时页面已取消，未改动账号"
+            );
+            return;
+        }
         // 遍历期间凭据被刷新或重新捕获，观测到的 state 不再属于当前凭据。
         match self
             .provider
@@ -406,7 +473,25 @@ impl Hunt {
                 return;
             }
         }
-        if !egress.bound {
+        // 代理在探测之后被改过（地址或测试状态）：同一个 ID 已经不是探测过的那个出口。
+        if let Some(id) = &proxy_id {
+            let unchanged = self.service.proxies.get(id).await.is_ok_and(|record| {
+                Some(record.revision) == probed.revision
+                    && Some(&record.proxy) == probed.proxy.as_ref()
+                    && record.last_test.as_ref().is_some_and(|test| test.success)
+            });
+            if !unchanged {
+                self.fail("egress_changed", "该代理在遍历期间被修改，请重新遍历")
+                    .await;
+                return;
+            }
+        }
+        let Ok(already_bound) = self.bound_to(probed).await else {
+            self.fail("bind_failed", "读取账号当前绑定失败，未改动账号")
+                .await;
+            return;
+        };
+        if !already_bound {
             let selection = proxy_id
                 .clone()
                 .map_or(AccountProxySelection::Direct, AccountProxySelection::Saved);
@@ -425,15 +510,22 @@ impl Hunt {
                     },
                 )
                 .await;
-            if let Err(error) = bound {
+            if let Err(error) = &bound {
                 tracing::warn!(
                     target: "turn_state_hunt",
                     account_id = account_id.as_str(),
                     error_kind = ?error.kind(),
-                    "遍历命中但绑定代理失败，未钉住 state"
+                    "遍历命中但绑定代理返回失败"
                 );
-                self.fail("bind_failed", "绑定代理失败，未钉住 state，请刷新后重试")
-                    .await;
+            }
+            // 绑定调用的返回值不足为凭（提交与发布分两步，也可能被并发改绑），
+            // 以回读到的账号绑定为准：不是探测过的出口就不钉。
+            if !self.bound_to(probed).await.unwrap_or(false) {
+                self.fail(
+                    "bind_mismatch",
+                    "账号当前绑定的不是刚探测的出口，未钉住 state，请刷新后重试",
+                )
+                .await;
                 return;
             }
         }
@@ -441,12 +533,12 @@ impl Hunt {
             target: "turn_state_hunt",
             account_id = account_id.as_str(),
             proxy_id = proxy_id.as_deref().unwrap_or("direct"),
-            changed = !egress.bound,
+            changed = !already_bound,
             "遍历命中，账号已绑定到该出口"
         );
         self.emit(TurnStateHuntEvent::Bound {
             proxy_id: proxy_id.clone(),
-            changed: !egress.bound,
+            changed: !already_bound,
         })
         .await;
         match self
@@ -537,17 +629,45 @@ fn not_sent_because_busy(error: &AccountProbeError) -> bool {
     ) && matches!(error.send_state(), None | Some(UpstreamSendState::NotSent))
 }
 
-fn is_account_level_failure(error: &AccountProbeError, upstream_status: Option<u16>) -> bool {
-    // 403 常见于出口 IP 被拒，按出口问题处理。
-    if upstream_status == Some(403) {
-        return false;
+/// 一次失败说明的是账号还是出口。
+///
+/// 必须看 Provider 的原始分类：面向客户端的 [`GatewayErrorKind`] 把凭据失效、无权限
+/// 都折叠成「上游不可用」，按它分类会把已经没救的账号拿去把所有代理打一遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    /// 换出口也不会好：凭据失效、被封、额度耗尽、限流、模型不支持、请求本身不合法。
+    Account,
+    /// 出口不通、被 Cloudflare 拦截、超时等：换一个出口再试。
+    Egress,
+}
+
+impl FailureClass {
+    fn of(error: &AccountProbeError) -> Self {
+        match error.provider_kind() {
+            Some(
+                ProviderErrorKind::Unauthorized
+                | ProviderErrorKind::PermissionDenied
+                | ProviderErrorKind::QuotaExhausted
+                | ProviderErrorKind::RateLimited
+                | ProviderErrorKind::Unsupported
+                | ProviderErrorKind::InvalidRequest,
+            ) => Self::Account,
+            Some(_) => Self::Egress,
+            // 没有 Provider 分类时只能看网关层；限流与不支持在那一层不会被折叠。
+            None => match error.kind() {
+                GatewayErrorKind::RateLimited
+                | GatewayErrorKind::Unsupported
+                | GatewayErrorKind::InvalidRequest
+                | GatewayErrorKind::ModelNotFound => Self::Account,
+                _ => Self::Egress,
+            },
+        }
     }
-    matches!(upstream_status, Some(401 | 429))
-        || matches!(
-            error.kind(),
-            GatewayErrorKind::Unauthorized
-                | GatewayErrorKind::RateLimited
-                | GatewayErrorKind::ModelNotFound
-                | GatewayErrorKind::PolicyDenied
-        )
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Account => "上游拒绝了该账号的请求",
+            Self::Egress => "经该出口的请求失败",
+        }
+    }
 }

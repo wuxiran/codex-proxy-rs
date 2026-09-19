@@ -312,6 +312,8 @@ pub struct TurnStateHuntCommand {
     pub upstream_model: gateway_core::routing::UpstreamModelId,
     pub attempts: u8,
     pub include_direct: bool,
+    /// 后台续期为 true：账号被停用或凭据失效后，开始前与每个出口前都会停手。
+    pub require_schedulable: bool,
     pub context: super::MutationContext,
 }
 

@@ -648,26 +648,33 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 依次经每个 `lastTest.success` 为 true 的代理发真实上游请求（`includeDirect=true` 时再加直连），账号当前绑定的出口排最前，
 每个出口最多 `attempts` 次。探测只替换单次请求的出口，不改账号已保存的绑定，也不计入 Provider 熔断和账号探测失败事实。
 要求该账号已开启并保存 `pinTurnState`，且模型在 `turnStateCaptureRule` 中有长度规则，否则直接返回 400；同一账号同时只允许一个遍历（409）。
-这是会改状态的 GET（EventSource 只能发 GET），请求必须带 `Accept: text/event-stream`，否则返回 400。
+这是会改状态的 GET（EventSource 只能发 GET），请求必须带 `Accept: text/event-stream`，且浏览器请求的
+`Sec-Fetch-Site` 必须是 `same-origin`（挡掉同站兄弟子域），否则返回 400。
 
 首次命中即停止：先核对凭据绑定未变，再把账号绑定到该出口（等同批量更新的 `outboundProxyId`，已绑定则跳过），最后把该 state
-钉为账号级 state。账号级 state 对该账号该模型的全部客户端密钥生效，并**替换**该模型已有的全部固定（旧值来自换绑前的出口）；
+钉为账号级 state。绑定以回读到的账号出口为准：代理在探测后被修改（`egress_changed`）或账号最终没有落在
+探测过的出口上（`bind_mismatch`）时不钉。账号级 state 对该账号该模型的全部客户端密钥生效，并**替换**该模型已有的全部固定（旧值来自换绑前的出口）；
 被动捕获仍然永不覆盖。`turnStatePins` 摘要以 `scope: "account" | "client"` 区分二者，寿命同为 3600 秒且不续期。
-命中后的绑定与钉住在服务端独立完成，不受页面断开影响；命中前断开连接即取消，账号不被改动。
+提交边界是 `hit` 事件送达：此后绑定与钉住在服务端独立完成，不受页面断开影响；此前断开连接即取消，
+即使在途请求随后命中，账号也不被改动。
 
 事件为 `data:` JSON，以 `type` 区分：`hunt_start{model,expectedLength,attempts,proxies[]}`、`proxy_start`、
 `attempt{proxyId,index,length,matched,error}`、`proxy_done{attempts,matched,skipped}`、`hit`、`bound{proxyId,changed}`、
 `pinned{model,length,expiresAt}`、`hunt_complete{success,requests}`、`error{code,message}`。直连的 `proxyId` 为 null。
 `length` 仅供筛选；state 的值及其任何摘要永不输出，也不写入日志。
-401/429、模型不存在或策略拒绝视为账号级失败并中止整个遍历；同一出口连续两次传输失败或 403 则跳过该出口；
+失败按 Provider 的原始分类判断：凭据失效、无权限/封号、额度耗尽、限流、模型不支持、请求不合法视为账号级失败并中止
+整个遍历（`account_rejected`）；传输失败、超时、Cloudflare 拦截等视为出口问题，同一出口连续两次即跳过。`attempt.error.message`
+是按分类给出的固定文案，不含上游原文；`requests` 只统计真正发往上游的请求。
 账号被线上流量占用而未发出的尝试不计次数，连续五次后中止。
 
 **自动续期。** `POST /api/admin/accounts/rotate` 接受 `turnStateAutoHunt: { enabled, modelId, attempts, includeDirect }`
-（`enabled: false` 关闭；不要同时提交 `pinTurnState`，重新提交开关会更换代次并作废已钉住的 state）。参数保存在账号凭据中，
-令牌刷新时保留，关闭「固定自身 state」时一并清除；详情的 `credentialConfiguration.turnStateAutoHunt` 返回当前参数或 null。
+（`enabled: false` 关闭；不要同时提交 `pinTurnState`，重新提交开关会更换代次并作废已钉住的 state）。参数保存在运行数据目录
+`turn_state/auto_hunt.json`（各实例共享），**不进账号凭据**——凭据 schema 拒绝未知字段，写进去会让回滚后的旧版本读不了该账号。
+开启续期要求固定已开启，关闭「固定自身 state」时一并清除；详情的 `credentialConfiguration.turnStateAutoHunt` 返回当前参数或 null。
 开启后服务端每 60 秒检查一次：该账号该模型的账号级 state 在本进程内缺失（含服务重启后）或将在 5 分钟内到期时，
 以系统身份用同样参数重新遍历——当前绑定的出口排最前，续不上就继续打其它出口，命中后照常换绑并替换旧 state。
-整轮都未命中则 5 分钟后重试，上游拒绝账号（401/429 等）则 15 分钟后重试；停用或凭据失效的账号不续期。
+整轮都未命中则 5 分钟后重试，上游拒绝账号则 15 分钟后重试。停用或凭据失效的账号不续期：轮到它时会按当时的事实重新确认，
+续期途中被停用也会在下一个出口前停手（`account_unschedulable`）。
 state 只存在于进程内存，续期任务不加跨实例租约，每个实例各自维护。
 
 

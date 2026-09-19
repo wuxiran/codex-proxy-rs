@@ -138,7 +138,7 @@ export function useAccountTurnStateHunt() {
       return
     close()
     status.value = 'cancelled'
-    message.value = '已取消；已发出的请求不会撤回，账号设置未改动'
+    message.value = '已取消；已发出的请求不会撤回，但即使它随后命中也不会改动账号'
   }
 
   onScopeDispose(close)

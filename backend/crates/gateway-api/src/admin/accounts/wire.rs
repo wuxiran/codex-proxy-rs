@@ -706,6 +706,8 @@ impl TurnStateHuntQuery {
                 .map_err(|_| WireValidationError::new("modelId"))?,
             attempts: self.attempts,
             include_direct: self.include_direct,
+            // 管理员手动遍历可以用于诊断已停用的账号。
+            require_schedulable: false,
             context,
         })
     }

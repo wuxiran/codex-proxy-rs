@@ -13,7 +13,7 @@ pub(super) struct TestProxies {
     pub events: Option<super::accounts::EventLog>,
     pub accounts: Option<Vec<ProxyAccountRef>>,
     /// 设置后 `list`/`get` 返回这些记录；用于遍历代理找 state 的用例。
-    pub records: Option<Vec<ProxyRecord>>,
+    pub records: Option<std::sync::Arc<std::sync::Mutex<Vec<ProxyRecord>>>>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -57,7 +57,8 @@ impl ProxyStore for TestProxies {
     async fn list(&self, query: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
         let items = self
             .records
-            .clone()
+            .as_ref()
+            .map(|records| records.lock().unwrap().clone())
             .ok_or_else(|| super::unavailable("proxy"))?;
         Ok(ProxyPage {
             total: items.len() as u64,
@@ -83,10 +84,15 @@ impl ProxyStore for TestProxies {
     }
     async fn get(&self, id: &str) -> AdminStoreResult<ProxyRecord> {
         self.records
-            .iter()
-            .flatten()
-            .find(|record| record.id == id)
-            .cloned()
+            .as_ref()
+            .and_then(|records| {
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|record| record.id == id)
+                    .cloned()
+            })
             .ok_or_else(|| super::unavailable("proxy"))
     }
     async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {

@@ -568,6 +568,13 @@ impl AttemptContext {
         self.account.diagnostic_egress()
     }
 
+    /// 让本次诊断 attempt 经指定出口发出。
+    #[must_use]
+    pub fn with_diagnostic_egress(mut self, egress: Option<DiagnosticEgress>) -> Self {
+        self.account = self.account.with_diagnostic_egress(egress);
+        self
+    }
+
     /// 普通请求认证时冻结的账号范围；管理端诊断为 `None`。
     #[must_use]
     pub const fn account_scope(&self) -> Option<&Arc<crate::account::scope::FrozenAccountScope>> {

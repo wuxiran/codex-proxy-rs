@@ -946,12 +946,17 @@ impl DefaultExecutionService {
                 );
             }
         }
+        let provider_kind = match error {
+            EngineError::Provider(provider_error) => Some(provider_error.kind()),
+            _ => None,
+        };
         AccountProbeError::new(
             gateway_error_from_engine(error),
             source,
             send_state,
             upstream_response,
         )
+        .with_provider_kind(provider_kind)
     }
 }
 

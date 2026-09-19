@@ -605,6 +605,9 @@ pub(super) struct FakeAccountStore {
     quota_forecast_history: Mutex<QuotaForecastHistory>,
     update_commands: Mutex<Vec<UpdateAccount>>,
     pub(super) lowered_limits: Mutex<Vec<(String, u32)>>,
+    /// 已保存代理 ID 到地址的解析表；批量更新选中其中之一时账号的出口随之改变。
+    pub(super) saved_proxies:
+        Mutex<std::collections::BTreeMap<String, gateway_core::account::OutboundProxy>>,
 }
 
 impl FakeAccountStore {
@@ -625,7 +628,12 @@ impl FakeAccountStore {
             quota_forecast_history: Mutex::new(QuotaForecastHistory::default()),
             update_commands: Mutex::new(Vec::new()),
             lowered_limits: Mutex::new(Vec::new()),
+            saved_proxies: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    pub(super) fn mutate_account(&self, change: impl FnOnce(&mut AccountRecord)) {
+        change(&mut self.accounts.lock().expect("accounts")[0]);
     }
 
     pub(super) fn update_commands(&self) -> Vec<UpdateAccount> {
@@ -994,6 +1002,24 @@ impl AccountStore for FakeAccountStore {
         self.record("store.batch_update_accounts");
         self.record_context(context);
         self.require_commit()?;
+        if let Some(selection) = &command.outbound_proxy {
+            use gateway_admin::model::proxies::AccountProxySelection;
+            let proxy = match selection {
+                AccountProxySelection::Direct => None,
+                AccountProxySelection::Url(proxy) => Some(proxy.clone()),
+                AccountProxySelection::Saved(id) => {
+                    self.saved_proxies.lock().expect("proxies").get(id).cloned()
+                }
+            };
+            // 解析不到的已保存代理保持原绑定：模拟「提交看似成功、账号却没换到该出口」。
+            if !matches!(selection, AccountProxySelection::Saved(_)) || proxy.is_some() {
+                for account in self.accounts.lock().expect("accounts").iter_mut() {
+                    if command.account_ids.contains(&account.id) {
+                        account.outbound_proxy = proxy.clone();
+                    }
+                }
+            }
+        }
         Ok(AccountsUpdateResult {
             config_revision: revision(2),
             account_ids: command

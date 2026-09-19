@@ -606,6 +606,16 @@ where
     if !accepts_event_stream {
         return Err(map_wire_error(WireValidationError::new("accept")));
     }
+    // `Accept` 任何脚本都能设，算不上来源证明。浏览器会如实标注请求来自哪里：
+    // 同站不同源（兄弟子域）的页面发来的请求仍会带上 Lax Cookie，这里挡掉。
+    // 没有这个头的是非浏览器客户端（脚本、x-api-key 调用），由鉴权本身把关。
+    let cross_origin = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| !site.eq_ignore_ascii_case("same-origin"));
+    if cross_origin {
+        return Err(map_wire_error(WireValidationError::new("origin")));
+    }
     let command = query
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;

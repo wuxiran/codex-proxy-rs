@@ -17,7 +17,7 @@ use gateway_core::{
         AccountProbe, AccountProbeError, AccountProbeErrorSource, AccountProbeRequest,
         AccountProbeResult,
     },
-    error::{GatewayError, GatewayErrorKind},
+    error::{GatewayError, GatewayErrorKind, ProviderErrorKind},
     event::ProviderResponseHeader,
     routing::UpstreamModelId,
     upstream::UpstreamSendState,
@@ -35,6 +35,8 @@ enum Reply {
     State(usize),
     NoState,
     Fail(GatewayErrorKind, UpstreamSendState),
+    /// Provider 的原始分类；网关层一律折叠成「上游不可用」，正如真实链路。
+    Rejected(ProviderErrorKind),
 }
 
 /// 按顺序回放探测结果，并记下每次请求走的出口。
@@ -42,6 +44,8 @@ struct ScriptedProbe {
     replies: Mutex<VecDeque<Reply>>,
     egresses: Mutex<Vec<Option<String>>>,
     on_probe: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// 设置后探测在收到通知前不返回：用来模拟「页面已取消，在途请求随后才命中」。
+    gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl ScriptedProbe {
@@ -50,6 +54,7 @@ impl ScriptedProbe {
             replies: Mutex::new(replies.into_iter().collect()),
             egresses: Mutex::new(Vec::new()),
             on_probe: Mutex::new(None),
+            gate: Mutex::new(None),
         })
     }
 
@@ -77,7 +82,11 @@ impl AccountProbe for ScriptedProbe {
             .unwrap()
             .pop_front()
             .expect("unexpected extra probe");
+        let gate = self.gate.lock().unwrap().clone();
         Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             match reply {
                 Reply::State(length) => Ok(AccountProbeResult {
                     response_headers: vec![ProviderResponseHeader::new(
@@ -93,6 +102,13 @@ impl AccountProbe for ScriptedProbe {
                     Some(send_state),
                     None,
                 )),
+                Reply::Rejected(kind) => Err(AccountProbeError::new(
+                    GatewayError::new(GatewayErrorKind::UpstreamUnavailable, "raw upstream text"),
+                    AccountProbeErrorSource::Upstream,
+                    Some(UpstreamSendState::Sent),
+                    None,
+                )
+                .with_provider_kind(Some(kind))),
             }
         })
     }
@@ -122,6 +138,8 @@ fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
 struct Setup {
     services: gateway_admin::AdminServices,
     provider: Arc<FakeProviderAdmin>,
+    store: Arc<FakeAccountStore>,
+    proxies: Arc<Mutex<Vec<ProxyRecord>>>,
     log: EventLog,
 }
 
@@ -135,12 +153,18 @@ async fn setup(
     *provider.hunt_binding.lock().unwrap() = Some("binding-1".to_owned());
     let mut account = account_record("openai");
     account.outbound_proxy = bound.map(|record| record.proxy.clone());
+    let store = FakeAccountStore::with_account(account, log.clone());
+    *store.saved_proxies.lock().unwrap() = proxies
+        .iter()
+        .map(|record| (record.id.clone(), record.proxy.clone()))
+        .collect();
+    let proxies = Arc::new(Mutex::new(proxies));
     let services = super::AdminHarness::new()
-        .accounts(FakeAccountStore::with_account(account, log.clone()))
+        .accounts(store.clone())
         .provider(provider.clone())
         .probe(probe)
         .proxies(Arc::new(TestProxies {
-            records: Some(proxies),
+            records: Some(proxies.clone()),
             ..Default::default()
         }))
         .build()
@@ -148,6 +172,8 @@ async fn setup(
     Setup {
         services,
         provider,
+        store,
+        proxies,
         log,
     }
 }
@@ -158,6 +184,7 @@ fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
         upstream_model: UpstreamModelId::new("gpt-6-astra").unwrap(),
         attempts,
         include_direct,
+        require_schedulable: false,
         context: context("hunt"),
     }
 }
@@ -484,4 +511,187 @@ async fn renewal_rehunts_due_accounts_and_backs_off_after_a_full_miss() {
     // 整轮未命中后进入退避，不会每个周期都把所有出口再打一遍。
     renewal_cycle(&task).await;
     assert_eq!(probe.egresses().len(), 4);
+}
+
+fn changed(log: &EventLog) -> bool {
+    let log = recorded(log);
+    log.contains(&"store.batch_update_accounts") || log.contains(&"provider.hunt_pin")
+}
+
+/// 凭据失效与封号在网关层都叫「上游不可用」；按 Provider 分类识别出来后必须立刻中止，
+/// 而不是拿一个没救的账号把所有代理打一遍。
+#[tokio::test]
+async fn account_level_rejection_aborts_without_trying_other_egresses() {
+    for kind in [
+        ProviderErrorKind::Unauthorized,
+        ProviderErrorKind::PermissionDenied,
+        ProviderErrorKind::QuotaExhausted,
+        ProviderErrorKind::Unsupported,
+    ] {
+        let probe = ScriptedProbe::new([Reply::Rejected(kind)]);
+        let setup = setup(
+            probe.clone(),
+            vec![proxy("first", 8001, true), proxy("second", 8002, true)],
+            None,
+        )
+        .await;
+
+        let events = run(&setup, command(5, false)).await;
+
+        assert_eq!(probe.egresses(), vec![endpoint(8001)], "{kind:?}");
+        assert!(matches!(
+            events.last(),
+            Some(TurnStateHuntEvent::Failed {
+                code: "account_rejected",
+                ..
+            })
+        ));
+        // 上游原文不进事件。
+        assert!(!format!("{events:?}").contains("raw upstream text"));
+        assert!(!changed(&setup.log));
+    }
+}
+
+#[tokio::test]
+async fn egress_level_failure_moves_on_to_the_next_egress() {
+    let probe = ScriptedProbe::new([
+        Reply::Rejected(ProviderErrorKind::Unavailable),
+        Reply::Rejected(ProviderErrorKind::Transport),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("blocked", 8001, true), proxy("good", 8002, true)],
+        None,
+    )
+    .await;
+
+    let events = run(&setup, command(5, false)).await;
+
+    assert_eq!(
+        probe.egresses(),
+        vec![endpoint(8001), endpoint(8001), endpoint(8002)]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 页面取消后在途探测才命中：取消承诺的是「账号未改动」，不能再绑定或钉住。
+#[tokio::test]
+async fn hit_that_arrives_after_cancellation_changes_nothing() {
+    let probe = ScriptedProbe::new([Reply::State(EXPECTED_LENGTH), Reply::NoState]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *probe.gate.lock().unwrap() = Some(gate.clone());
+    let setup = setup(probe.clone(), vec![proxy("good", 8001, true)], None).await;
+
+    let mut stream = setup
+        .services
+        .accounts()
+        .turn_state_hunt(command(1, false))
+        .await
+        .expect("hunt stream");
+    // 等到探测真的发出去，再模拟用户取消。
+    while probe.egresses().is_empty() {
+        let _ = stream.next().await;
+    }
+    drop(stream);
+    *probe.gate.lock().unwrap() = None;
+    gate.notify_waiters();
+
+    // 后台任务结束后占位才会释放；能再次开始遍历说明上一轮已经走完。
+    let mut finished = false;
+    for _ in 0..200 {
+        match setup
+            .services
+            .accounts()
+            .turn_state_hunt(command(1, false))
+            .await
+        {
+            Ok(stream) => {
+                let _ = stream.collect::<Vec<_>>().await;
+                finished = true;
+                break;
+            }
+            Err(_) => tokio::task::yield_now().await,
+        }
+    }
+    assert!(finished);
+    assert!(!changed(&setup.log));
+}
+
+/// 同一个代理 ID 在探测之后被改了地址：绑定会解析到一个没探测过的出口，必须中止。
+#[tokio::test]
+async fn egress_edited_after_the_probe_is_not_bound() {
+    let probe = ScriptedProbe::new([Reply::State(EXPECTED_LENGTH)]);
+    let setup = setup(probe.clone(), vec![proxy("good", 8001, true)], None).await;
+    let proxies = setup.proxies.clone();
+    *probe.on_probe.lock().unwrap() = Some(Box::new(move || {
+        let mut proxies = proxies.lock().unwrap();
+        proxies[0] = ProxyRecord {
+            revision: revision(2),
+            ..proxy("good", 9999, true)
+        };
+    }));
+
+    let events = run(&setup, command(1, false)).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Failed {
+            code: "egress_changed",
+            ..
+        })
+    ));
+    assert!(!changed(&setup.log));
+}
+
+/// 绑定调用返回成功不等于账号真的走了这个出口；以回读到的绑定为准，不符就不钉。
+#[tokio::test]
+async fn state_is_not_pinned_when_the_account_did_not_end_up_on_the_probed_egress() {
+    let probe = ScriptedProbe::new([Reply::State(EXPECTED_LENGTH)]);
+    let setup = setup(probe, vec![proxy("good", 8001, true)], None).await;
+    setup.store.saved_proxies.lock().unwrap().clear();
+
+    let events = run(&setup, command(1, false)).await;
+
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Failed {
+            code: "bind_mismatch",
+            ..
+        })
+    ));
+    assert!(!recorded(&setup.log).contains(&"provider.hunt_pin"));
+}
+
+/// 续期是系统替管理员发请求：账号一旦被停用，连第一个请求都不该发。
+#[tokio::test]
+async fn renewal_never_probes_an_account_that_was_disabled_meanwhile() {
+    let probe = ScriptedProbe::new([]);
+    let setup = setup(probe.clone(), vec![proxy("good", 8001, true)], None).await;
+    setup
+        .store
+        .mutate_account(|account| account.enabled = false);
+
+    let events = run(
+        &setup,
+        TurnStateHuntCommand {
+            require_schedulable: true,
+            ..command(5, false)
+        },
+    )
+    .await;
+
+    assert!(probe.egresses().is_empty());
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Failed {
+            code: "account_unschedulable",
+            ..
+        })
+    ));
+    // 手动遍历不受此限：管理员可以诊断已停用的账号（此处没有脚本化回复，只验证能开始）。
+    assert!(!changed(&setup.log));
 }
