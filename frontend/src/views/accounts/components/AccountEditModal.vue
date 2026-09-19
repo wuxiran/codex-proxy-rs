@@ -16,6 +16,7 @@ import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
 import AccountSettingsFields from './AccountSettingsFields.vue'
 import AccountTurnStateHistory from './AccountTurnStateHistory.vue'
+import AccountTurnStateHunt from './AccountTurnStateHunt.vue'
 
 defineProps<{
   account: AccountRow | null
@@ -27,18 +28,25 @@ defineProps<{
   guanlanRevive: GuanlanReviveStatus | null
   turnStatePins: TurnStatePinStatus[]
   turnStateCaptureRule: TurnStateCaptureRule | null
+  /** 已保存到服务端的开关值；遍历只对已生效的开关有意义。 */
+  savedPinTurnState: boolean
 }>()
 
 const emit = defineEmits<{
   save: []
+  turnStateHunted: [boundChanged: boolean]
 }>()
 
 const open = defineModel<boolean>({ required: true })
 const showStateHistory = ref(false)
+const showStateHunt = ref(false)
 const historyId = useId()
+const huntId = useId()
 watch(open, (value) => {
-  if (!value)
+  if (!value) {
     showStateHistory.value = false
+    showStateHunt.value = false
+  }
 })
 const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
 const guanlanAutoRevive = defineModel<boolean>('guanlanAutoRevive', { required: true })
@@ -107,6 +115,17 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             固定自身 state <span class="text-cp-sm text-cp-text-secondary">（实验）</span>
           </h3>
           <div class="flex items-center gap-3">
+            <BaseButton
+              variant="soft"
+              size="sm"
+              :disabled="saving || !savedPinTurnState || !pinTurnState || recaptureTurnState"
+              :title="savedPinTurnState ? undefined : '请先开启并保存「固定自身 state」'"
+              :aria-expanded="showStateHunt"
+              :aria-controls="huntId"
+              @click="showStateHunt = !showStateHunt"
+            >
+              遍历代理找 state
+            </BaseButton>
             <BaseButton variant="soft" size="sm" :disabled="saving" :aria-expanded="showStateHistory" :aria-controls="historyId" @click="showStateHistory = !showStateHistory">
               最近捕获
             </BaseButton>
@@ -146,6 +165,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             <ul v-else class="m-0 grid gap-2 pl-4 text-cp-sm text-cp-text">
               <li v-for="(pin, index) in turnStatePins" :key="`${pin.model}-${pin.capturedAt}-${index}`">
                 {{ pin.model }} · {{ pin.length }} 字节 · 命中 {{ pin.hits }} 次 · {{ new Date(pin.expiresAt).toLocaleString() }} 到期
+                <span v-if="pin.scope === 'account'" class="text-cp-xs text-cp-text-secondary">· 全部客户端</span>
               </li>
             </ul>
             <div>
@@ -155,6 +175,14 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             </div>
           </template>
         </template>
+        <AccountTurnStateHunt
+          v-if="showStateHunt"
+          :id="huntId"
+          :account-id="account.id"
+          :capture-rule="turnStateCaptureRule"
+          @close="showStateHunt = false"
+          @hunted="emit('turnStateHunted', $event)"
+        />
         <AccountTurnStateHistory v-if="showStateHistory" :id="historyId" :account-id="account.id" :capture-rule="turnStateCaptureRule" @close="showStateHistory = false" />
       </section>
 

@@ -169,6 +169,8 @@ const {
   guanlanAutoRevive: editingGuanlanAutoRevive,
   guanlanRevive: editingGuanlanRevive,
   pinTurnState: editingPinTurnState,
+  savedPinTurnState: editingSavedPinTurnState,
+  afterTurnStateHunt,
   recaptureTurnState: editingRecaptureTurnState,
   turnStatePins: editingTurnStatePins,
   turnStateCaptureRule: editingTurnStateCaptureRule,
@@ -425,12 +427,14 @@ const {
       :guanlan-revive="editingGuanlanRevive"
       :turn-state-pins="editingTurnStatePins"
       :turn-state-capture-rule="editingTurnStateCaptureRule"
+      :saved-pin-turn-state="editingSavedPinTurnState"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
+      @turn-state-hunted="afterTurnStateHunt"
       @save="saveAccountEdit"
     />
 

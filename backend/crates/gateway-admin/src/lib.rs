@@ -355,6 +355,7 @@ pub async fn initialize(
         registry.clone(),
         snapshot.clone(),
         probe.clone(),
+        store.proxies(),
     ));
     let backup_ports = store.backup();
     let backups = Arc::new(DefaultBackupService::new(

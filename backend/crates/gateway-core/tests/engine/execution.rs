@@ -895,6 +895,7 @@ fn account_probe_should_not_write_to_the_persistent_execution_store() {
         provider_kind: ProviderKind::new("openai").expect("provider kind"),
         upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
         operation: probe_operation(),
+        egress: None,
     }))
     .expect_err("empty Provider registry should stop the probe after it starts");
 
@@ -924,6 +925,7 @@ fn probe_failures_should_be_observable_without_a_model_request_row() {
         provider_kind: ProviderKind::new("openai").expect("provider kind"),
         upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
         operation: probe_operation(),
+        egress: None,
     }))
     .expect_err("the provider rejects every probe");
 
@@ -967,6 +969,7 @@ fn provider_local_probe_failure_should_remain_distinct_from_upstream() {
         provider_kind: ProviderKind::new("openai").expect("provider kind"),
         upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
         operation: probe_operation(),
+        egress: None,
     }))
     .expect_err("the Provider rejects the probe before sending it");
 
@@ -998,6 +1001,7 @@ fn probe_observation_store_failure_preserves_the_provider_error() {
         provider_kind: ProviderKind::new("openai").expect("provider kind"),
         upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
         operation: probe_operation(),
+        egress: None,
     }))
     .expect_err("the provider error must survive observation failure");
 

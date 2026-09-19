@@ -2,7 +2,7 @@
 #[path = "../src/turn_state_pin.rs"]
 mod implementation;
 
-use implementation::{CaptureRule, MAX_PIN_AGE, TurnStatePins, credential_binding};
+use implementation::{CaptureRule, MAX_PIN_AGE, PinRejected, TurnStatePins, credential_binding};
 use std::time::{Duration, SystemTime};
 
 #[test]
@@ -103,6 +103,120 @@ fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expi
         pins.status("account", "binding", now + MAX_PIN_AGE)
             .is_empty()
     );
+}
+
+#[test]
+fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let binding = credential_binding("generation", "token");
+    for model in ["astra", "terra"] {
+        let mut own = pins.attempt("account", binding.clone(), model, "client-a", 332, now);
+        own.observe(Some(&"o".repeat(332)));
+        own.completed(now);
+    }
+    let hunted = "h".repeat(332);
+    pins.pin_account_wide("account", binding.clone(), "astra", 332, &hunted, now, now)
+        .unwrap();
+    // 旧出口上捕获的客户端级 state 被替换，其它模型不受影响。
+    for client in ["client-a", "client-b"] {
+        assert_eq!(
+            pins.attempt("account", binding.clone(), "astra", client, 332, now)
+                .value(),
+            Some(hunted.as_str())
+        );
+    }
+    assert_eq!(
+        pins.attempt("account", binding.clone(), "terra", "client-a", 332, now)
+            .value(),
+        Some("o".repeat(332).as_str())
+    );
+    assert!(
+        pins.attempt("account", binding.clone(), "terra", "client-b", 332, now)
+            .value()
+            .is_none()
+    );
+    let status = pins.status("account", &binding, now);
+    let astra: Vec<_> = status.iter().filter(|pin| pin.model == "astra").collect();
+    assert_eq!(astra.len(), 1);
+    assert!(astra[0].account_wide);
+    assert_eq!(astra[0].hits, 2);
+    assert!(
+        status
+            .iter()
+            .any(|pin| pin.model == "terra" && !pin.account_wide)
+    );
+    // 换凭据或换长度规则后账号级 state 同样不可见。
+    assert!(
+        pins.attempt(
+            "account",
+            credential_binding("generation", "new"),
+            "astra",
+            "c",
+            332,
+            now
+        )
+        .value()
+        .is_none()
+    );
+    assert!(
+        pins.attempt("account", binding, "astra", "c", 356, now)
+            .value()
+            .is_none()
+    );
+}
+
+#[test]
+fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let hunted = "h".repeat(332);
+    pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
+        .unwrap();
+    let later = now + Duration::from_secs(3599);
+    let mut reuse = pins.attempt("account", "binding".into(), "astra", "client", 332, later);
+    assert_eq!(reuse.value(), Some(hunted.as_str()));
+    reuse.observe(Some(&"n".repeat(332)));
+    reuse.completed(later);
+    assert_eq!(pins.status("account", "binding", later).len(), 1);
+    // 命中不续期：寿命从捕获时刻起算。
+    assert!(
+        pins.attempt(
+            "account",
+            "binding".into(),
+            "astra",
+            "client",
+            332,
+            now + MAX_PIN_AGE
+        )
+        .value()
+        .is_none()
+    );
+}
+
+#[test]
+fn account_wide_pin_rejects_wrong_length_non_ascii_and_stale_captures() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    for value in ["s".repeat(331), format!("{} ", "s".repeat(331))] {
+        assert_eq!(
+            pins.pin_account_wide("account", "binding".into(), "astra", 332, &value, now, now),
+            Err(PinRejected::Length)
+        );
+    }
+    assert_eq!(
+        pins.pin_account_wide(
+            "account",
+            "binding".into(),
+            "astra",
+            332,
+            &"s".repeat(332),
+            now,
+            now + MAX_PIN_AGE
+        ),
+        Err(PinRejected::Expired)
+    );
+    assert!(pins.status("account", "binding", now).is_empty());
 }
 
 #[test]

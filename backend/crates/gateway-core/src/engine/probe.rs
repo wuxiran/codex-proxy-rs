@@ -5,7 +5,9 @@ use std::fmt;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
+use crate::engine::DiagnosticEgress;
 use crate::error::{ClientVisibleUpstreamResponse, GatewayError, GatewayErrorKind};
+use crate::event::ProviderResponseHeader;
 use crate::identity::ProviderKind;
 use crate::routing::UpstreamModelId;
 use crate::{account::ProviderAccountId, operation::Operation, upstream::UpstreamSendState};
@@ -16,11 +18,15 @@ pub struct AccountProbeRequest {
     pub provider_kind: ProviderKind,
     pub upstream_model: UpstreamModelId,
     pub operation: Operation,
+    /// 临时出口；`None` 沿用账号已绑定的代理（连接测试的既有行为）。
+    pub egress: Option<DiagnosticEgress>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountProbeResult {
     pub text: Vec<String>,
+    /// 上游响应头，仅供 Provider 管理端在进程内解读；`Debug` 已脱敏，不得序列化。
+    pub response_headers: Vec<ProviderResponseHeader>,
 }
 
 /// 仅供当前管理端连接测试展示的原始上游失败响应。

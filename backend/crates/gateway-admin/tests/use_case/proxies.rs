@@ -12,6 +12,8 @@ use gateway_core::account::{OutboundProxy, ProviderAccountId};
 pub(super) struct TestProxies {
     pub events: Option<super::accounts::EventLog>,
     pub accounts: Option<Vec<ProxyAccountRef>>,
+    /// 设置后 `list`/`get` 返回这些记录；用于遍历代理找 state 的用例。
+    pub records: Option<Vec<ProxyRecord>>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -52,8 +54,17 @@ impl ProxyStore for TestProxies {
             guard: Box::new(ImportGuard(events.clone())),
         })
     }
-    async fn list(&self, _: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
-        Err(super::unavailable("proxy"))
+    async fn list(&self, query: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
+        let items = self
+            .records
+            .clone()
+            .ok_or_else(|| super::unavailable("proxy"))?;
+        Ok(ProxyPage {
+            total: items.len() as u64,
+            items: if query.page == 1 { items } else { Vec::new() },
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
     }
     async fn list_accounts(
         &self,
@@ -70,8 +81,13 @@ impl ProxyStore for TestProxies {
             page_size: query.page_size.get(),
         })
     }
-    async fn get(&self, _: &str) -> AdminStoreResult<ProxyRecord> {
-        Err(super::unavailable("proxy"))
+    async fn get(&self, id: &str) -> AdminStoreResult<ProxyRecord> {
+        self.records
+            .iter()
+            .flatten()
+            .find(|record| record.id == id)
+            .cloned()
+            .ok_or_else(|| super::unavailable("proxy"))
     }
     async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))

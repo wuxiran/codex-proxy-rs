@@ -18,7 +18,8 @@ use crate::{
         accounts::{
             AccountConnectionTestEvent, AccountConnectionTestEventStream, AccountListQuery,
             AccountPageItem, AccountUpdateResult, AccountUsage, AccountUsageWindowQuery,
-            AccountsUpdateResult, BatchUpdateAccounts, UpdateAccount,
+            AccountsUpdateResult, BatchUpdateAccounts, TurnStateHuntCommand,
+            TurnStateHuntEventStream, UpdateAccount,
         },
         observability::TimeRange,
         provider_credentials::{
@@ -33,6 +34,7 @@ use crate::{
     },
     ports::{
         provider::ProviderAdminRegistry,
+        proxy::ProxyStore,
         store::{AccountRuntimeStore, AccountStore},
     },
 };
@@ -42,7 +44,7 @@ use super::{
     validate_prepared_rotation,
 };
 
-const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
+pub(super) const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 
 /// 统一账号页消费的服务。
 #[async_trait]
@@ -145,14 +147,25 @@ pub trait AccountsService: Send + Sync {
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
+
+    /// 逐个出口发真实请求找符合长度规则的 state；命中即绑定该出口并钉住。
+    async fn turn_state_hunt(
+        &self,
+        _command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        Err(AdminError::invalid("当前服务不支持遍历代理找 state"))
+    }
 }
 
+#[derive(Clone)]
 pub(crate) struct DefaultAccountsService {
     accounts: Arc<dyn AccountStore>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     providers: ProviderAdminRegistry,
     snapshot: Arc<dyn SnapshotControl>,
-    probe: Arc<dyn AccountProbe>,
+    pub(super) probe: Arc<dyn AccountProbe>,
+    pub(super) proxies: Arc<dyn ProxyStore>,
+    pub(super) hunts: super::turn_state_hunt::ActiveHunts,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
 }
@@ -165,6 +178,7 @@ impl DefaultAccountsService {
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
+        proxies: Arc<dyn ProxyStore>,
     ) -> Self {
         Self {
             accounts,
@@ -172,6 +186,8 @@ impl DefaultAccountsService {
             providers,
             snapshot,
             probe,
+            proxies,
+            hunts: super::turn_state_hunt::ActiveHunts::default(),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -204,7 +220,7 @@ impl DefaultAccountsService {
             .ok_or_else(|| AdminError::not_found("Provider 账号不存在"))
     }
 
-    async fn provider_for_account(
+    pub(super) async fn provider_for_account(
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<
@@ -906,6 +922,7 @@ impl AccountsService for DefaultAccountsService {
                     provider_kind: account.provider_kind,
                     upstream_model,
                     operation,
+                    egress: None,
                 })
                 .await;
             match result {
@@ -944,6 +961,13 @@ impl AccountsService for DefaultAccountsService {
         })
         .flat_map(futures::stream::iter);
         Ok(Box::pin(futures::stream::iter(initial).chain(terminal)))
+    }
+
+    async fn turn_state_hunt(
+        &self,
+        command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        self.start_turn_state_hunt(command).await
     }
 }
 

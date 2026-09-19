@@ -28,13 +28,17 @@ use gateway_admin::model::provider_credentials::{
     QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
-use gateway_admin::ports::provider::{ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind};
+use gateway_admin::ports::provider::{
+    ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind, TurnStateHuntObservation,
+    TurnStateHuntTicket,
+};
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
     OpaqueProviderData, PlaintextCredential, ProviderAccount, ProviderAccountId,
     ProviderAccountStore,
 };
 use gateway_core::error::StoreErrorKind;
+use gateway_core::event::ProviderResponseHeader;
 use gateway_core::metering::Money;
 use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload};
 use gateway_core::provider_ports::{
@@ -515,6 +519,94 @@ impl ProviderAdmin for OpenAiAdminProvider {
         prepared_rotation(prepared, command.account.provider_kind)
     }
 
+    async fn turn_state_hunt_prepare(
+        &self,
+        account_id: &ProviderAccountId,
+        upstream_model: &UpstreamModelId,
+    ) -> Result<TurnStateHuntTicket, ProviderAdminError> {
+        self.account(account_id).await?;
+        let current = self
+            .accounts
+            .load_current_credential(account_id)
+            .await
+            .map_err(map_store_error)?;
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let crate::credential::CodexCredentialData::OAuth(data) = data else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
+                .with_public_message("只有 OAuth 账号支持遍历代理找 state"));
+        };
+        let Some(generation) = data.turn_state_pin.as_ref() else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("请先开启并保存「固定自身 state」"));
+        };
+        let Some(expected_length) =
+            crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                .expected_length(upstream_model.as_str())
+        else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("该模型没有 state 长度规则，无法判断是否正确"));
+        };
+        Ok(TurnStateHuntTicket::new(
+            account_id.clone(),
+            upstream_model.clone(),
+            expected_length,
+            crate::turn_state_pin::credential_binding(generation, &data.access_token),
+        ))
+    }
+
+    fn turn_state_hunt_inspect(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+    ) -> TurnStateHuntObservation {
+        let length = hunted_turn_state(response_headers).map(str::len);
+        TurnStateHuntObservation {
+            length,
+            matched: length == Some(ticket.expected_length())
+                && hunted_turn_state(response_headers)
+                    .is_some_and(|value| value.bytes().all(|b| b.is_ascii_graphic())),
+        }
+    }
+
+    async fn turn_state_hunt_pin(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+        captured_at: SystemTime,
+    ) -> Result<SystemTime, ProviderAdminError> {
+        // 钉之前重新派生绑定：遍历期间凭据被刷新或重新捕获时，旧观测不再有资格复用。
+        let current = self
+            .turn_state_hunt_prepare(ticket.account_id(), ticket.upstream_model())
+            .await?;
+        if &current != ticket {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("凭据在遍历期间已变化，请重新遍历"));
+        }
+        let value = hunted_turn_state(response_headers)
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        self.turn_state_pins
+            .pin_account_wide(
+                ticket.account_id().as_str(),
+                ticket.binding().to_owned(),
+                ticket.upstream_model().as_str(),
+                ticket.expected_length(),
+                value,
+                captured_at,
+                SystemTime::now(),
+            )
+            .map_err(|rejected| {
+                provider_admin_error(match rejected {
+                    crate::turn_state_pin::PinRejected::Full => ProviderAdminErrorKind::Unavailable,
+                    crate::turn_state_pin::PinRejected::Length
+                    | crate::turn_state_pin::PinRejected::Expired => {
+                        ProviderAdminErrorKind::Invalid
+                    }
+                })
+            })?;
+        Ok(captured_at + crate::turn_state_pin::MAX_PIN_AGE)
+    }
+
     async fn account_configuration(
         &self,
         account_id: &ProviderAccountId,
@@ -552,6 +644,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     "capturedAt": DateTime::<Utc>::from(pin.captured_at),
                     "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
                     "hits": pin.hits,
+                    "scope": if pin.account_wide { "account" } else { "client" },
                 })).collect::<Vec<_>>();
                 let value = serde_json::json!({
                     "guanlanRevive": self.credentials.revive_service().map(|service| service.account_status(&current.account, data.guanlan_auto_revive)),
@@ -1492,6 +1585,15 @@ fn decode_mutation(
 
 fn binding(value: &str) -> Result<OAuthPendingBinding, CodexOAuthPendingStoreError> {
     OAuthPendingBinding::try_new(value.to_owned()).map_err(map_pending_store_error)
+}
+
+/// 上游最新返回的 turn state。仅在进程内用于判长和钉住，绝不序列化或落日志。
+fn hunted_turn_state(response_headers: &[ProviderResponseHeader]) -> Option<&str> {
+    response_headers
+        .iter()
+        .rev()
+        .find(|header| header.name().eq_ignore_ascii_case("x-codex-turn-state"))
+        .and_then(|header| std::str::from_utf8(header.value()).ok())
 }
 
 fn provider_admin_error(kind: ProviderAdminErrorKind) -> ProviderAdminError {

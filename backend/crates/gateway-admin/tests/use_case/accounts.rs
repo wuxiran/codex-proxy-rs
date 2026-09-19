@@ -83,6 +83,8 @@ pub(super) struct FakeProviderAdmin {
     profile_result: Mutex<Result<ProviderProfileStatistics, ProviderAdminErrorKind>>,
     subscription_result: Mutex<Result<Option<ProviderSubscription>, ProviderAdminErrorKind>>,
     personal_info_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// `Some` 时支持遍历代理找 state；值是当前凭据绑定，测试可中途改写模拟凭据刷新。
+    pub(super) hunt_binding: Mutex<Option<String>>,
 }
 
 impl FakeProviderAdmin {
@@ -107,6 +109,7 @@ impl FakeProviderAdmin {
             profile_result: Mutex::new(Ok(empty_profile_statistics())),
             subscription_result: Mutex::new(Ok(None)),
             personal_info_barrier: Mutex::new(None),
+            hunt_binding: Mutex::new(None),
         })
     }
 
@@ -261,6 +264,50 @@ impl FakeProviderAdmin {
 impl ProviderAdmin for FakeProviderAdmin {
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
+    }
+
+    async fn turn_state_hunt_prepare(
+        &self,
+        account_id: &ProviderAccountId,
+        upstream_model: &gateway_core::routing::UpstreamModelId,
+    ) -> Result<gateway_admin::ports::provider::TurnStateHuntTicket, ProviderAdminError> {
+        let binding = self
+            .hunt_binding
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))?;
+        Ok(gateway_admin::ports::provider::TurnStateHuntTicket::new(
+            account_id.clone(),
+            upstream_model.clone(),
+            super::turn_state_hunt::EXPECTED_LENGTH,
+            binding,
+        ))
+    }
+
+    fn turn_state_hunt_inspect(
+        &self,
+        ticket: &gateway_admin::ports::provider::TurnStateHuntTicket,
+        response_headers: &[gateway_core::event::ProviderResponseHeader],
+    ) -> gateway_admin::ports::provider::TurnStateHuntObservation {
+        let length = response_headers.first().map(|header| header.value().len());
+        gateway_admin::ports::provider::TurnStateHuntObservation {
+            length,
+            matched: length == Some(ticket.expected_length()),
+        }
+    }
+
+    async fn turn_state_hunt_pin(
+        &self,
+        ticket: &gateway_admin::ports::provider::TurnStateHuntTicket,
+        _: &[gateway_core::event::ProviderResponseHeader],
+        captured_at: std::time::SystemTime,
+    ) -> Result<std::time::SystemTime, ProviderAdminError> {
+        if self.hunt_binding.lock().unwrap().as_deref() != Some(ticket.binding()) {
+            return Err(ProviderAdminError::new(ProviderAdminErrorKind::Conflict));
+        }
+        self.record("provider.hunt_pin");
+        Ok(captured_at + std::time::Duration::from_secs(3600))
     }
 
     async fn profile_statistics(
@@ -2838,6 +2885,7 @@ impl AccountProbe for SuccessfulAccountProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                ..AccountProbeResult::default()
             })
         })
     }

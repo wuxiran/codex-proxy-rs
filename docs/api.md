@@ -358,6 +358,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `GET` | `/api/admin/accounts/turn-state-hunt` | `accountId`、`modelId`、`attempts`（1–20，默认 5）、`includeDirect` | 通过 SSE 遍历已测试通过的代理找符合长度规则的 state；命中后绑定该代理并钉住 state |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -650,6 +651,26 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 默认关闭。单个候选的本地最长保留时间为 3600 秒，不随命中续期；这不是已验证的上游有效期。
 到期、访问令牌改变、重新捕获或服务重启后等待新的候选，尚无候选时保持原有透传行为。
 此功能偏离常规同轮粘性路由合同，state 长度不构成模型质量判断，也不保证减少 overload。
+
+#### 遍历代理找 state
+
+上游是否返回符合规则长度的 state 与出口有关。`GET /api/admin/accounts/turn-state-hunt` 对单个 OpenAI OAuth 账号
+依次经每个 `lastTest.success` 为 true 的代理发真实上游请求（`includeDirect=true` 时再加直连），账号当前绑定的出口排最前，
+每个出口最多 `attempts` 次。探测只替换单次请求的出口，不改账号已保存的绑定，也不计入 Provider 熔断和账号探测失败事实。
+要求该账号已开启并保存 `pinTurnState`，且模型在 `turnStateCaptureRule` 中有长度规则，否则直接返回 400；同一账号同时只允许一个遍历（409）。
+这是会改状态的 GET（EventSource 只能发 GET），请求必须带 `Accept: text/event-stream`，否则返回 400。
+
+首次命中即停止：先核对凭据绑定未变，再把账号绑定到该出口（等同批量更新的 `outboundProxyId`，已绑定则跳过），最后把该 state
+钉为账号级 state。账号级 state 对该账号该模型的全部客户端密钥生效，并**替换**该模型已有的全部固定（旧值来自换绑前的出口）；
+被动捕获仍然永不覆盖。`turnStatePins` 摘要以 `scope: "account" | "client"` 区分二者，寿命同为 3600 秒且不续期。
+命中后的绑定与钉住在服务端独立完成，不受页面断开影响；命中前断开连接即取消，账号不被改动。
+
+事件为 `data:` JSON，以 `type` 区分：`hunt_start{model,expectedLength,attempts,proxies[]}`、`proxy_start`、
+`attempt{proxyId,index,length,matched,error}`、`proxy_done{attempts,matched,skipped}`、`hit`、`bound{proxyId,changed}`、
+`pinned{model,length,expiresAt}`、`hunt_complete{success,requests}`、`error{code,message}`。直连的 `proxyId` 为 null。
+`length` 仅供筛选；state 的值及其任何摘要永不输出，也不写入日志。
+401/429、模型不存在或策略拒绝视为账号级失败并中止整个遍历；同一出口连续两次传输失败或 403 则跳过该出口；
+账号被线上流量占用而未发出的尝试不计次数，连续五次后中止。
 
 
 OAuth start 使用：
