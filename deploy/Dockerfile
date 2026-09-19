@@ -21,6 +21,8 @@ ARG CPR_VERSION=
 ARG CPR_GIT_SHA=unknown
 ARG CPR_BUILD_TIME=unknown
 ARG CPR_BUILD_TYPE=release
+# 本机默认只并行编译两个 crate，避免占满桌面资源。
+ARG CARGO_BUILD_JOBS=2
 ENV CARGO_TARGET_DIR=/app/backend/target/${TARGETARCH}
 ENV CPR_VERSION=${CPR_VERSION}
 ENV CPR_GIT_SHA=${CPR_GIT_SHA}
@@ -34,7 +36,7 @@ COPY release/version.yaml /app/release/version.yaml
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/backend/target \
-    cargo build --release --locked --bin codex-proxy-rs \
+    cargo build --release --locked --jobs "${CARGO_BUILD_JOBS}" --bin codex-proxy-rs \
     && cp "${CARGO_TARGET_DIR}/release/codex-proxy-rs" /tmp/codex-proxy-rs
 
 # 备份客户端来源：与 compose 服务端同一固定镜像，版本一致。

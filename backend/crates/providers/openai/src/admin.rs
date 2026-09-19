@@ -28,13 +28,17 @@ use gateway_admin::model::provider_credentials::{
     QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
-use gateway_admin::ports::provider::{ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind};
+use gateway_admin::ports::provider::{
+    ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind, TurnStateHuntObservation,
+    TurnStateHuntTicket, TurnStateRenewal,
+};
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
     OpaqueProviderData, PlaintextCredential, ProviderAccount, ProviderAccountId,
     ProviderAccountStore,
 };
 use gateway_core::error::StoreErrorKind;
+use gateway_core::event::ProviderResponseHeader;
 use gateway_core::metering::Money;
 use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload};
 use gateway_core::provider_ports::{
@@ -73,6 +77,8 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
+    turn_state_pins: crate::turn_state_pin::TurnStatePins,
+    auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -105,6 +111,8 @@ impl OpenAiAdminProvider {
     ) -> Self {
         Self {
             provider_kind,
+            turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
+            auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore::default(),
             profile,
             accounts,
             credentials: services.credentials,
@@ -115,6 +123,22 @@ impl OpenAiAdminProvider {
             websocket_pool,
             desktop_release,
         }
+    }
+
+    pub(crate) fn with_turn_state_pins(
+        mut self,
+        pins: crate::turn_state_pin::TurnStatePins,
+    ) -> Self {
+        self.turn_state_pins = pins;
+        self
+    }
+
+    pub(crate) fn with_auto_hunt_store(
+        mut self,
+        store: crate::turn_state_auto_hunt::AutoHuntStore,
+    ) -> Self {
+        self.auto_hunt = store;
+        self
     }
 
     async fn account(
@@ -192,6 +216,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     }
 
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
+        self.turn_state_pins.clear(account_id.as_str());
         self.websocket_pool.evict_account(account_id.as_str()).await;
     }
 
@@ -416,6 +441,61 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
                 .with_public_message("账号凭据已被更新，请刷新账号列表后重试"));
         }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("guanlan_revive")
+        {
+            let material = command
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider();
+            if material.len() != 1 || material.get("guanlan_revive") != Some(&Value::Bool(true)) {
+                return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+            }
+            let revive = self.credentials.revive_service().ok_or_else(|| {
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message("观澜复活服务未配置")
+            })?;
+            let (mut secret, guard) = revive
+                .prepare_manual_revival(&current.account)
+                .await
+                .map_err(map_revive_error)?;
+            let runtime = CodexCredentialCodec::decode(&current.credential)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            if let Some(oauth) = runtime.authentication.oauth() {
+                secret.refresh_token = secret.refresh_token.or_else(|| oauth.refresh_token.clone());
+                secret.id_token = secret.id_token.or_else(|| oauth.id_token.clone());
+            }
+            let expires_at = parse_access_token_expiration(secret.access_token.expose_secret());
+            let prepared = CodexCredentialAdmin
+                .prepare_refreshed_oauth_rotation(current, secret, expires_at, None)
+                .map_err(map_credential_admin_error)?;
+            let (facts, credential_guard) =
+                prepared_rotation(prepared, command.account.provider_kind)?.into_parts();
+            return Ok(PreparedCredentialRotation::new(
+                facts,
+                Box::new(GuanlanReviveCommitGuard {
+                    _operation: guard,
+                    _credential: credential_guard,
+                }),
+            ));
+        }
+        let settings_material = command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        if settings_material.contains_key("pin_turn_state")
+            || settings_material.contains_key("turn_state_auto_hunt")
+        {
+            return prepare_turn_state_pin_rotation(
+                &self.auto_hunt,
+                current,
+                command.provider_material,
+                command.account.provider_kind,
+            );
+        }
         if current.account.authentication_kind()
             == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY
         {
@@ -472,24 +552,247 @@ impl ProviderAdmin for OpenAiAdminProvider {
         prepared_rotation(prepared, command.account.provider_kind)
     }
 
-    async fn account_configuration(
+    async fn turn_state_hunt_prepare(
         &self,
         account_id: &ProviderAccountId,
-    ) -> Result<Option<ProviderDocument>, ProviderAdminError> {
-        let account = self.account(account_id).await?;
-        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
-            return Ok(None);
-        }
+        upstream_model: &UpstreamModelId,
+    ) -> Result<TurnStateHuntTicket, ProviderAdminError> {
+        self.account(account_id).await?;
         let current = self
             .accounts
             .load_current_credential(account_id)
             .await
             .map_err(map_store_error)?;
-        let crate::credential::CodexCredentialData::ApiKey(data) =
-            CodexCredentialCodec::decode_complete(&current.credential)
-                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let crate::credential::CodexCredentialData::OAuth(data) = data else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
+                .with_public_message("只有 OAuth 账号支持遍历代理找 state"));
+        };
+        let Some(generation) = data.turn_state_pin.as_ref() else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("请先开启并保存「固定自身 state」"));
+        };
+        let Some(expected_length) =
+            crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                .expected_length(upstream_model.as_str())
         else {
-            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("该模型没有 state 长度规则，无法判断是否正确"));
+        };
+        Ok(TurnStateHuntTicket::new(
+            account_id.clone(),
+            upstream_model.clone(),
+            expected_length,
+            crate::turn_state_pin::credential_binding(generation, &data.access_token),
+        ))
+    }
+
+    fn turn_state_hunt_inspect(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+    ) -> TurnStateHuntObservation {
+        let length = hunted_turn_state(response_headers).map(str::len);
+        TurnStateHuntObservation {
+            length,
+            matched: length == Some(ticket.expected_length())
+                && hunted_turn_state(response_headers)
+                    .is_some_and(|value| value.bytes().all(|b| b.is_ascii_graphic())),
+        }
+    }
+
+    async fn turn_state_hunt_renewals(
+        &self,
+        now: SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        let Ok(provider) = ProviderKind::new(PROVIDER_NAME) else {
+            return Vec::new();
+        };
+        let Ok(accounts) = self.accounts.list_for_provider(&provider).await else {
+            return Vec::new();
+        };
+        let settings = match self.auto_hunt.all() {
+            Ok(settings) if settings.is_empty() => return Vec::new(),
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(
+                    target: "turn_state_hunt",
+                    error = %error,
+                    "state 自动续期的参数文件读不出来，本周期不续期"
+                );
+                return Vec::new();
+            }
+        };
+        let mut due = Vec::new();
+        for account in accounts {
+            // 停用或凭据失效的账号发不出请求，续期只会白白失败。
+            if !account.enabled()
+                || account.authentication_kind() != "oauth"
+                || account.credential_state() != gateway_core::account::CredentialState::Ready
+            {
+                continue;
+            }
+            let Ok(current) = self.accounts.load_current_credential(account.id()).await else {
+                continue;
+            };
+            let Ok(crate::credential::CodexCredentialData::OAuth(data)) =
+                CodexCredentialCodec::decode_complete(&current.credential)
+            else {
+                continue;
+            };
+            let (Some(auto), Some(generation)) =
+                (settings.get(account.id().as_str()), &data.turn_state_pin)
+            else {
+                continue;
+            };
+            let Ok(upstream_model) = UpstreamModelId::new(auto.model.clone()) else {
+                continue;
+            };
+            // 套餐规则里没有这个模型时，遍历本身就会被拒绝，不必进续期队列。
+            let Some(expected_length) =
+                crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                    .expected_length(&auto.model)
+            else {
+                continue;
+            };
+            let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
+            let fresh = self
+                .turn_state_pins
+                .account_wide_captured_at(
+                    account.id().as_str(),
+                    &binding,
+                    &auto.model,
+                    expected_length,
+                    // 账号改绑到别的出口后，旧出口上的 state 不再生效，要在新出口上重新找。
+                    &crate::turn_state_pin::egress_fingerprint(
+                        account.outbound_proxy().map(|proxy| proxy.expose_url()),
+                    ),
+                    now,
+                )
+                .is_some_and(|captured_at| {
+                    captured_at + crate::turn_state_pin::MAX_PIN_AGE > now + margin
+                });
+            if !fresh {
+                due.push(TurnStateRenewal {
+                    account_id: account.id().clone(),
+                    upstream_model,
+                    attempts: auto.attempts,
+                    include_direct: auto.include_direct,
+                });
+            }
+        }
+        due
+    }
+
+    async fn turn_state_hunt_pin(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+        captured_at: SystemTime,
+        egress: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<SystemTime, ProviderAdminError> {
+        // 钉之前重新派生绑定：遍历期间凭据被刷新或重新捕获时，旧观测不再有资格复用。
+        let current = self
+            .turn_state_hunt_prepare(ticket.account_id(), ticket.upstream_model())
+            .await?;
+        if &current != ticket {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("凭据在遍历期间已变化，请重新遍历"));
+        }
+        let value = hunted_turn_state(response_headers)
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        self.turn_state_pins
+            .pin_account_wide(
+                ticket.account_id().as_str(),
+                ticket.binding().to_owned(),
+                ticket.upstream_model().as_str(),
+                ticket.expected_length(),
+                crate::turn_state_pin::egress_fingerprint(egress.map(|proxy| proxy.expose_url())),
+                value,
+                captured_at,
+                SystemTime::now(),
+            )
+            .map_err(|rejected| {
+                provider_admin_error(match rejected {
+                    crate::turn_state_pin::PinRejected::Full => ProviderAdminErrorKind::Unavailable,
+                    crate::turn_state_pin::PinRejected::Length
+                    | crate::turn_state_pin::PinRejected::Expired => {
+                        ProviderAdminErrorKind::Invalid
+                    }
+                })
+            })?;
+        Ok(captured_at + crate::turn_state_pin::MAX_PIN_AGE)
+    }
+
+    async fn account_configuration(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderDocument>, ProviderAdminError> {
+        self.account(account_id).await?;
+        let current = self
+            .accounts
+            .load_current_credential(account_id)
+            .await
+            .map_err(map_store_error)?;
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let data = match data {
+            crate::credential::CodexCredentialData::OAuth(data) => {
+                let now = std::time::SystemTime::now();
+                let rule =
+                    crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type());
+                let pins = data
+                    .turn_state_pin
+                    .as_ref()
+                    .map(|generation| {
+                        let binding = crate::turn_state_pin::credential_binding(
+                            generation,
+                            &data.access_token,
+                        );
+                        self.turn_state_pins
+                            .status(account_id.as_str(), &binding, now)
+                    })
+                    .unwrap_or_default();
+                let pins = pins.into_iter()
+                    .filter(|pin| rule.expected_length(&pin.model) == Some(pin.length))
+                    .map(|pin| serde_json::json!({
+                    "model": pin.model,
+                    "length": pin.length,
+                    "capturedAt": DateTime::<Utc>::from(pin.captured_at),
+                    "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
+                    "hits": pin.hits,
+                    "scope": if pin.account_wide { "account" } else { "client" },
+                })).collect::<Vec<_>>();
+                let guanlan_revive_available = self.credentials.revive_service()
+                    .map(|service| service.supports_account(&current.account))
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "Guanlan revival availability could not be read");
+                        None
+                    }).unwrap_or(false);
+                let value = serde_json::json!({
+                    "guanlanReviveAvailable": guanlan_revive_available,
+                    "pinTurnState": data.turn_state_pin.is_some(),
+                    // 续期只对开启中的固定有意义；固定关着时即便文件里有残留也不展示、不续期。
+                    "turnStateAutoHunt": data.turn_state_pin.as_ref().and_then(|_| self.auto_hunt.get(account_id.as_str())).map(|auto| serde_json::json!({
+                        "modelId": auto.model,
+                        "attempts": auto.attempts,
+                        "includeDirect": auto.include_direct,
+                    })),
+                    "turnStatePins": pins,
+                    "turnStateCaptureRule": rule,
+                    "maxAgeSeconds": crate::turn_state_pin::MAX_PIN_AGE.as_secs(),
+                });
+                return Ok(Some(ProviderDocument::new(OpaqueProviderData::new(
+                    value
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+                ))));
+            }
+            crate::credential::CodexCredentialData::ApiKey(data) => data,
         };
         let value = serde_json::to_value(data.configuration())
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
@@ -775,6 +1078,44 @@ fn prepared_create(
     })
 }
 
+struct GuanlanReviveCommitGuard {
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    _credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for GuanlanReviveCommitGuard {
+    fn finish(self: Box<Self>) {
+        self._credential.finish();
+    }
+}
+
+fn map_revive_error(error: crate::credential::CodexReviveError) -> ProviderAdminError {
+    use crate::credential::CodexReviveError;
+    let (kind, message) = match error {
+        CodexReviveError::Unsupported => (
+            ProviderAdminErrorKind::Invalid,
+            "该账号没有可用的观澜签名导入记录",
+        ),
+        CodexReviveError::Busy => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活任务正在执行，请稍后重试",
+        ),
+        CodexReviveError::Cooldown => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活失败冷却中，请稍后重试",
+        ),
+        CodexReviveError::NoRecovery => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜未返回该账号的恢复凭据，账号可能无需复活或暂不可恢复",
+        ),
+        _ => (
+            ProviderAdminErrorKind::Unavailable,
+            "观澜复活失败，请稍后重试",
+        ),
+    };
+    provider_admin_error(kind).with_public_message(message)
+}
+
 fn prepared_rotation(
     prepared: crate::credential::PreparedCodexCredentialRotation,
     provider_kind: ProviderKind,
@@ -806,6 +1147,7 @@ fn prepared_rotation(
             email: profile.email,
             plan_type: profile.plan_type,
             preserve_profile,
+            preserve_credential_state: false,
             provider_material: ProviderDocument::new(OpaqueProviderData::new(
                 credential.into_inner(),
             )),
@@ -815,6 +1157,113 @@ fn prepared_rotation(
         },
         Box::new(OpenAiCredentialCommitGuard { _guard: guard }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStatePinDocument {
+    pin_turn_state: Option<bool>,
+    turn_state_auto_hunt: Option<TurnStateAutoHuntDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStateAutoHuntDocument {
+    enabled: bool,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    attempts: u8,
+    #[serde(default)]
+    include_direct: bool,
+}
+
+impl TurnStateAutoHuntDocument {
+    fn into_setting(
+        self,
+    ) -> Result<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>, ProviderAdminError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if UpstreamModelId::new(self.model.clone()).is_err() || !(1..=20).contains(&self.attempts) {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        Ok(Some(crate::turn_state_auto_hunt::TurnStateAutoHunt {
+            model: self.model,
+            attempts: self.attempts,
+            include_direct: self.include_direct,
+        }))
+    }
+}
+
+fn prepare_turn_state_pin_rotation(
+    auto_hunt: &crate::turn_state_auto_hunt::AutoHuntStore,
+    current: LoadedCredential,
+    document: ProviderDocument,
+    provider_kind: ProviderKind,
+) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+    let document: TurnStatePinDocument =
+        serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    let account_id = current.account.id().as_str().to_owned();
+    let setting = document
+        .turn_state_auto_hunt
+        .map(TurnStateAutoHuntDocument::into_setting)
+        .transpose()?;
+    let pinned_now = CodexCredentialCodec::decode_complete(&current.credential)
+        .ok()
+        .and_then(|data| data.oauth().map(|oauth| oauth.turn_state_pin.is_some()))
+        .unwrap_or(false);
+    let pinned_after = document.pin_turn_state.unwrap_or(pinned_now);
+    if matches!(setting, Some(Some(_))) && !pinned_after {
+        return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+            .with_public_message("请先开启并保存「固定自身 state」再开启自动续期"));
+    }
+    // 只改续期参数时凭据原样重编码（不换代次），仍走既有的 CAS 与审计。
+    let prepared = CodexCredentialAdmin
+        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
+        .map_err(map_credential_admin_error)?;
+    // 续期参数不进凭据：旧版本的凭据 schema 拒绝未知字段，写进去会让回滚后的实例读不了该账号。
+    let stored = if pinned_after { setting } else { Some(None) };
+    let (facts, credential) = prepared_rotation(prepared, provider_kind)?
+        .preserving_credential_state()
+        .into_parts();
+    Ok(PreparedCredentialRotation::new(
+        facts,
+        Box::new(AutoHuntCommitGuard {
+            store: auto_hunt.clone(),
+            account_id,
+            setting: stored,
+            credential,
+        }),
+    ))
+}
+
+/// 续期参数只在凭据提交成功之后才落盘：准备阶段就写的话，CAS 冲突或数据库失败时
+/// 接口报了失败，后台却已经按新参数开始发真实请求（或已经把续期删掉）。
+struct AutoHuntCommitGuard {
+    store: crate::turn_state_auto_hunt::AutoHuntStore,
+    account_id: String,
+    setting: Option<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>>,
+    credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for AutoHuntCommitGuard {
+    fn finish(self: Box<Self>) {
+        let this = *self;
+        if let Some(setting) = this.setting
+            && let Err(error) = this.store.set(&this.account_id, setting)
+        {
+            // 凭据已经提交，这里无法再让接口失败；留下能定位的日志，管理员重新保存即可。
+            tracing::warn!(
+                target: "turn_state_hunt",
+                account_id = this.account_id.as_str(),
+                error = %error,
+                "state 自动续期参数保存失败，请重新保存"
+            );
+        }
+        this.credential.finish();
+    }
 }
 
 #[derive(Deserialize)]
@@ -1389,6 +1838,15 @@ fn binding(value: &str) -> Result<OAuthPendingBinding, CodexOAuthPendingStoreErr
     OAuthPendingBinding::try_new(value.to_owned()).map_err(map_pending_store_error)
 }
 
+/// 上游最新返回的 turn state。仅在进程内用于判长和钉住，绝不序列化或落日志。
+fn hunted_turn_state(response_headers: &[ProviderResponseHeader]) -> Option<&str> {
+    response_headers
+        .iter()
+        .rev()
+        .find(|header| header.name().eq_ignore_ascii_case("x-codex-turn-state"))
+        .and_then(|header| std::str::from_utf8(header.value()).ok())
+}
+
 fn provider_admin_error(kind: ProviderAdminErrorKind) -> ProviderAdminError {
     ProviderAdminError::new(kind)
 }
@@ -1505,11 +1963,30 @@ fn map_credential_admin_error(error: CodexCredentialAdminError) -> ProviderAdmin
             Kind::Ambiguous,
             "令牌刷新结果未知，请先核对账号状态，不要立即重复刷新",
         ),
+        Error::CdkRedeem { message } => (Kind::Invalid, cdk_redeem_public_message(&message)),
     };
     let error = provider_admin_error(kind).with_public_message(public_message);
     match upstream_message {
         Some(message) => error.with_message(message),
         None => error,
+    }
+}
+
+fn cdk_redeem_public_message(message: &str) -> &'static str {
+    if message.contains("格式") {
+        "CDK 格式不正确，请检查卡密"
+    } else if message.contains("不存在") || message.contains("无效") {
+        "CDK 不存在或无效"
+    } else if message.contains("已兑换") {
+        "CDK 已兑换且无法再次取回，请改用已下载的 JSON 导入"
+    } else if message.contains("未启用") || message.contains("未配置") {
+        "未启用 CDK 兑换"
+    } else if message.contains("限流") {
+        "CDK 兑换被限流，请稍后重试"
+    } else if message.contains("连接") || message.contains("身份") {
+        "暂时无法连接 CDK 兑换服务，请稍后重试"
+    } else {
+        "CDK 兑换失败，请稍后重试或改用账号 JSON 导入"
     }
 }
 
@@ -1541,6 +2018,7 @@ const fn credential_admin_error_code(error: &CodexCredentialAdminError) -> &'sta
         CodexCredentialAdminError::RefreshUnavailable => "refresh_unavailable",
         CodexCredentialAdminError::RefreshUpstream { .. } => "refresh_upstream_failed",
         CodexCredentialAdminError::RefreshAmbiguous { .. } => "refresh_ambiguous",
+        CodexCredentialAdminError::CdkRedeem { .. } => "cdk_redeem_failed",
     }
 }
 

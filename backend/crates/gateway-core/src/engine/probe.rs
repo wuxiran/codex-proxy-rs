@@ -5,7 +5,11 @@ use std::fmt;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
-use crate::error::{ClientVisibleUpstreamResponse, GatewayError, GatewayErrorKind};
+use crate::engine::DiagnosticEgress;
+use crate::error::{
+    ClientVisibleUpstreamResponse, GatewayError, GatewayErrorKind, ProviderErrorKind,
+};
+use crate::event::ProviderResponseHeader;
 use crate::identity::ProviderKind;
 use crate::routing::UpstreamModelId;
 use crate::{account::ProviderAccountId, operation::Operation, upstream::UpstreamSendState};
@@ -16,11 +20,15 @@ pub struct AccountProbeRequest {
     pub provider_kind: ProviderKind,
     pub upstream_model: UpstreamModelId,
     pub operation: Operation,
+    /// 临时出口；`None` 沿用账号已绑定的代理（连接测试的既有行为）。
+    pub egress: Option<DiagnosticEgress>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountProbeResult {
     pub text: Vec<String>,
+    /// 上游响应头，仅供 Provider 管理端在进程内解读；`Debug` 已脱敏，不得序列化。
+    pub response_headers: Vec<ProviderResponseHeader>,
 }
 
 /// 仅供当前管理端连接测试展示的原始上游失败响应。
@@ -101,6 +109,7 @@ pub struct AccountProbeError {
     source: AccountProbeErrorSource,
     send_state: Option<UpstreamSendState>,
     upstream_response: Option<AccountProbeUpstreamResponse>,
+    provider_kind: Option<ProviderErrorKind>,
 }
 
 impl AccountProbeError {
@@ -116,7 +125,23 @@ impl AccountProbeError {
             source,
             send_state,
             upstream_response,
+            provider_kind: None,
         }
+    }
+
+    /// 附上 Provider 的原始失败分类。
+    ///
+    /// 面向客户端的 [`GatewayErrorKind`] 会把凭据失效、无权限与上游不可用折叠成同一类；
+    /// 管理端要区分「账号的问题」和「出口的问题」，只能看这里。
+    #[must_use]
+    pub const fn with_provider_kind(mut self, kind: Option<ProviderErrorKind>) -> Self {
+        self.provider_kind = kind;
+        self
+    }
+
+    #[must_use]
+    pub const fn provider_kind(&self) -> Option<ProviderErrorKind> {
+        self.provider_kind
     }
 
     #[must_use]

@@ -43,6 +43,12 @@ pub struct OpenAiConfig {
     pub wire_profile: CodexWireProfileConfig,
     #[serde(skip)]
     identity_secret_path: PathBuf,
+    #[serde(skip)]
+    revive_data_dir: PathBuf,
+    #[serde(skip)]
+    cdk_data_dir: PathBuf,
+    #[serde(skip)]
+    turn_state_data_dir: PathBuf,
 }
 
 impl OpenAiConfig {
@@ -57,6 +63,9 @@ impl OpenAiConfig {
         self.auth.validate()?;
         self.wire_profile.validate()?;
         self.identity_secret_path = runtime_data_dir.join("identity_hmac_secret");
+        self.revive_data_dir = runtime_data_dir.join("revive");
+        self.cdk_data_dir = runtime_data_dir.join("cdk");
+        self.turn_state_data_dir = runtime_data_dir.join("turn_state");
         Ok(())
     }
 
@@ -98,6 +107,31 @@ impl OpenAiConfig {
         self.auth.refresh_enabled
     }
 
+    #[must_use]
+    pub fn revive_data_dir(&self) -> &Path {
+        &self.revive_data_dir
+    }
+
+    #[must_use]
+    pub const fn revive_settings(&self) -> &CodexReviveSettings {
+        &self.auth.revive
+    }
+
+    #[must_use]
+    pub fn cdk_data_dir(&self) -> &Path {
+        &self.cdk_data_dir
+    }
+
+    #[must_use]
+    pub fn turn_state_data_dir(&self) -> &Path {
+        &self.turn_state_data_dir
+    }
+
+    #[must_use]
+    pub const fn cdk_settings(&self) -> &CodexCdkSettings {
+        &self.auth.cdk
+    }
+
     /// 返回经官方同款硬上限约束后的上游流重试预算。
     #[must_use]
     pub fn stream_max_retries(&self) -> u32 {
@@ -122,6 +156,9 @@ impl Default for OpenAiConfig {
             stream_max_retries: DEFAULT_STREAM_MAX_RETRIES,
             wire_profile: CodexWireProfileConfig::default(),
             identity_secret_path: PathBuf::new(),
+            revive_data_dir: PathBuf::new(),
+            cdk_data_dir: PathBuf::new(),
+            turn_state_data_dir: PathBuf::new(),
         }
     }
 }
@@ -223,10 +260,13 @@ impl CodexQuotaSettings {
 
 /// OpenAI OAuth 的 Provider-owned 运行开关和端点。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct CodexAuthSettings {
     pub refresh_enabled: bool,
     pub oauth_client_id: String,
     pub oauth_token_endpoint: String,
+    pub revive: CodexReviveSettings,
+    pub cdk: CodexCdkSettings,
 }
 
 impl Default for CodexAuthSettings {
@@ -235,6 +275,8 @@ impl Default for CodexAuthSettings {
             refresh_enabled: true,
             oauth_client_id: OFFICIAL_CODEX_OAUTH_CLIENT_ID.to_owned(),
             oauth_token_endpoint: OFFICIAL_CODEX_TOKEN_ENDPOINT.to_owned(),
+            revive: CodexReviveSettings::default(),
+            cdk: CodexCdkSettings::default(),
         }
     }
 }
@@ -248,6 +290,96 @@ impl CodexAuthSettings {
                 .is_none()
         {
             return Err(OpenAiConfigError::InvalidField("openai.auth"));
+        }
+        self.revive.validate()?;
+        self.cdk.validate()
+    }
+}
+
+/// 401 签名号池自动复活。默认关闭；未归档签名原文的账号不会提交第三方。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexReviveSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub verify_workers: u32,
+    pub task_workers: u32,
+}
+
+impl Default for CodexReviveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://zzledu.kdns.fr/api/revive/v1".to_owned(),
+            verify_workers: 50,
+            task_workers: 10,
+        }
+    }
+}
+
+impl CodexReviveSettings {
+    fn validate(&self) -> Result<(), OpenAiConfigError> {
+        if self.verify_workers == 0 || self.verify_workers > 200 {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.revive.verify_workers",
+            ));
+        }
+        if self.task_workers == 0 || self.task_workers > 50 {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.revive.task_workers",
+            ));
+        }
+        let parsed = Url::parse(&self.base_url).ok();
+        let valid = parsed.is_some_and(|url| {
+            (url.scheme() == "https" && url.host_str().is_some())
+                || (url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+        });
+        if !valid {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.revive.base_url",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// CDK 兑换导入。默认开启；只在导入文档带 `cdks` 时访问第三方。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexCdkSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub client_id: String,
+    pub client_version: String,
+}
+
+impl Default for CodexCdkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "https://zzledu.kdns.fr".to_owned(),
+            client_id: String::new(),
+            client_version: "20260907-receipt-capacity".to_owned(),
+        }
+    }
+}
+
+impl CodexCdkSettings {
+    fn validate(&self) -> Result<(), OpenAiConfigError> {
+        if self.client_version.trim().is_empty() {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.cdk.client_version",
+            ));
+        }
+        let parsed = Url::parse(&self.base_url).ok();
+        let valid = parsed.is_some_and(|url| {
+            (url.scheme() == "https" && url.host_str().is_some())
+                || (url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+        });
+        if !valid {
+            return Err(OpenAiConfigError::InvalidField("openai.auth.cdk.base_url"));
         }
         Ok(())
     }

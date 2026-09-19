@@ -4,6 +4,8 @@ mod admin;
 pub mod config;
 mod provider;
 mod session_transport;
+mod turn_state_auto_hunt;
+mod turn_state_pin;
 
 use std::sync::Arc;
 
@@ -17,10 +19,10 @@ use gateway_core::task::WorkerContribution;
 use crate::admin::{OpenAiAdminProvider, OpenAiAdminServices, OpenAiOAuthPendingStore};
 use crate::credential::token_client::{AuthorizationCodeExchanger, TokenRefresher};
 use crate::credential::{
-    CodexCookiePolicy, CodexCredentialAdmin, CodexCredentialAdminService,
+    CodexCdkClient, CodexCookiePolicy, CodexCredentialAdmin, CodexCredentialAdminService,
     CodexCredentialCatalogService, CodexCredentialProfileService, CodexCredentialQuotaService,
     CodexCredentialRefreshService, CodexCredentialRepository, CodexCredentialSelector,
-    CodexOAuthAdmin, CodexOAuthAdminService,
+    CodexOAuthAdmin, CodexOAuthAdminService, CodexReviveService,
 };
 use crate::transport::profile::{
     CodexArtifactProfileCache, CodexDesktopReleaseService, OfficialCodexDesktopReleaseTransport,
@@ -131,6 +133,7 @@ pub async fn initialize(
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
     ));
+    let turn_state_pins = crate::turn_state_pin::TurnStatePins::default();
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,
@@ -144,7 +147,8 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
-        .with_session_identity(session_identity),
+        .with_session_identity(session_identity)
+        .with_turn_state_pins(turn_state_pins.clone()),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -155,13 +159,28 @@ pub async fn initialize(
     );
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client.clone();
+    let revive = CodexReviveService::new(
+        config.revive_data_dir().to_path_buf(),
+        config.revive_settings().clone(),
+        repository.clone(),
+    )
+    .map(Arc::new)
+    .map_err(|_| OpenAiInitializeError::Transport)?;
+    let cdk = CodexCdkClient::new(
+        config.cdk_data_dir().to_path_buf(),
+        config.cdk_settings().clone(),
+    )
+    .map(Arc::new)
+    .map_err(|_| OpenAiInitializeError::Transport)?;
     let credential_admin = Arc::new(
         CodexCredentialAdminService::new(
             Arc::clone(&refresher),
             Arc::clone(&leases),
             Arc::clone(&runtime_policy),
         )
-        .with_personal_access_token_client(token_client),
+        .with_personal_access_token_client(token_client)
+        .with_revive_exports(Arc::clone(&revive))
+        .with_cdk_client(cdk),
     );
     let refresh = Arc::new(CodexCredentialRefreshService::new(
         repository,
@@ -184,20 +203,27 @@ pub async fn initialize(
         )
         .with_oauth_client_id(config.oauth_client_id()),
     );
-    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(OpenAiAdminProvider::new(
-        provider_kind,
-        profile,
-        accounts,
-        OpenAiAdminServices {
-            credentials: credential_admin,
-            oauth: oauth_admin,
-            profile_statistics,
-            quota: Arc::clone(&quota),
-            catalog: Arc::clone(&catalog),
-        },
-        websocket_pool,
-        desktop_release_status,
-    ));
+    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(
+        OpenAiAdminProvider::new(
+            provider_kind,
+            profile,
+            accounts,
+            OpenAiAdminServices {
+                credentials: credential_admin,
+                oauth: oauth_admin,
+                profile_statistics,
+                quota: Arc::clone(&quota),
+                catalog: Arc::clone(&catalog),
+            },
+            websocket_pool,
+            desktop_release_status,
+        )
+        .with_turn_state_pins(turn_state_pins)
+        .with_auto_hunt_store(
+            turn_state_auto_hunt::AutoHuntStore::new(config.turn_state_data_dir().to_path_buf())
+                .map_err(|_| OpenAiInitializeError::Transport)?,
+        ),
+    );
     let worker_contributions = provider::worker_contributions(
         refresh,
         quota,
@@ -205,6 +231,7 @@ pub async fn initialize(
         config.quota_refresh_policy(),
         config.oauth_refresh_enabled(),
         desktop_release,
+        revive,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
 

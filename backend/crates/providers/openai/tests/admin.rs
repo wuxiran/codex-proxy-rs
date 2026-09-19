@@ -2163,3 +2163,248 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         ProviderAdminErrorKind::Unsupported
     );
 }
+
+/// 续期参数绝不进凭据：现网旧版的凭据 schema 是 `deny_unknown_fields`，多一个字段就会让
+/// 回滚后的实例（以及发版排空期间的旧槽位）读不了这个账号。
+#[tokio::test]
+async fn turn_state_auto_hunt_lives_outside_the_credential_and_requires_the_pin_switch() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_auto_hunt".to_owned(),
+            name: "auto".to_owned(),
+            secret: secret("test-auto-hunt-token"),
+            verified_account: profile("chatgpt-auto-hunt"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_auto_hunt").unwrap();
+    // 配置持有运行数据目录的 TempDir；必须活到测试结束，续期参数就写在里面。
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let rotate = |material: serde_json::Value| {
+        admin.prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                material.as_object().unwrap().clone(),
+            )),
+        })
+    };
+    let auto = json!({"enabled":true,"model":"gpt-6-astra","attempts":5,"include_direct":true});
+
+    // 固定没开时不能开续期：否则后台会对一个不使用 state 的账号持续发请求。
+    assert!(rotate(json!({"turn_state_auto_hunt":auto})).await.is_err());
+    for invalid in [
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":0}),
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":21}),
+        json!({"enabled":true,"model":"","attempts":5}),
+    ] {
+        assert!(
+            rotate(json!({"pin_turn_state":true,"turn_state_auto_hunt":invalid}))
+                .await
+                .is_err()
+        );
+    }
+
+    let prepared = rotate(json!({"pin_turn_state":true,"turn_state_auto_hunt":auto}))
+        .await
+        .unwrap();
+    let data = prepared
+        .facts()
+        .provider_material
+        .expose_to_provider()
+        .expose_to_provider();
+    // 凭据里只有旧版本认识的字段。
+    assert!(data.contains_key("turn_state_pin"));
+    assert!(!data.contains_key("turn_state_auto_hunt"));
+    assert!(prepared.facts().preserve_credential_state);
+
+    // 准备阶段不落盘：凭据提交若失败，接口报错的同时后台不能已经按新参数开始发请求。
+    let settings_file = config
+        ._runtime
+        .path()
+        .join("deploy")
+        .join("turn_state")
+        .join("auto_hunt.json");
+    assert!(!settings_file.exists());
+    // 只有提交成功后 Admin 才调用 finish，参数此时才生效。
+    prepared.into_parts().1.finish();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_file).unwrap()).unwrap();
+    assert_eq!(
+        saved,
+        json!({"acct_auto_hunt":{"model":"gpt-6-astra","attempts":5,"include_direct":true}})
+    );
+    // 文件损坏不能被当成「没人开启」：否则下一次保存会抹掉其它账号的设置。
+    std::fs::write(&settings_file, b"{ truncated").unwrap();
+    rotate(json!({"turn_state_auto_hunt":{"enabled":false}}))
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .finish();
+    assert_eq!(std::fs::read(&settings_file).unwrap(), b"{ truncated");
+
+    // 关掉固定会一并清掉续期参数；此时凭据未提交固定开关，续期任务没有可做的事。
+    rotate(json!({"pin_turn_state":false})).await.unwrap();
+    assert!(
+        admin
+            .turn_state_hunt_renewals(SystemTime::now(), std::time::Duration::from_secs(300))
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_pin_admin".to_owned(),
+            name: "pin".to_owned(),
+            secret: secret("test-pin-token"),
+            verified_account: profile("chatgpt-pin-admin"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_pin_admin").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let view = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let view = view.expose_to_provider().expose_to_provider();
+    assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+    assert_eq!(view.get("guanlanReviveAvailable"), Some(&json!(false)));
+    assert_eq!(view.get("turnStatePins"), Some(&json!([])));
+    assert_eq!(
+        view.get("turnStateCaptureRule"),
+        Some(&json!({"defaultLength":292,"modelLengths":{}}))
+    );
+    assert!(
+        !serde_json::to_string(view)
+            .unwrap()
+            .contains("test-pin-token")
+    );
+    let mut generations = Vec::new();
+    for enabled in [true, true, false] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"pin_turn_state":enabled})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let data = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(data.get("access_token"), Some(&json!("test-pin-token")));
+        assert_eq!(prepared.facts().account_id, *account.id());
+        assert!(prepared.facts().preserve_profile);
+        assert!(prepared.facts().preserve_credential_state);
+        if enabled {
+            generations.push(data["turn_state_pin"].as_str().unwrap().to_owned());
+        } else {
+            assert!(!data.contains_key("turn_state_pin"));
+        }
+    }
+    assert_ne!(generations[0], generations[1]);
+    for material in [
+        json!({"guanlan_revive":true}),
+        json!({"guanlan_revive":false}),
+        json!({"guanlan_revive":true, "pin_turn_state":true}),
+        json!({"guanlan_revive":true, "access_token":"injected"}),
+    ] {
+        let result = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    material.as_object().unwrap().clone(),
+                )),
+            })
+            .await;
+        assert!(result.is_err());
+    }
+    let mixed = admin
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"pin_turn_state":true, "access_token":"injected"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await;
+    assert!(mixed.is_err());
+}
+
+#[tokio::test]
+async fn turn_state_pin_team_admin_exposes_model_rules_without_enabling_capture() {
+    for plan in [
+        "team",
+        "business",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let mut account_profile = profile("chatgpt-team-pin");
+        account_profile.plan_type = Some(plan.to_owned());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: "acct_team_pin".to_owned(),
+                name: "team-pin".to_owned(),
+                secret: secret("team-pin-test-token"),
+                verified_account: account_profile,
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let account = store.account("acct_team_pin").unwrap();
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        let view = bundle
+            .admin_provider()
+            .account_configuration(account.id())
+            .await
+            .unwrap()
+            .unwrap();
+        let view = view.expose_to_provider().expose_to_provider();
+        assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+        assert_eq!(
+            view.get("turnStateCaptureRule"),
+            Some(&json!({
+                "defaultLength":null,
+                "modelLengths":{"gpt-5.5":332,"gpt-5.6-sol":332,"gpt-5.6-terra":356,"gpt-6-astra":332}
+            }))
+        );
+    }
+}

@@ -185,6 +185,7 @@ impl AccountProbe for SuccessfulProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                ..AccountProbeResult::default()
             })
         })
     }

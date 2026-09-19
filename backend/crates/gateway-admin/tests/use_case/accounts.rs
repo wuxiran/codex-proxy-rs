@@ -84,6 +84,12 @@ pub(super) struct FakeProviderAdmin {
     profile_result: Mutex<Result<ProviderProfileStatistics, ProviderAdminErrorKind>>,
     subscription_result: Mutex<Result<Option<ProviderSubscription>, ProviderAdminErrorKind>>,
     personal_info_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// `Some` 时支持遍历代理找 state；值是当前凭据绑定，测试可中途改写模拟凭据刷新。
+    pub(super) hunt_binding: Mutex<Option<String>>,
+    /// 续期任务每个周期看到的到期账号。
+    pub(super) hunt_renewals: Mutex<Vec<gateway_admin::ports::provider::TurnStateRenewal>>,
+    /// 最近一次钉住 state 时传入的出口（外层 `None` = 还没钉过；内层 `None` = 直连）。
+    pub(super) hunt_pinned_egress: Mutex<Option<Option<String>>>,
 }
 
 impl FakeProviderAdmin {
@@ -109,6 +115,9 @@ impl FakeProviderAdmin {
             profile_result: Mutex::new(Ok(empty_profile_statistics())),
             subscription_result: Mutex::new(Ok(None)),
             personal_info_barrier: Mutex::new(None),
+            hunt_binding: Mutex::new(None),
+            hunt_renewals: Mutex::new(Vec::new()),
+            hunt_pinned_egress: Mutex::new(None),
         })
     }
 
@@ -254,6 +263,7 @@ impl FakeProviderAdmin {
                 email: account.email.clone(),
                 plan_type: account.plan_type.clone(),
                 preserve_profile: false,
+                preserve_credential_state: false,
                 provider_material: document(),
                 has_refresh_token: account.has_refresh_token,
                 access_token_expires_at: account
@@ -270,6 +280,61 @@ impl FakeProviderAdmin {
 impl ProviderAdmin for FakeProviderAdmin {
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
+    }
+
+    async fn turn_state_hunt_prepare(
+        &self,
+        account_id: &ProviderAccountId,
+        upstream_model: &gateway_core::routing::UpstreamModelId,
+    ) -> Result<gateway_admin::ports::provider::TurnStateHuntTicket, ProviderAdminError> {
+        let binding = self
+            .hunt_binding
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))?;
+        Ok(gateway_admin::ports::provider::TurnStateHuntTicket::new(
+            account_id.clone(),
+            upstream_model.clone(),
+            super::turn_state_hunt::EXPECTED_LENGTH,
+            binding,
+        ))
+    }
+
+    async fn turn_state_hunt_renewals(
+        &self,
+        _: std::time::SystemTime,
+        _: std::time::Duration,
+    ) -> Vec<gateway_admin::ports::provider::TurnStateRenewal> {
+        self.hunt_renewals.lock().unwrap().clone()
+    }
+
+    fn turn_state_hunt_inspect(
+        &self,
+        ticket: &gateway_admin::ports::provider::TurnStateHuntTicket,
+        response_headers: &[gateway_core::event::ProviderResponseHeader],
+    ) -> gateway_admin::ports::provider::TurnStateHuntObservation {
+        let length = response_headers.first().map(|header| header.value().len());
+        gateway_admin::ports::provider::TurnStateHuntObservation {
+            length,
+            matched: length == Some(ticket.expected_length()),
+        }
+    }
+
+    async fn turn_state_hunt_pin(
+        &self,
+        ticket: &gateway_admin::ports::provider::TurnStateHuntTicket,
+        _: &[gateway_core::event::ProviderResponseHeader],
+        captured_at: std::time::SystemTime,
+        egress: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<std::time::SystemTime, ProviderAdminError> {
+        *self.hunt_pinned_egress.lock().unwrap() =
+            Some(egress.map(gateway_core::account::OutboundProxy::endpoint));
+        if self.hunt_binding.lock().unwrap().as_deref() != Some(ticket.binding()) {
+            return Err(ProviderAdminError::new(ProviderAdminErrorKind::Conflict));
+        }
+        self.record("provider.hunt_pin");
+        Ok(captured_at + std::time::Duration::from_secs(3600))
     }
 
     async fn profile_statistics(
@@ -566,6 +631,9 @@ pub(super) struct FakeAccountStore {
     quota_forecast_history: Mutex<QuotaForecastHistory>,
     update_commands: Mutex<Vec<UpdateAccount>>,
     pub(super) lowered_limits: Mutex<Vec<(String, u32)>>,
+    /// 已保存代理 ID 到地址的解析表；批量更新选中其中之一时账号的出口随之改变。
+    pub(super) saved_proxies:
+        Mutex<std::collections::BTreeMap<String, gateway_core::account::OutboundProxy>>,
 }
 
 impl FakeAccountStore {
@@ -586,7 +654,12 @@ impl FakeAccountStore {
             quota_forecast_history: Mutex::new(QuotaForecastHistory::default()),
             update_commands: Mutex::new(Vec::new()),
             lowered_limits: Mutex::new(Vec::new()),
+            saved_proxies: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    pub(super) fn mutate_account(&self, change: impl FnOnce(&mut AccountRecord)) {
+        change(&mut self.accounts.lock().expect("accounts")[0]);
     }
 
     pub(super) fn update_commands(&self) -> Vec<UpdateAccount> {
@@ -955,6 +1028,24 @@ impl AccountStore for FakeAccountStore {
         self.record("store.batch_update_accounts");
         self.record_context(context);
         self.require_commit()?;
+        if let Some(selection) = &command.outbound_proxy {
+            use gateway_admin::model::proxies::AccountProxySelection;
+            let proxy = match selection {
+                AccountProxySelection::Direct => None,
+                AccountProxySelection::Url(proxy) => Some(proxy.clone()),
+                AccountProxySelection::Saved(id) => {
+                    self.saved_proxies.lock().expect("proxies").get(id).cloned()
+                }
+            };
+            // 解析不到的已保存代理保持原绑定：模拟「提交看似成功、账号却没换到该出口」。
+            if !matches!(selection, AccountProxySelection::Saved(_)) || proxy.is_some() {
+                for account in self.accounts.lock().expect("accounts").iter_mut() {
+                    if command.account_ids.contains(&account.id) {
+                        account.outbound_proxy = proxy.clone();
+                    }
+                }
+            }
+        }
         Ok(AccountsUpdateResult {
             config_revision: revision(2),
             account_ids: command
@@ -2089,6 +2180,57 @@ async fn api_key_list_and_detail_should_accumulate_local_usage_without_subscript
 }
 
 #[tokio::test]
+async fn unobserved_quota_should_preserve_local_cost_in_list_detail_and_refresh() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let mut account = account_record("openai");
+    account.created_at = Utc::now() - TimeDelta::days(60);
+    let added_at = account.created_at;
+    let store = FakeAccountStore::with_account(account, events());
+    let services = accounts_service(provider, store.clone()).await;
+    let account_id = ProviderAccountId::new("acct_test").unwrap();
+
+    // 金额未知、已知零和已有消费都不依赖上游额度；统计范围也不能缩为最近 24 小时。
+    for amount in [None, Some("0"), Some("12.34")] {
+        let mut expected = quota_local_usage("acct_test", 4_330_000);
+        expected.costs = amount
+            .map(|value| gateway_admin::model::accounts::AccountCost {
+                currency: "USD".to_owned(),
+                amount: value.parse().unwrap(),
+            })
+            .into_iter()
+            .collect();
+        store.set_quota_window_usage(vec![AccountUsageWindowResult {
+            account_id: account_id.to_string(),
+            key: "account-lifetime".to_owned(),
+            usage: expected.clone(),
+        }]);
+        let page = services
+            .accounts()
+            .list(AccountListQuery {
+                page: 1,
+                page_size: gateway_admin::model::PageSize::new(20).unwrap(),
+                provider_kind: None,
+                group_filter: None,
+                search: None,
+                status: None,
+                sort: None,
+            })
+            .await
+            .unwrap();
+        let detail = services.accounts().quota(&account_id, false).await.unwrap();
+        let refreshed = services.accounts().quota(&account_id, true).await.unwrap();
+        for item in [&page.items[0], &detail, &refreshed] {
+            assert_eq!(item.usage.as_ref(), Some(&expected));
+            assert!(item.quota.windows.is_empty());
+        }
+        let queries = store.quota_window_queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].range.start, added_at);
+        assert!(queries[0].range.end > added_at + TimeDelta::days(59));
+    }
+}
+
+#[tokio::test]
 async fn accounts_list_should_attach_local_usage_to_quota_windows() {
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::hours(1);
@@ -2807,6 +2949,7 @@ impl AccountProbe for SuccessfulAccountProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                ..AccountProbeResult::default()
             })
         })
     }

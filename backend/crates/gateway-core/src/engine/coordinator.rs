@@ -46,19 +46,22 @@ pub struct AttemptCoordinator<S: ?Sized> {
 #[derive(Debug, Clone)]
 enum AccountSelection {
     Scheduled(Option<crate::account::ProviderAccountId>),
-    Diagnostic(crate::account::ProviderAccountId),
+    Diagnostic {
+        account: crate::account::ProviderAccountId,
+        egress: Option<super::DiagnosticEgress>,
+    },
 }
 
 impl AccountSelection {
     fn required_account(&self) -> Option<&crate::account::ProviderAccountId> {
         match self {
             Self::Scheduled(account) => account.as_ref(),
-            Self::Diagnostic(account) => Some(account),
+            Self::Diagnostic { account, .. } => Some(account),
         }
     }
 
     const fn is_diagnostic(&self) -> bool {
-        matches!(self, Self::Diagnostic(_))
+        matches!(self, Self::Diagnostic { .. })
     }
 }
 
@@ -107,15 +110,19 @@ where
         operation: Operation,
         plan: RoutingPlan,
         required_account: crate::account::ProviderAccountId,
-        continuation: Option<ContinuationBinding>,
+        egress: Option<super::DiagnosticEgress>,
         cancellation: CancellationToken,
     ) -> Result<ResponseExecutionSession<S>, EngineError> {
+        // 诊断是独立的一次性请求，从不续接既有会话。
         self.start_with_account_selection(
             request,
             operation,
             plan,
-            AccountSelection::Diagnostic(required_account),
-            continuation,
+            AccountSelection::Diagnostic {
+                account: required_account,
+                egress,
+            },
+            None,
             cancellation,
         )
         .await
@@ -770,7 +777,7 @@ where
             (Some(recovery.account), recovery.transport)
         } else {
             match &self.account_selection {
-                AccountSelection::Diagnostic(account) => {
+                AccountSelection::Diagnostic { account, .. } => {
                     (Some(account.clone()), AttemptTransport::Default)
                 }
                 AccountSelection::Scheduled(_) => (
@@ -782,11 +789,12 @@ where
             }
         };
         let account_context = match &self.account_selection {
-            AccountSelection::Diagnostic(account) => AccountAttemptContext::diagnostic(
+            AccountSelection::Diagnostic { account, egress } => AccountAttemptContext::diagnostic(
                 self.excluded_accounts.clone(),
                 account.clone(),
                 self.account_state_owner.clone(),
-            ),
+            )
+            .with_diagnostic_egress(egress.clone()),
             AccountSelection::Scheduled(_) => AccountAttemptContext::new(
                 self.excluded_accounts.clone(),
                 pinned_account.clone(),

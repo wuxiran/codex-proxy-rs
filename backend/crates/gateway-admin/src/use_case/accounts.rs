@@ -18,7 +18,8 @@ use crate::{
         accounts::{
             AccountConnectionTestEvent, AccountConnectionTestEventStream, AccountListQuery,
             AccountPageItem, AccountUpdateResult, AccountUsage, AccountUsageWindowQuery,
-            AccountsUpdateResult, BatchUpdateAccounts, UpdateAccount,
+            AccountsUpdateResult, BatchUpdateAccounts, TurnStateHuntCommand,
+            TurnStateHuntEventStream, UpdateAccount,
         },
         observability::TimeRange,
         provider_credentials::{
@@ -33,6 +34,7 @@ use crate::{
     },
     ports::{
         provider::ProviderAdminRegistry,
+        proxy::ProxyStore,
         store::{AccountRuntimeStore, AccountStore},
     },
 };
@@ -42,7 +44,7 @@ use super::{
     validate_prepared_rotation,
 };
 
-const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
+pub(super) const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 
 /// 统一账号页消费的服务。
 #[async_trait]
@@ -145,14 +147,34 @@ pub trait AccountsService: Send + Sync {
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
+
+    /// 账号级 state 缺失或将在 `margin` 内到期、需要自动续期的账号。
+    async fn turn_state_renewals(
+        &self,
+        _now: std::time::SystemTime,
+        _margin: std::time::Duration,
+    ) -> Vec<crate::ports::provider::TurnStateRenewal> {
+        Vec::new()
+    }
+
+    /// 逐个出口发真实请求找符合长度规则的 state；命中即绑定该出口并钉住。
+    async fn turn_state_hunt(
+        &self,
+        _command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        Err(AdminError::invalid("当前服务不支持遍历代理找 state"))
+    }
 }
 
+#[derive(Clone)]
 pub(crate) struct DefaultAccountsService {
     accounts: Arc<dyn AccountStore>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     providers: ProviderAdminRegistry,
     snapshot: Arc<dyn SnapshotControl>,
-    probe: Arc<dyn AccountProbe>,
+    pub(super) probe: Arc<dyn AccountProbe>,
+    pub(super) proxies: Arc<dyn ProxyStore>,
+    pub(super) hunts: super::turn_state_hunt::ActiveHunts,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
 }
@@ -165,6 +187,7 @@ impl DefaultAccountsService {
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
+        proxies: Arc<dyn ProxyStore>,
     ) -> Self {
         Self {
             accounts,
@@ -172,6 +195,8 @@ impl DefaultAccountsService {
             providers,
             snapshot,
             probe,
+            proxies,
+            hunts: super::turn_state_hunt::ActiveHunts::default(),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -204,7 +229,7 @@ impl DefaultAccountsService {
             .ok_or_else(|| AdminError::not_found("Provider 账号不存在"))
     }
 
-    async fn provider_for_account(
+    pub(super) async fn provider_for_account(
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<
@@ -264,16 +289,20 @@ impl DefaultAccountsService {
         Ok(())
     }
 
-    async fn load_api_key_usage(
+    async fn load_lifetime_usage(
         &self,
         accounts: &[AccountPageItem],
+        quotas: &[ProviderQuota],
     ) -> Result<BTreeMap<String, AccountUsage>, AdminError> {
         let now = Utc::now();
-        // API Key 没有套餐周期；本地累计直接查询账号创建后仍保留的请求记录。
+        // API Key 或尚无额度窗口的账号展示本地累计，仅统计账号创建后仍保留的请求记录。
         let windows = accounts
             .iter()
-            .filter(|item| item.account.authentication_kind == "api_key")
-            .map(|item| AccountUsageWindowQuery {
+            .zip(quotas)
+            .filter(|(item, quota)| {
+                item.account.authentication_kind == "api_key" || quota.windows.is_empty()
+            })
+            .map(|(item, _)| AccountUsageWindowQuery {
                 account_id: item.account.id.clone(),
                 key: "account-lifetime".to_owned(),
                 range: TimeRange {
@@ -289,7 +318,7 @@ impl DefaultAccountsService {
             .accounts
             .load_account_usage_by_windows(&windows)
             .await
-            .map_err(|error| map_store_error(error, "API Key account usage"))?
+            .map_err(|error| map_store_error(error, "lifetime account usage"))?
             .into_iter()
             .map(|result| (result.account_id, result.usage))
             .collect())
@@ -333,7 +362,7 @@ impl DefaultAccountsService {
         )
         .await?;
         let usage = self
-            .load_api_key_usage(std::slice::from_ref(&stored))
+            .load_lifetime_usage(std::slice::from_ref(&stored), std::slice::from_ref(&quota))
             .await?
             .remove(&stored.account.id)
             .or_else(|| {
@@ -428,13 +457,13 @@ impl AccountsService for DefaultAccountsService {
         .collect::<Result<Vec<_>, AdminError>>()?;
         self.attach_quota_local_usage(&page.items, &mut quotas)
             .await?;
-        let mut api_key_usage = self.load_api_key_usage(&page.items).await?;
+        let mut lifetime_usage = self.load_lifetime_usage(&page.items, &quotas).await?;
         let items = page
             .items
             .into_iter()
             .zip(quotas)
             .map(|(mut item, quota)| {
-                let usage = api_key_usage.remove(&item.account.id).or_else(|| {
+                let usage = lifetime_usage.remove(&item.account.id).or_else(|| {
                     quota
                         .usage_window()
                         .and_then(|(window, _)| window.local_usage.clone())
@@ -902,6 +931,7 @@ impl AccountsService for DefaultAccountsService {
                     provider_kind: account.provider_kind,
                     upstream_model,
                     operation,
+                    egress: None,
                 })
                 .await;
             match result {
@@ -940,6 +970,21 @@ impl AccountsService for DefaultAccountsService {
         })
         .flat_map(futures::stream::iter);
         Ok(Box::pin(futures::stream::iter(initial).chain(terminal)))
+    }
+
+    async fn turn_state_renewals(
+        &self,
+        now: std::time::SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<crate::ports::provider::TurnStateRenewal> {
+        self.providers.turn_state_hunt_renewals(now, margin).await
+    }
+
+    async fn turn_state_hunt(
+        &self,
+        command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        self.start_turn_state_hunt(command).await
     }
 }
 

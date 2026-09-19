@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
+import { API_BASE_URL } from '../constants'
 import request from '../request'
 
 export type AccountStatus
@@ -663,8 +664,104 @@ export interface ApiKeyConfiguration {
   transport: 'http' | 'prefer_websocket'
 }
 
+export interface TurnStatePinStatus {
+  model: string
+  length: number
+  capturedAt: string
+  expiresAt: string
+  hits: number
+  /** account：遍历代理后钉住，对全部客户端生效；client：按客户端密钥被动捕获。 */
+  scope?: 'account' | 'client'
+}
+
+export interface TurnStateHuntProxy {
+  /** null 表示直连 */
+  proxyId: string | null
+  name: string
+  endpoint: string | null
+}
+
+export interface TurnStateHuntAttemptError {
+  code: string
+  source: 'gateway' | 'provider' | 'upstream'
+  upstreamStatus: number | null
+  message: string
+}
+
+/** 遍历代理找 state 的 SSE 事件；只有 state 的字节数，没有值。 */
+export type TurnStateHuntEvent
+  = | { type: 'hunt_start', model: string, expectedLength: number, attempts: number, proxies: TurnStateHuntProxy[] }
+    | ({ type: 'proxy_start', index: number, total: number } & TurnStateHuntProxy)
+    | { type: 'attempt', proxyId: string | null, index: number, length: number | null, matched: boolean, error: TurnStateHuntAttemptError | null }
+    | { type: 'proxy_done', proxyId: string | null, attempts: number, matched: boolean, skipped: 'unavailable' | 'unreachable' | null }
+    | { type: 'hit', proxyId: string | null, attemptIndex: number, length: number }
+    | { type: 'bound', proxyId: string | null, changed: boolean }
+    | { type: 'pinned', model: string, length: number, expiresAt: string }
+    | { type: 'hunt_complete', success: boolean, requests: number }
+    | { type: 'error', code: string, message: string }
+
+export interface TurnStateHuntParam {
+  accountId: string
+  modelId: string
+  attempts: number
+  includeDirect: boolean
+}
+
+export function turnStateHuntStreamUrl(params: TurnStateHuntParam) {
+  const query = new URLSearchParams({
+    accountId: params.accountId,
+    modelId: params.modelId,
+    attempts: String(params.attempts),
+    includeDirect: String(params.includeDirect),
+  })
+  return `${API_BASE_URL}/api/admin/accounts/turn-state-hunt?${query}`
+}
+
+export interface TurnStateCaptureRule {
+  defaultLength: number | null
+  modelLengths: Record<string, number>
+}
+
+/** 账号级 state 到期前自动重新遍历代理的参数；null 表示未开启。 */
+export interface TurnStateAutoHunt {
+  modelId: string
+  attempts: number
+  includeDirect: boolean
+}
+
+export interface OAuthStateConfiguration {
+  guanlanReviveAvailable?: boolean
+  pinTurnState: boolean
+  turnStateAutoHunt?: TurnStateAutoHunt | null
+  turnStatePins: TurnStatePinStatus[]
+  turnStateCaptureRule?: TurnStateCaptureRule
+  maxAgeSeconds: number
+}
+
+export function updateAccountTurnState(data: {
+  accountId: string
+  pinTurnState?: boolean
+  turnStateAutoHunt?: { enabled: false } | ({ enabled: true } & TurnStateAutoHunt)
+  settings?: AccountUpdateParam
+}) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/rotate',
+    method: 'POST',
+    data: { provider: 'openai', ...data },
+  })
+}
+
+export function reviveGuanlanAccount(data: AccountIdParam) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/rotate',
+    method: 'POST',
+    data: { provider: 'openai', ...data, guanlanRevive: true },
+    timeout: 65 * 60 * 1000,
+  })
+}
+
 export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
-  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration }>({
+  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration | OAuthStateConfiguration }>({
     url: '/api/admin/accounts/detail',
     method: 'GET',
     params: data,

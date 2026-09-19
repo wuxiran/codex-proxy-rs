@@ -19,11 +19,16 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: path => path.replace(/^\/dev/, ''),
       },
+      '/guanlan': {
+        target: 'https://zzledu.kdns.fr',
+        changeOrigin: true,
+        rewrite: path => path.replace(/^\/guanlan/, ''),
+      },
     },
   },
   build: {
     outDir: 'dist',
-    assetsDir: 'assets',
+    assetsDir: 'assets/account-controls-20260919',
     chunkSizeWarningLimit: 600,
     rolldownOptions: {
       checks: {

@@ -326,3 +326,91 @@ pub enum AccountConnectionTestEvent {
 /// 每次连接测试独占的有限事件流。
 pub type AccountConnectionTestEventStream =
     Pin<Box<dyn Stream<Item = AccountConnectionTestEvent> + Send + 'static>>;
+
+/// 遍历代理找 state 的命令；`attempts` 是每个出口最多发出的真实上游请求数。
+#[derive(Debug, Clone)]
+pub struct TurnStateHuntCommand {
+    pub account_id: gateway_core::account::ProviderAccountId,
+    pub upstream_model: gateway_core::routing::UpstreamModelId,
+    pub attempts: u8,
+    pub include_direct: bool,
+    /// 后台续期为 true：账号被停用或凭据失效后，开始前与每个出口前都会停手。
+    pub require_schedulable: bool,
+    pub context: super::MutationContext,
+}
+
+impl TurnStateHuntCommand {
+    pub const MAX_ATTEMPTS: u8 = 20;
+}
+
+/// 遍历中的一个出口；`proxy_id == None` 表示直连。`endpoint` 不含代理凭据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateHuntEgress {
+    pub proxy_id: Option<String>,
+    pub name: String,
+    pub endpoint: Option<String>,
+}
+
+/// 单次探测失败的可公开事实；不含上游正文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateHuntAttemptError {
+    pub code: GatewayErrorKind,
+    pub source: AccountProbeErrorSource,
+    pub upstream_status: Option<u16>,
+    pub message: String,
+}
+
+/// 遍历代理找 state 的语义事件。任何事件都只携带 state 的字节数，绝不携带其值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStateHuntEvent {
+    Started {
+        model: String,
+        expected_length: usize,
+        attempts: u8,
+        egresses: Vec<TurnStateHuntEgress>,
+    },
+    EgressStarted {
+        egress: TurnStateHuntEgress,
+        index: usize,
+        total: usize,
+    },
+    Attempt {
+        proxy_id: Option<String>,
+        index: u8,
+        length: Option<usize>,
+        matched: bool,
+        error: Option<TurnStateHuntAttemptError>,
+    },
+    EgressFinished {
+        proxy_id: Option<String>,
+        attempts: u8,
+        matched: bool,
+        skipped: Option<&'static str>,
+    },
+    Hit {
+        proxy_id: Option<String>,
+        attempt_index: u8,
+        length: usize,
+    },
+    Bound {
+        proxy_id: Option<String>,
+        changed: bool,
+    },
+    Pinned {
+        model: String,
+        length: usize,
+        expires_at: DateTime<Utc>,
+    },
+    Completed {
+        success: bool,
+        requests: u32,
+    },
+    Failed {
+        code: &'static str,
+        message: String,
+    },
+}
+
+/// 每次遍历独占的有限事件流。
+pub type TurnStateHuntEventStream =
+    Pin<Box<dyn Stream<Item = TurnStateHuntEvent> + Send + 'static>>;

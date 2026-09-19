@@ -16,6 +16,9 @@ export * from './modules/backups'
 // Dashboard 聚合
 export * from './modules/dashboard'
 
+// 观澜 CDK 兑换
+export * from './modules/guanlanCdk'
+
 export * from './modules/proxies'
 export * from './modules/public-import'
 

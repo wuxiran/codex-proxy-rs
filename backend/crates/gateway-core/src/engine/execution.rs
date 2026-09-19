@@ -749,7 +749,10 @@ impl DefaultExecutionService {
             provider_kind,
             upstream_model,
             operation,
+            egress,
         } = request;
+        // 遍历代理时的失败多半是出口问题：不计入全局熔断，也不写成账号的探测失败事实。
+        let isolated = egress.is_some();
         let observed = ProbeObservation {
             provider_kind: provider_kind.clone(),
             account_id: account_id.clone(),
@@ -794,14 +797,26 @@ impl DefaultExecutionService {
             routing: crate::routing::AccountRoutingSnapshot::all(),
             protocol: "admin_connection_test".to_owned(),
             operation: operation.kind(),
-            endpoint: "/api/admin/accounts/connection-test".to_owned(),
+            endpoint: if isolated {
+                "/api/admin/accounts/turn-state-hunt"
+            } else {
+                "/api/admin/accounts/connection-test"
+            }
+            .to_owned(),
             client_transport: ClientTransport::InternalProbe.as_str().to_owned(),
             requested_model: Some(public_model),
             client_ip: None,
             user_agent: None,
             reasoning_effort: None,
             reasoning_preset: None,
-            request_kind: Some("account_connection_test".to_owned()),
+            request_kind: Some(
+                if isolated {
+                    "account_turn_state_hunt"
+                } else {
+                    "account_connection_test"
+                }
+                .to_owned(),
+            ),
             subagent_kind: None,
             compact: false,
             continuation: Default::default(),
@@ -817,7 +832,7 @@ impl DefaultExecutionService {
                 operation,
                 plan,
                 account_id,
-                None,
+                egress,
                 CancellationToken::new(),
             )
             .await
@@ -825,30 +840,34 @@ impl DefaultExecutionService {
             Ok(session) => session,
             Err(error) => {
                 return Err(self
-                    .observe_probe_failure(&observed, started_at, &error)
+                    .observe_probe_failure(&observed, started_at, &error, isolated)
                     .await);
             }
         };
         let events = session.collect_uncommitted().await;
-        publish_provider_attempt_outcomes(
-            self.circuits.as_ref(),
-            session.provider_attempt_outcomes(),
-        )
-        .await;
+        if !isolated {
+            publish_provider_attempt_outcomes(
+                self.circuits.as_ref(),
+                session.provider_attempt_outcomes(),
+            )
+            .await;
+        }
         let events = match events {
             Ok(events) => events,
             Err(error) => {
                 return Err(self
-                    .observe_probe_failure(&observed, started_at, &error)
+                    .observe_probe_failure(&observed, started_at, &error, isolated)
                     .await);
             }
         };
         if let Err(error) = session.commit_downstream(Some(200)).await {
             return Err(self
-                .observe_probe_failure(&observed, started_at, &error)
+                .observe_probe_failure(&observed, started_at, &error, isolated)
                 .await);
         }
+        let response_headers = session.response_headers().to_vec();
         Ok(AccountProbeResult {
+            response_headers,
             text: events
                 .into_iter()
                 .flat_map(|event| event.into_parts().0)
@@ -866,6 +885,7 @@ impl DefaultExecutionService {
         observed: &ProbeObservation,
         started_at: SystemTime,
         error: &EngineError,
+        isolated: bool,
     ) -> AccountProbeError {
         let (source, send_state, upstream_response) = match error {
             EngineError::Provider(provider_error) => {
@@ -901,6 +921,11 @@ impl DefaultExecutionService {
                 latency_ms,
                 "账号连接测试失败"
             );
+        }
+        if let EngineError::Provider(provider_error) = error
+            && !isolated
+        {
+            let latency = started_at.elapsed().unwrap_or_default();
             if let Err(store_error) = self
                 .observations
                 .record_probe_failure(ProbeFailure {
@@ -921,12 +946,17 @@ impl DefaultExecutionService {
                 );
             }
         }
+        let provider_kind = match error {
+            EngineError::Provider(provider_error) => Some(provider_error.kind()),
+            _ => None,
+        };
         AccountProbeError::new(
             gateway_error_from_engine(error),
             source,
             send_state,
             upstream_response,
         )
+        .with_provider_kind(provider_kind)
     }
 }
 

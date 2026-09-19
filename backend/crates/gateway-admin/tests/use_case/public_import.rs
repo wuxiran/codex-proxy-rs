@@ -39,7 +39,7 @@ async fn fixture(pool: Vec<ProxyRecord>) -> Fixture {
         .account_groups(Arc::new(FakeGroupStore::default()))
         .proxies(Arc::new(TestProxies {
             events: Some(events.clone()),
-            records: Some(pool),
+            records: Some(Arc::new(std::sync::Mutex::new(pool))),
             reserved: Some(reserved.clone()),
             ..Default::default()
         }))

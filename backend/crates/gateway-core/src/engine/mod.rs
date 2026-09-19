@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::account::{AccountSelectionPolicy, ProviderAccountId};
+use crate::account::{AccountSelectionPolicy, OutboundProxy, ProviderAccountId, RequestLocation};
 use crate::engine::continuation::{ContinuationBinding, NativeContinuationPin};
 use crate::error::{
     GatewayError, ProviderConnectionObservation, ProviderError, ProviderErrorKind, StoreError,
@@ -145,6 +145,32 @@ impl ProviderAttemptOutcome {
     }
 }
 
+/// 管理端诊断临时指定的出口；只作用于本次请求，不改账号已保存的代理绑定。
+///
+/// `proxy == None` 表示直连。地域随出口走，避免用旧出口的地域对齐新出口的请求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticEgress {
+    proxy: Option<OutboundProxy>,
+    location: Option<RequestLocation>,
+}
+
+impl DiagnosticEgress {
+    #[must_use]
+    pub const fn new(proxy: Option<OutboundProxy>, location: Option<RequestLocation>) -> Self {
+        Self { proxy, location }
+    }
+
+    #[must_use]
+    pub const fn proxy(&self) -> Option<&OutboundProxy> {
+        self.proxy.as_ref()
+    }
+
+    #[must_use]
+    pub const fn location(&self) -> Option<&RequestLocation> {
+        self.location.as_ref()
+    }
+}
+
 /// 单次 attempt 的账号选择与账号绑定状态事实。
 ///
 /// `required_account` 用于管理端 connection test，或请求局部的同账号恢复 attempt；
@@ -156,6 +182,7 @@ pub struct AccountAttemptContext {
     state_owner: Option<ProviderAccountStateOwner>,
     credential_recovery_attempted: bool,
     diagnostic_required_account: bool,
+    diagnostic_egress: Option<DiagnosticEgress>,
     account_scope: Option<Arc<crate::account::scope::FrozenAccountScope>>,
 }
 
@@ -172,6 +199,7 @@ impl AccountAttemptContext {
             state_owner,
             credential_recovery_attempted: false,
             diagnostic_required_account: false,
+            diagnostic_egress: None,
             account_scope: None,
         }
     }
@@ -191,8 +219,16 @@ impl AccountAttemptContext {
             state_owner,
             credential_recovery_attempted: false,
             diagnostic_required_account: true,
+            diagnostic_egress: None,
             account_scope: None,
         }
+    }
+
+    /// 让本次诊断经指定出口发出。
+    #[must_use]
+    pub fn with_diagnostic_egress(mut self, egress: Option<DiagnosticEgress>) -> Self {
+        self.diagnostic_egress = egress;
+        self
     }
 
     /// 附着普通请求认证时冻结的账号范围。
@@ -236,6 +272,11 @@ impl AccountAttemptContext {
     #[must_use]
     pub const fn is_diagnostic_required_account(&self) -> bool {
         self.diagnostic_required_account
+    }
+
+    #[must_use]
+    pub const fn diagnostic_egress(&self) -> Option<&DiagnosticEgress> {
+        self.diagnostic_egress.as_ref()
     }
 
     #[must_use]
@@ -519,6 +560,19 @@ impl AttemptContext {
     #[must_use]
     pub const fn is_diagnostic_required_account(&self) -> bool {
         self.account.is_diagnostic_required_account()
+    }
+
+    /// 管理端诊断临时指定的出口；普通请求恒为 `None`。
+    #[must_use]
+    pub const fn diagnostic_egress(&self) -> Option<&DiagnosticEgress> {
+        self.account.diagnostic_egress()
+    }
+
+    /// 让本次诊断 attempt 经指定出口发出。
+    #[must_use]
+    pub fn with_diagnostic_egress(mut self, egress: Option<DiagnosticEgress>) -> Self {
+        self.account = self.account.with_diagnostic_egress(egress);
+        self
     }
 
     /// 普通请求认证时冻结的账号范围；管理端诊断为 `None`。

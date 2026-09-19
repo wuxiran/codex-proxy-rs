@@ -55,6 +55,10 @@ where
             get(test_account_connection::<S>),
         )
         .route(
+            "/api/admin/accounts/turn-state-hunt",
+            get(hunt_account_turn_state::<S>),
+        )
+        .route(
             "/api/admin/accounts/oauth/start",
             post(start_account_authorization::<S>),
         )
@@ -582,6 +586,47 @@ where
         .map_err(map_service_error)?;
     let data = account_models_data(result);
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+/// 遍历会改账号绑定，却只能是 GET（EventSource）。会话 Cookie 是 SameSite=Lax，
+/// 跨站顶层导航会带上它，所以只接受显式声明 SSE 的请求；导航请求带不上这个 Accept。
+async fn hunt_account_turn_state<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    headers: axum::http::HeaderMap,
+    AdminQuery(query): AdminQuery<TurnStateHuntQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let accepts_event_stream = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    if !accepts_event_stream {
+        return Err(map_wire_error(WireValidationError::new("accept")));
+    }
+    // `Accept` 任何脚本都能设，算不上来源证明。浏览器会如实标注请求来自哪里：
+    // 同站不同源（兄弟子域）的页面发来的请求仍会带上 Lax Cookie，这里挡掉。
+    // 没有这个头的是非浏览器客户端（脚本、x-api-key 调用），由鉴权本身把关。
+    let cross_origin = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| !site.eq_ignore_ascii_case("same-origin"));
+    if cross_origin {
+        return Err(map_wire_error(WireValidationError::new("origin")));
+    }
+    let command = query
+        .into_command(auth.context().mutation_context())
+        .map_err(map_wire_error)?;
+    let stream = state
+        .admin_services()
+        .accounts()
+        .turn_state_hunt(command)
+        .await
+        .map_err(map_service_error)?
+        .map(|event| Ok(Event::default().data(turn_state_hunt_event_data(event).to_string())));
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 async fn test_account_connection<S>(

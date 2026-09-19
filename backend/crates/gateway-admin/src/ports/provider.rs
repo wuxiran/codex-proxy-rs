@@ -1,10 +1,11 @@
 //! Provider 管理能力与动态注册表。
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use gateway_core::{
     account::ProviderAccountId,
+    event::ProviderResponseHeader,
     operation::Operation,
     routing::{ProviderKind, UpstreamModelId},
 };
@@ -104,6 +105,82 @@ impl ProviderAdminError {
     }
 }
 
+/// 一次遍历代理找 state 冻结的 Provider 事实。
+///
+/// `binding` 由 Provider 从凭据派生，对控制面不透明；`Debug` 不展开它。
+#[derive(Clone, PartialEq, Eq)]
+pub struct TurnStateHuntTicket {
+    account_id: ProviderAccountId,
+    upstream_model: UpstreamModelId,
+    expected_length: usize,
+    binding: String,
+}
+
+impl TurnStateHuntTicket {
+    #[must_use]
+    pub const fn new(
+        account_id: ProviderAccountId,
+        upstream_model: UpstreamModelId,
+        expected_length: usize,
+        binding: String,
+    ) -> Self {
+        Self {
+            account_id,
+            upstream_model,
+            expected_length,
+            binding,
+        }
+    }
+
+    #[must_use]
+    pub const fn account_id(&self) -> &ProviderAccountId {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub const fn upstream_model(&self) -> &UpstreamModelId {
+        &self.upstream_model
+    }
+
+    #[must_use]
+    pub const fn expected_length(&self) -> usize {
+        self.expected_length
+    }
+
+    #[must_use]
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+}
+
+impl std::fmt::Debug for TurnStateHuntTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnStateHuntTicket")
+            .field("account_id", &self.account_id)
+            .field("upstream_model", &self.upstream_model)
+            .field("expected_length", &self.expected_length)
+            .field("binding", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 一个账号级 state 临近到期、需要重新遍历代理续期的账号。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateRenewal {
+    pub account_id: ProviderAccountId,
+    pub upstream_model: UpstreamModelId,
+    pub attempts: u8,
+    pub include_direct: bool,
+}
+
+/// 单次探测观测到的 state 形状；不含 state 值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnStateHuntObservation {
+    pub length: Option<usize>,
+    pub matched: bool,
+}
+
 /// 一个具体 Provider 对管理控制面提供的解析、验证、上游交互与运行时资源回收能力。
 ///
 /// 数据变更由 Provider 返回 prepared facts；config revision、审计与 PostgreSQL 事务
@@ -135,6 +212,51 @@ pub trait ProviderAdmin: Send + Sync {
         upstream_model: &UpstreamModelId,
         input_text: &str,
     ) -> Result<Operation, ProviderAdminError>;
+
+    /// 校验账号可以遍历代理找 state，并冻结本次遍历的长度规则与凭据绑定。
+    ///
+    /// 命中后再次调用并与首张票据比较，即可发现遍历期间凭据被刷新或重新捕获。
+    async fn turn_state_hunt_prepare(
+        &self,
+        _account_id: &ProviderAccountId,
+        _upstream_model: &UpstreamModelId,
+    ) -> Result<TurnStateHuntTicket, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 只报告上游返回的 state 字节数与是否符合规则；state 值不离开 Provider。
+    fn turn_state_hunt_inspect(
+        &self,
+        _ticket: &TurnStateHuntTicket,
+        _response_headers: &[ProviderResponseHeader],
+    ) -> TurnStateHuntObservation {
+        TurnStateHuntObservation::default()
+    }
+
+    /// 把刚观测到的 state 钉为账号级 state，返回其到期时间。
+    ///
+    /// `egress` 是发出这次探测的出口（`None` = 直连）。state 只对经同一出口发出的请求生效，
+    /// 所以绑定与钉住之间即使被并发改绑，也不会把它用到别的出口上。
+    async fn turn_state_hunt_pin(
+        &self,
+        _ticket: &TurnStateHuntTicket,
+        _response_headers: &[ProviderResponseHeader],
+        _captured_at: SystemTime,
+        _egress: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<SystemTime, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 已开启自动续期、且本进程内账号级 state 缺失或将在 `margin` 内到期的账号。
+    ///
+    /// state 只存在于进程内存；服务重启后全部视为缺失，由续期任务重新找回。
+    async fn turn_state_hunt_renewals(
+        &self,
+        _now: SystemTime,
+        _margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        Vec::new()
+    }
 
     /// 返回该 Provider 实际持有的 Dashboard 上游身份画像。
     fn dashboard_wire_profile(&self) -> Option<DashboardWireProfile>;
@@ -313,6 +435,19 @@ impl ProviderAdminRegistry {
     }
 
     /// 返回所有已注册 Provider 的 Dashboard 上游身份画像。
+    /// 汇总各 Provider 需要续期账号级 state 的账号。
+    pub(crate) async fn turn_state_hunt_renewals(
+        &self,
+        now: SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        let mut due = Vec::new();
+        for provider in self.providers.values() {
+            due.extend(provider.turn_state_hunt_renewals(now, margin).await);
+        }
+        due
+    }
+
     pub fn dashboard_wire_profiles(&self) -> Vec<DashboardWireProfile> {
         self.providers
             .values()
