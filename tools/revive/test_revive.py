@@ -167,8 +167,22 @@ class ReviveClientTests(unittest.TestCase):
                         }
                     )
                 )
+            # 与观澜实测一致（2026-09-19）：统计计数只在 summary 视图，result 视图不带。
             if "/verify/j1" in url and "summary=1" in url:
-                return FakeResponse(json_bytes({"ok": True, "job": {"job_id": "j1", "status": "completed"}}))
+                return FakeResponse(
+                    json_bytes(
+                        {
+                            "ok": True,
+                            "job": {
+                                "job_id": "j1",
+                                "status": "completed",
+                                "normal_count": 1,
+                                "unauthorized_count": 1,
+                                "preflight_id": "pf-1",
+                            },
+                        }
+                    )
+                )
             if "/verify/j1" in url and "result=1" in url:
                 return FakeResponse(
                     json_bytes(
@@ -177,8 +191,8 @@ class ReviveClientTests(unittest.TestCase):
                             "job": {
                                 "job_id": "j1",
                                 "status": "completed",
-                                "unauthorized_count": 1,
                                 "preflight_id": "pf-1",
+                                "verification": {"records": [{"index": 0, "needs_recovery": True}]},
                             },
                         }
                     )

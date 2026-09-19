@@ -233,26 +233,61 @@ impl CodexReviveService {
                 recovered_oauth_tokens(item)
                     .is_some_and(|t| accounts.iter().any(|a| identity_matches(a, &t)))
             }) {
+                tracing::info!(
+                    export = %export_label(&digest),
+                    eligible_accounts = accounts.len(),
+                    export_accounts = document_accounts(&document).len(),
+                    "Guanlan revive skipped: signed export contains accounts that are not expired and opted in"
+                );
                 self.write_state(&digest, "waiting", Some("batch_requires_all_accounts"))?;
                 continue;
             }
+            tracing::info!(
+                export = %export_label(&digest),
+                accounts = accounts.len(),
+                "Guanlan revive attempt started"
+            );
             self.write_state(&digest, "running", None)?;
             match self.revive_export(&bytes, &accounts).await {
                 Ok(applied) if applied == accounts.len() as u64 => {
+                    tracing::info!(
+                        export = %export_label(&digest),
+                        applied,
+                        "Guanlan revive recovered all accounts"
+                    );
                     summary.applied += applied;
                     self.write_state(&digest, "recovered", None)?;
                 }
                 Ok(applied) if applied > 0 => {
+                    tracing::warn!(
+                        export = %export_label(&digest),
+                        applied,
+                        expected = accounts.len(),
+                        retry_after_secs = FAILURE_COOLDOWN,
+                        "Guanlan revive recovered only part of the accounts"
+                    );
                     summary.applied += applied;
                     summary.failed += 1;
                     self.write_state(&digest, "failed", Some("partial_recovery"))?;
                 }
                 Ok(_) => {
+                    tracing::warn!(
+                        export = %export_label(&digest),
+                        retry_after_secs = FAILURE_COOLDOWN,
+                        "Guanlan revive result discarded: accounts changed during recovery"
+                    );
                     summary.failed += 1;
                     self.write_state(&digest, "failed", Some("account_changed"))?;
                 }
                 Err(error) => {
-                    tracing::warn!(error=%error, "OpenAI signed-export revive failed");
+                    tracing::warn!(
+                        export = %export_label(&digest),
+                        accounts = accounts.len(),
+                        error = %error,
+                        error_class = error_class(&error),
+                        retry_after_secs = FAILURE_COOLDOWN,
+                        "Guanlan revive attempt failed"
+                    );
                     summary.failed += 1;
                     self.write_state(&digest, "failed", Some(error_class(&error)))?;
                 }
@@ -380,6 +415,11 @@ fn eligible(account: &ProviderAccount) -> bool {
     account.enabled()
         && account.authentication_kind() == "oauth"
         && account.credential_state() == CredentialState::Expired
+}
+
+/// 日志里只露归档摘要前缀，足够对上 state/ 与 exports/ 下的文件名。
+fn export_label(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 fn identity_matches(account: &ProviderAccount, token: &RecoveredOAuthTokens) -> bool {

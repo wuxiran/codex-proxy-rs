@@ -176,7 +176,12 @@ class ReviveClient:
             job = self.get_verify(job_id, token, summary=True)
             status = str(job.get("status") or "")
             if status in VERIFY_DONE:
-                return self.get_verify(job_id, token, result=True)
+                # result 视图不带 unauthorized_count 等统计计数；缺失会让 recover 误判
+                # “无需复活”而静默跳过建任务，所以把 summary 的计数并回去。
+                result = self.get_verify(job_id, token, result=True)
+                for key, value in job.items():
+                    result.setdefault(key, value)
+                return result
             if time.monotonic() >= deadline:
                 raise ReviveError(f"verify {job_id} timed out still {status or 'unknown'}")
             time.sleep(interval)
