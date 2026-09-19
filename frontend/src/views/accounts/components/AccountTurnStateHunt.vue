@@ -14,6 +14,8 @@ const emit = defineEmits<{
   close: []
   /** 命中并完成绑定与钉住；boundChanged 表示账号的代理绑定发生了变化，autoRenew 为要保存的续期参数。 */
   hunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
+  /** 取消后账号是否被改动只有服务端知道，让上层按实际状态刷新。 */
+  cancelled: []
 }>()
 
 const PREFERRED_MODEL = 'gpt-6-astra'
@@ -52,6 +54,8 @@ function start() {
 }
 
 watch(status, (value) => {
+  if (value === 'cancelled')
+    emit('cancelled')
   if (value === 'success') {
     emit('hunted', hunt.boundChanged.value, autoRenew.value
       ? { modelId: modelId.value, attempts: attempts.value, includeDirect: includeDirect.value }
@@ -163,14 +167,14 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       :class="status === 'error' ? 'text-cp-error' : status === 'success' ? 'text-cp-success' : 'text-cp-text-secondary'"
     >
       <template v-if="status === 'running'">
-        遍历中，目标 {{ expectedLength ?? '…' }} 字节，已发出 {{ requests }} 次请求
+        遍历中，目标 {{ expectedLength ?? '…' }} 字节，已尝试 {{ requests }} 次
       </template>
       <template v-else-if="status === 'finalizing'">
         已命中，正在绑定代理并钉住 state…
       </template>
       <template v-else>
         {{ message }}<template v-if="status !== 'error' && requests">
-          （共 {{ requests }} 次请求）
+          （共 {{ requests }} 次）
         </template>
       </template>
     </p>

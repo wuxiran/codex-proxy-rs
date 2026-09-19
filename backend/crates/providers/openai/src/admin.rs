@@ -613,10 +613,18 @@ impl ProviderAdmin for OpenAiAdminProvider {
         let Ok(accounts) = self.accounts.list_for_provider(&provider).await else {
             return Vec::new();
         };
-        let settings = self.auto_hunt.all();
-        if settings.is_empty() {
-            return Vec::new();
-        }
+        let settings = match self.auto_hunt.all() {
+            Ok(settings) if settings.is_empty() => return Vec::new(),
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(
+                    target: "turn_state_hunt",
+                    error = %error,
+                    "state 自动续期的参数文件读不出来，本周期不续期"
+                );
+                return Vec::new();
+            }
+        };
         let mut due = Vec::new();
         for account in accounts {
             // 停用或凭据失效的账号发不出请求，续期只会白白失败。
@@ -657,6 +665,10 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     &binding,
                     &auto.model,
                     expected_length,
+                    // 账号改绑到别的出口后，旧出口上的 state 不再生效，要在新出口上重新找。
+                    &crate::turn_state_pin::egress_fingerprint(
+                        account.outbound_proxy().map(|proxy| proxy.expose_url()),
+                    ),
                     now,
                 )
                 .is_some_and(|captured_at| {
@@ -679,6 +691,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
         ticket: &TurnStateHuntTicket,
         response_headers: &[ProviderResponseHeader],
         captured_at: SystemTime,
+        egress: Option<&gateway_core::account::OutboundProxy>,
     ) -> Result<SystemTime, ProviderAdminError> {
         // 钉之前重新派生绑定：遍历期间凭据被刷新或重新捕获时，旧观测不再有资格复用。
         let current = self
@@ -696,6 +709,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 ticket.binding().to_owned(),
                 ticket.upstream_model().as_str(),
                 ticket.expected_length(),
+                crate::turn_state_pin::egress_fingerprint(egress.map(|proxy| proxy.expose_url())),
                 value,
                 captured_at,
                 SystemTime::now(),
@@ -1211,13 +1225,45 @@ fn prepare_turn_state_pin_rotation(
         .map_err(map_credential_admin_error)?;
     // 续期参数不进凭据：旧版本的凭据 schema 拒绝未知字段，写进去会让回滚后的实例读不了该账号。
     let stored = if pinned_after { setting } else { Some(None) };
-    if let Some(setting) = stored {
-        auto_hunt
-            .set(&account_id, setting)
-            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Unavailable))?;
+    let (facts, credential) = prepared_rotation(prepared, provider_kind)?
+        .preserving_credential_state()
+        .into_parts();
+    Ok(PreparedCredentialRotation::new(
+        facts,
+        Box::new(AutoHuntCommitGuard {
+            store: auto_hunt.clone(),
+            account_id,
+            setting: stored,
+            credential,
+        }),
+    ))
+}
+
+/// 续期参数只在凭据提交成功之后才落盘：准备阶段就写的话，CAS 冲突或数据库失败时
+/// 接口报了失败，后台却已经按新参数开始发真实请求（或已经把续期删掉）。
+struct AutoHuntCommitGuard {
+    store: crate::turn_state_auto_hunt::AutoHuntStore,
+    account_id: String,
+    setting: Option<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>>,
+    credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for AutoHuntCommitGuard {
+    fn finish(self: Box<Self>) {
+        let this = *self;
+        if let Some(setting) = this.setting
+            && let Err(error) = this.store.set(&this.account_id, setting)
+        {
+            // 凭据已经提交，这里无法再让接口失败；留下能定位的日志，管理员重新保存即可。
+            tracing::warn!(
+                target: "turn_state_hunt",
+                account_id = this.account_id.as_str(),
+                error = %error,
+                "state 自动续期参数保存失败，请重新保存"
+            );
+        }
+        this.credential.finish();
     }
-    prepared_rotation(prepared, provider_kind)
-        .map(PreparedCredentialRotation::preserving_credential_state)
 }
 
 #[derive(Deserialize)]

@@ -2226,6 +2226,32 @@ async fn turn_state_auto_hunt_lives_outside_the_credential_and_requires_the_pin_
     assert!(!data.contains_key("turn_state_auto_hunt"));
     assert!(prepared.facts().preserve_credential_state);
 
+    // 准备阶段不落盘：凭据提交若失败，接口报错的同时后台不能已经按新参数开始发请求。
+    let settings_file = config
+        ._runtime
+        .path()
+        .join("deploy")
+        .join("turn_state")
+        .join("auto_hunt.json");
+    assert!(!settings_file.exists());
+    // 只有提交成功后 Admin 才调用 finish，参数此时才生效。
+    prepared.into_parts().1.finish();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_file).unwrap()).unwrap();
+    assert_eq!(
+        saved,
+        json!({"acct_auto_hunt":{"model":"gpt-6-astra","attempts":5,"include_direct":true}})
+    );
+    // 文件损坏不能被当成「没人开启」：否则下一次保存会抹掉其它账号的设置。
+    std::fs::write(&settings_file, b"{ truncated").unwrap();
+    rotate(json!({"turn_state_auto_hunt":{"enabled":false}}))
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .finish();
+    assert_eq!(std::fs::read(&settings_file).unwrap(), b"{ truncated");
+
     // 关掉固定会一并清掉续期参数；此时凭据未提交固定开关，续期任务没有可做的事。
     rotate(json!({"pin_turn_state":false})).await.unwrap();
     assert!(

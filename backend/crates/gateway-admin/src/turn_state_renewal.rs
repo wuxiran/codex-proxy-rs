@@ -74,15 +74,16 @@ impl TurnStateRenewalTask {
             }
             // 前面账号的整轮遍历可能耗时数分钟；轮到这个账号时它可能已被停用、
             // 关了续期，或已经被别处续上。以此刻的事实为准，而不是周期开始时的名单。
-            let still_due = self
+            // 同时换用此刻的参数：管理员可能刚改了模型、次数或是否含直连。
+            let Some(renewal) = self
                 .accounts
                 .turn_state_renewals(SystemTime::now(), RENEWAL_MARGIN)
                 .await
-                .iter()
-                .any(|current| current.account_id == renewal.account_id);
-            if !still_due {
+                .into_iter()
+                .find(|current| current.account_id == renewal.account_id)
+            else {
                 continue;
-            }
+            };
             let account_id = renewal.account_id.clone();
             let stream = self
                 .accounts
@@ -110,9 +111,15 @@ impl TurnStateRenewalTask {
                 Ok(stream) => match stream.collect::<Vec<_>>().await.last() {
                     Some(TurnStateHuntEvent::Completed { success: true, .. }) => None,
                     Some(TurnStateHuntEvent::Failed {
-                        code: "account_rejected" | "account_unschedulable",
+                        code: "account_rejected",
                         ..
                     }) => Some(REJECTED_BACKOFF),
+                    // 停用是本地事实，不是上游的拒绝：不记退避。停用期间它本就不在到期名单里，
+                    // 管理员重新启用后应当立刻恢复续期，而不是被一段旧退避挡住。
+                    Some(TurnStateHuntEvent::Failed {
+                        code: "account_unschedulable",
+                        ..
+                    }) => continue,
                     _ => Some(MISS_BACKOFF),
                 },
             };

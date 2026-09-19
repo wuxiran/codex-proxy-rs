@@ -245,6 +245,11 @@ async fn hit_binds_the_egress_before_pinning_and_stops_probing() {
         .position(|event| *event == "provider.hunt_pin")
         .expect("state pinned");
     assert!(bind < pin);
+    // state 钉在探测到它的那个出口上，而不是「账号当时绑着的出口」。
+    assert_eq!(
+        *setup.provider.hunt_pinned_egress.lock().unwrap(),
+        Some(endpoint(8002))
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         TurnStateHuntEvent::Attempt { proxy_id: Some(id), length: Some(292), matched: false, .. } if id == "first"
@@ -694,4 +699,65 @@ async fn renewal_never_probes_an_account_that_was_disabled_meanwhile() {
     ));
     // 手动遍历不受此限：管理员可以诊断已停用的账号（此处没有脚本化回复，只验证能开始）。
     assert!(!changed(&setup.log));
+}
+
+/// 模型没容量、网关本地故障都与出口无关：不能拿它们当理由把所有代理打一遍。
+#[tokio::test]
+async fn capacity_and_local_failures_abort_instead_of_walking_every_egress() {
+    for (kind, code) in [
+        (
+            ProviderErrorKind::UpstreamCapacityUnavailable,
+            "upstream_capacity",
+        ),
+        (
+            ProviderErrorKind::ProviderInfrastructureUnavailable,
+            "system_error",
+        ),
+    ] {
+        let probe = ScriptedProbe::new([Reply::Rejected(kind)]);
+        let setup = setup(
+            probe.clone(),
+            vec![proxy("first", 8001, true), proxy("second", 8002, true)],
+            None,
+        )
+        .await;
+
+        let events = run(&setup, command(5, false)).await;
+
+        assert_eq!(probe.egresses(), vec![endpoint(8001)], "{kind:?}");
+        assert!(
+            matches!(events.last(), Some(TurnStateHuntEvent::Failed { code: actual, .. }) if *actual == code),
+            "{kind:?}"
+        );
+        assert!(!changed(&setup.log));
+    }
+}
+
+/// 续期途中账号被停用：同一出口上剩下的尝试也不再发，不只是「下一个出口前」才停。
+#[tokio::test]
+async fn renewal_stops_mid_egress_once_the_account_is_disabled() {
+    let probe = ScriptedProbe::new([Reply::NoState]);
+    let setup = setup(probe.clone(), vec![proxy("good", 8001, true)], None).await;
+    let store = setup.store.clone();
+    *probe.on_probe.lock().unwrap() = Some(Box::new(move || {
+        store.mutate_account(|account| account.enabled = false);
+    }));
+
+    let events = run(
+        &setup,
+        TurnStateHuntCommand {
+            require_schedulable: true,
+            ..command(5, false)
+        },
+    )
+    .await;
+
+    assert_eq!(probe.egresses().len(), 1);
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Failed {
+            code: "account_unschedulable",
+            ..
+        })
+    ));
 }

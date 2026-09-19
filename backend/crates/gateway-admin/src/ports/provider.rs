@@ -234,11 +234,15 @@ pub trait ProviderAdmin: Send + Sync {
     }
 
     /// 把刚观测到的 state 钉为账号级 state，返回其到期时间。
+    ///
+    /// `egress` 是发出这次探测的出口（`None` = 直连）。state 只对经同一出口发出的请求生效，
+    /// 所以绑定与钉住之间即使被并发改绑，也不会把它用到别的出口上。
     async fn turn_state_hunt_pin(
         &self,
         _ticket: &TurnStateHuntTicket,
         _response_headers: &[ProviderResponseHeader],
         _captured_at: SystemTime,
+        _egress: Option<&gateway_core::account::OutboundProxy>,
     ) -> Result<SystemTime, ProviderAdminError> {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }

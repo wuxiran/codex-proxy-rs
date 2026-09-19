@@ -84,6 +84,20 @@ export function useAccountEditor(options: {
     await loadConfiguration(accountId)
   }
 
+  /** 取消时服务端可能已经提交：稍等它收尾，再按实际状态刷新绑定与固定列表。 */
+  async function afterTurnStateHuntCancelled() {
+    const accountId = editingAccountId.value
+    if (!accountId)
+      return
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    if (editingAccountId.value !== accountId)
+      return
+    proxyMode.value = 'preserve'
+    proxyId.value = ''
+    void options.reloadAccounts()
+    await loadConfiguration(accountId)
+  }
+
   async function afterTurnStateHunt(boundChanged: boolean, autoRenew: TurnStateAutoHunt | null) {
     const accountId = editingAccountId.value
     if (!accountId)
@@ -214,6 +228,7 @@ export function useAccountEditor(options: {
     pinTurnState,
     savedPinTurnState,
     afterTurnStateHunt,
+    afterTurnStateHuntCancelled,
     turnStateAutoHunt,
     stopTurnStateAutoHunt: () => setTurnStateAutoHunt(null),
     recaptureTurnState,

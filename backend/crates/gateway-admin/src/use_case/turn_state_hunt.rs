@@ -271,14 +271,6 @@ impl Hunt {
 
     async fn try_egress(&mut self, egress: Egress, index: usize, total: usize) -> Outcome {
         let proxy_id = egress.view.proxy_id.clone();
-        if !self.still_schedulable().await {
-            self.fail(
-                "account_unschedulable",
-                "账号已停用或凭据已失效，续期已停止",
-            )
-            .await;
-            return Outcome::Stop;
-        }
         // 列表之后代理可能被删除、改地址或测试失效，逐个重新读取。
         let (probed, location) = match &proxy_id {
             None => (
@@ -321,6 +313,15 @@ impl Hunt {
         let mut skipped = None;
         while used < self.command.attempts {
             if self.events.is_closed() {
+                return Outcome::Stop;
+            }
+            // 每个请求前都核对：账号在遍历途中被停用后，连同一出口上剩下的尝试也不再发。
+            if !self.still_schedulable().await {
+                self.fail(
+                    "account_unschedulable",
+                    "账号已停用或凭据已失效，续期已停止",
+                )
+                .await;
                 return Outcome::Stop;
             }
             let captured_at = SystemTime::now();
@@ -402,11 +403,10 @@ impl Hunt {
                 }),
             })
             .await;
-            if class == FailureClass::Account {
+            if let Some((code, message)) = class.abort() {
                 self.log_egress(&egress.view, &lengths, false);
                 // 这些失败换出口也不会好，继续只会白耗额度。
-                self.fail("account_rejected", "上游拒绝了该账号的请求，遍历已中止")
-                    .await;
+                self.fail(code, message).await;
                 return Outcome::Stop;
             }
             failures += 1;
@@ -458,6 +458,14 @@ impl Hunt {
                 account_id = account_id.as_str(),
                 "遍历命中时页面已取消，未改动账号"
             );
+            return;
+        }
+        if !self.still_schedulable().await {
+            self.fail(
+                "account_unschedulable",
+                "账号已停用或凭据已失效，未改动账号",
+            )
+            .await;
             return;
         }
         // 遍历期间凭据被刷新或重新捕获，观测到的 state 不再属于当前凭据。
@@ -543,7 +551,12 @@ impl Hunt {
         .await;
         match self
             .provider
-            .turn_state_hunt_pin(&self.ticket, response_headers, captured_at)
+            .turn_state_hunt_pin(
+                &self.ticket,
+                response_headers,
+                captured_at,
+                probed.proxy.as_ref(),
+            )
             .await
         {
             Ok(expires_at) => {
@@ -637,7 +650,11 @@ fn not_sent_because_busy(error: &AccountProbeError) -> bool {
 enum FailureClass {
     /// 换出口也不会好：凭据失效、被封、额度耗尽、限流、模型不支持、请求本身不合法。
     Account,
-    /// 出口不通、被 Cloudflare 拦截、超时等：换一个出口再试。
+    /// 上游明确拒绝的是这个模型的容量。传输层已对它做过有界重试，逐个出口再打一遍没有意义。
+    Capacity,
+    /// 本机的账号存储、租约协调或凭据数据不可用，或请求被取消：与出口无关，整轮中止。
+    System,
+    /// 出口不通、被 Cloudflare 拦截、超时、返回了不合法的协议等：换一个出口再试。
     Egress,
 }
 
@@ -652,6 +669,16 @@ impl FailureClass {
                 | ProviderErrorKind::Unsupported
                 | ProviderErrorKind::InvalidRequest,
             ) => Self::Account,
+            Some(ProviderErrorKind::UpstreamCapacityUnavailable) => Self::Capacity,
+            Some(
+                ProviderErrorKind::ProviderInfrastructureUnavailable
+                | ProviderErrorKind::NoEligibleAccount
+                | ProviderErrorKind::ContinuationRecoveryRequired
+                | ProviderErrorKind::Cancelled
+                | ProviderErrorKind::ProcessTerminated,
+            ) => Self::System,
+            // 只剩与链路有关的类别：Transport / Timeout / Unavailable / Protocol，
+            // 以及本应在发出前就被当作「账号忙」处理掉的排队类。
             Some(_) => Self::Egress,
             // 没有 Provider 分类时只能看网关层；限流与不支持在那一层不会被折叠。
             None => match error.kind() {
@@ -667,7 +694,19 @@ impl FailureClass {
     const fn message(self) -> &'static str {
         match self {
             Self::Account => "上游拒绝了该账号的请求",
+            Self::Capacity => "上游该模型暂无容量",
+            Self::System => "网关本地错误，请求未能完成",
             Self::Egress => "经该出口的请求失败",
+        }
+    }
+
+    /// 需要中止整轮遍历时返回事件码与说明；出口类失败返回 `None`，换下一个出口。
+    const fn abort(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Account => Some(("account_rejected", "上游拒绝了该账号的请求，遍历已中止")),
+            Self::Capacity => Some(("upstream_capacity", "上游该模型暂无容量，稍后再试")),
+            Self::System => Some(("system_error", "网关本地错误，遍历已中止")),
+            Self::Egress => None,
         }
     }
 }

@@ -34,6 +34,7 @@ defineProps<{
 const emit = defineEmits<{
   save: []
   turnStateHunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
+  turnStateHuntCancelled: []
   stopTurnStateAutoHunt: []
 }>()
 
@@ -180,6 +181,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           :capture-rule="turnStateCaptureRule"
           @close="showStateHunt = false"
           @hunted="(boundChanged, autoRenew) => emit('turnStateHunted', boundChanged, autoRenew)"
+          @cancelled="emit('turnStateHuntCancelled')"
         />
         <AccountTurnStateHistory v-if="showStateHistory" :id="historyId" :account-id="account.id" :capture-rule="turnStateCaptureRule" @close="showStateHistory = false" />
       </section>

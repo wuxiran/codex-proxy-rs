@@ -681,9 +681,12 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 .expected_length(upstream_model.as_str())
         {
             let binding = crate::turn_state_pin::credential_binding(generation, oauth.access_token.expose_secret());
+            let egress = crate::turn_state_pin::egress_fingerprint(
+                active_account.outbound_proxy().map(|proxy| proxy.expose_url()),
+            );
             Some(turn_state_pins.attempt(
                 active_account.id().as_str(), binding, upstream_model.as_str(),
-                context.client_api_key_ref().as_str(), expected_length, SystemTime::now(),
+                context.client_api_key_ref().as_str(), expected_length, &egress, SystemTime::now(),
             ))
         } else { None };
         if let Some(value) = pin_attempt.as_ref().and_then(crate::turn_state_pin::PinAttempt::value) {

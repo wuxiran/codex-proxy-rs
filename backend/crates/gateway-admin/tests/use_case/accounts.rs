@@ -87,6 +87,8 @@ pub(super) struct FakeProviderAdmin {
     pub(super) hunt_binding: Mutex<Option<String>>,
     /// 续期任务每个周期看到的到期账号。
     pub(super) hunt_renewals: Mutex<Vec<gateway_admin::ports::provider::TurnStateRenewal>>,
+    /// 最近一次钉住 state 时传入的出口（外层 `None` = 还没钉过；内层 `None` = 直连）。
+    pub(super) hunt_pinned_egress: Mutex<Option<Option<String>>>,
 }
 
 impl FakeProviderAdmin {
@@ -113,6 +115,7 @@ impl FakeProviderAdmin {
             personal_info_barrier: Mutex::new(None),
             hunt_binding: Mutex::new(None),
             hunt_renewals: Mutex::new(Vec::new()),
+            hunt_pinned_egress: Mutex::new(None),
         })
     }
 
@@ -313,7 +316,10 @@ impl ProviderAdmin for FakeProviderAdmin {
         ticket: &gateway_admin::ports::provider::TurnStateHuntTicket,
         _: &[gateway_core::event::ProviderResponseHeader],
         captured_at: std::time::SystemTime,
+        egress: Option<&gateway_core::account::OutboundProxy>,
     ) -> Result<std::time::SystemTime, ProviderAdminError> {
+        *self.hunt_pinned_egress.lock().unwrap() =
+            Some(egress.map(gateway_core::account::OutboundProxy::endpoint));
         if self.hunt_binding.lock().unwrap().as_deref() != Some(ticket.binding()) {
             return Err(ProviderAdminError::new(ProviderAdminErrorKind::Conflict));
         }

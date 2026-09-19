@@ -5,23 +5,50 @@ mod implementation;
 use implementation::{CaptureRule, MAX_PIN_AGE, PinRejected, TurnStatePins, credential_binding};
 use std::time::{Duration, SystemTime};
 
+/// 多数用例不关心出口；账号级 state 与请求走同一个出口。
+const EGRESS: &str = "egress-a";
+
 #[test]
 fn pins_require_success_are_immutable_and_expire_without_sliding() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
     let binding = credential_binding("generation", "access-token");
-    let mut failed = pins.attempt("account", binding.clone(), "model", "client", 292, now);
+    let mut failed = pins.attempt(
+        "account",
+        binding.clone(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
     failed.observe(Some(&"f".repeat(292)));
     drop(failed);
     assert!(pins.status("account", &binding, now).is_empty());
-    let mut first = pins.attempt("account", binding.clone(), "model", "client", 292, now);
+    let mut first = pins.attempt(
+        "account",
+        binding.clone(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
     first.observe(Some(&"b".repeat(312)));
     first.completed(now);
     assert!(pins.status("account", &binding, now).is_empty());
     first.observe(Some(&"a".repeat(292)));
     first.completed(now);
     let later = now + Duration::from_secs(3599);
-    let mut second = pins.attempt("account", binding.clone(), "model", "client", 292, later);
+    let mut second = pins.attempt(
+        "account",
+        binding.clone(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        later,
+    );
     assert_eq!(second.value(), Some("a".repeat(292).as_str()));
     second.observe(Some(&"c".repeat(292)));
     second.completed(later);
@@ -37,6 +64,7 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
             "model",
             "client",
             292,
+            EGRESS,
             now + MAX_PIN_AGE
         )
         .value()
@@ -49,7 +77,15 @@ fn pins_separate_account_model_client_and_credential_and_can_be_cleared() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
     let binding = credential_binding("first", "token");
-    let mut first = pins.attempt("account", binding.clone(), "model", "client", 292, now);
+    let mut first = pins.attempt(
+        "account",
+        binding.clone(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
     first.observe(Some(&"a".repeat(292)));
     first.completed(now);
     for (account, epoch, model, client) in [
@@ -70,7 +106,7 @@ fn pins_separate_account_model_client_and_credential_and_can_be_cleared() {
         ),
     ] {
         assert!(
-            pins.attempt(account, epoch, model, client, 292, now)
+            pins.attempt(account, epoch, model, client, 292, EGRESS, now)
                 .value()
                 .is_none()
         );
@@ -85,18 +121,50 @@ fn pins_separate_account_model_client_and_credential_and_can_be_cleared() {
 fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expired_state() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
-    let mut first = pins.attempt("account", "binding".to_owned(), "model", "client", 292, now);
-    let mut second = pins.attempt("account", "binding".to_owned(), "model", "client", 292, now);
+    let mut first = pins.attempt(
+        "account",
+        "binding".to_owned(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
+    let mut second = pins.attempt(
+        "account",
+        "binding".to_owned(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
     first.observe(Some(&"a".repeat(292)));
     second.observe(Some(&"b".repeat(292)));
     second.completed(now);
     first.completed(now);
     assert_eq!(
-        pins.attempt("account", "binding".to_owned(), "model", "client", 292, now)
-            .value(),
+        pins.attempt(
+            "account",
+            "binding".to_owned(),
+            "model",
+            "client",
+            292,
+            EGRESS,
+            now
+        )
+        .value(),
         Some("b".repeat(292).as_str())
     );
-    let mut late = pins.attempt("account", "binding".to_owned(), "model", "client", 292, now);
+    let mut late = pins.attempt(
+        "account",
+        "binding".to_owned(),
+        "model",
+        "client",
+        292,
+        EGRESS,
+        now,
+    );
     late.observe(Some(&"c".repeat(292)));
     late.completed(now + MAX_PIN_AGE);
     assert!(
@@ -111,30 +179,71 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
     let now = SystemTime::now();
     let binding = credential_binding("generation", "token");
     for model in ["astra", "terra"] {
-        let mut own = pins.attempt("account", binding.clone(), model, "client-a", 332, now);
+        let mut own = pins.attempt(
+            "account",
+            binding.clone(),
+            model,
+            "client-a",
+            332,
+            EGRESS,
+            now,
+        );
         own.observe(Some(&"o".repeat(332)));
         own.completed(now);
     }
     let hunted = "h".repeat(332);
-    pins.pin_account_wide("account", binding.clone(), "astra", 332, &hunted, now, now)
-        .unwrap();
+    pins.pin_account_wide(
+        "account",
+        binding.clone(),
+        "astra",
+        332,
+        EGRESS.into(),
+        &hunted,
+        now,
+        now,
+    )
+    .unwrap();
     // 旧出口上捕获的客户端级 state 被替换，其它模型不受影响。
     for client in ["client-a", "client-b"] {
         assert_eq!(
-            pins.attempt("account", binding.clone(), "astra", client, 332, now)
-                .value(),
+            pins.attempt(
+                "account",
+                binding.clone(),
+                "astra",
+                client,
+                332,
+                EGRESS,
+                now
+            )
+            .value(),
             Some(hunted.as_str())
         );
     }
     assert_eq!(
-        pins.attempt("account", binding.clone(), "terra", "client-a", 332, now)
-            .value(),
+        pins.attempt(
+            "account",
+            binding.clone(),
+            "terra",
+            "client-a",
+            332,
+            EGRESS,
+            now
+        )
+        .value(),
         Some("o".repeat(332).as_str())
     );
     assert!(
-        pins.attempt("account", binding.clone(), "terra", "client-b", 332, now)
-            .value()
-            .is_none()
+        pins.attempt(
+            "account",
+            binding.clone(),
+            "terra",
+            "client-b",
+            332,
+            EGRESS,
+            now
+        )
+        .value()
+        .is_none()
     );
     let status = pins.status("account", &binding, now);
     let astra: Vec<_> = status.iter().filter(|pin| pin.model == "astra").collect();
@@ -154,13 +263,14 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             "astra",
             "c",
             332,
+            EGRESS,
             now
         )
         .value()
         .is_none()
     );
     assert!(
-        pins.attempt("account", binding, "astra", "c", 356, now)
+        pins.attempt("account", binding, "astra", "c", 356, EGRESS, now)
             .value()
             .is_none()
     );
@@ -171,23 +281,40 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
     let hunted = "h".repeat(332);
-    pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
-        .unwrap();
+    pins.pin_account_wide(
+        "account",
+        "binding".into(),
+        "astra",
+        332,
+        EGRESS.into(),
+        &hunted,
+        now,
+        now,
+    )
+    .unwrap();
     assert_eq!(
-        pins.account_wide_captured_at("account", "binding", "astra", 332, now),
+        pins.account_wide_captured_at("account", "binding", "astra", 332, EGRESS, now),
         Some(now)
     );
     assert!(
-        pins.account_wide_captured_at("account", "binding", "terra", 332, now)
+        pins.account_wide_captured_at("account", "binding", "terra", 332, EGRESS, now)
             .is_none()
     );
     // 长度规则变了的旧 state 对续期来说等于没有。
     assert!(
-        pins.account_wide_captured_at("account", "binding", "astra", 356, now)
+        pins.account_wide_captured_at("account", "binding", "astra", 356, EGRESS, now)
             .is_none()
     );
     let later = now + Duration::from_secs(3599);
-    let mut reuse = pins.attempt("account", "binding".into(), "astra", "client", 332, later);
+    let mut reuse = pins.attempt(
+        "account",
+        "binding".into(),
+        "astra",
+        "client",
+        332,
+        EGRESS,
+        later,
+    );
     assert_eq!(reuse.value(), Some(hunted.as_str()));
     reuse.observe(Some(&"n".repeat(332)));
     reuse.completed(later);
@@ -200,6 +327,7 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
             "astra",
             "client",
             332,
+            EGRESS,
             now + MAX_PIN_AGE
         )
         .value()
@@ -213,18 +341,96 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
 fn request_in_flight_during_a_hunt_cannot_shadow_the_account_wide_pin() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
-    let mut in_flight = pins.attempt("account", "binding".into(), "astra", "client", 332, now);
+    let mut in_flight = pins.attempt(
+        "account",
+        "binding".into(),
+        "astra",
+        "client",
+        332,
+        EGRESS,
+        now,
+    );
     assert!(in_flight.value().is_none());
     let hunted = "h".repeat(332);
-    pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
-        .unwrap();
+    pins.pin_account_wide(
+        "account",
+        "binding".into(),
+        "astra",
+        332,
+        EGRESS.into(),
+        &hunted,
+        now,
+        now,
+    )
+    .unwrap();
     in_flight.observe(Some(&"o".repeat(332)));
     in_flight.completed(now);
     assert_eq!(pins.status("account", "binding", now).len(), 1);
     assert_eq!(
-        pins.attempt("account", "binding".into(), "astra", "client", 332, now)
-            .value(),
+        pins.attempt(
+            "account",
+            "binding".into(),
+            "astra",
+            "client",
+            332,
+            EGRESS,
+            now
+        )
+        .value(),
         Some(hunted.as_str())
+    );
+}
+
+/// 账号级 state 只属于探测到它的出口：账号被改绑到别处后不再使用，续期也视其为缺失。
+#[test]
+fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let hunted = "h".repeat(332);
+    pins.pin_account_wide(
+        "account",
+        "binding".into(),
+        "astra",
+        332,
+        EGRESS.into(),
+        &hunted,
+        now,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        pins.attempt(
+            "account",
+            "binding".into(),
+            "astra",
+            "client",
+            332,
+            EGRESS,
+            now
+        )
+        .value(),
+        Some(hunted.as_str())
+    );
+    assert!(
+        pins.attempt(
+            "account",
+            "binding".into(),
+            "astra",
+            "client",
+            332,
+            "egress-b",
+            now
+        )
+        .value()
+        .is_none()
+    );
+    assert!(
+        pins.account_wide_captured_at("account", "binding", "astra", 332, "egress-b", now)
+            .is_none()
+    );
+    assert_ne!(
+        implementation::egress_fingerprint(None),
+        implementation::egress_fingerprint(Some("http://127.0.0.1:1"))
     );
 }
 
@@ -234,7 +440,16 @@ fn account_wide_pin_rejects_wrong_length_non_ascii_and_stale_captures() {
     let now = SystemTime::now();
     for value in ["s".repeat(331), format!("{} ", "s".repeat(331))] {
         assert_eq!(
-            pins.pin_account_wide("account", "binding".into(), "astra", 332, &value, now, now),
+            pins.pin_account_wide(
+                "account",
+                "binding".into(),
+                "astra",
+                332,
+                EGRESS.into(),
+                &value,
+                now,
+                now
+            ),
             Err(PinRejected::Length)
         );
     }
@@ -244,6 +459,7 @@ fn account_wide_pin_rejects_wrong_length_non_ascii_and_stale_captures() {
             "binding".into(),
             "astra",
             332,
+            EGRESS.into(),
             &"s".repeat(332),
             now,
             now + MAX_PIN_AGE
@@ -274,8 +490,15 @@ fn team_capture_rule_is_model_specific_and_pro_stays_292() {
             assert_eq!(rule.expected_length(model), Some(expected));
             for length in [292, 312, 332, 356] {
                 let pins = TurnStatePins::default();
-                let mut attempt =
-                    pins.attempt("account", "binding".into(), model, "client", expected, now);
+                let mut attempt = pins.attempt(
+                    "account",
+                    "binding".into(),
+                    model,
+                    "client",
+                    expected,
+                    EGRESS,
+                    now,
+                );
                 attempt.observe(Some(&"s".repeat(length)));
                 // metadata 符合长度也须等请求完整成功。
                 assert!(pins.status("account", "binding", now).is_empty());
@@ -292,6 +515,7 @@ fn team_capture_rule_is_model_specific_and_pro_stays_292() {
                             model,
                             "client",
                             expected + 1,
+                            EGRESS,
                             now
                         )
                         .value()

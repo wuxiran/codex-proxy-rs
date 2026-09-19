@@ -59,6 +59,7 @@ export function useAccountTurnStateHunt() {
         break
       }
       case 'attempt':
+        // 这里数的是探测尝试；其中在本地就失败的并没有发往上游，准确的请求数以结束事件为准。
         requests.value += 1
         row(event.proxyId)?.attempts.push({
           index: event.index,
@@ -138,7 +139,7 @@ export function useAccountTurnStateHunt() {
       return
     close()
     status.value = 'cancelled'
-    message.value = '已取消；已发出的请求不会撤回，但即使它随后命中也不会改动账号'
+    message.value = '已取消。若取消的瞬间恰好命中，服务端可能已经完成绑定与钉住——下方已按服务端的实际状态刷新，请以它为准'
   }
 
   onScopeDispose(close)

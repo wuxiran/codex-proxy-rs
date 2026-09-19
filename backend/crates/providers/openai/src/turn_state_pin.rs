@@ -66,6 +66,9 @@ struct PinnedState {
     value: String,
     captured_at: SystemTime,
     hits: u64,
+    /// 账号级 state 是在哪个出口上观测到的；只对同一出口发出的请求生效。
+    /// 客户端级 state 由真实流量被动捕获，不区分出口，恒为 `None`。
+    egress: Option<String>,
 }
 
 impl PinnedState {
@@ -95,7 +98,15 @@ pub(crate) enum PinRejected {
     Full,
 }
 
+/// 出口的稳定指纹：代理地址含凭据，不在更多地方保留原文。
+pub(crate) fn egress_fingerprint(proxy_url: Option<&str>) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(proxy_url.unwrap_or("direct").as_bytes()))
+}
+
 impl TurnStatePins {
+    // 作用域的每个分量都是独立事实，打包成结构体只会多一层无意义的搬运。
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn attempt(
         &self,
         account: &str,
@@ -103,6 +114,7 @@ impl TurnStatePins {
         model: &str,
         client: &str,
         expected_length: usize,
+        egress: &str,
         now: SystemTime,
     ) -> PinAttempt {
         let scope = Scope {
@@ -125,6 +137,11 @@ impl TurnStatePins {
                 &account_wide
             };
             let pin = pins.get_mut(key)?;
+            // 账号级 state 只属于探测到它的那个出口：账号之后被改绑到别处（包括钉住
+            // 前后那一瞬间的并发改绑）就不再使用，等续期在新出口上重新找。
+            if pin.egress.as_deref().is_some_and(|probed| probed != egress) {
+                return None;
+            }
             pin.hits = pin.hits.saturating_add(1);
             Some(pin.value.clone())
         });
@@ -167,6 +184,7 @@ impl TurnStatePins {
         binding: String,
         model: &str,
         expected_length: usize,
+        egress: String,
         value: &str,
         captured_at: SystemTime,
         now: SystemTime,
@@ -200,6 +218,7 @@ impl TurnStatePins {
                 value: value.to_owned(),
                 captured_at,
                 hits: 0,
+                egress: Some(egress),
             },
         );
         Ok(())
@@ -215,10 +234,12 @@ impl TurnStatePins {
         binding: &str,
         model: &str,
         expected_length: usize,
+        egress: &str,
         now: SystemTime,
     ) -> Option<SystemTime> {
         self.0.lock().ok()?.iter().find_map(|(scope, pin)| {
             (scope.client.is_none()
+                && pin.egress.as_deref() == Some(egress)
                 && scope.account == account
                 && scope.binding == binding
                 && scope.model == model
@@ -291,6 +312,7 @@ impl PinAttempt {
                     value,
                     captured_at: self.started_at,
                     hits: 0,
+                    egress: None,
                 });
             }
         }
