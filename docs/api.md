@@ -338,7 +338,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts` | `page`、`pageSize`、`provider`、`groupId`、`search`、`status`、排序字段 | 分页查询账号与汇总 |
 | `GET` | `/api/admin/accounts/detail` | `accountId` | 查询账号详情、额度和本地用量 |
 | `GET` | `/api/admin/accounts/export` | `accountIds`、`confirm=export_sensitive_accounts` | 显式导出最多 200 个账号的敏感 Provider 文档 |
-| `POST` | `/api/admin/accounts/import` | `{ provider, data, settings?, outboundProxyId? }` | 导入或按上游身份更新账号，可同时应用调度、分组设置与默认代理 |
+| `POST` | `/api/admin/accounts/import` | `{ provider, data, settings?, outboundProxyId? }` | 导入或按上游身份更新账号，可同时应用调度、分组设置与默认代理。OpenAI 的 `data` 可以是观澜 CDK 文档 `{ cdks: ["CDK-..."] }`，网关会兑换并导入已签名账号包 |
 | `POST` | `/api/admin/accounts/import-tasks` | `{ submissionId, items: [{ provider, data, settings?, outboundProxyId? }] }` | 接受后台导入，返回 HTTP 202 和任务摘要 |
 | `GET` | `/api/admin/accounts/import-tasks` | 无 | 当前管理员仍保留的任务，按创建时间倒序 |
 | `GET` | `/api/admin/accounts/import-tasks/detail` | `taskId` | 任务摘要和逐条结果，不含原始凭据 |
@@ -675,10 +675,16 @@ OAuth start 使用：
 - 账号详情的 Token 统计、模型排行和列表 Token 汇总优先使用账号级周额度窗口，无可统计的周窗口时
   使用月额度窗口；`usage.windowLabelDisplay` 随选中的窗口返回“周额度窗口”或“月额度窗口”。查询边界
   严格为 `[resetAt - windowSeconds, resetAt)`，不是自然周/月或最近 7/30 天；额度刷新若返回了更早的
-  重置时间，会按新边界重新聚合。没有边界完整、可归属到账号的周/月窗口时显示无数据，标签为
-  “周/月额度窗口”，不回退到 5 小时、日窗口或历史累计。
+  重置时间，会按新边界重新聚合。已提供额度窗口但没有边界完整、可归属到账号的周/月窗口时显示无数据，
+  标签为“周/月额度窗口”，不回退到 5 小时、日窗口或历史累计。
+  OAuth 账号尚无任何额度窗口时，`usage` 返回账号创建后仍保留的本地请求累计，标签为“本地累计”；
+  API Key 账号保持相同的本地累计口径和“通用额度”标签。上游额度未知不影响已有消费金额的展示，
+  金额缺失保持未知，已知零金额与未知分开呈现。
   金额原值保持完整精度，USD 展示值
   小于 1 美元时最多保留四位小数，其余保留两位。
+  账号列表「用量」列在已有 Token 汇总外，同时展示本机记录的 USD 已用金额；
+  若当前额度窗口 `usedPercent` 大于 0，再按 `已用 × 100 / usedPercent` 给出近似额度，
+  供对照官方使用率，不代表 OpenAI 账单或站外消耗。
 
 ### 周/月额度预测
 

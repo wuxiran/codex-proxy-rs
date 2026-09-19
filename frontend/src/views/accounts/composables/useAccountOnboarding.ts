@@ -4,7 +4,10 @@ import { computed, ref, shallowRef, watch } from 'vue'
 import {
   completeAccountOAuth,
   createAccountImportTask,
+  GuanlanCdkError,
   importAccounts,
+  parseGuanlanCdkCodes,
+  redeemGuanlanCdks,
   startAccountOAuth,
 } from '@/api'
 import { toast } from '@/components/base/BaseToast'
@@ -89,7 +92,11 @@ export function useAccountOnboarding(options: {
         }
         const documents = createForm.value.provider === 'batch'
           ? parseMixedImportDocuments(parseImportJson(createForm.value.importTexts.json))
-          : accountImportDocuments(requireImportProvider(createForm.value.provider), mode, createForm.value.importTexts[mode])
+          : await accountImportDocuments(
+              requireImportProvider(createForm.value.provider),
+              mode,
+              createForm.value.importTexts[mode],
+            )
         if (documents.length > MAX_TOKEN_IMPORT_COUNT)
           throw new Error(`单次最多导入 ${MAX_TOKEN_IMPORT_COUNT} 个条目`)
         submissionId ??= generateRequestId()
@@ -214,7 +221,7 @@ export function useAccountOnboarding(options: {
         ...createForm.value,
         mode: createForm.value.provider === 'batch' ? 'json' : 'oauth',
         apiKey: emptyApiKeyAccountForm(),
-        importTexts: { access_token: '', refresh_token: '', json: '' },
+        importTexts: { access_token: '', refresh_token: '', json: '', cdk: '' },
         oauthFlowId: '',
         oauthAuthUrl: '',
         oauthCallback: '',
@@ -249,6 +256,30 @@ export function useAccountOnboarding(options: {
   }
 }
 
+function isSub2apiAccountExport(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value))
+    return false
+  const nested = isRecord(value.data) ? value.data : null
+  const accounts = Array.isArray(value.accounts)
+    ? value.accounts
+    : nested && Array.isArray(nested.accounts)
+      ? nested.accounts
+      : null
+  if (!Array.isArray(accounts) || accounts.length === 0)
+    return false
+  return accounts.some((account) => {
+    if (!isRecord(account))
+      return false
+    const platform = typeof account.platform === 'string' ? account.platform : typeof account.provider === 'string' ? account.provider : ''
+    const kind = typeof account.type === 'string' ? account.type : ''
+    return platform.toLowerCase() === 'openai'
+      || platform.toLowerCase() === 'codex'
+      || kind.toLowerCase() === 'oauth'
+      || kind.toLowerCase() === 'openai'
+      || kind.toLowerCase() === 'codex'
+  })
+}
+
 function parseImportJson(value: string) {
   try {
     return JSON.parse(value)
@@ -264,15 +295,29 @@ function requireImportProvider(value: string): ImportProvider {
   throw new Error('请选择要导入的账号平台')
 }
 
-function accountImportDocuments(
+async function accountImportDocuments(
   provider: ImportProvider,
   mode: string,
   value: string,
-): MixedImportDocument[] {
+): Promise<MixedImportDocument[]> {
+  if (provider === 'openai' && mode === 'cdk')
+    return [{ provider, document: await redeemGuanlanImport(value) }]
   if (provider === 'openai' && isOpenAiTokenImportMode(mode)) {
     return parseOpenAiTokenImport(value, mode).map(document => ({ provider, document }))
   }
   return providerImportDocuments(parseImportJson(value), provider)
+}
+
+async function redeemGuanlanImport(value: string) {
+  const cdks = parseGuanlanCdkCodes(value)
+  try {
+    return await redeemGuanlanCdks(cdks)
+  }
+  catch (error) {
+    if (error instanceof GuanlanCdkError && error.network)
+      return { cdks }
+    throw error
+  }
 }
 
 function parseOpenAiTokenImport(value: string, mode: OpenAiTokenImportMode) {
@@ -296,6 +341,11 @@ function isOpenAiTokenImportMode(value: string): value is OpenAiTokenImportMode 
 }
 
 function providerImportDocuments(value: unknown, provider: ImportProvider): MixedImportDocument[] {
+  if (isSub2apiAccountExport(value)) {
+    if (provider !== 'openai')
+      throw new Error('Sub2API 导出只包含 OpenAI / Codex 账号，请选择 OpenAI')
+    return [{ provider: 'openai', document: value }]
+  }
   if (isRecord(value) && Array.isArray(value.documents)) {
     const documents = parseMixedImportDocuments(value)
       .filter(entry => entry.provider === provider)
@@ -311,8 +361,10 @@ function providerImportDocuments(value: unknown, provider: ImportProvider): Mixe
 }
 
 function parseMixedImportDocuments(value: unknown): MixedImportDocument[] {
+  if (isSub2apiAccountExport(value))
+    return [{ provider: 'openai', document: value }]
   if (!isRecord(value) || !Array.isArray(value.documents))
-    throw new Error('批量导入文件必须是 CPR 多平台导出文件')
+    throw new Error('批量导入文件必须是 CPR 多平台导出或 Sub2API 账号导出')
 
   const documents: MixedImportDocument[] = []
   for (const entry of value.documents) {

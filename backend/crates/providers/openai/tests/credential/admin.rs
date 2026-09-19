@@ -57,6 +57,47 @@ async fn sub2api_import_resolves_distinct_proxy_bindings_and_encodes_credentials
 }
 
 #[tokio::test]
+async fn sub2api_top_level_export_with_revive_manifest_imports() {
+    let service = CodexCredentialAdminService::new(
+        Arc::new(UnusedRefresher),
+        Arc::new(TestLeaseCoordinator::default()),
+        runtime_policy(),
+    );
+    let prepared = service
+        .prepare_import_document(serde_json::json!({
+            "exported_at": "2026-09-17T09:23:33.325693Z",
+            "proxies": [],
+            "x_revive_manifest": {
+                "signature": "test-signature",
+                "source": "cdk_redeem"
+            },
+            "accounts": [{
+                "name": "paezoastridj77+mj5@gmail.com",
+                "platform": "openai",
+                "type": "oauth",
+                "group_ids": [4],
+                "extra": {"source": "sub2api"},
+                "credentials": {
+                    "access_token": test_jwt(serde_json::json!({
+                        "https://api.openai.com/auth": {"chatgpt_user_id": "user-sub2api"}
+                    })),
+                    "refresh_token": "rt-sub2api",
+                    "email": "paezoastridj77+mj5@gmail.com",
+                    "plan_type": "self_serve_business_prolite"
+                }
+            }]
+        }))
+        .await
+        .unwrap();
+    assert_eq!(prepared.accounts().len(), 1);
+    assert_eq!(
+        prepared.accounts()[0].account.name(),
+        "paezoastridj77+mj5@gmail.com"
+    );
+    assert!(prepared.accounts()[0].account.outbound_proxy().is_none());
+}
+
+#[tokio::test]
 async fn import_default_proxy_preserves_explicit_account_exits() {
     let service = CodexCredentialAdminService::new(
         Arc::new(UnusedRefresher),

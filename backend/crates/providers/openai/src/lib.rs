@@ -17,10 +17,10 @@ use gateway_core::task::WorkerContribution;
 use crate::admin::{OpenAiAdminProvider, OpenAiAdminServices, OpenAiOAuthPendingStore};
 use crate::credential::token_client::{AuthorizationCodeExchanger, TokenRefresher};
 use crate::credential::{
-    CodexCookiePolicy, CodexCredentialAdmin, CodexCredentialAdminService,
+    CodexCdkClient, CodexCookiePolicy, CodexCredentialAdmin, CodexCredentialAdminService,
     CodexCredentialCatalogService, CodexCredentialProfileService, CodexCredentialQuotaService,
     CodexCredentialRefreshService, CodexCredentialRepository, CodexCredentialSelector,
-    CodexOAuthAdmin, CodexOAuthAdminService,
+    CodexOAuthAdmin, CodexOAuthAdminService, CodexReviveService,
 };
 use crate::transport::profile::{
     CodexArtifactProfileCache, CodexDesktopReleaseService, OfficialCodexDesktopReleaseTransport,
@@ -155,13 +155,28 @@ pub async fn initialize(
     );
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client.clone();
+    let revive = CodexReviveService::new(
+        config.revive_data_dir().to_path_buf(),
+        config.revive_settings().clone(),
+        repository.clone(),
+    )
+    .map(|service| Arc::new(service))
+    .map_err(|_| OpenAiInitializeError::Transport)?;
+    let cdk = CodexCdkClient::new(
+        config.cdk_data_dir().to_path_buf(),
+        config.cdk_settings().clone(),
+    )
+    .map(Arc::new)
+    .map_err(|_| OpenAiInitializeError::Transport)?;
     let credential_admin = Arc::new(
         CodexCredentialAdminService::new(
             Arc::clone(&refresher),
             Arc::clone(&leases),
             Arc::clone(&runtime_policy),
         )
-        .with_personal_access_token_client(token_client),
+        .with_personal_access_token_client(token_client)
+        .with_revive_exports(Arc::clone(&revive))
+        .with_cdk_client(cdk),
     );
     let refresh = Arc::new(CodexCredentialRefreshService::new(
         repository,
@@ -205,6 +220,7 @@ pub async fn initialize(
         config.quota_refresh_policy(),
         config.oauth_refresh_enabled(),
         desktop_release,
+        revive,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
 

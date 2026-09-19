@@ -25,7 +25,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::api_key::{ApiKeyCredentialData, ApiKeyTransport, CODEX_AUTHENTICATION_KIND_API_KEY};
+use super::cdk::{CodexCdkClient, CodexCdkError, extract_cdk_codes};
 use super::recovery_log::{CodexOAuthRecoveryOperation, record_oauth_recovery};
+use super::revive::CodexReviveService;
 use super::security::CodexCredentialCodec;
 use super::token_client::{
     OpenAiTokenClient, PersonalAccessTokenError, RefreshFailure, TokenRefresher,
@@ -382,6 +384,8 @@ pub enum CodexCredentialAdminError {
     },
     #[error("Codex refresh send state is ambiguous")]
     RefreshAmbiguous { message: Option<String> },
+    #[error("CDK redeem failed")]
+    CdkRedeem { message: String },
 }
 
 impl CodexCredentialAdminError {
@@ -398,7 +402,16 @@ impl CodexCredentialAdminError {
             | Self::NotFound
             | Self::MissingRefreshToken
             | Self::RefreshLeaseUnavailable
-            | Self::RefreshUnavailable => None,
+            | Self::RefreshUnavailable
+            | Self::CdkRedeem { .. } => None,
+        }
+    }
+}
+
+impl From<CodexCdkError> for CodexCredentialAdminError {
+    fn from(error: CodexCdkError) -> Self {
+        Self::CdkRedeem {
+            message: error.public_message().to_owned(),
         }
     }
 }
@@ -819,6 +832,8 @@ pub struct CodexCredentialAdminService {
     personal_access_token_client: Option<Arc<OpenAiTokenClient>>,
     leases: Arc<dyn ProviderLeasePort>,
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+    revive: Option<Arc<CodexReviveService>>,
+    cdk: Option<Arc<CodexCdkClient>>,
 }
 
 impl fmt::Debug for CodexCredentialAdminService {
@@ -832,6 +847,8 @@ impl fmt::Debug for CodexCredentialAdminService {
             )
             .field("leases", &"ProviderLeasePort")
             .field("runtime_policy", &"ProviderRuntimePolicyPort")
+            .field("revive", &self.revive.is_some())
+            .field("cdk", &self.cdk.is_some())
             .finish()
     }
 }
@@ -847,6 +864,8 @@ impl CodexCredentialAdminService {
             personal_access_token_client: None,
             leases,
             runtime_policy,
+            revive: None,
+            cdk: None,
         }
     }
 
@@ -855,6 +874,33 @@ impl CodexCredentialAdminService {
     pub fn with_personal_access_token_client(mut self, client: Arc<OpenAiTokenClient>) -> Self {
         self.personal_access_token_client = Some(client);
         self
+    }
+
+    #[must_use]
+    pub fn with_revive_exports(mut self, revive: Arc<CodexReviveService>) -> Self {
+        self.revive = Some(revive);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cdk_client(mut self, cdk: Arc<CodexCdkClient>) -> Self {
+        self.cdk = Some(cdk);
+        self
+    }
+
+    async fn expand_cdk_document(
+        &self,
+        payload: Value,
+    ) -> Result<Value, CodexCredentialAdminError> {
+        let Some(codes) = extract_cdk_codes(&payload)? else {
+            return Ok(payload);
+        };
+        let Some(cdk) = &self.cdk else {
+            return Err(CodexCredentialAdminError::CdkRedeem {
+                message: "CDK 兑换未配置".to_owned(),
+            });
+        };
+        Ok(cdk.redeem_export(&codes).await?)
     }
 
     /// 官方 RT exchange；结果由 App 在同一 revision/audit 事务中提交。
@@ -982,6 +1028,15 @@ impl CodexCredentialAdminService {
             > MAX_IMPORT_DOCUMENT_BYTES
         {
             return Err(CodexCredentialAdminError::InvalidInput);
+        }
+        let payload = self.expand_cdk_document(payload).await?;
+        if let Some(revive) = &self.revive
+            && let Err(error) = revive.record_signed_document(&payload)
+        {
+            tracing::warn!(
+                error = %error,
+                "signed Codex export could not be archived for 401 revive"
+            );
         }
         let candidates = parse_import_document(&payload, default_proxy)?;
         if candidates.is_empty() || candidates.len() > MAX_BATCH {
