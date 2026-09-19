@@ -19,15 +19,20 @@ pub struct ResponseMeta {
     response_id: String,
     model: Option<String>,
     finish_reason: Option<FinishReason>,
+    observed_model: Option<String>,
+    billing_model: Option<String>,
 }
 
 impl ResponseMeta {
     /// 创建响应元数据。
     #[must_use]
     pub fn new(response_id: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
         Self {
+            observed_model: Some(model.clone()),
+            billing_model: None,
             response_id: response_id.into(),
-            model: Some(model.into()),
+            model: Some(model),
             finish_reason: None,
         }
     }
@@ -38,8 +43,34 @@ impl ResponseMeta {
         Self {
             response_id: response_id.into(),
             model: None,
+            observed_model: None,
+            billing_model: None,
             finish_reason: None,
         }
+    }
+
+    /// 单独保留上游实际回显，避免协议 fallback 被误记为观测模型。
+    #[must_use]
+    pub fn with_observed_model(mut self, model: Option<&str>) -> Self {
+        self.observed_model = model.filter(|model| !model.is_empty()).map(str::to_owned);
+        self
+    }
+
+    /// 标记本次价格计算实际使用的模型。
+    #[must_use]
+    pub fn with_billing_model(mut self, model: Option<String>) -> Self {
+        self.billing_model = model;
+        self
+    }
+
+    #[must_use]
+    pub fn observed_model(&self) -> Option<&str> {
+        self.observed_model.as_deref()
+    }
+
+    #[must_use]
+    pub fn billing_model(&self) -> Option<&str> {
+        self.billing_model.as_deref()
     }
 
     /// 设置终止原因。

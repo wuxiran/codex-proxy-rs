@@ -490,6 +490,7 @@ fn provider_call_metadata(
         selected.account_id().clone(),
         UpstreamTransport::new(HTTP_SSE_TRANSPORT).map_err(|_| protocol_not_sent())?,
     )
+    .with_outbound_proxy(selected.binding().outbound_proxy())
     .with_selection_observation(ProviderSelectionObservation::new(
         account_selection_wait_ms,
         selected.capacity_snapshot(),

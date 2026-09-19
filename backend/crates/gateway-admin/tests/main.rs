@@ -167,6 +167,7 @@ fn representative_quota_should_prefer_account_wide_window_over_model_specific_wi
 #[test]
 fn usage_window_should_not_use_daily_rolling_usage_for_weekly_statistics() {
     let usage = AccountUsage {
+        billing: Default::default(),
         account_id: "acct_xai".to_owned(),
         request_count: 5,
         success_count: 5,

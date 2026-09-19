@@ -315,6 +315,7 @@ fn valid_compaction_summary(marker: &str) -> String {
 }
 
 struct StubSelector {
+    proxy: Option<gateway_core::account::OutboundProxy>,
     calls: AtomicUsize,
     feedback: Mutex<Vec<GrokCredentialFailure>>,
     error: Mutex<Option<GrokSessionSelectorError>>,
@@ -325,6 +326,7 @@ struct StubSelector {
 impl StubSelector {
     fn success() -> Arc<Self> {
         Arc::new(Self {
+            proxy: None,
             calls: AtomicUsize::new(0),
             feedback: Mutex::new(Vec::new()),
             error: Mutex::new(None),
@@ -335,6 +337,7 @@ impl StubSelector {
 
     fn failing(error: GrokSessionSelectorError) -> Arc<Self> {
         Arc::new(Self {
+            proxy: None,
             calls: AtomicUsize::new(0),
             feedback: Mutex::new(Vec::new()),
             error: Mutex::new(Some(error)),
@@ -375,7 +378,9 @@ impl GrokSessionSelector for StubSelector {
                 SecretValue::new("oauth-access"),
                 SecretValue::new("verified-user"),
                 Some(SecretValue::new("user@example.com")),
-                GrokSessionBinding::new("acct_provider").expect("binding"),
+                GrokSessionBinding::new("acct_provider")
+                    .expect("binding")
+                    .with_outbound_proxy(self.proxy.clone()),
                 (),
             )
             .map_err(|_| GrokSessionSelectorError::InvalidSession)
@@ -3445,4 +3450,35 @@ async fn missing_catalog_feature_metadata_keeps_build_responses_routable() {
             )
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn attribution_metadata_projects_selected_proxy_before_any_inference() {
+    for url in [
+        None,
+        Some("http://synthetic-user:synthetic-secret@proxy.example:8080"),
+    ] {
+        let mut selector = StubSelector::success();
+        Arc::get_mut(&mut selector).unwrap().proxy =
+            url.map(|url| gateway_core::account::OutboundProxy::parse(url).unwrap());
+        let transport = StubInferenceTransport::success();
+        let provider = provider(selector, transport.clone()).await;
+        let stream = provider
+            .execute(
+                provider_request("xai"),
+                context(CancellationToken::new(), None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stream.metadata().outbound_proxy_endpoint(),
+            Some(if url.is_some() {
+                "http://proxy.example:8080/"
+            } else {
+                "direct"
+            })
+        );
+        assert!(!format!("{:?}", stream.metadata()).contains("synthetic"));
+    }
 }

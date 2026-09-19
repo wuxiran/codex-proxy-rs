@@ -18,6 +18,14 @@ pub(crate) async fn provider_account_usage(
            select pa.id, pa.provider_kind, pa.authentication_kind, pa.name, pa.email,
                   pa.plan_type, mr.id as request_id,
                   coalesce(mr.upstream_model_id, mr.requested_model_id) as model,
+                case when ",
+    );
+    statement.push_bind(query.split_model_identity);
+    statement.push(
+        " then jsonb_build_array(mr.requested_model_id, mr.upstream_model_id,
+                                 mr.response_model, mr.billing_model)::text
+          else jsonb_build_array(null, coalesce(mr.upstream_model_id, mr.requested_model_id), null, null)::text end as model_key,
+                mr.calculated_cost_amount, mr.calculated_cost_currency,
                   mr.cost_currency, mr.outcome, mr.input_tokens, mr.output_tokens,
                   mr.cached_tokens, mr.cache_write_tokens, mr.reasoning_tokens,
                   mr.image_input_tokens, mr.image_output_tokens,
@@ -39,7 +47,7 @@ pub(crate) async fn provider_account_usage(
     statement.push(
         "), aggregated as (
            select id, provider_kind, authentication_kind, name, email, plan_type,
-                  model, cost_currency,
+                  model, model_key, cost_currency,
                   grouping(model)::integer as model_grouping,
                   grouping(cost_currency)::integer as currency_grouping,
                   count(request_id)::bigint as request_count,
@@ -64,10 +72,14 @@ pub(crate) async fn provider_account_usage(
                   count(request_id) filter (where cost_source = 'unavailable')::bigint
                     as unavailable_count,
                   max(started_at) as last_used_at,
-                  sum(cost_amount)::text as amount
+                  sum(cost_amount)::text as amount,
+            sum(calculated_cost_amount) filter (where calculated_cost_currency = 'USD')::text as model_price_usd,
+            sum(cost_amount) filter (where cost_source = 'provider_reported' and cost_currency = 'USD')::text as upstream_cost_usd,
+            count(request_id) filter (where calculated_cost_currency = 'USD')::bigint as model_price_count,
+            count(request_id) filter (where cost_source = 'provider_reported' and cost_currency = 'USD')::bigint as upstream_cost_count
              from matched
             group by id, provider_kind, authentication_kind, name, email, plan_type,
-                     grouping sets ((), (cost_currency), (model), (model, cost_currency))
+                     grouping sets ((), (cost_currency), (model, model_key), (model, model_key, cost_currency))
          ), selected_accounts as (
            select id,
                   row_number() over (order by last_used_at desc nulls last, name, id)
@@ -120,7 +132,7 @@ pub(crate) async fn provider_account_usage(
                     && get::<Option<String>>(row, "cost_currency")?.is_some() =>
             {
                 model_costs
-                    .entry((get(row, "id")?, get(row, "model")?))
+                    .entry((get(row, "id")?, get(row, "model_key")?))
                     .or_default()
                     .push(cost_from_row(row)?);
             }
@@ -152,7 +164,7 @@ pub(crate) async fn provider_account_usage(
         observation.models = models.remove(&observation.account_id).unwrap_or_default();
         for model in &mut observation.models {
             model.costs = model_costs
-                .remove(&(observation.account_id.clone(), model.model.clone()))
+                .remove(&(observation.account_id.clone(), model.identity.key.clone()))
                 .unwrap_or_default();
         }
         observation.models.sort_by(|left, right| {
@@ -229,6 +241,8 @@ fn provider_account_model_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<ProviderAccountModelUsageObservation> {
     Ok(ProviderAccountModelUsageObservation {
+        identity: account_model_identity(row)?,
+        billing: account_billing_amounts(row)?,
         model: get(row, "model")?,
         request_count: unsigned(row, "request_count")?,
         success_count: unsigned(row, "success_count")?,
@@ -252,6 +266,7 @@ pub(crate) fn provider_account_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<ProviderAccountUsageObservation> {
     Ok(ProviderAccountUsageObservation {
+        billing: account_billing_amounts(row)?,
         account_id: get(row, "id")?,
         provider_kind: get(row, "provider_kind")?,
         authentication_kind: get(row, "authentication_kind")?,
@@ -275,5 +290,46 @@ pub(crate) fn provider_account_from_row(
         last_used_at: get(row, "last_used_at")?,
         request_buckets: Vec::new(),
         models: Vec::new(),
+    })
+}
+
+pub(crate) fn account_model_identity(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<gateway_admin::model::accounts::AccountModelIdentity> {
+    let key: String = get(row, "model_key")?;
+    let [
+        requested_model_id,
+        upstream_model_id,
+        response_model,
+        billing_model,
+    ]: [Option<String>; 4] = serde_json::from_str(&key)
+        .map_err(|_| postgres_unavailable("decode account model identity"))?;
+    Ok(gateway_admin::model::accounts::AccountModelIdentity {
+        key,
+        requested_model_id,
+        upstream_model_id,
+        response_model,
+        billing_model,
+    })
+}
+
+pub(crate) fn account_billing_amounts(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<gateway_admin::model::accounts::AccountBillingAmounts> {
+    let amount =
+        |column| -> StoreResult<Option<gateway_admin::model::observability::DecimalAmount>> {
+            get::<Option<String>>(row, column)?
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| postgres_unavailable("decode account billing amount"))
+                })
+                .transpose()
+        };
+    Ok(gateway_admin::model::accounts::AccountBillingAmounts {
+        model_price_usd: amount("model_price_usd")?,
+        upstream_cost_usd: amount("upstream_cost_usd")?,
+        model_price_count: unsigned(row, "model_price_count")?,
+        upstream_cost_count: unsigned(row, "upstream_cost_count")?,
     })
 }

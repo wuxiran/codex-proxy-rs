@@ -134,7 +134,9 @@ service；客户端原生对象保存在有界进程缓存中，与套餐 Redis 
 Provider 在选定账号后应用代理位置覆盖。请求期间不额外查询全局设置，配置发布不改变已开始请求的全局值。
 
 `engine::observation` 统一维护单次响应的用量、费用、时间和响应 ID，并负责重试前清理；协调器继续
-独占发送、提交、重试和终结顺序。Provider 上报费用优先于本地估算，丢弃的 attempt 不得污染最终计量。
+独占发送、提交、重试和终结顺序。Provider 上报费用优先于本地估算作为既有结算金额；模型计算费用同时独立保留，不能冒充真实上游费用。
+`model_requests` 分别持久化入口请求模型、路由模型、实际响应模型与实际计价模型；最终响应与计价
+观测在重试前一并清空，丢弃的 attempt 不得污染最终计量。
 Client Key 费用账本独立累计各次 attempt 的实际费用，不能因请求重试而清空已产生的费用或未知计费状态。
 
 ## 4. 数据面请求生命周期
@@ -172,7 +174,8 @@ Client Key 鉴权完成后，API adapter 从有界请求头识别 Codex Desktop/
 核心不变量：
 
 - 一个客户端请求对应一条 `model_requests`；attempt 是请求内事实，不建立第二张权威表。
-- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、重试和 fallback 由 Core 决定。
+- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、通用重试和 fallback 由 Core 决定。
+  OpenAI 密文恢复仅在该次执行内处理明确拒绝，受下述 Provider 恢复边界约束。
 - `not_sent`、`sent`、`ambiguous` 是单调的上游发送边界；结果不明确时不能假定上游未收到请求。
 - downstream commit 是不可撤回的交付承诺。commit 后禁止换号、重试和 fallback。
 - Provider 可将明确容量拒绝标记为有界同账号退避，Core 在既有安全重放边界内执行，按账号维护请求内
@@ -219,6 +222,13 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 xAI Provider 负责 Codex custom 工具与 Grok function 工具的双向转换，保持工具类型、item ID 与
 `call_id` 配对；超限或转换失败终止流。默认 `store: false` 的续接由现有会话 owner 重放完整历史；
 原生续接按上游约束处理 `instructions` 与 `previous_response_id`，不把协议差异交给 Core。
+
+OpenAI Provider 对明确的 `invalid_encrypted_content` 拒绝提供一次同账号、同凭据、同模型恢复，
+仅在尚未交付客户端事件、未观察到输出或工具活动，且输入可自含重放时移除加密 reasoning 项。
+普通消息和配对工具历史保持原样；引用、compaction、孤儿工具结果及未知历史项继续要求客户端重放。
+正常请求保留密文。已拒绝项的摘要只在有界进程缓存中保存，按账号、凭据代际、模型、Client Key 与
+客户端会话隔离，供后续请求预清理；缺少客户端会话时只允许本次恢复。恢复不改变 Core 的结算合同，
+也不证明被拒绝的上游请求免费。
 
 ### 后台账号导入
 

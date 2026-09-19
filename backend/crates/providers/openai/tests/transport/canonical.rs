@@ -1064,3 +1064,52 @@ fn billing_should_not_emit_partial_totals_for_unpriced_tool_outputs() {
         );
     }
 }
+
+#[test]
+fn billing_identity_preserves_luna_response_and_never_forges_upstream_cost() {
+    for ticks in [None, Some(0), Some(123)] {
+        let mut usage = json!({"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"total_tokens":110});
+        if let Some(ticks) = ticks {
+            usage["cost_in_usd_ticks"] = json!(ticks);
+        }
+        let created = json!({"type":"response.created","response":{"id":"resp_identity","model":"gpt-6-astra"}});
+        let completed = json!({"type":"response.completed","response":{"id":"resp_identity","model":"gpt-5.6-luna","status":"completed","output":[],"usage":usage}});
+        let body = format!(
+            "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
+        );
+        let events = CodexCanonicalDecoder::new("gpt-6-astra")
+            .push(body.as_bytes())
+            .expect("decode billing identity");
+        let facts = canonical_facts(&events);
+        assert!(facts.iter().any(|event| matches!(event, GatewayEvent::Completed(meta)
+            if meta.observed_model() == Some("gpt-5.6-luna") && meta.billing_model() == Some("gpt-5.6-luna"))));
+        assert!(
+            facts
+                .iter()
+                .any(|event| matches!(event, GatewayEvent::CalculatedCost(_)))
+        );
+        let actual = facts.iter().find_map(|event| match event {
+            GatewayEvent::ProviderCost(cost) => Some(cost.total().amount().scaled()),
+            _ => None,
+        });
+        assert_eq!(actual, ticks.map(|ticks| ticks as u128));
+    }
+}
+
+#[test]
+fn billing_identity_does_not_present_fallback_as_observed_model() {
+    let created = json!({"type":"response.created","response":{"id":"resp_missing"}});
+    let completed = json!({"type":"response.completed","response":{"id":"resp_missing","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"total_tokens":110}}});
+    let body = format!(
+        "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
+    let events = CodexCanonicalDecoder::new("gpt-6-astra")
+        .push(body.as_bytes())
+        .expect("decode missing identity");
+    assert!(
+        canonical_facts(&events)
+            .iter()
+            .any(|event| matches!(event, GatewayEvent::Completed(meta)
+        if meta.observed_model().is_none() && meta.billing_model() == Some("gpt-6-astra")))
+    );
+}

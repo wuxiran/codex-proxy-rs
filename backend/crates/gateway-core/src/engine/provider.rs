@@ -12,7 +12,8 @@ use futures::{Stream, future::BoxFuture};
 use thiserror::Error;
 
 use crate::account::{
-    AccountAttemptFeedback, AccountCapacitySnapshot, AccountFeedbackStats, ProviderAccountId,
+    AccountAttemptFeedback, AccountCapacitySnapshot, AccountFeedbackStats, OutboundProxy,
+    ProviderAccountId,
 };
 use crate::engine::AttemptContext;
 use crate::error::{PreDeliveryRetry, ProviderError, ProviderErrorKind};
@@ -40,6 +41,7 @@ pub struct ProviderCallMetadata {
     upstream_request_id: Option<OpaqueUpstreamValue>,
     transport: UpstreamTransport,
     selection_observation: Option<ProviderSelectionObservation>,
+    outbound_proxy_endpoint: Option<String>,
 }
 
 /// Provider 账号选择阶段输出的中立运行压力事实。
@@ -88,6 +90,7 @@ impl ProviderCallMetadata {
             upstream_request_id: None,
             transport,
             selection_observation: None,
+            outbound_proxy_endpoint: None,
         }
     }
 
@@ -105,6 +108,7 @@ impl ProviderCallMetadata {
             upstream_request_id: None,
             transport,
             selection_observation: None,
+            outbound_proxy_endpoint: None,
         }
     }
 
@@ -158,6 +162,19 @@ impl ProviderCallMetadata {
     #[must_use]
     pub const fn selection_observation(&self) -> Option<ProviderSelectionObservation> {
         self.selection_observation
+    }
+
+    #[must_use]
+    pub fn outbound_proxy_endpoint(&self) -> Option<&str> {
+        self.outbound_proxy_endpoint.as_deref()
+    }
+
+    /// 在元数据边界统一去除代理用户名/密码；显式 None 表示直连，未调用则为未知。
+    #[must_use]
+    pub fn with_outbound_proxy(mut self, proxy: Option<&OutboundProxy>) -> Self {
+        self.outbound_proxy_endpoint =
+            Some(proxy.map_or_else(|| "direct".to_owned(), OutboundProxy::endpoint));
+        self
     }
 
     /// 确认 metadata 没有替换请求计划中冻结的 Provider 候选。

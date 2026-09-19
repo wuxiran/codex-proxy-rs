@@ -131,6 +131,10 @@ where
         cancellation: CancellationToken,
     ) -> Result<ResponseExecutionSession<S>, EngineError> {
         let request_id = request.id.clone();
+        let requested_model_id = request
+            .requested_model
+            .as_ref()
+            .map(|model| model.as_str().to_owned());
         let client_api_key_ref = request.client_api_key_ref.clone();
         let timing_started_at = Instant::now();
         let deadline = request.deadline_at;
@@ -166,6 +170,10 @@ where
         let mut session = ResponseExecutionSession {
             engine: Arc::clone(&self.engine),
             request_id,
+            requested_model_id,
+            last_route_model: None,
+            last_provider_account_id: None,
+            last_outbound_proxy_endpoint: None,
             client_api_key_ref,
             concurrency_wait_budget: ConcurrencyWaitBudget::default(),
             observation: ResponseObservation::new(timing_started_at),
@@ -271,6 +279,10 @@ struct PendingAttemptRetry {
 pub struct ResponseExecutionSession<S: ?Sized> {
     engine: Arc<GatewayEngine<S>>,
     request_id: ModelRequestId,
+    requested_model_id: Option<String>,
+    last_route_model: Option<String>,
+    last_provider_account_id: Option<String>,
+    last_outbound_proxy_endpoint: Option<String>,
     client_api_key_ref: crate::policy::ClientApiKeyId,
     concurrency_wait_budget: ConcurrencyWaitBudget,
     observation: ResponseObservation,
@@ -1037,6 +1049,21 @@ where
         if !is_transport_recovery {
             self.routing_attempts = self.routing_attempts.saturating_add(1);
         }
+        // 只保存通过冻结路由/账号校验的归因；重试取走 current 后仍可终结最后一次真实尝试。
+        self.last_route_model = metadata
+            .upstream_model()
+            .map(|model| model.as_str().to_owned());
+        self.last_provider_account_id = Some(metadata.provider_account_id().as_str().to_owned());
+        self.last_outbound_proxy_endpoint = metadata.outbound_proxy_endpoint().map(str::to_owned);
+        attempt_trace.record(
+            "request.attempt_attribution",
+            json!({
+                "attempt": next_attempt.get(),
+                "route_model": self.last_route_model,
+                "provider_account_id": self.last_provider_account_id,
+                "outbound_proxy_endpoint": self.last_outbound_proxy_endpoint,
+            }),
+        );
         self.current = Some(CurrentAttempt {
             stream,
             metadata,
@@ -1499,7 +1526,7 @@ where
             websocket_pool,
             service_tier,
             provider_metadata_json,
-            diagnostic_trace_json: self.trace.snapshot().map(|value| value.to_string()),
+            diagnostic_trace_json: self.attribution_trace_json(),
             error: None,
             provider_error_code: None,
             raw_upstream_error: None,
@@ -1508,6 +1535,7 @@ where
             usage: self.observation.usage.clone(),
             image_generation_succeeded: self.image_generation_succeeded(),
             cost: self.observation.cost.clone(),
+            billing: self.observation.billing.clone(),
             timings: self.observation.timings.clone(),
             completed_at,
         })
@@ -1660,7 +1688,7 @@ where
             websocket_pool,
             service_tier,
             provider_metadata_json,
-            diagnostic_trace_json: self.trace.snapshot().map(|value| value.to_string()),
+            diagnostic_trace_json: self.attribution_trace_json(),
             error: Some(finalization.error),
             provider_error_code: finalization.provider_error_code,
             raw_upstream_error: finalization.raw_upstream_error,
@@ -1669,6 +1697,7 @@ where
             usage: self.observation.usage.clone(),
             image_generation_succeeded: self.image_generation_succeeded(),
             cost: self.observation.cost.clone(),
+            billing: self.observation.billing.clone(),
             timings: self.observation.timings.clone(),
             completed_at,
         })
@@ -1745,6 +1774,23 @@ where
             .and_then(|current| current.response_observation.as_ref())
             .and_then(ProviderResponseObservation::provider_metadata)
             .map(|metadata| metadata.as_json().to_owned())
+    }
+
+    fn attribution_trace_json(&self) -> Option<String> {
+        let mut root = self.trace.snapshot().unwrap_or_else(|| json!({}));
+        let object = root.as_object_mut()?;
+        object.insert(
+            "request_attribution".to_owned(),
+            json!({
+                "requested_model": self.requested_model_id,
+                "route_model": self.last_route_model.as_deref(),
+                "response_model": self.observation.billing.response_model.as_deref(),
+                "billing_model": self.observation.billing.billing_model.as_deref(),
+                "provider_account_id": self.last_provider_account_id.as_deref(),
+                "outbound_proxy_endpoint": self.last_outbound_proxy_endpoint.as_deref(),
+            }),
+        );
+        serde_json::to_string(&root).ok()
     }
 
     fn current_service_tier(&self) -> Option<String> {

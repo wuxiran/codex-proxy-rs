@@ -672,6 +672,7 @@ pub struct ModelRequestFinalization {
     pub usage: Usage,
     pub image_generation_succeeded: Option<bool>,
     pub cost: CostEstimate,
+    pub billing: crate::metering::ModelBillingObservation,
     pub timings: ModelRequestTimings,
     pub completed_at: SystemTime,
 }

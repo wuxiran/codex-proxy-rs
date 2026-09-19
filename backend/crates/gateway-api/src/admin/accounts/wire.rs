@@ -392,6 +392,7 @@ pub struct AccountQuotaWindowView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsageView {
+    pub billing: AccountBillingView,
     pub window_label_display: String,
     pub request_count: Option<u64>,
     pub request_count_display: String,
@@ -431,6 +432,13 @@ pub struct AccountUsageView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsageView {
+    pub key: String,
+    pub requested_model_id: Option<String>,
+    pub upstream_model_id: Option<String>,
+    pub response_model: Option<String>,
+    pub billing_model: Option<String>,
+    pub mismatch: bool,
+    pub billing: AccountBillingView,
     pub model: String,
     pub request_count: u64,
     pub request_count_display: String,
@@ -461,6 +469,20 @@ pub struct ModelUsageView {
     pub costs: Vec<CurrencyCostView>,
     pub last_used_at: String,
     pub last_used_at_display: String,
+}
+
+/// 两类费用独立展示，覆盖不足时不计算差额。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBillingView {
+    pub model_price_amount_usd: Option<String>,
+    pub model_price_amount_usd_display: String,
+    pub upstream_cost_amount_usd: Option<String>,
+    pub upstream_cost_amount_usd_display: String,
+    pub difference_amount_usd: Option<String>,
+    pub difference_amount_usd_display: String,
+    pub model_price_count: u64,
+    pub upstream_cost_count: u64,
 }
 
 /// 单一货币的可查询成本。

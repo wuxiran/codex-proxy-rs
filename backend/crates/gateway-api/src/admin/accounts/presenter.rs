@@ -73,7 +73,7 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
     let usage_period = quota.usage_window().map(|(_, period)| period);
     let mut usage = account_usage_view(usage, usage_period, now);
     if account.authentication_kind == "api_key" {
-        usage.window_label_display = "通用额度".to_owned();
+        usage.window_label_display = "本地累计".to_owned();
     }
     let (quota, refresh_token_expires_at) = account_quota_view(quota, cooldown, now);
     AccountView {
@@ -262,6 +262,7 @@ pub(crate) fn quota_window_view(window: ProviderQuotaWindow) -> AccountQuotaWind
 pub(super) fn quota_local_usage(usage: &AccountUsage) -> Value {
     let total_tokens = usage.total_tokens.unwrap_or_default();
     serde_json::json!({
+        "billing": AccountBillingView::from((&usage.billing, usage.request_count)),
         "requestCount": usage.request_count,
         "requestCountDisplay": format_number(usage.request_count),
         "inputTokens": usage.input_tokens.unwrap_or_default(),
@@ -305,6 +306,7 @@ pub(super) fn account_usage_view(
         "known"
     };
     AccountUsageView {
+        billing: AccountBillingView::from((&usage.billing, usage.request_count)),
         window_label_display: match period {
             Some(AccountUsagePeriod::Weekly) => "周额度窗口",
             Some(AccountUsagePeriod::Monthly) => "月额度窗口",
@@ -347,72 +349,89 @@ pub(super) fn account_usage_view(
         models: usage
             .models
             .into_iter()
-            .map(|model| account_model_usage_view(model, now))
+            .map(|model| ModelUsageView::from((model, now)))
             .collect(),
     }
 }
 
-pub(super) fn account_model_usage_view(
-    usage: AccountModelUsage,
-    now: DateTime<Utc>,
-) -> ModelUsageView {
-    let known_count = usage
-        .cost_coverage
-        .provider_reported_count
-        .saturating_add(usage.cost_coverage.calculated_count);
-    let cost_estimate_status = if known_count == 0 {
-        "unknown"
-    } else if usage.cost_coverage.unavailable_count > 0 {
-        "partial"
-    } else {
-        "known"
-    };
-    let usd = usage
-        .costs
-        .iter()
-        .find(|cost| cost.currency.eq_ignore_ascii_case("USD"));
-    ModelUsageView {
-        model: usage.model,
-        request_count: usage.request_count,
-        request_count_display: format_number(usage.request_count),
-        success_rate: (usage.request_count > 0)
-            .then(|| usage.success_count as f64 * 100.0 / usage.request_count as f64),
-        success_rate_display: if usage.request_count == 0 {
-            "—".to_owned()
+impl From<(AccountModelUsage, DateTime<Utc>)> for ModelUsageView {
+    fn from((usage, now): (AccountModelUsage, DateTime<Utc>)) -> Self {
+        let known_count = usage
+            .cost_coverage
+            .provider_reported_count
+            .saturating_add(usage.cost_coverage.calculated_count);
+        let cost_estimate_status = if known_count == 0 {
+            "unknown"
+        } else if usage.cost_coverage.unavailable_count > 0 {
+            "partial"
         } else {
-            format!(
-                "{:.1}%",
-                usage.success_count as f64 * 100.0 / usage.request_count as f64
-            )
-        },
-        input_tokens: usage.input_tokens,
-        input_tokens_display: display_optional_tokens(usage.input_tokens),
-        output_tokens: usage.output_tokens,
-        output_tokens_display: display_optional_tokens(usage.output_tokens),
-        cached_tokens: usage.cached_tokens,
-        cached_tokens_display: display_optional_tokens(usage.cached_tokens),
-        image_input_tokens: usage.image_input_tokens,
-        image_input_tokens_display: display_optional_tokens(usage.image_input_tokens),
-        image_output_tokens: usage.image_output_tokens,
-        image_output_tokens_display: display_optional_tokens(usage.image_output_tokens),
-        image_request_count: usage.image_request_count,
-        image_request_count_display: format_number(usage.image_request_count),
-        image_request_failed_count: usage.image_request_failed_count,
-        image_request_failed_count_display: format_number(usage.image_request_failed_count),
-        total_tokens: usage.total_tokens,
-        total_tokens_display: display_optional_tokens(usage.total_tokens),
-        billing_amount_usd: usd.map(|cost| cost.amount.as_str().to_owned()),
-        billing_amount_usd_display: usd.map_or_else(
-            || "—".to_owned(),
-            |cost| format_decimal_currency(cost.amount.as_str(), "USD"),
-        ),
-        cost_estimate_status: cost_estimate_status.to_owned(),
-        known_cost_count: known_count,
-        partial_cost_count: u64::from(cost_estimate_status == "partial"),
-        unknown_cost_count: usage.cost_coverage.unavailable_count,
-        costs: usage.costs.iter().map(account_currency_cost_view).collect(),
-        last_used_at: china_rfc3339(&usage.last_used_at),
-        last_used_at_display: relative_time(usage.last_used_at, now),
+            "known"
+        };
+        let usd = usage.billing.model_price_usd.as_ref();
+        let identity = usage.identity;
+        let mismatch = identity
+            .requested_model_id
+            .as_ref()
+            .is_some_and(|requested| {
+                [
+                    &identity.upstream_model_id,
+                    &identity.response_model,
+                    &identity.billing_model,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|model| model != requested)
+            });
+        ModelUsageView {
+            key: identity.key,
+            requested_model_id: identity.requested_model_id,
+            upstream_model_id: identity.upstream_model_id,
+            response_model: identity.response_model,
+            billing_model: identity.billing_model,
+            mismatch,
+            billing: AccountBillingView::from((&usage.billing, usage.request_count)),
+            model: usage.model,
+            request_count: usage.request_count,
+            request_count_display: format_number(usage.request_count),
+            success_rate: (usage.request_count > 0)
+                .then(|| usage.success_count as f64 * 100.0 / usage.request_count as f64),
+            success_rate_display: if usage.request_count == 0 {
+                "—".to_owned()
+            } else {
+                format!(
+                    "{:.1}%",
+                    usage.success_count as f64 * 100.0 / usage.request_count as f64
+                )
+            },
+            input_tokens: usage.input_tokens,
+            input_tokens_display: display_optional_tokens(usage.input_tokens),
+            output_tokens: usage.output_tokens,
+            output_tokens_display: display_optional_tokens(usage.output_tokens),
+            cached_tokens: usage.cached_tokens,
+            cached_tokens_display: display_optional_tokens(usage.cached_tokens),
+            image_input_tokens: usage.image_input_tokens,
+            image_input_tokens_display: display_optional_tokens(usage.image_input_tokens),
+            image_output_tokens: usage.image_output_tokens,
+            image_output_tokens_display: display_optional_tokens(usage.image_output_tokens),
+            image_request_count: usage.image_request_count,
+            image_request_count_display: format_number(usage.image_request_count),
+            image_request_failed_count: usage.image_request_failed_count,
+            image_request_failed_count_display: format_number(usage.image_request_failed_count),
+            total_tokens: usage.total_tokens,
+            total_tokens_display: display_optional_tokens(usage.total_tokens),
+            billing_amount_usd: usd.map(|amount| amount.as_str().to_owned()),
+            billing_amount_usd_display: usd.map_or_else(
+                || "—".to_owned(),
+                |amount| format_decimal_currency(amount.as_str(), "USD"),
+            ),
+            cost_estimate_status: cost_estimate_status.to_owned(),
+            known_cost_count: known_count,
+            partial_cost_count: u64::from(cost_estimate_status == "partial"),
+            unknown_cost_count: usage.cost_coverage.unavailable_count,
+            costs: usage.costs.iter().map(account_currency_cost_view).collect(),
+            last_used_at: china_rfc3339(&usage.last_used_at),
+            last_used_at_display: relative_time(usage.last_used_at, now),
+        }
     }
 }
 
@@ -430,6 +449,7 @@ pub(super) fn display_optional_tokens(value: Option<u64>) -> String {
 
 pub(super) fn empty_account_usage() -> AccountUsageView {
     AccountUsageView {
+        billing: AccountBillingView::from((&Default::default(), 0)),
         window_label_display: "周/月额度窗口".to_owned(),
         request_count: None,
         request_count_display: "—".to_owned(),
@@ -504,4 +524,89 @@ pub(super) fn map_wire_error(error: WireValidationError) -> AdminError {
 
 pub(super) fn map_service_error(error: AdminServiceError) -> AdminError {
     super::super::wire::map_admin_service_error(error)
+}
+
+impl From<(&gateway_admin::model::accounts::AccountBillingAmounts, u64)> for AccountBillingView {
+    fn from(
+        (billing, request_count): (&gateway_admin::model::accounts::AccountBillingAmounts, u64),
+    ) -> Self {
+        let model_price = billing
+            .model_price_usd
+            .as_ref()
+            .map(|amount| amount.as_str().to_owned());
+        let upstream_cost = billing
+            .upstream_cost_usd
+            .as_ref()
+            .map(|amount| amount.as_str().to_owned());
+        let difference = if request_count > 0
+            && billing.model_price_count == request_count
+            && billing.upstream_cost_count == request_count
+        {
+            model_price
+                .as_deref()
+                .zip(upstream_cost.as_deref())
+                .and_then(|(price, upstream)| {
+                    let price = price
+                        .parse::<gateway_core::metering::Decimal>()
+                        .ok()?
+                        .scaled();
+                    let upstream = upstream
+                        .parse::<gateway_core::metering::Decimal>()
+                        .ok()?
+                        .scaled();
+                    let magnitude =
+                        gateway_core::metering::Decimal::from_scaled(price.abs_diff(upstream))
+                            .ok()?
+                            .canonical();
+                    Some(if price < upstream {
+                        format!("-{magnitude}")
+                    } else {
+                        magnitude
+                    })
+                })
+        } else {
+            None
+        };
+        let display = |amount: Option<&str>, count: u64, missing: &str| {
+            amount.map_or_else(
+                || missing.to_owned(),
+                |amount| {
+                    let display = format_decimal_currency(amount, "USD");
+                    if count < request_count {
+                        format!("{display}（部分 {count}/{request_count}）")
+                    } else {
+                        display
+                    }
+                },
+            )
+        };
+        let difference_display = difference.as_deref().map_or_else(
+            || "不可计算".to_owned(),
+            |amount| {
+                if let Some(magnitude) = amount.strip_prefix('-') {
+                    format!("-{}", format_decimal_currency(magnitude, "USD"))
+                } else {
+                    format_decimal_currency(amount, "USD")
+                }
+            },
+        );
+        AccountBillingView {
+            model_price_amount_usd_display: display(
+                model_price.as_deref(),
+                billing.model_price_count,
+                "未提供",
+            ),
+            upstream_cost_amount_usd_display: display(
+                upstream_cost.as_deref(),
+                billing.upstream_cost_count,
+                "未提供",
+            ),
+            model_price_amount_usd: model_price,
+            upstream_cost_amount_usd: upstream_cost,
+            difference_amount_usd: difference,
+            difference_amount_usd_display: difference_display,
+            model_price_count: billing.model_price_count,
+            upstream_cost_count: billing.upstream_cost_count,
+        }
+    }
 }

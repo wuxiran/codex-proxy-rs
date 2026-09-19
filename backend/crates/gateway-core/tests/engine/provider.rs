@@ -459,3 +459,41 @@ fn provider_stream_should_report_one_success_after_same_account_retry() {
 
     assert_eq!(feedback.scheduling_signals(&provider, &account).0, Some(0));
 }
+
+#[test]
+fn provider_call_metadata_redacts_proxy_credentials_and_distinguishes_direct_from_unknown() {
+    let metadata = ProviderCallMetadata::new(
+        ProviderKind::new("openai").unwrap(),
+        UpstreamModelId::new("gpt-5.6-luna").unwrap(),
+        ProviderAccountId::new("acct_proxy").unwrap(),
+        UpstreamTransport::new("http_sse").unwrap(),
+    );
+    assert!(metadata.outbound_proxy_endpoint().is_none());
+    assert_eq!(
+        metadata
+            .clone()
+            .with_outbound_proxy(None)
+            .outbound_proxy_endpoint(),
+        Some("direct")
+    );
+    for scheme in ["http", "https", "socks5", "socks5h"] {
+        let proxy = gateway_core::account::OutboundProxy::parse(&format!(
+            "{scheme}://synthetic-user:synthetic%40secret@[::1]:1080"
+        ))
+        .unwrap();
+        let projected = metadata.clone().with_outbound_proxy(Some(&proxy));
+        assert_eq!(
+            projected.outbound_proxy_endpoint(),
+            Some(
+                format!(
+                    "{scheme}://[::1]:1080{}",
+                    if scheme.starts_with("http") { "/" } else { "" }
+                )
+                .as_str()
+            )
+        );
+        let debug = format!("{projected:?}");
+        assert!(!debug.contains("synthetic"));
+        assert!(!debug.contains("%40secret"));
+    }
+}
