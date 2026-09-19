@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
-import type { AccountGroup, AccountModelAccess, GuanlanReviveStatus, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
+import type { AccountGroup, AccountModelAccess, GuanlanReviveStatus, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { ref, useId, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -30,11 +30,13 @@ defineProps<{
   turnStateCaptureRule: TurnStateCaptureRule | null
   /** 已保存到服务端的开关值；遍历只对已生效的开关有意义。 */
   savedPinTurnState: boolean
+  turnStateAutoHunt: TurnStateAutoHunt | null
 }>()
 
 const emit = defineEmits<{
   save: []
-  turnStateHunted: [boundChanged: boolean]
+  turnStateHunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
+  stopTurnStateAutoHunt: []
 }>()
 
 const open = defineModel<boolean>({ required: true })
@@ -168,6 +170,14 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
                 <span v-if="pin.scope === 'account'" class="text-cp-xs text-cp-text-secondary">· 全部客户端</span>
               </li>
             </ul>
+            <p v-if="turnStateAutoHunt" role="status" class="m-0 flex flex-wrap items-center gap-2 text-cp-sm text-cp-text">
+              自动续期：{{ turnStateAutoHunt.modelId }} · 每个代理 {{ turnStateAutoHunt.attempts }} 次<template v-if="turnStateAutoHunt.includeDirect">
+                · 含直连
+              </template>
+              <BaseButton variant="soft" size="sm" :disabled="saving" @click="emit('stopTurnStateAutoHunt')">
+                关闭自动续期
+              </BaseButton>
+            </p>
             <div>
               <BaseButton variant="secondary" :disabled="saving || recaptureTurnState" @click="recaptureTurnState = true">
                 重新捕获（保存后生效）
@@ -181,7 +191,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           :account-id="account.id"
           :capture-rule="turnStateCaptureRule"
           @close="showStateHunt = false"
-          @hunted="emit('turnStateHunted', $event)"
+          @hunted="(boundChanged, autoRenew) => emit('turnStateHunted', boundChanged, autoRenew)"
         />
         <AccountTurnStateHistory v-if="showStateHistory" :id="historyId" :account-id="account.id" :capture-rule="turnStateCaptureRule" @close="showStateHistory = false" />
       </section>

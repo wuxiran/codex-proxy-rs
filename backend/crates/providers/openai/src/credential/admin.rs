@@ -702,6 +702,7 @@ impl CodexCredentialAdmin {
         current: LoadedCredential,
         pin_turn_state: Option<bool>,
         guanlan_auto_revive: Option<bool>,
+        turn_state_auto_hunt: Option<Option<super::types::TurnStateAutoHunt>>,
     ) -> Result<PreparedCodexCredentialRotation, CodexCredentialAdminError> {
         if current.account.provider().as_str() != PROVIDER_NAME
             || current.account.authentication_kind() != CODEX_AUTHENTICATION_KIND_OAUTH
@@ -718,6 +719,13 @@ impl CodexCredentialAdmin {
         }
         if let Some(enabled) = guanlan_auto_revive {
             oauth.guanlan_auto_revive = enabled;
+        }
+        if let Some(auto_hunt) = turn_state_auto_hunt {
+            oauth.turn_state_auto_hunt = auto_hunt;
+        }
+        // 续期只对开启中的固定有意义；关掉固定时不留下会继续发请求的续期任务。
+        if oauth.turn_state_pin.is_none() {
+            oauth.turn_state_auto_hunt = None;
         }
         let credential = CodexCredentialCodec::encode_complete(data)
             .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;

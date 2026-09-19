@@ -124,6 +124,7 @@ impl CodexCredentialCodec {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
             turn_state_pin: None,
+            turn_state_auto_hunt: None,
             guanlan_auto_revive: false,
             principal,
             installation_id,
@@ -244,6 +245,7 @@ impl CodexCredentialCodec {
             (CodexCredentialData::OAuth(incoming), CodexCredentialData::OAuth(existing)) => {
                 incoming.installation_id = existing.installation_id;
                 incoming.turn_state_pin = existing.turn_state_pin;
+                incoming.turn_state_auto_hunt = existing.turn_state_auto_hunt;
                 incoming.guanlan_auto_revive = existing.guanlan_auto_revive;
             }
             (CodexCredentialData::ApiKey(incoming), CodexCredentialData::ApiKey(existing)) => {

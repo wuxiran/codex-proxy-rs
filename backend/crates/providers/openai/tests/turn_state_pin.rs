@@ -173,6 +173,14 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
     let hunted = "h".repeat(332);
     pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
         .unwrap();
+    assert_eq!(
+        pins.account_wide_captured_at("account", "binding", "astra", now),
+        Some(now)
+    );
+    assert!(
+        pins.account_wide_captured_at("account", "binding", "terra", now)
+            .is_none()
+    );
     let later = now + Duration::from_secs(3599);
     let mut reuse = pins.attempt("account", "binding".into(), "astra", "client", 332, later);
     assert_eq!(reuse.value(), Some(hunted.as_str()));

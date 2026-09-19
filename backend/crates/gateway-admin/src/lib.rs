@@ -21,6 +21,7 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
+pub mod turn_state_renewal;
 mod use_case;
 
 pub use use_case::key_usage::KeyUsageService;
@@ -447,6 +448,11 @@ pub async fn initialize(
     .map_err(|_| AdminError::internal("导入 Worker 注册信息不合法"))?;
     worker_contributions.push(WorkerContribution::Registration(registration));
     worker_contributions.extend(freeze_recovery_worker_contribution(freeze_recovery)?);
+    worker_contributions.extend(turn_state_renewal_worker_contribution(
+        turn_state_renewal::TurnStateRenewalTask::new(
+            Arc::clone(&accounts) as Arc<dyn AccountsService>
+        ),
+    )?);
     Ok(AdminBundle {
         services,
         worker_contributions,
@@ -469,6 +475,38 @@ fn backup_worker_contribution(
         },
     )
     .map_err(|_| AdminError::internal("备份 Worker 注册信息不合法"))?;
+    Ok(vec![WorkerContribution::Registration(registration)])
+}
+
+/// state 自动续期 Worker 注册。
+///
+/// 归在账号自动维护这一类（与冻结恢复同 kind、不同 owner）。不带租约：state 只存在于
+/// 进程内存，每个实例都要各自续，跨实例选主反而会让没拿到租约的实例一直没有 state。
+fn turn_state_renewal_worker_contribution(
+    task: turn_state_renewal::TurnStateRenewalTask,
+) -> Result<Vec<WorkerContribution>, AdminError> {
+    let id = WorkerId::try_new(
+        WorkerKind::AccountFreezeRecovery,
+        turn_state_renewal::TURN_STATE_RENEWAL_WORKER_OWNER,
+    )
+    .map_err(|_| AdminError::internal("state 续期 Worker ID 不合法"))?;
+    let schedule = WorkerSchedule::try_new(
+        turn_state_renewal::TURN_STATE_RENEWAL_INTERVAL,
+        turn_state_renewal::WORKER_INITIAL_BACKOFF,
+        turn_state_renewal::WORKER_MAXIMUM_BACKOFF,
+        freeze_recovery::WORKER_LEASE_TTL,
+        freeze_recovery::WORKER_LEASE_RENEWAL,
+    )
+    .map_err(|_| AdminError::internal("state 续期 Worker 调度配置不合法"))?;
+    let registration = WorkerRegistration::try_new(
+        id,
+        WorkerRunnable::Scheduled {
+            schedule,
+            lease: None,
+            task: Box::new(task),
+        },
+    )
+    .map_err(|_| AdminError::internal("state 续期 Worker 注册信息不合法"))?;
     Ok(vec![WorkerContribution::Registration(registration)])
 }
 

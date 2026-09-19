@@ -2165,6 +2165,81 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
 }
 
 #[tokio::test]
+async fn turn_state_auto_hunt_is_validated_and_never_outlives_the_pin_switch() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_auto_hunt".to_owned(),
+            name: "auto".to_owned(),
+            secret: secret("test-auto-hunt-token"),
+            verified_account: profile("chatgpt-auto-hunt"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_auto_hunt").unwrap();
+    let bundle = provider_openai::initialize(
+        valid_config().config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let rotate = |material: serde_json::Value| {
+        admin.prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                material.as_object().unwrap().clone(),
+            )),
+        })
+    };
+    let auto = json!({"enabled":true,"model":"gpt-6-astra","attempts":5,"include_direct":true});
+
+    let prepared = rotate(json!({"pin_turn_state":true,"turn_state_auto_hunt":auto}))
+        .await
+        .unwrap();
+    let data = prepared
+        .facts()
+        .provider_material
+        .expose_to_provider()
+        .expose_to_provider();
+    assert_eq!(
+        data.get("turn_state_auto_hunt"),
+        Some(&json!({"model":"gpt-6-astra","attempts":5,"include_direct":true}))
+    );
+    assert!(prepared.facts().preserve_credential_state);
+
+    // 固定关闭时续期参数不落盘：否则后台会对一个不再使用 state 的账号持续发请求。
+    let prepared = rotate(json!({"turn_state_auto_hunt":auto})).await.unwrap();
+    assert!(
+        !prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("turn_state_auto_hunt")
+    );
+    for invalid in [
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":0}),
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":21}),
+        json!({"enabled":true,"model":"","attempts":5}),
+    ] {
+        assert!(
+            rotate(json!({"turn_state_auto_hunt":invalid}))
+                .await
+                .is_err()
+        );
+    }
+    // 没有任何账号开启续期时，续期任务没有可做的事。
+    assert!(
+        admin
+            .turn_state_hunt_renewals(SystemTime::now(), std::time::Duration::from_secs(300))
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status() {
     let store = Arc::new(MemoryAccountStore::default());
     store

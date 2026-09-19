@@ -205,6 +205,24 @@ impl TurnStatePins {
         Ok(())
     }
 
+    /// 账号级 state 的捕获时刻；自动续期据此判断是否临近到期。
+    pub(crate) fn account_wide_captured_at(
+        &self,
+        account: &str,
+        binding: &str,
+        model: &str,
+        now: SystemTime,
+    ) -> Option<SystemTime> {
+        self.0.lock().ok()?.iter().find_map(|(scope, pin)| {
+            (scope.client.is_none()
+                && scope.account == account
+                && scope.binding == binding
+                && scope.model == model
+                && pin.active(now))
+            .then_some(pin.captured_at)
+        })
+    }
+
     pub(crate) fn clear(&self, account: &str) {
         if let Ok(mut pins) = self.0.lock() {
             pins.retain(|scope, _| scope.account != account);

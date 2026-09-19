@@ -714,15 +714,29 @@ export interface GuanlanReviveStatus {
   nextAttemptAt: number | null
 }
 
+/** 账号级 state 到期前自动重新遍历代理的参数；null 表示未开启。 */
+export interface TurnStateAutoHunt {
+  modelId: string
+  attempts: number
+  includeDirect: boolean
+}
+
 export interface OAuthStateConfiguration {
   guanlanRevive?: GuanlanReviveStatus | null
   pinTurnState: boolean
+  turnStateAutoHunt?: TurnStateAutoHunt | null
   turnStatePins: TurnStatePinStatus[]
   turnStateCaptureRule?: TurnStateCaptureRule
   maxAgeSeconds: number
 }
 
-export function updateAccountTurnState(data: { accountId: string, pinTurnState?: boolean, guanlanAutoRevive?: boolean, settings?: AccountUpdateParam }) {
+export function updateAccountTurnState(data: {
+  accountId: string
+  pinTurnState?: boolean
+  guanlanAutoRevive?: boolean
+  turnStateAutoHunt?: { enabled: false } | ({ enabled: true } & TurnStateAutoHunt)
+  settings?: AccountUpdateParam
+}) {
   return request<{ accountId: string }>({
     url: '/api/admin/accounts/rotate',
     method: 'POST',

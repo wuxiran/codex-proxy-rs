@@ -432,3 +432,56 @@ async fn one_hunt_per_account_and_the_slot_is_released_afterwards() {
         Some(TurnStateHuntEvent::Completed { success: false, .. })
     ));
 }
+
+async fn renewal_cycle(task: &gateway_admin::turn_state_renewal::TurnStateRenewalTask) {
+    use gateway_core::task::{ScheduledTask as _, WorkerCycleContext, WorkerId, WorkerKind};
+    let worker = WorkerId::try_new(WorkerKind::AccountFreezeRecovery, "test").expect("worker id");
+    task.run_cycle(WorkerCycleContext::new(
+        worker,
+        None,
+        gateway_core::lifecycle::CancellationToken::new(),
+    ))
+    .await
+    .expect("renewal cycle");
+}
+
+#[tokio::test]
+async fn renewal_rehunts_due_accounts_and_backs_off_after_a_full_miss() {
+    // 第一轮：绑定的出口续不上，继续打另一个出口并命中。第二轮：全部未命中。
+    let probe = ScriptedProbe::new([
+        Reply::State(292),
+        Reply::State(EXPECTED_LENGTH),
+        Reply::NoState,
+        Reply::NoState,
+    ]);
+    let current = proxy("current", 8001, true);
+    let setup = setup(
+        probe.clone(),
+        vec![current.clone(), proxy("other", 8002, true)],
+        Some(&current),
+    )
+    .await;
+    *setup.provider.hunt_renewals.lock().unwrap() =
+        vec![gateway_admin::ports::provider::TurnStateRenewal {
+            account_id: ProviderAccountId::new("acct_test").unwrap(),
+            upstream_model: UpstreamModelId::new("gpt-6-astra").unwrap(),
+            attempts: 1,
+            include_direct: false,
+        }];
+    let task = gateway_admin::turn_state_renewal::TurnStateRenewalTask::new(
+        setup.services.accounts_handle(),
+    );
+
+    renewal_cycle(&task).await;
+    assert_eq!(probe.egresses(), vec![endpoint(8001), endpoint(8002)]);
+    let log = recorded(&setup.log);
+    assert!(log.contains(&"store.batch_update_accounts"));
+    assert!(log.contains(&"provider.hunt_pin"));
+
+    // 成功后不退避：账号仍到期时下个周期照常再续。
+    renewal_cycle(&task).await;
+    assert_eq!(probe.egresses().len(), 4);
+    // 整轮未命中后进入退避，不会每个周期都把所有出口再打一遍。
+    renewal_cycle(&task).await;
+    assert_eq!(probe.egresses().len(), 4);
+}

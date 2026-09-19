@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { TurnStateHuntRow } from '../composables/useAccountTurnStateHunt'
-import type { TurnStateCaptureRule } from '@/api'
+import type { TurnStateAutoHunt, TurnStateCaptureRule } from '@/api'
 import { computed, ref, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -12,8 +12,8 @@ import { useAccountTurnStateHunt } from '../composables/useAccountTurnStateHunt'
 const props = defineProps<{ accountId: string, captureRule: TurnStateCaptureRule | null }>()
 const emit = defineEmits<{
   close: []
-  /** 命中并完成绑定与钉住；boundChanged 表示账号的代理绑定发生了变化。 */
-  hunted: [boundChanged: boolean]
+  /** 命中并完成绑定与钉住；boundChanged 表示账号的代理绑定发生了变化，autoRenew 为要保存的续期参数。 */
+  hunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
 }>()
 
 const PREFERRED_MODEL = 'gpt-6-astra'
@@ -29,6 +29,7 @@ watch(models, (value) => {
 }, { immediate: true })
 const attempts = ref(5)
 const includeDirect = ref(false)
+const autoRenew = ref(true)
 
 const { proxies } = useProxyCatalog()
 const usableProxies = computed(() => proxies.value.filter(proxy => proxy.lastTest?.success === true).length)
@@ -51,8 +52,11 @@ function start() {
 }
 
 watch(status, (value) => {
-  if (value === 'success')
-    emit('hunted', hunt.boundChanged.value)
+  if (value === 'success') {
+    emit('hunted', hunt.boundChanged.value, autoRenew.value
+      ? { modelId: modelId.value, attempts: attempts.value, includeDirect: includeDirect.value }
+      : null)
+  }
 })
 
 const STATE_TEXT: Record<TurnStateHuntRow['state'], string> = {
@@ -87,7 +91,7 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       </BaseButton>
     </div>
     <p class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
-      依次经每个已测试通过的代理向上游发真实请求，直到返回符合长度规则的 state；命中后把账号绑定到该代理，并把这个 state 钉给该账号此模型的全部客户端（替换已有的固定）。每次尝试都会消耗少量额度，未命中不改动账号。
+      依次经每个已测试通过的代理向上游发真实请求，直到返回符合长度规则的 state；命中后把账号绑定到该代理，并把这个 state 钉给该账号此模型的全部客户端（替换已有的固定）。每次尝试都会消耗少量额度，未命中不改动账号。勾选自动续期后，服务端会在到期前 5 分钟用同样的参数重新遍历：先试当前绑定的代理，续不上就继续打其它代理；整轮都没续上则 5 分钟后再来。
     </p>
     <p v-if="!models.length" role="alert" class="mb-0 mt-2 text-cp-sm text-cp-error">
       该账号的套餐没有按模型的长度规则，无法判断哪个 state 正确。
@@ -103,6 +107,9 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
         <BaseCheckbox v-model="includeDirect" label="同时尝试直连" show-label :disabled="busy" />
+      </div>
+      <div class="pb-2 text-cp-sm text-cp-text">
+        <BaseCheckbox v-model="autoRenew" label="到期前自动续期" show-label :disabled="busy" />
       </div>
       <div class="flex gap-2 pb-1">
         <BaseButton variant="primary" size="sm" :disabled="!canStart" @click="start">
