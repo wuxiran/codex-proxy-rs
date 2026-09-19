@@ -9,6 +9,10 @@ export const router = createRouter({
 })
 
 router.beforeEach(async (to) => {
+  // 密链导入页不属于任何登录身份，既不恢复会话也不跳转登录。
+  if (to.name === 'public-import')
+    return
+
   const authStore = useAuthStore()
 
   // 登录页不依赖会话恢复；只使用当前已知身份决定是否跳转。

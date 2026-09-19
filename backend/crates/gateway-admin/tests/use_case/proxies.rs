@@ -12,6 +12,10 @@ use gateway_core::account::{OutboundProxy, ProviderAccountId};
 pub(super) struct TestProxies {
     pub events: Option<super::accounts::EventLog>,
     pub accounts: Option<Vec<ProxyAccountRef>>,
+    /// 设置后 `list` 返回这些记录。
+    pub records: Option<Vec<ProxyRecord>>,
+    /// 记录每次导入预留的代理 ID。
+    pub reserved: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -44,6 +48,9 @@ impl ProxyStore for TestProxies {
             .as_ref()
             .ok_or_else(|| super::unavailable("proxy"))?;
         events.lock().unwrap().push("proxy.reserve");
+        if let Some(reserved) = &self.reserved {
+            reserved.lock().unwrap().push(id.to_owned());
+        }
         Ok(gateway_admin::ports::proxy::ProxyImportReservation {
             binding: ImportProxyBinding {
                 id: id.to_owned(),
@@ -52,8 +59,17 @@ impl ProxyStore for TestProxies {
             guard: Box::new(ImportGuard(events.clone())),
         })
     }
-    async fn list(&self, _: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
-        Err(super::unavailable("proxy"))
+    async fn list(&self, query: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
+        let items = self
+            .records
+            .clone()
+            .ok_or_else(|| super::unavailable("proxy"))?;
+        Ok(ProxyPage {
+            total: items.len() as u64,
+            items: if query.page == 1 { items } else { Vec::new() },
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
     }
     async fn list_accounts(
         &self,
