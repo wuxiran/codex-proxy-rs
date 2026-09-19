@@ -281,16 +281,6 @@ impl fmt::Debug for CodexCookie {
 
 pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
 
-/// 账号级 state 到期前自动重新遍历代理的参数；只有管理员遍历成功后显式开启才存在。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TurnStateAutoHunt {
-    pub model: String,
-    pub attempts: u8,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub include_direct: bool,
-}
-
 /// Codex OAuth 对 `provider_credentials_json` 的完整明文 schema。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,9 +289,6 @@ pub struct CodexOAuthCredentialData {
     /// 管理员显式开启时生成；重新捕获会更换代次，原始 state 不入凭据。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_state_pin: Option<String>,
-    /// 账号级 state 的自动续期参数；关闭「固定自身 state」时一并清除。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_state_auto_hunt: Option<TurnStateAutoHunt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,

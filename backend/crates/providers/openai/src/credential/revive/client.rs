@@ -288,9 +288,20 @@ fn check_status(stage: &'static str, status: StatusCode) -> Result<(), ReviveCli
 
 const LOG_TEXT_LIMIT: usize = 200;
 
+/// 观澜的失败原因是定位问题的关键线索（签名不符、记录数不符等），保留；
+/// 但它是第三方自由文本，出现 JWT 或长凭据样字符串时整条不落日志。
 fn log_text(text: Option<&str>) -> String {
-    text.unwrap_or_default()
-        .chars()
+    let text = text.unwrap_or_default();
+    let credential_like = text.contains("eyJ")
+        || text
+            .split(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='))
+            })
+            .any(|run| run.len() >= 40);
+    if credential_like {
+        return "<redacted>".to_owned();
+    }
+    text.chars()
         .filter(|c| !c.is_control())
         .take(LOG_TEXT_LIMIT)
         .collect()

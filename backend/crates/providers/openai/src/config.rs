@@ -47,6 +47,8 @@ pub struct OpenAiConfig {
     revive_data_dir: PathBuf,
     #[serde(skip)]
     cdk_data_dir: PathBuf,
+    #[serde(skip)]
+    turn_state_data_dir: PathBuf,
 }
 
 impl OpenAiConfig {
@@ -63,6 +65,7 @@ impl OpenAiConfig {
         self.identity_secret_path = runtime_data_dir.join("identity_hmac_secret");
         self.revive_data_dir = runtime_data_dir.join("revive");
         self.cdk_data_dir = runtime_data_dir.join("cdk");
+        self.turn_state_data_dir = runtime_data_dir.join("turn_state");
         Ok(())
     }
 
@@ -120,6 +123,11 @@ impl OpenAiConfig {
     }
 
     #[must_use]
+    pub fn turn_state_data_dir(&self) -> &Path {
+        &self.turn_state_data_dir
+    }
+
+    #[must_use]
     pub const fn cdk_settings(&self) -> &CodexCdkSettings {
         &self.auth.cdk
     }
@@ -150,6 +158,7 @@ impl Default for OpenAiConfig {
             identity_secret_path: PathBuf::new(),
             revive_data_dir: PathBuf::new(),
             cdk_data_dir: PathBuf::new(),
+            turn_state_data_dir: PathBuf::new(),
         }
     }
 }

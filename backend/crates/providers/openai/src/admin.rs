@@ -78,6 +78,7 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
     turn_state_pins: crate::turn_state_pin::TurnStatePins,
+    auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -111,6 +112,7 @@ impl OpenAiAdminProvider {
         Self {
             provider_kind,
             turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
+            auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore::default(),
             profile,
             accounts,
             credentials: services.credentials,
@@ -128,6 +130,14 @@ impl OpenAiAdminProvider {
         pins: crate::turn_state_pin::TurnStatePins,
     ) -> Self {
         self.turn_state_pins = pins;
+        self
+    }
+
+    pub(crate) fn with_auto_hunt_store(
+        mut self,
+        store: crate::turn_state_auto_hunt::AutoHuntStore,
+    ) -> Self {
+        self.auto_hunt = store;
         self
     }
 
@@ -480,6 +490,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             || settings_material.contains_key("turn_state_auto_hunt")
         {
             return prepare_turn_state_pin_rotation(
+                &self.auto_hunt,
                 current,
                 command.provider_material,
                 command.account.provider_kind,
@@ -602,6 +613,10 @@ impl ProviderAdmin for OpenAiAdminProvider {
         let Ok(accounts) = self.accounts.list_for_provider(&provider).await else {
             return Vec::new();
         };
+        let settings = self.auto_hunt.all();
+        if settings.is_empty() {
+            return Vec::new();
+        }
         let mut due = Vec::new();
         for account in accounts {
             // 停用或凭据失效的账号发不出请求，续期只会白白失败。
@@ -619,17 +634,31 @@ impl ProviderAdmin for OpenAiAdminProvider {
             else {
                 continue;
             };
-            let (Some(auto), Some(generation)) = (&data.turn_state_auto_hunt, &data.turn_state_pin)
+            let (Some(auto), Some(generation)) =
+                (settings.get(account.id().as_str()), &data.turn_state_pin)
             else {
                 continue;
             };
             let Ok(upstream_model) = UpstreamModelId::new(auto.model.clone()) else {
                 continue;
             };
+            // 套餐规则里没有这个模型时，遍历本身就会被拒绝，不必进续期队列。
+            let Some(expected_length) =
+                crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                    .expected_length(&auto.model)
+            else {
+                continue;
+            };
             let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
             let fresh = self
                 .turn_state_pins
-                .account_wide_captured_at(account.id().as_str(), &binding, &auto.model, now)
+                .account_wide_captured_at(
+                    account.id().as_str(),
+                    &binding,
+                    &auto.model,
+                    expected_length,
+                    now,
+                )
                 .is_some_and(|captured_at| {
                     captured_at + crate::turn_state_pin::MAX_PIN_AGE > now + margin
                 });
@@ -732,7 +761,8 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 let value = serde_json::json!({
                     "guanlanReviveAvailable": guanlan_revive_available,
                     "pinTurnState": data.turn_state_pin.is_some(),
-                    "turnStateAutoHunt": data.turn_state_auto_hunt.as_ref().map(|auto| serde_json::json!({
+                    // 续期只对开启中的固定有意义；固定关着时即便文件里有残留也不展示、不续期。
+                    "turnStateAutoHunt": data.turn_state_pin.as_ref().and_then(|_| self.auto_hunt.get(account_id.as_str())).map(|auto| serde_json::json!({
                         "modelId": auto.model,
                         "attempts": auto.attempts,
                         "includeDirect": auto.include_direct,
@@ -1137,14 +1167,14 @@ struct TurnStateAutoHuntDocument {
 impl TurnStateAutoHuntDocument {
     fn into_setting(
         self,
-    ) -> Result<Option<crate::credential::TurnStateAutoHunt>, ProviderAdminError> {
+    ) -> Result<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>, ProviderAdminError> {
         if !self.enabled {
             return Ok(None);
         }
         if UpstreamModelId::new(self.model.clone()).is_err() || !(1..=20).contains(&self.attempts) {
             return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
         }
-        Ok(Some(crate::credential::TurnStateAutoHunt {
+        Ok(Some(crate::turn_state_auto_hunt::TurnStateAutoHunt {
             model: self.model,
             attempts: self.attempts,
             include_direct: self.include_direct,
@@ -1153,6 +1183,7 @@ impl TurnStateAutoHuntDocument {
 }
 
 fn prepare_turn_state_pin_rotation(
+    auto_hunt: &crate::turn_state_auto_hunt::AutoHuntStore,
     current: LoadedCredential,
     document: ProviderDocument,
     provider_kind: ProviderKind,
@@ -1160,16 +1191,31 @@ fn prepare_turn_state_pin_rotation(
     let document: TurnStatePinDocument =
         serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    let account_id = current.account.id().as_str().to_owned();
+    let setting = document
+        .turn_state_auto_hunt
+        .map(TurnStateAutoHuntDocument::into_setting)
+        .transpose()?;
+    let pinned_now = CodexCredentialCodec::decode_complete(&current.credential)
+        .ok()
+        .and_then(|data| data.oauth().map(|oauth| oauth.turn_state_pin.is_some()))
+        .unwrap_or(false);
+    let pinned_after = document.pin_turn_state.unwrap_or(pinned_now);
+    if matches!(setting, Some(Some(_))) && !pinned_after {
+        return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+            .with_public_message("请先开启并保存「固定自身 state」再开启自动续期"));
+    }
+    // 只改续期参数时凭据原样重编码（不换代次），仍走既有的 CAS 与审计。
     let prepared = CodexCredentialAdmin
-        .prepare_turn_state_pin_rotation(
-            current,
-            document.pin_turn_state,
-            document
-                .turn_state_auto_hunt
-                .map(TurnStateAutoHuntDocument::into_setting)
-                .transpose()?,
-        )
+        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
         .map_err(map_credential_admin_error)?;
+    // 续期参数不进凭据：旧版本的凭据 schema 拒绝未知字段，写进去会让回滚后的实例读不了该账号。
+    let stored = if pinned_after { setting } else { Some(None) };
+    if let Some(setting) = stored {
+        auto_hunt
+            .set(&account_id, setting)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Unavailable))?;
+    }
     prepared_rotation(prepared, provider_kind)
         .map(PreparedCredentialRotation::preserving_credential_state)
 }

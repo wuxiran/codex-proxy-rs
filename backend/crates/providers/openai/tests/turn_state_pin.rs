@@ -174,11 +174,16 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
     pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
         .unwrap();
     assert_eq!(
-        pins.account_wide_captured_at("account", "binding", "astra", now),
+        pins.account_wide_captured_at("account", "binding", "astra", 332, now),
         Some(now)
     );
     assert!(
-        pins.account_wide_captured_at("account", "binding", "terra", now)
+        pins.account_wide_captured_at("account", "binding", "terra", 332, now)
+            .is_none()
+    );
+    // 长度规则变了的旧 state 对续期来说等于没有。
+    assert!(
+        pins.account_wide_captured_at("account", "binding", "astra", 356, now)
             .is_none()
     );
     let later = now + Duration::from_secs(3599);
@@ -199,6 +204,27 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
         )
         .value()
         .is_none()
+    );
+}
+
+/// 在途请求开始时还没有 state；它完成前管理员钉了账号级 state。
+/// 它完成时不能再写客户端级 state —— 查找优先客户端级，旧出口的值会盖过刚钉的。
+#[test]
+fn request_in_flight_during_a_hunt_cannot_shadow_the_account_wide_pin() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let mut in_flight = pins.attempt("account", "binding".into(), "astra", "client", 332, now);
+    assert!(in_flight.value().is_none());
+    let hunted = "h".repeat(332);
+    pins.pin_account_wide("account", "binding".into(), "astra", 332, &hunted, now, now)
+        .unwrap();
+    in_flight.observe(Some(&"o".repeat(332)));
+    in_flight.completed(now);
+    assert_eq!(pins.status("account", "binding", now).len(), 1);
+    assert_eq!(
+        pins.attempt("account", "binding".into(), "astra", "client", 332, now)
+            .value(),
+        Some(hunted.as_str())
     );
 }
 

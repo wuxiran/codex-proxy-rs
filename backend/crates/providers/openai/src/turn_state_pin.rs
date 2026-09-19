@@ -206,11 +206,15 @@ impl TurnStatePins {
     }
 
     /// 账号级 state 的捕获时刻；自动续期据此判断是否临近到期。
+    ///
+    /// 长度规则属于作用域：套餐变化让规则变了之后，旧 state 已经不会被任何请求命中，
+    /// 这里同样视为缺失，续期才会去找符合新规则的 state。
     pub(crate) fn account_wide_captured_at(
         &self,
         account: &str,
         binding: &str,
         model: &str,
+        expected_length: usize,
         now: SystemTime,
     ) -> Option<SystemTime> {
         self.0.lock().ok()?.iter().find_map(|(scope, pin)| {
@@ -218,6 +222,7 @@ impl TurnStatePins {
                 && scope.account == account
                 && scope.binding == binding
                 && scope.model == model
+                && scope.expected_length == expected_length
                 && pin.active(now))
             .then_some(pin.captured_at)
         })
@@ -271,6 +276,15 @@ impl PinAttempt {
         }
         if let Ok(mut pins) = self.pins.0.lock() {
             pins.retain(|_, pin| pin.active(now));
+            // 本请求在途期间管理员可能已经钉了账号级 state。此时再写客户端级 state，
+            // 查找会优先命中它，等于让换绑前出口的旧值盖过刚钉的新值。
+            let account_wide = Scope {
+                client: None,
+                ..self.scope.clone()
+            };
+            if pins.contains_key(&account_wide) {
+                return;
+            }
             if pins.len() < MAX_PINS {
                 // 并发请求中的首个成功候选获胜，随后任何长度都不覆盖它。
                 pins.entry(self.scope.clone()).or_insert(PinnedState {

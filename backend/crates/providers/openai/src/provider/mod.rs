@@ -598,7 +598,8 @@ impl Provider for CodexProvider {
                 response_store,
                 continuation_scope: None,
             });
-        let allows_account_state_mutation = lease.allows_account_state_mutation();
+        let allows_account_state_mutation =
+            lease.allows_account_state_mutation() && context.diagnostic_egress().is_none();
         let session_affinity_key_hash = session_affinity
             .as_ref()
             .map(|affinity| affinity.key_hash().to_owned());

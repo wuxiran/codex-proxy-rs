@@ -75,5 +75,5 @@ pub(crate) use selector::{CodexCyberPolicyScope, SelectCodexProviderEndpointCred
 pub use types::{
     CODEX_AUTHENTICATION_KIND_OAUTH, CodexAccountProfile, CodexCookie, CodexCookieCaptureOutcome,
     CodexCredentialData, CodexCredentialPrincipal, CodexOAuthCredentialData, CodexOAuthSecret,
-    RuntimeCodexCookie, TurnStateAutoHunt, UpsertCodexCookie,
+    RuntimeCodexCookie, UpsertCodexCookie,
 };

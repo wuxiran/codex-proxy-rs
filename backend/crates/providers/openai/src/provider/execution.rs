@@ -650,7 +650,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
-        let allows_account_state_mutation = lease.allows_account_state_mutation();
+        // 经临时出口的探测，其成败说明的是那个出口而不是账号：不回写冷却、反馈分、Cookie 或配额。
+        let allows_account_state_mutation =
+            lease.allows_account_state_mutation() && context.diagnostic_egress().is_none();
         let failure_context = OpenAiFailureContext {
             client: &client,
             selector: &selector,

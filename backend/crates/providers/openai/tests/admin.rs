@@ -2164,8 +2164,10 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
     );
 }
 
+/// 续期参数绝不进凭据：现网旧版的凭据 schema 是 `deny_unknown_fields`，多一个字段就会让
+/// 回滚后的实例（以及发版排空期间的旧槽位）读不了这个账号。
 #[tokio::test]
-async fn turn_state_auto_hunt_is_validated_and_never_outlives_the_pin_switch() {
+async fn turn_state_auto_hunt_lives_outside_the_credential_and_requires_the_pin_switch() {
     let store = Arc::new(MemoryAccountStore::default());
     store
         .seed_oauth_credential(ImportCodexOAuthCredential {
@@ -2178,8 +2180,10 @@ async fn turn_state_auto_hunt_is_validated_and_never_outlives_the_pin_switch() {
         })
         .await;
     let account = store.account("acct_auto_hunt").unwrap();
+    // 配置持有运行数据目录的 TempDir；必须活到测试结束，续期参数就写在里面。
+    let config = valid_config();
     let bundle = provider_openai::initialize(
-        valid_config().config.clone(),
+        config.config.clone(),
         provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
     )
     .await
@@ -2195,6 +2199,20 @@ async fn turn_state_auto_hunt_is_validated_and_never_outlives_the_pin_switch() {
     };
     let auto = json!({"enabled":true,"model":"gpt-6-astra","attempts":5,"include_direct":true});
 
+    // 固定没开时不能开续期：否则后台会对一个不使用 state 的账号持续发请求。
+    assert!(rotate(json!({"turn_state_auto_hunt":auto})).await.is_err());
+    for invalid in [
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":0}),
+        json!({"enabled":true,"model":"gpt-6-astra","attempts":21}),
+        json!({"enabled":true,"model":"","attempts":5}),
+    ] {
+        assert!(
+            rotate(json!({"pin_turn_state":true,"turn_state_auto_hunt":invalid}))
+                .await
+                .is_err()
+        );
+    }
+
     let prepared = rotate(json!({"pin_turn_state":true,"turn_state_auto_hunt":auto}))
         .await
         .unwrap();
@@ -2203,34 +2221,13 @@ async fn turn_state_auto_hunt_is_validated_and_never_outlives_the_pin_switch() {
         .provider_material
         .expose_to_provider()
         .expose_to_provider();
-    assert_eq!(
-        data.get("turn_state_auto_hunt"),
-        Some(&json!({"model":"gpt-6-astra","attempts":5,"include_direct":true}))
-    );
+    // 凭据里只有旧版本认识的字段。
+    assert!(data.contains_key("turn_state_pin"));
+    assert!(!data.contains_key("turn_state_auto_hunt"));
     assert!(prepared.facts().preserve_credential_state);
 
-    // 固定关闭时续期参数不落盘：否则后台会对一个不再使用 state 的账号持续发请求。
-    let prepared = rotate(json!({"turn_state_auto_hunt":auto})).await.unwrap();
-    assert!(
-        !prepared
-            .facts()
-            .provider_material
-            .expose_to_provider()
-            .expose_to_provider()
-            .contains_key("turn_state_auto_hunt")
-    );
-    for invalid in [
-        json!({"enabled":true,"model":"gpt-6-astra","attempts":0}),
-        json!({"enabled":true,"model":"gpt-6-astra","attempts":21}),
-        json!({"enabled":true,"model":"","attempts":5}),
-    ] {
-        assert!(
-            rotate(json!({"turn_state_auto_hunt":invalid}))
-                .await
-                .is_err()
-        );
-    }
-    // 没有任何账号开启续期时，续期任务没有可做的事。
+    // 关掉固定会一并清掉续期参数；此时凭据未提交固定开关，续期任务没有可做的事。
+    rotate(json!({"pin_turn_state":false})).await.unwrap();
     assert!(
         admin
             .turn_state_hunt_renewals(SystemTime::now(), std::time::Duration::from_secs(300))

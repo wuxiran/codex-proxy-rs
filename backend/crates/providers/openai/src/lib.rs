@@ -4,6 +4,7 @@ mod admin;
 pub mod config;
 mod provider;
 mod session_transport;
+mod turn_state_auto_hunt;
 mod turn_state_pin;
 
 use std::sync::Arc;
@@ -217,7 +218,11 @@ pub async fn initialize(
             websocket_pool,
             desktop_release_status,
         )
-        .with_turn_state_pins(turn_state_pins),
+        .with_turn_state_pins(turn_state_pins)
+        .with_auto_hunt_store(
+            turn_state_auto_hunt::AutoHuntStore::new(config.turn_state_data_dir().to_path_buf())
+                .map_err(|_| OpenAiInitializeError::Transport)?,
+        ),
     );
     let worker_contributions = provider::worker_contributions(
         refresh,
