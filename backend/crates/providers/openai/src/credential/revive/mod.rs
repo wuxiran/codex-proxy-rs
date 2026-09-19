@@ -2,6 +2,7 @@
 
 mod client;
 mod detect;
+mod repair;
 mod service;
 mod store;
 

@@ -136,10 +136,18 @@ impl CodexReviveService {
         if !self.due_for_attempt(&digest) {
             return Err(CodexReviveError::Cooldown);
         }
+        let bytes = self.submittable(&digest, &bytes);
         let recovered = match self.client.recover_signed_export(&bytes).await {
             Ok(document) => document,
             Err(error) => {
                 let error = CodexReviveError::Client(error);
+                tracing::warn!(
+                    account_id = account.id().as_str(),
+                    export = digest.get(..12).unwrap_or(&digest),
+                    error = %error,
+                    error_class = error_class(&error),
+                    "Guanlan manual revive failed"
+                );
                 self.write_state(&digest, "failed", Some(error_class(&error)));
                 return Err(error);
             }
@@ -235,6 +243,7 @@ impl CodexReviveService {
         let Some((_, bytes)) = self.store.export_for_user(&user_id)? else {
             return Ok(0);
         };
+        let bytes = self.submittable(_digest, &bytes);
         let recovered = self.client.recover_signed_export(&bytes).await?;
         let mut applied = 0_u64;
         for tokens in recovered_accounts(&recovered) {
@@ -275,6 +284,19 @@ impl CodexReviveService {
             Err(CredentialRepositoryError::RevisionConflict) => Ok(()),
             Err(_) => Err(CodexReviveError::Repository),
         }
+    }
+
+    /// 归档里的数字可能已被浏览器改写；提交前按签名清单还原，并留下可查的日志。
+    fn submittable(&self, digest: &str, bytes: &[u8]) -> Vec<u8> {
+        let (bytes, restored) = super::repair::restore_signed_numbers(bytes);
+        if restored > 0 {
+            tracing::info!(
+                export = digest.get(..12).unwrap_or(digest),
+                restored_accounts = restored,
+                "Guanlan revive restored browser-rewritten numbers to match the signed manifest"
+            );
+        }
+        bytes
     }
 
     fn due_for_attempt(&self, digest: &str) -> bool {

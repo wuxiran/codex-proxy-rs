@@ -68,21 +68,48 @@ impl ReviveApiClient {
 
     pub async fn recover_signed_export(&self, document: &[u8]) -> Result<Value, ReviveClientError> {
         let job = self.start_verify(document).await?;
+        tracing::info!(
+            job_id = %job.job_id,
+            document_bytes = document.len(),
+            "Guanlan revive verify started"
+        );
         let token = job.task_token.clone();
         let job = self
             .poll_job(&job.job_id, &token, "/verify/", &["completed", "failed"])
             .await?;
         if job.status == "failed" {
+            // last_error 是观澜的拒绝原因（如签名/记录数不符），不含凭据；截断后落日志。
+            tracing::warn!(
+                job_id = %job.job_id,
+                reason = %log_text(job.last_error.as_deref()),
+                "Guanlan revive verify rejected the signed export"
+            );
             return Err(ReviveClientError::Rejected);
         }
+        tracing::info!(
+            job_id = %job.job_id,
+            total = job.total_count.unwrap_or(0),
+            normal = job.normal_count.unwrap_or(0),
+            unauthorized = job.unauthorized_count.unwrap_or(0),
+            counts_present = job.unauthorized_count.is_some(),
+            "Guanlan revive verify completed"
+        );
         if job.unauthorized_count.unwrap_or(0) == 0 {
             return Ok(serde_json::json!({ "accounts": [] }));
         }
-        let preflight_id = job
+        // result 视图可能不带统计计数，因此保留 summary 的最终 unauthorized_count。
+        let detail_url = format!(
+            "{}/verify/{}?result=1",
+            self.settings.base_url.trim_end_matches('/'),
+            job.job_id
+        );
+        let detail = self.get_json(&detail_url, &token).await?;
+        let preflight_id = detail
             .preflight_id
             .clone()
             .ok_or(ReviveClientError::InvalidResponse)?;
         let task = self.start_task(document, &preflight_id).await?;
+        tracing::info!(task_id = %task.job_id, "Guanlan revive task started");
         let token = if task.task_token.is_empty() {
             token
         } else {
@@ -96,7 +123,18 @@ impl ReviveApiClient {
                 &["normal", "recovered", "partial", "failed", "stopped"],
             )
             .await?;
-        if !task.download_ready.unwrap_or(false) && !task.all_download_ready.unwrap_or(false) {
+        let download_ready =
+            task.download_ready.unwrap_or(false) || task.all_download_ready.unwrap_or(false);
+        tracing::info!(
+            task_id = %task.job_id,
+            status = %task.status,
+            success = task.success_count.unwrap_or(0),
+            failure = task.failure_count.unwrap_or(0),
+            download_ready,
+            reason = %log_text(task.last_error.as_deref()),
+            "Guanlan revive task finished"
+        );
+        if !download_ready {
             return Err(ReviveClientError::InvalidResponse);
         }
         self.download_task(&task.job_id, &token).await
@@ -133,7 +171,7 @@ impl ReviveApiClient {
     ) -> Result<JobView, ReviveClientError> {
         let url = if path_prefix == "/verify/" {
             format!(
-                "{}{path_prefix}{id}?result=1",
+                "{}{path_prefix}{id}?summary=1",
                 self.settings.base_url.trim_end_matches('/')
             )
         } else {
@@ -149,6 +187,7 @@ impl ReviveApiClient {
                 return Ok(view);
             }
             if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(job_id = %id, status = %view.status, "Guanlan revive poll timed out");
                 return Err(ReviveClientError::Timeout);
             }
             sleep(self.poll_interval).await;
@@ -167,7 +206,7 @@ impl ReviveApiClient {
             .send()
             .await
             .map_err(|_| ReviveClientError::Transport)?;
-        map_status(response.status())?;
+        check_status("download", response.status())?;
         response
             .json()
             .await
@@ -191,7 +230,7 @@ impl ReviveApiClient {
             .send()
             .await
             .map_err(|_| ReviveClientError::Transport)?;
-        map_status(response.status())?;
+        check_status("submit", response.status())?;
         let envelope: JobEnvelope = response
             .json()
             .await
@@ -207,7 +246,7 @@ impl ReviveApiClient {
             .send()
             .await
             .map_err(|_| ReviveClientError::Transport)?;
-        map_status(response.status())?;
+        check_status("poll", response.status())?;
         let envelope: JobEnvelope = response
             .json()
             .await
@@ -235,6 +274,28 @@ fn map_status(status: StatusCode) -> Result<(), ReviveClientError> {
     }
 }
 
+/// 失败时只记录阶段与状态码；响应正文可能回显凭据，不落日志。
+fn check_status(stage: &'static str, status: StatusCode) -> Result<(), ReviveClientError> {
+    map_status(status).inspect_err(|error| {
+        tracing::warn!(
+            stage,
+            http_status = status.as_u16(),
+            error = %error,
+            "Guanlan revive-api returned an error status"
+        );
+    })
+}
+
+const LOG_TEXT_LIMIT: usize = 200;
+
+fn log_text(text: Option<&str>) -> String {
+    text.unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(LOG_TEXT_LIMIT)
+        .collect()
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct JobEnvelope {
     #[serde(default)]
@@ -258,6 +319,16 @@ struct JobBody {
     #[serde(default)]
     unauthorized_count: Option<u64>,
     #[serde(default)]
+    total_count: Option<u64>,
+    #[serde(default)]
+    normal_count: Option<u64>,
+    #[serde(default)]
+    success_count: Option<u64>,
+    #[serde(default)]
+    failure_count: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
     download_ready: Option<bool>,
     #[serde(default)]
     all_download_ready: Option<bool>,
@@ -269,6 +340,11 @@ struct JobView {
     status: String,
     preflight_id: Option<String>,
     unauthorized_count: Option<u64>,
+    total_count: Option<u64>,
+    normal_count: Option<u64>,
+    success_count: Option<u64>,
+    failure_count: Option<u64>,
+    last_error: Option<String>,
     download_ready: Option<bool>,
     all_download_ready: Option<bool>,
 }
@@ -289,6 +365,11 @@ impl JobEnvelope {
             status: body.status.unwrap_or_default(),
             preflight_id: body.preflight_id,
             unauthorized_count: body.unauthorized_count,
+            total_count: body.total_count,
+            normal_count: body.normal_count,
+            success_count: body.success_count,
+            failure_count: body.failure_count,
+            last_error: body.last_error,
             download_ready: body.download_ready,
             all_download_ready: body.all_download_ready,
         })

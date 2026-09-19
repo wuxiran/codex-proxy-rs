@@ -266,3 +266,145 @@ async fn manual_and_automatic_revival_share_guards_and_only_apply_recovered_cred
     let unchanged = store.load_current_credential(&account_id).await.unwrap();
     assert_eq!(unchanged.account.revision(), refreshed.revision());
 }
+
+/// 线上事故复现：CDK 兑换经浏览器往返后 `1.0` 变 `1`，原样提交会被观澜按签名哈希拒绝；
+/// verify 的 result 视图又不带 `unauthorized_count`，读它会把 401 账号误判成无需复活。
+#[tokio::test]
+async fn manual_revival_restores_signed_numbers_and_reads_counts_from_the_summary_view() {
+    use sha2::{Digest as _, Sha256};
+    use wiremock::matchers::{body_string_contains, query_param};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryAccountStore::default());
+    let old_access = test_jwt("user-a");
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_revive_float".to_owned(),
+            name: "pool-a".to_owned(),
+            secret: CodexOAuthSecret {
+                access_token: secrecy::SecretString::from(old_access.clone()),
+                refresh_token: Some(secrecy::SecretString::from("rt-old")),
+                id_token: None,
+            },
+            verified_account: CodexAccountProfile {
+                email: Some("a@example.com".to_owned()),
+                oauth_subject: "user-a".to_owned(),
+                poid: None,
+                chatgpt_account_id: "chatgpt-a".to_owned(),
+                chatgpt_user_id: "user-a".to_owned(),
+                plan_type: Some("plus".to_owned()),
+                access_token_expires_at: None,
+            },
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account_id = ProviderAccountId::new("acct_revive_float").unwrap();
+    let account = store.get_account(&account_id).await.unwrap().unwrap();
+
+    // 观澜按「键排序、紧凑」的原文算哈希，原文里 rate_multiplier 是 1.0。
+    let signed_original = format!(
+        r#"{{"credentials":{{"access_token":"{old_access}","refresh_token":"rt-old"}},"name":"pool-a","platform":"openai","rate_multiplier":1.0,"type":"oauth"}}"#
+    );
+    let archived = json!({
+        "exported_at": "2026-09-19T00:00:00Z",
+        "x_revive_manifest": {
+            "version": 1,
+            "signature": "test-ed25519-signature",
+            "scope": ["inspect", "reauth", "download"],
+            "records": [{
+                "index": 0,
+                "payload_sha256": hex::encode(Sha256::digest(signed_original.as_bytes())),
+            }],
+        },
+        "accounts": [{
+            "name": "pool-a",
+            "platform": "openai",
+            "type": "oauth",
+            "rate_multiplier": 1,
+            "credentials": { "access_token": old_access, "refresh_token": "rt-old" }
+        }]
+    });
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/verify/start"))
+        .and(body_string_contains(r#""rate_multiplier":1.0"#))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "ok": true,
+            "job": { "job_id": "j-float", "task_token": "secret-token", "status": "queued" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/verify/j-float"))
+        .and(query_param("summary", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "job": { "job_id": "j-float", "status": "completed", "preflight_id": "pf-float", "unauthorized_count": 1 }
+        })))
+        .mount(&server)
+        .await;
+    // 与观澜实测一致：result 视图没有任何统计计数。
+    Mock::given(method("GET"))
+        .and(path("/verify/j-float"))
+        .and(query_param("result", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "job": { "job_id": "j-float", "status": "completed", "preflight_id": "pf-float" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tasks"))
+        .and(body_string_contains(r#""rate_multiplier":1.0"#))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "ok": true,
+            "task": { "task_id": "t-float", "status": "running" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-float"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "task": { "task_id": "t-float", "status": "recovered", "download_ready": true, "success_count": 1 }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-float/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accounts": [{ "credentials": { "access_token": test_jwt("user-a"), "refresh_token": "rt-new" } }]
+        })))
+        .mount(&server)
+        .await;
+
+    let service = CodexReviveService::for_test(
+        dir.path().to_path_buf(),
+        CodexReviveSettings {
+            enabled: true,
+            base_url: server.uri(),
+            verify_workers: 1,
+            task_workers: 1,
+        },
+        store.repository(),
+    )
+    .unwrap();
+    service.record_signed_document(&archived).unwrap();
+
+    let (secret, _guard) = service
+        .prepare_manual_revival(&account)
+        .await
+        .expect("revival succeeds once the signed numbers are restored");
+    use secrecy::ExposeSecret as _;
+    assert_eq!(
+        secret
+            .refresh_token
+            .as_ref()
+            .map(|token| token.expose_secret().to_owned()),
+        Some("rt-new".to_owned())
+    );
+}
