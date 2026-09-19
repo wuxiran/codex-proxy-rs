@@ -7,7 +7,6 @@ import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
@@ -86,7 +85,6 @@ const {
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
-  updatingSchedulingAccountIds,
   deletingAccount,
   creatingAccount,
   authorizingOAuth,
@@ -105,7 +103,6 @@ const {
   handleRecover,
   handleRefresh,
   handleRefreshQuota,
-  handleToggleScheduling,
 } = useAccountMutations({
   onImportTaskCreated: importTasks.created,
   accounts,
@@ -297,17 +294,6 @@ const {
                 :rate-limit-reason="row.quota.rateLimitReason"
                 :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
-              />
-            </template>
-
-            <template #enabled="{ row }">
-              <BaseSwitch
-                :model-value="row.enabled"
-                :label="`${row.name} 调度`"
-                :disabled="updatingSchedulingAccountIds.has(row.id)"
-                :aria-busy="updatingSchedulingAccountIds.has(row.id)"
-                :title="row.enabled ? '关闭调度' : '开启调度'"
-                @update:model-value="handleToggleScheduling(row, $event)"
               />
             </template>
 
