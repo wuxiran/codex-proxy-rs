@@ -683,6 +683,49 @@ impl CodexCredentialAdmin {
         })
     }
 
+    /// 仅修改本账号的实验开关，复用既有 CAS/audit 事务，不接受外部 state。
+    pub(crate) fn prepare_turn_state_pin_rotation(
+        &self,
+        current: LoadedCredential,
+        enabled: bool,
+    ) -> Result<PreparedCodexCredentialRotation, CodexCredentialAdminError> {
+        if current.account.provider().as_str() != PROVIDER_NAME
+            || current.account.authentication_kind() != CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(CodexCredentialAdminError::InvalidCredential);
+        }
+        let mut data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
+        data.oauth_mut()
+            .ok_or(CodexCredentialAdminError::InvalidCredential)?
+            .turn_state_pin = enabled.then(|| uuid::Uuid::new_v4().to_string());
+        let credential = CodexCredentialCodec::encode_complete(data)
+            .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
+        let profile = ProviderAccountUpdate {
+            account_id: current.account.id().clone(),
+            name: current.account.name().to_owned(),
+            email: current.account.email().map(str::to_owned),
+            plan_type: current.account.plan_type().map(str::to_owned),
+        };
+        let credential = CredentialCasUpdate::new(
+            current.account.id().clone(),
+            current.account.revision(),
+            profile.clone(),
+            credential,
+            current.account.has_refresh_token(),
+            current.account.access_token_expires_at(),
+            current.account.next_refresh_at(),
+        )
+        .map_err(|_| CodexCredentialAdminError::InvalidCredential)?
+        .preserving_profile();
+        Ok(PreparedCodexCredentialRotation {
+            profile,
+            credential,
+            replacement_identity: None,
+            refresh_guards: None,
+        })
+    }
+
     pub fn prepare_rotation(
         &self,
         input: RotateManagedCodexCredential,

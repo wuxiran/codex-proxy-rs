@@ -61,6 +61,8 @@ INSTALL_DIR="$HOME/services/codex-proxy-rs" bash install.sh
 ### 登录管理端
 
 部署完成后，打开 `http://127.0.0.1:8080`，使用 `admin@cpr.local` 和管理员密码登录。
+
+OpenAI OAuth 账号的「账号管理 → 编辑账号 → 固定自身 state（实验）」可启用候选固定或重新捕获，查看当前模型、到期时间和命中次数。默认关闭；行为与效果边界见 [账号 API](docs/api.md#5-账号)。
 API Key 持有者可在同一登录页切换登录身份，进入 `/key-usage` 查看自己的用量、趋势、请求日志、额度与健康时间线；不能访问管理员页面。
 
 默认地址只能在服务器本机访问。从其他设备使用时，需要配置

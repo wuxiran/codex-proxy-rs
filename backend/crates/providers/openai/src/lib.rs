@@ -4,6 +4,7 @@ mod admin;
 pub mod config;
 mod provider;
 mod session_transport;
+mod turn_state_pin;
 
 use std::sync::Arc;
 
@@ -131,6 +132,7 @@ pub async fn initialize(
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
     ));
+    let turn_state_pins = crate::turn_state_pin::TurnStatePins::default();
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,
@@ -144,7 +146,8 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
-        .with_session_identity(session_identity),
+        .with_session_identity(session_identity)
+        .with_turn_state_pins(turn_state_pins.clone()),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -184,20 +187,23 @@ pub async fn initialize(
         )
         .with_oauth_client_id(config.oauth_client_id()),
     );
-    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(OpenAiAdminProvider::new(
-        provider_kind,
-        profile,
-        accounts,
-        OpenAiAdminServices {
-            credentials: credential_admin,
-            oauth: oauth_admin,
-            profile_statistics,
-            quota: Arc::clone(&quota),
-            catalog: Arc::clone(&catalog),
-        },
-        websocket_pool,
-        desktop_release_status,
-    ));
+    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(
+        OpenAiAdminProvider::new(
+            provider_kind,
+            profile,
+            accounts,
+            OpenAiAdminServices {
+                credentials: credential_admin,
+                oauth: oauth_admin,
+                profile_statistics,
+                quota: Arc::clone(&quota),
+                catalog: Arc::clone(&catalog),
+            },
+            websocket_pool,
+            desktop_release_status,
+        )
+        .with_turn_state_pins(turn_state_pins),
+    );
     let worker_contributions = provider::worker_contributions(
         refresh,
         quota,

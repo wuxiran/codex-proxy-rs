@@ -73,6 +73,7 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
+    turn_state_pins: crate::turn_state_pin::TurnStatePins,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -105,6 +106,7 @@ impl OpenAiAdminProvider {
     ) -> Self {
         Self {
             provider_kind,
+            turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
             profile,
             accounts,
             credentials: services.credentials,
@@ -115,6 +117,14 @@ impl OpenAiAdminProvider {
             websocket_pool,
             desktop_release,
         }
+    }
+
+    pub(crate) fn with_turn_state_pins(
+        mut self,
+        pins: crate::turn_state_pin::TurnStatePins,
+    ) -> Self {
+        self.turn_state_pins = pins;
+        self
     }
 
     async fn account(
@@ -192,6 +202,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     }
 
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
+        self.turn_state_pins.clear(account_id.as_str());
         self.websocket_pool.evict_account(account_id.as_str()).await;
     }
 
@@ -416,6 +427,18 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
                 .with_public_message("账号凭据已被更新，请刷新账号列表后重试"));
         }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("pin_turn_state")
+        {
+            return prepare_turn_state_pin_rotation(
+                current,
+                command.provider_material,
+                command.account.provider_kind,
+            );
+        }
         if current.account.authentication_kind()
             == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY
         {
@@ -476,20 +499,49 @@ impl ProviderAdmin for OpenAiAdminProvider {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<Option<ProviderDocument>, ProviderAdminError> {
-        let account = self.account(account_id).await?;
-        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
-            return Ok(None);
-        }
+        self.account(account_id).await?;
         let current = self
             .accounts
             .load_current_credential(account_id)
             .await
             .map_err(map_store_error)?;
-        let crate::credential::CodexCredentialData::ApiKey(data) =
-            CodexCredentialCodec::decode_complete(&current.credential)
-                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?
-        else {
-            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let data = match data {
+            crate::credential::CodexCredentialData::OAuth(data) => {
+                let now = std::time::SystemTime::now();
+                let pins = data
+                    .turn_state_pin
+                    .as_ref()
+                    .map(|generation| {
+                        let binding = crate::turn_state_pin::credential_binding(
+                            generation,
+                            &data.access_token,
+                        );
+                        self.turn_state_pins
+                            .status(account_id.as_str(), &binding, now)
+                    })
+                    .unwrap_or_default();
+                let pins = pins.into_iter().map(|pin| serde_json::json!({
+                    "model": pin.model,
+                    "length": 292,
+                    "capturedAt": DateTime::<Utc>::from(pin.captured_at),
+                    "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
+                    "hits": pin.hits,
+                })).collect::<Vec<_>>();
+                let value = serde_json::json!({
+                    "pinTurnState": data.turn_state_pin.is_some(),
+                    "turnStatePins": pins,
+                    "maxAgeSeconds": crate::turn_state_pin::MAX_PIN_AGE.as_secs(),
+                });
+                return Ok(Some(ProviderDocument::new(OpaqueProviderData::new(
+                    value
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+                ))));
+            }
+            crate::credential::CodexCredentialData::ApiKey(data) => data,
         };
         let value = serde_json::to_value(data.configuration())
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
@@ -806,6 +858,7 @@ fn prepared_rotation(
             email: profile.email,
             plan_type: profile.plan_type,
             preserve_profile,
+            preserve_credential_state: false,
             provider_material: ProviderDocument::new(OpaqueProviderData::new(
                 credential.into_inner(),
             )),
@@ -815,6 +868,27 @@ fn prepared_rotation(
         },
         Box::new(OpenAiCredentialCommitGuard { _guard: guard }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStatePinDocument {
+    pin_turn_state: bool,
+}
+
+fn prepare_turn_state_pin_rotation(
+    current: LoadedCredential,
+    document: ProviderDocument,
+    provider_kind: ProviderKind,
+) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+    let document: TurnStatePinDocument =
+        serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    let prepared = CodexCredentialAdmin
+        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
+        .map_err(map_credential_admin_error)?;
+    prepared_rotation(prepared, provider_kind)
+        .map(PreparedCredentialRotation::preserving_credential_state)
 }
 
 #[derive(Deserialize)]
