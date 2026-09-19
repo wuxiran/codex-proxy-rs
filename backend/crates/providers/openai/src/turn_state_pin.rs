@@ -148,6 +148,7 @@ impl TurnStatePins {
         PinAttempt {
             pins: self.clone(),
             scope,
+            egress: egress.to_owned(),
             value,
             candidate: None,
             started_at: now,
@@ -259,6 +260,8 @@ impl TurnStatePins {
 pub(crate) struct PinAttempt {
     pins: TurnStatePins,
     scope: Scope,
+    /// 本次请求实际走的出口。
+    egress: String,
     value: Option<String>,
     candidate: Option<String>,
     started_at: SystemTime,
@@ -299,11 +302,16 @@ impl PinAttempt {
             pins.retain(|_, pin| pin.active(now));
             // 本请求在途期间管理员可能已经钉了账号级 state。此时再写客户端级 state，
             // 查找会优先命中它，等于让换绑前出口的旧值盖过刚钉的新值。
+            // 只有同一出口上的账号级 state 才需要这样保护：账号已被改绑到别的出口时，
+            // 旧出口的账号级 state 对本请求本来就不生效，不能让它挡住新出口上的被动捕获。
             let account_wide = Scope {
                 client: None,
                 ..self.scope.clone()
             };
-            if pins.contains_key(&account_wide) {
+            if pins
+                .get(&account_wide)
+                .is_some_and(|pin| pin.egress.as_deref() == Some(self.egress.as_str()))
+            {
                 return;
             }
             if pins.len() < MAX_PINS {

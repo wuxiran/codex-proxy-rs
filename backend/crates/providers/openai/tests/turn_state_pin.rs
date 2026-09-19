@@ -432,6 +432,31 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
         implementation::egress_fingerprint(None),
         implementation::egress_fingerprint(Some("http://127.0.0.1:1"))
     );
+    // 旧出口的账号级 state 不生效，也不能挡住新出口上的被动捕获。
+    let mut on_new_egress = pins.attempt(
+        "account",
+        "binding".into(),
+        "astra",
+        "client",
+        332,
+        "egress-b",
+        now,
+    );
+    on_new_egress.observe(Some(&"n".repeat(332)));
+    on_new_egress.completed(now);
+    assert_eq!(
+        pins.attempt(
+            "account",
+            "binding".into(),
+            "astra",
+            "client",
+            332,
+            "egress-b",
+            now
+        )
+        .value(),
+        Some("n".repeat(332).as_str())
+    );
 }
 
 #[test]

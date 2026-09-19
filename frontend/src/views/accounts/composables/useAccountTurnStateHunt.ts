@@ -139,7 +139,7 @@ export function useAccountTurnStateHunt() {
       return
     close()
     status.value = 'cancelled'
-    message.value = '已取消。若取消的瞬间恰好命中，服务端可能已经完成绑定与钉住——下方已按服务端的实际状态刷新，请以它为准'
+    message.value = '已取消。若取消的瞬间恰好命中，服务端可能仍在完成绑定与钉住；稍后会按服务端的实际状态刷新下方的代理与固定列表，请以刷新后的内容为准（可重新打开账号再次确认）'
   }
 
   onScopeDispose(close)

@@ -713,6 +713,8 @@ async fn capacity_and_local_failures_abort_instead_of_walking_every_egress() {
             ProviderErrorKind::ProviderInfrastructureUnavailable,
             "system_error",
         ),
+        // 选不出可用账号在网关层叫 NoAvailableProvider，不能被当成「账号忙」重试五次。
+        (ProviderErrorKind::NoEligibleAccount, "system_error"),
     ] {
         let probe = ScriptedProbe::new([Reply::Rejected(kind)]);
         let setup = setup(

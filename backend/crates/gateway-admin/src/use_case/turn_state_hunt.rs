@@ -633,6 +633,10 @@ impl Hunt {
 }
 
 fn not_sent_because_busy(error: &AccountProbeError) -> bool {
+    // Provider 已经明确说「选不出可用账号」时不是忙，是账号不可用：重试五次也不会变好。
+    if error.provider_kind() == Some(ProviderErrorKind::NoEligibleAccount) {
+        return false;
+    }
     matches!(
         error.kind(),
         GatewayErrorKind::AccountCapacityUnavailable
@@ -686,6 +690,8 @@ impl FailureClass {
                 | GatewayErrorKind::Unsupported
                 | GatewayErrorKind::InvalidRequest
                 | GatewayErrorKind::ModelNotFound => Self::Account,
+                // 没有 Provider 分类的内部错误来自网关自身（如运行时快照不可用），与出口无关。
+                GatewayErrorKind::Internal | GatewayErrorKind::Cancelled => Self::System,
                 _ => Self::Egress,
             },
         }
