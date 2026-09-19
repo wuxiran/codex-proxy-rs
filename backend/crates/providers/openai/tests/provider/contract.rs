@@ -106,6 +106,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
         let location = location.map(|value| serde_json::from_value::<RequestLocation>(value).unwrap());
         store.set_egress(account_id, Some(OutboundProxy::parse(&proxy.uri()).unwrap()), location);
         let mut stream = provider.execute(planned_request("openai", operation.clone()), context_with_state_owner_and_location(&format!("req_proxy_location_{index}"), account_id, global_enabled.then(global_request_location))).await.expect("prepare");
+        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some(format!("{}/", proxy.uri()).as_str()));
         while let Some(event) = stream.next().await { event.expect("proxy response"); }
         let requests = proxy.received_requests().await.unwrap();
         let body = captured_request_body(requests.last().expect("request reached selected proxy"));
@@ -1227,6 +1228,7 @@ async fn image_endpoints_bypass_only_the_text_catalog_and_preserve_the_current_c
             )
             .await
             .expect("prepare image provider stream");
+        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some("direct"));
         let mut raw_response = None;
         let mut completed = false;
         let mut observed_http_json = false;

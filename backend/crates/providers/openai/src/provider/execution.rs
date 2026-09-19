@@ -114,6 +114,7 @@ impl CodexProvider {
                 provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
             })?,
         )
+        .with_outbound_proxy(lease.account().outbound_proxy())
         .with_selection_observation(ProviderSelectionObservation::new(
             account_selection_wait_ms,
             lease.capacity_snapshot(),

@@ -1783,6 +1783,12 @@ async fn model_billing_identity_and_both_costs_survive_finalization() {
         billing_model: Some("gpt-5.6-luna".to_owned()),
         calculated_cost: Some(CalculatedCost::from_usd_ticks(12345).unwrap().total()),
     };
+    let trace = json!({"request_attribution": {
+        "requested_model":"gpt-6-astra", "route_model":"gpt-6-astra",
+        "response_model":"gpt-5.6-luna", "billing_model":"gpt-5.6-luna",
+        "provider_account_id":"acct_mock", "outbound_proxy_endpoint":"http://proxy.example:8080/"
+    }});
+    finalization.diagnostic_trace_json = Some(trace.to_string());
     ExecutionStore::finalize_model_request(&store, finalization)
         .await
         .unwrap();
@@ -1792,6 +1798,11 @@ async fn model_billing_identity_and_both_costs_survive_finalization() {
         row,
         json!({"requested":"gpt-6-astra","upstream":"gpt-6-astra","response":"gpt-5.6-luna","billing":"gpt-5.6-luna","calculated":"0.0000012345","actual":"0.0000000000","source":"provider_reported"})
     );
+    let detail = super::observability_repository(&database.pool)
+        .usage_record_detail("req_billing_identity")
+        .await
+        .unwrap();
+    assert_eq!(detail.trace, Some(trace));
     database.close().await;
 }
 
