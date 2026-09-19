@@ -98,7 +98,7 @@ impl ProxyStore for MemoryProxies {
         proxy_id: &str,
         account_id: &ProviderAccountId,
         _: &MutationContext,
-    ) -> AdminStoreResult<Revision> {
+    ) -> AdminStoreResult<ProxyAccountMutation> {
         if proxy_id != "proxy_test" || account_id.as_str() != "acct_linked" {
             return Err(AdminStoreError::new(
                 AdminStoreErrorKind::Conflict,
@@ -106,7 +106,13 @@ impl ProxyStore for MemoryProxies {
                 "changed binding",
             ));
         }
-        Ok(Revision::new(4).unwrap())
+        Ok(ProxyAccountMutation {
+            config_revision: Revision::new(4).unwrap(),
+            account: ProxyAccountTransportRef {
+                account_id: account_id.clone(),
+                provider_kind: gateway_core::routing::ProviderKind::new("openai").unwrap(),
+            },
+        })
     }
 
     async fn reserve_import(
@@ -178,6 +184,7 @@ impl ProxyStore for MemoryProxies {
         Ok(ProxyMutation {
             config_revision: record.revision,
             record,
+            affected_accounts: Vec::new(),
         })
     }
     async fn update(
@@ -198,6 +205,7 @@ impl ProxyStore for MemoryProxies {
         Ok(ProxyMutation {
             config_revision: record.revision,
             record: record.clone(),
+            affected_accounts: Vec::new(),
         })
     }
     async fn delete(

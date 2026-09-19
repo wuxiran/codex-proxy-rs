@@ -5,7 +5,7 @@ use std::{
     fmt,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::transport::profile::CodexWireProfileState;
@@ -45,8 +45,53 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
     "x-codex-ws-stream-request-start-ms";
-type ReqwestClientCacheKey = (Option<String>, String);
-type ReqwestClientCache = Mutex<HashMap<ReqwestClientCacheKey, Client>>;
+type ReqwestClientCacheKey = (Option<String>, String, String);
+
+#[derive(Default)]
+struct ReqwestClientCache {
+    clients: HashMap<ReqwestClientCacheKey, (Client, Instant)>,
+    // 控制面确认的新出口用于阻止旧请求快照重新填充已退役的缓存。
+    account_egresses: HashMap<String, String>,
+}
+
+fn http_clients() -> &'static Mutex<ReqwestClientCache> {
+    static CLIENTS: OnceLock<Mutex<ReqwestClientCache>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(ReqwestClientCache::default()))
+}
+
+pub(crate) fn reconcile_account_http_clients(
+    account_id: &str,
+    proxy: Option<&gateway_core::account::OutboundProxy>,
+) {
+    let egress = egress_key(account_id, proxy);
+    let mut cache = http_clients()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .clients
+        .retain(|(_, id, key), _| id != account_id || *key == egress);
+    cache.account_egresses.insert(account_id.to_owned(), egress);
+}
+
+pub(crate) fn evict_account_http_clients(account_id: &str) {
+    let mut cache = http_clients()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.clients.retain(|(_, id, _), _| id != account_id);
+    cache
+        .account_egresses
+        .insert(account_id.to_owned(), String::new());
+}
+
+pub(crate) fn account_transport_egress_key(
+    account: &gateway_core::account::ProviderAccount,
+) -> String {
+    let mut key = egress_key(account.id().as_str(), account.outbound_proxy());
+    if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
+        key.push_str(&format!(":revision:{}", account.revision().get()));
+    }
+    key
+}
 
 /// 构建带缓存、自动协商 HTTP/2 的 reqwest Client。
 pub fn build_reqwest_client() -> Result<Client, CustomCaError> {
@@ -58,22 +103,27 @@ pub fn build_account_http_client(
     proxy: Option<&gateway_core::account::OutboundProxy>,
 ) -> Result<Client, CustomCaError> {
     super::tls::ensure_rustls_provider();
-    let cache_key = (custom_ca_env_cache_key(), egress_key(account_id, proxy));
-    static CLIENTS: OnceLock<ReqwestClientCache> = OnceLock::new();
-    let cache = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(client) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&cache_key)
+    let cache_key = (
+        custom_ca_env_cache_key(),
+        account_id.to_owned(),
+        egress_key(account_id, proxy),
+    );
+    let cache = http_clients();
     {
-        return Ok(client.clone());
+        let mut clients = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((client, last_used)) = clients.clients.get_mut(&cache_key) {
+            *last_used = Instant::now();
+            return Ok(client.clone());
+        }
     }
 
     let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(4)
-        .pool_idle_timeout(None::<Duration>)
+        .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
         .http2_keep_alive_interval(Duration::from_secs(30))
@@ -89,10 +139,30 @@ pub fn build_account_http_client(
     let mut clients = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if clients.len() >= 256 {
-        clients.clear();
+    if clients
+        .account_egresses
+        .get(account_id)
+        .is_some_and(|current| *current != cache_key.2)
+    {
+        // 已开始的请求可以完成，但不能让旧出口重回共享池。
+        return Ok(client);
     }
-    Ok(clients.entry(cache_key).or_insert(client).clone())
+    if clients.clients.len() >= 256 {
+        let oldest = clients
+            .clients
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            clients.clients.remove(&oldest);
+        }
+    }
+    Ok(clients
+        .clients
+        .entry(cache_key)
+        .or_insert((client, Instant::now()))
+        .0
+        .clone())
 }
 
 fn egress_key(account_id: &str, proxy: Option<&gateway_core::account::OutboundProxy>) -> String {
@@ -695,12 +765,7 @@ impl CodexBackendClient {
     ) -> Result<Self, CodexClientError> {
         let mut client = self.clone();
         client.outbound_proxy = account.outbound_proxy().cloned();
-        client.egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
-        if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
-            client
-                .egress_key
-                .push_str(&format!(":revision:{}", account.revision().get()));
-        }
+        client.egress_key = account_transport_egress_key(account);
         client.websocket_origin_key = format!(
             "{}:{}",
             websocket_origin_key(&self.base_url),

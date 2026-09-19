@@ -65,6 +65,354 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
+async fn proxy_change_closes_old_http_pool_without_disrupting_unchanged_egress() {
+    use gateway_core::account::OutboundProxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy =
+        OutboundProxy::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let (stale_closed_tx, stale_closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        for _ in 0..2 {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.expect("旧出口未变化时应复用连接"));
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .unwrap();
+        }
+        let mut byte = [0];
+        let closed = matches!(socket.read(&mut byte).await, Ok(0));
+        let _ = closed_tx.send(closed);
+        let (mut late, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(late.read_u8().await.unwrap());
+        }
+        late.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            .await
+            .unwrap();
+        let _ = stale_closed_tx.send(matches!(late.read(&mut byte).await, Ok(0)));
+    });
+    let store = Arc::new(MemoryAccountStore::default());
+    let id = "acct_http_proxy_retirement";
+    store
+        .seed_api_key(
+            id,
+            "https://upstream.invalid/v1".to_owned(),
+            provider_openai::credential::ApiKeyTransport::Http,
+        )
+        .await;
+    store.set_egress(id, Some(proxy.clone()), None);
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let account_id = ProviderAccountId::new(id).unwrap();
+    for _ in 0..2 {
+        admin
+            .account_facts_changed(std::slice::from_ref(&account_id))
+            .await;
+        let client =
+            provider_openai::transport::client::build_account_http_client(id, Some(&proxy))
+                .unwrap();
+        assert_eq!(
+            client
+                .get("http://upstream.invalid/check")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "OK"
+        );
+    }
+    store.set_egress(id, None, None);
+    admin.account_facts_changed(&[account_id]).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("切换出口后旧 HTTP 空闲连接应关闭")
+            .unwrap()
+    );
+    // 切换前冻结的请求可以继续执行，但它创建的旧客户端不能再进入缓存。
+    let late =
+        provider_openai::transport::client::build_account_http_client(id, Some(&proxy)).unwrap();
+    assert_eq!(
+        late.get("http://upstream.invalid/late")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "OK"
+    );
+    drop(late);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stale_closed_rx)
+            .await
+            .expect("旧快照不能重建旧出口缓存")
+            .unwrap()
+    );
+    server.await.unwrap();
+}
+
+struct ProxyWebSocketFixture {
+    proxy: gateway_core::account::OutboundProxy,
+    received: tokio::sync::oneshot::Receiver<()>,
+    finish: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::sync::oneshot::Receiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn proxy_change_cancels_old_websocket_opening_before_payload_send() {
+    use gateway_core::account::OutboundProxy;
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy =
+        OutboundProxy::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (opening_tx, opening_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"CONNECT "));
+        opening_tx.send(()).unwrap();
+        let mut byte = [0];
+        let _ = closed_tx.send(matches!(socket.read(&mut byte).await, Ok(0)));
+    });
+    let store = Arc::new(MemoryAccountStore::default());
+    let id = "acct_proxy_opening";
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: id.to_owned(),
+            name: id.to_owned(),
+            secret: secret("opening-access"),
+            verified_account: profile(id),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    store.set_egress(id, Some(proxy), None);
+    let mut config = valid_config();
+    config.config.api.base_url = "http://127.0.0.1:49112".to_owned();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let provider = bundle.core_provider();
+    let task = tokio::spawn(async move {
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"OK","session_id":id})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
+        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+        if let Ok(mut stream) = provider
+            .execute(
+                initialized_provider_request(operation, id),
+                initialized_attempt_context("req_proxy_opening", id),
+            )
+            .await
+        {
+            while stream.next().await.is_some() {}
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), opening_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    store.set_egress(id, None, None);
+    bundle
+        .admin_provider()
+        .account_facts_changed(&[ProviderAccountId::new(id).unwrap()])
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("切换应取消旧 CONNECT，无需等待上游连接超时")
+            .unwrap()
+    );
+    task.abort();
+    let _ = task.await;
+    server.await.unwrap();
+}
+
+async fn proxy_websocket_fixture() -> ProxyWebSocketFixture {
+    use futures::SinkExt as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = gateway_core::account::OutboundProxy::parse(&format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let (received_tx, received) = tokio::sync::oneshot::channel();
+    let (finish, finish_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut connect = Vec::new();
+        while !connect.ends_with(b"\r\n\r\n") {
+            connect.push(socket.read_u8().await.unwrap());
+        }
+        assert!(connect.starts_with(b"CONNECT "));
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut ws = crate::transport::accept_codex_test_websocket(socket).await;
+        assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+        received_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"resp_proxy_retirement","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}).to_string().into())).await.unwrap();
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_))) => ws.flush().await.unwrap(),
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                other => panic!("旧出口不应再接收生成请求：{other:?}"),
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    ProxyWebSocketFixture {
+        proxy,
+        received,
+        finish,
+        closed,
+        task,
+    }
+}
+
+#[tokio::test]
+async fn proxy_change_retires_idle_and_busy_websockets_without_replaying_requests() {
+    for busy in [false, true] {
+        let old = proxy_websocket_fixture().await;
+        let mut old_finish = Some(old.finish);
+        let new = proxy_websocket_fixture().await;
+        let id = if busy {
+            "acct_ws_proxy_busy"
+        } else {
+            "acct_ws_proxy_idle"
+        };
+        let store = Arc::new(MemoryAccountStore::default());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: id.to_owned(),
+                name: id.to_owned(),
+                secret: secret("proxy-switch-access"),
+                verified_account: profile(id),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        store.set_egress(id, Some(old.proxy), None);
+        let mut config = valid_config();
+        config.config.api.base_url = "http://127.0.0.1:49111".to_owned();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        let admin = bundle.admin_provider();
+        let account_id = ProviderAccountId::new(id).unwrap();
+        admin
+            .account_facts_changed(std::slice::from_ref(&account_id))
+            .await;
+        let execute = |request_id: &'static str| {
+            let provider = bundle.core_provider();
+            async move {
+                let payload = ProtocolPayload::json_object(
+                    "openai",
+                    json!({"model":"gpt-5.4","input":"OK","session_id":id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap()
+                .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
+                let operation =
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+                let mut stream = provider
+                    .execute(
+                        initialized_provider_request(operation, id),
+                        initialized_attempt_context(request_id, id),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(event) = stream.next().await {
+                    event.expect("已经发出的请求应正常完成");
+                }
+            }
+        };
+        let first = tokio::spawn(execute("req_proxy_old"));
+        tokio::time::timeout(Duration::from_secs(3), old.received)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = if busy {
+            Some(first)
+        } else {
+            old_finish.take().unwrap().send(()).unwrap();
+            first.await.unwrap();
+            None
+        };
+        store.set_egress(id, Some(new.proxy), None);
+        admin.account_facts_changed(&[account_id]).await;
+        let second = tokio::spawn(execute("req_proxy_new"));
+        tokio::time::timeout(Duration::from_secs(3), new.received)
+            .await
+            .unwrap()
+            .unwrap();
+        new.finish.send(()).unwrap();
+        second.await.unwrap();
+        if let Some(first) = first {
+            assert!(!first.is_finished(), "切换出口不能强行取消已发出的请求");
+            old_finish.take().unwrap().send(()).unwrap();
+            first.await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), old.closed)
+            .await
+            .expect("旧连接应关闭而不是等待 55 分钟")
+            .unwrap();
+        old.task.await.unwrap();
+        admin
+            .account_unavailable(&ProviderAccountId::new(id).unwrap())
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), new.closed)
+            .await
+            .unwrap()
+            .unwrap();
+        new.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
     let config = valid_config();
     let mut bundle = provider_openai::initialize(config.config.clone(), provider_ports())
@@ -2162,4 +2510,83 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         admin.reset_credits(account.id()).await.unwrap_err().kind(),
         ProviderAdminErrorKind::Unsupported
     );
+}
+
+#[tokio::test]
+async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_pin_admin".to_owned(),
+            name: "pin".to_owned(),
+            secret: secret("test-pin-token"),
+            verified_account: profile("chatgpt-pin-admin"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_pin_admin").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let view = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let view = view.expose_to_provider().expose_to_provider();
+    assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+    assert_eq!(view.get("turnStatePins"), Some(&json!([])));
+    assert!(
+        !serde_json::to_string(view)
+            .unwrap()
+            .contains("test-pin-token")
+    );
+    let mut generations = Vec::new();
+    for enabled in [true, true, false] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"pin_turn_state":enabled})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let data = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(data.get("access_token"), Some(&json!("test-pin-token")));
+        assert_eq!(prepared.facts().account_id, *account.id());
+        assert!(prepared.facts().preserve_profile);
+        assert!(prepared.facts().preserve_credential_state);
+        if enabled {
+            generations.push(data["turn_state_pin"].as_str().unwrap().to_owned());
+        } else {
+            assert!(!data.contains_key("turn_state_pin"));
+        }
+    }
+    assert_ne!(generations[0], generations[1]);
+    let mixed = admin
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"pin_turn_state":true, "access_token":"injected"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await;
+    assert!(mixed.is_err());
 }

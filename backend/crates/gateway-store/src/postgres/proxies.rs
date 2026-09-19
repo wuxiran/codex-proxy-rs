@@ -28,6 +28,16 @@ use crate::{
 };
 
 const ENTITY: &str = "outbound proxy";
+
+fn proxy_account_transport_ref(
+    (id, kind): (String, String),
+) -> AdminStoreResult<ProxyAccountTransportRef> {
+    Ok(ProxyAccountTransportRef {
+        account_id: ProviderAccountId::new(id).map_err(|_| store_error(invalid()))?,
+        provider_kind: gateway_core::routing::ProviderKind::new(kind)
+            .map_err(|_| store_error(invalid()))?,
+    })
+}
 const SELECT: &str = "select p.*,
     (select count(*) from provider_accounts a where a.outbound_proxy_id = p.id) as account_count
     from outbound_proxies p";
@@ -273,7 +283,7 @@ impl ProxyStore for PgProxyRepository {
         proxy_id: &str,
         account_id: &ProviderAccountId,
         context: &MutationContext,
-    ) -> AdminStoreResult<AdminRevision> {
+    ) -> AdminStoreResult<ProxyAccountMutation> {
         let mut transaction = self
             .pool
             .begin()
@@ -283,20 +293,19 @@ impl ProxyStore for PgProxyRepository {
             .await
             .map_err(store_error)?;
         // 在同一条更新中校验绑定，避免旧弹窗清除账号后来选择的其他代理。
-        let updated = sqlx::query(
+        let updated = sqlx::query_scalar::<_, String>(
             "update provider_accounts
              set outbound_proxy_id = null, outbound_proxy_url = null,
                  updated_at = greatest(now(), updated_at)
-             where id = $1 and outbound_proxy_id = $2",
+             where id = $1 and outbound_proxy_id = $2 returning provider_kind",
         )
         .bind(account_id.as_str())
         .bind(proxy_id)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| store_error(unavailable()))?;
-        if updated.rows_affected() != 1 {
-            return Err(store_error(conflict(proxy_id)));
-        }
+        let provider_kind = updated.ok_or_else(|| store_error(conflict(proxy_id)))?;
+        let account = proxy_account_transport_ref((account_id.as_str().to_owned(), provider_kind))?;
         append_admin_audit_event_in_transaction(
             &mut transaction,
             mutation_audit(
@@ -314,7 +323,10 @@ impl ProxyStore for PgProxyRepository {
             .commit()
             .await
             .map_err(|_| store_error(unavailable()))?;
-        admin_revision(revision)
+        Ok(ProxyAccountMutation {
+            config_revision: admin_revision(revision)?,
+            account,
+        })
     }
 
     async fn list_accounts(
@@ -558,6 +570,7 @@ impl ProxyStore for PgProxyRepository {
         Ok(ProxyMutation {
             config_revision: admin_revision(revision)?,
             record: self.get(&id).await?,
+            affected_accounts: Vec::new(),
         })
     }
 
@@ -612,8 +625,9 @@ impl ProxyStore for PgProxyRepository {
                 .await
                 .map_err(store_error)?;
         }
-        sqlx::query("update provider_accounts a set outbound_proxy_url = p.proxy_url, updated_at = greatest(now(), a.updated_at) from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and a.outbound_proxy_url is distinct from p.proxy_url")
-            .bind(&command.id).execute(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
+        let affected_accounts = sqlx::query_as::<_, (String, String)>("update provider_accounts a set outbound_proxy_url = p.proxy_url, updated_at = greatest(now(), a.updated_at) from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and a.outbound_proxy_url is distinct from p.proxy_url returning a.id, a.provider_kind")
+            .bind(&command.id).fetch_all(&mut *transaction).await.map_err(|_| store_error(unavailable()))?
+            .into_iter().map(proxy_account_transport_ref).collect::<AdminStoreResult<Vec<_>>>()?;
         audit(
             &mut transaction,
             context,
@@ -635,6 +649,7 @@ impl ProxyStore for PgProxyRepository {
         Ok(ProxyMutation {
             config_revision: admin_revision(revision)?,
             record: self.get(&command.id).await?,
+            affected_accounts,
         })
     }
 

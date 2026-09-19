@@ -85,6 +85,21 @@ impl DefaultProxiesService {
             test_slots: Semaphore::new(4),
         }
     }
+
+    async fn notify_egress_changes(&self, accounts: &[ProxyAccountTransportRef]) {
+        let mut grouped = std::collections::BTreeMap::<ProviderKind, Vec<ProviderAccountId>>::new();
+        for account in accounts {
+            grouped
+                .entry(account.provider_kind.clone())
+                .or_default()
+                .push(account.account_id.clone());
+        }
+        for (kind, ids) in grouped {
+            if let Ok(provider) = self.providers.require(&kind) {
+                provider.account_facts_changed(&ids).await;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -100,7 +115,7 @@ impl ProxiesService for DefaultProxiesService {
         }
         let account_id = ProviderAccountId::new(account_id.to_owned())
             .map_err(|_| AdminError::invalid("账号 ID 不合法"))?;
-        let revision = self
+        let result = self
             .store
             .remove_account(proxy_id, &account_id, context)
             .await
@@ -111,8 +126,10 @@ impl ProxiesService for DefaultProxiesService {
                     map_store_error(error, "proxy account")
                 }
             })?;
-        publish_committed(self.snapshot.as_ref(), revision).await?;
-        Ok(revision)
+        self.notify_egress_changes(std::slice::from_ref(&result.account))
+            .await;
+        publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        Ok(result.config_revision)
     }
 
     async fn list_accounts(
@@ -211,6 +228,7 @@ impl ProxiesService for DefaultProxiesService {
             .update(command, context)
             .await
             .map_err(|error| map_store_error(error, "proxy"))?;
+        self.notify_egress_changes(&result.affected_accounts).await;
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
         Ok(result)
     }

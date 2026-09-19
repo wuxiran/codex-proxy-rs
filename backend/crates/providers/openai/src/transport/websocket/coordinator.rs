@@ -558,7 +558,8 @@ fn bypass_unavailable_error(reason: WebSocketPoolBypassReason) -> CodexWebSocket
         WebSocketPoolBypassReason::Disabled | WebSocketPoolBypassReason::Cap => {
             continuation_unavailable(PreviousResponseUnavailableReason::PoolUnavailable)
         }
-        WebSocketPoolBypassReason::ContinuationNotFound => {
+        WebSocketPoolBypassReason::ContinuationNotFound
+        | WebSocketPoolBypassReason::EgressChanged => {
             continuation_unavailable(PreviousResponseUnavailableReason::FreshConnectionRequired)
         }
     }

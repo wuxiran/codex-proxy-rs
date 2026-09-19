@@ -12,6 +12,7 @@ use gateway_core::account::{OutboundProxy, ProviderAccountId};
 pub(super) struct TestProxies {
     pub events: Option<super::accounts::EventLog>,
     pub accounts: Option<Vec<ProxyAccountRef>>,
+    pub mutation_accounts: Option<Vec<ProxyAccountTransportRef>>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -29,10 +30,26 @@ impl ProxyStore for TestProxies {
     async fn remove_account(
         &self,
         _: &str,
-        _: &ProviderAccountId,
+        account_id: &ProviderAccountId,
         _: &MutationContext,
-    ) -> AdminStoreResult<Revision> {
-        Err(super::unavailable("proxy"))
+    ) -> AdminStoreResult<ProxyAccountMutation> {
+        let account = self
+            .mutation_accounts
+            .as_ref()
+            .and_then(|accounts| {
+                accounts
+                    .iter()
+                    .find(|account| account.account_id == *account_id)
+            })
+            .cloned()
+            .ok_or_else(|| super::unavailable("proxy"))?;
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("proxy.remove_account");
+        }
+        Ok(ProxyAccountMutation {
+            config_revision: Revision::new(2).unwrap(),
+            account,
+        })
     }
 
     async fn reserve_import(
@@ -76,8 +93,36 @@ impl ProxyStore for TestProxies {
     async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))
     }
-    async fn update(&self, _: UpdateProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
-        Err(super::unavailable("proxy"))
+    async fn update(
+        &self,
+        command: UpdateProxy,
+        _: &MutationContext,
+    ) -> AdminStoreResult<ProxyMutation> {
+        let affected_accounts = self
+            .mutation_accounts
+            .clone()
+            .ok_or_else(|| super::unavailable("proxy"))?;
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("proxy.update");
+        }
+        Ok(ProxyMutation {
+            config_revision: Revision::new(2).unwrap(),
+            record: ProxyRecord {
+                id: command.id,
+                name: command.name,
+                proxy: command
+                    .proxy
+                    .unwrap_or_else(|| OutboundProxy::parse("http://127.0.0.1:8080").unwrap()),
+                location: None,
+                revision: Revision::new(2).unwrap(),
+                account_count: affected_accounts.len() as u64,
+                last_test_at: None,
+                last_test: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            affected_accounts,
+        })
     }
     async fn delete(
         &self,
@@ -223,5 +268,93 @@ async fn credential_import_keeps_proxy_reserved_until_commit_and_releases_on_err
             };
             assert_eq!(&events[..expected.len()], expected);
         }
+    }
+}
+
+#[tokio::test]
+async fn proxy_updates_notify_committed_accounts_but_not_failed_or_unchanged_updates() {
+    use super::accounts::{FakeProviderAdmin, events};
+    use std::sync::Arc;
+    for changed in [
+        None,
+        Some(Vec::new()),
+        Some(vec![ProxyAccountTransportRef {
+            account_id: ProviderAccountId::new("acct_changed").unwrap(),
+            provider_kind: gateway_core::routing::ProviderKind::new("openai").unwrap(),
+        }]),
+    ] {
+        let events = events();
+        let provider = FakeProviderAdmin::new("openai", events.clone());
+        let services = super::AdminHarness::new()
+            .provider(provider)
+            .proxies(Arc::new(TestProxies {
+                events: Some(events.clone()),
+                mutation_accounts: changed.clone(),
+                ..Default::default()
+            }))
+            .build()
+            .await;
+        let result = services
+            .proxies()
+            .update(
+                UpdateProxy {
+                    id: "proxy_update".to_owned(),
+                    revision: Revision::new(1).unwrap(),
+                    name: "代理".to_owned(),
+                    proxy: Some(OutboundProxy::parse("http://127.0.0.1:18081").unwrap()),
+                    location: None,
+                },
+                &super::accounts::context("proxy-update"),
+            )
+            .await;
+        assert_eq!(result.is_ok(), changed.is_some());
+        let recorded = events.lock().unwrap().clone();
+        let expected = match changed {
+            None => vec![],
+            Some(ref ids) if ids.is_empty() => vec!["proxy.update"],
+            Some(_) => vec!["proxy.update", "provider.account_facts_changed"],
+        };
+        assert_eq!(recorded, expected);
+    }
+}
+
+#[tokio::test]
+async fn proxy_detachment_notifies_only_after_store_commit() {
+    use super::accounts::{FakeProviderAdmin, events};
+    use std::sync::Arc;
+    for success in [true, false] {
+        let events = events();
+        let account_id = ProviderAccountId::new("acct_detached").unwrap();
+        let services = super::AdminHarness::new()
+            .provider(FakeProviderAdmin::new("openai", events.clone()))
+            .proxies(Arc::new(TestProxies {
+                events: Some(events.clone()),
+                mutation_accounts: success.then(|| {
+                    vec![ProxyAccountTransportRef {
+                        account_id: account_id.clone(),
+                        provider_kind: gateway_core::routing::ProviderKind::new("openai").unwrap(),
+                    }]
+                }),
+                ..Default::default()
+            }))
+            .build()
+            .await;
+        let result = services
+            .proxies()
+            .remove_account(
+                "proxy_detach",
+                account_id.as_str(),
+                &super::accounts::context("proxy-detach"),
+            )
+            .await;
+        assert_eq!(result.is_ok(), success);
+        assert_eq!(
+            *events.lock().unwrap(),
+            if success {
+                vec!["proxy.remove_account", "provider.account_facts_changed"]
+            } else {
+                vec![]
+            }
+        );
     }
 }

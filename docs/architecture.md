@@ -237,6 +237,11 @@ OpenAI / xAI 导入用例。并发槽位由单个 Worker 统一管理，条目�
 用户浏览器访问第三方授权页时的出口不受网关设置控制。
 
 连接池按出口隔离。修改代理推进配置 revision，使后续请求使用新出口；已执行请求可沿原连接完成。
+OpenAI 在账号代理绑定变更、共享代理地址更新及解除绑定提交后，按当前账号事实退役旧出口的 HTTP
+客户端和 WebSocket 连接：空闲连接关闭，未完成的建连取消，活动连接完成后不再入池。旧请求快照
+不能重新填充已退役出口的共享缓存；相同出口的普通账号设置更新保留可复用连接。空闲 HTTP 连接有
+有限保留期，批量 WebSocket 关闭也有时限，避免失联出口拖住配置提交。外部代理服务在相同 URL
+下切换节点不构成 CPR 配置变更，现有隧道是否切换由该代理服务控制。
 代理变更不推进 `credential_revision`，不会使进行中的令牌刷新因凭据版本冲突而丢失结果。
 xAI 的推理连接池继续按账号绑定隔离；OAuth、目录/计费辅助请求在各自 transport 内复用有界出口
 client，OIDC 的 JWKS 缓存与单飞归属对应出口状态。自动刷新提交凭据后的目录预热重新读取当前账号
@@ -419,6 +424,7 @@ PostgreSQL 周期对账才是正确性基础。
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | OpenAI upstream | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
+| OpenAI 实验 state 固定开关 / 候选 | PostgreSQL 凭据 JSON / Provider 进程内有界缓存 | 开关持久化；候选不落盘，最多 2048 条、固定一小时，按账号、令牌指纹、捕获代次、模型和客户端密钥隔离 |
 | Provider 公开模型与请求画像 | Provider/runtime cache | 由官方目录或发布源刷新，不写成第二份业务配置 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
@@ -506,7 +512,8 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 - Core：`runtime` owner 的 RuntimeSnapshot 周期对账和 Redis change 订阅；
 - Admin：S3/R2 备份 daemon，负责调度、执行、删除收敛与保留清理；
   以及账号冻结恢复 worker（容量熔断的自适应并发下调与到期探测解冻）；
-- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查。
+- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查；
+  OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，默认关闭。
 
 账号容量熔断默认关闭。启用后，仅普通请求收到的容量类上游错误（`server_is_overloaded` 等与
 5xx 不可用）按滑动窗口计数，并把当时观测到的在途并发并入峰值证据；本地连接保护与诊断探测

@@ -83,7 +83,10 @@ class ReviveClient:
             if parts:
                 url += "?" + "&".join(parts)
 
-        headers = {"Accept": "application/json, application/zip, application/octet-stream"}
+        headers = {
+            "Accept": "application/json, application/zip, application/octet-stream",
+            "User-Agent": "cpr-revive/1.0",
+        }
         data = raw_body
         if body is not None:
             data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
