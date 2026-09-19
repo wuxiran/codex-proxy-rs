@@ -165,6 +165,15 @@ impl std::fmt::Debug for TurnStateHuntTicket {
     }
 }
 
+/// 一个账号级 state 临近到期、需要重新遍历代理续期的账号。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateRenewal {
+    pub account_id: ProviderAccountId,
+    pub upstream_model: UpstreamModelId,
+    pub attempts: u8,
+    pub include_direct: bool,
+}
+
 /// 单次探测观测到的 state 形状；不含 state 值。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnStateHuntObservation {
@@ -232,6 +241,17 @@ pub trait ProviderAdmin: Send + Sync {
         _captured_at: SystemTime,
     ) -> Result<SystemTime, ProviderAdminError> {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 已开启自动续期、且本进程内账号级 state 缺失或将在 `margin` 内到期的账号。
+    ///
+    /// state 只存在于进程内存；服务重启后全部视为缺失，由续期任务重新找回。
+    async fn turn_state_hunt_renewals(
+        &self,
+        _now: SystemTime,
+        _margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        Vec::new()
     }
 
     /// 返回该 Provider 实际持有的 Dashboard 上游身份画像。
@@ -411,6 +431,19 @@ impl ProviderAdminRegistry {
     }
 
     /// 返回所有已注册 Provider 的 Dashboard 上游身份画像。
+    /// 汇总各 Provider 需要续期账号级 state 的账号。
+    pub(crate) async fn turn_state_hunt_renewals(
+        &self,
+        now: SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        let mut due = Vec::new();
+        for provider in self.providers.values() {
+            due.extend(provider.turn_state_hunt_renewals(now, margin).await);
+        }
+        due
+    }
+
     pub fn dashboard_wire_profiles(&self) -> Vec<DashboardWireProfile> {
         self.providers
             .values()

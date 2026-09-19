@@ -148,6 +148,15 @@ pub trait AccountsService: Send + Sync {
         upstream_model: UpstreamModelId,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
 
+    /// 账号级 state 缺失或将在 `margin` 内到期、需要自动续期的账号。
+    async fn turn_state_renewals(
+        &self,
+        _now: std::time::SystemTime,
+        _margin: std::time::Duration,
+    ) -> Vec<crate::ports::provider::TurnStateRenewal> {
+        Vec::new()
+    }
+
     /// 逐个出口发真实请求找符合长度规则的 state；命中即绑定该出口并钉住。
     async fn turn_state_hunt(
         &self,
@@ -961,6 +970,14 @@ impl AccountsService for DefaultAccountsService {
         })
         .flat_map(futures::stream::iter);
         Ok(Box::pin(futures::stream::iter(initial).chain(terminal)))
+    }
+
+    async fn turn_state_renewals(
+        &self,
+        now: std::time::SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<crate::ports::provider::TurnStateRenewal> {
+        self.providers.turn_state_hunt_renewals(now, margin).await
     }
 
     async fn turn_state_hunt(

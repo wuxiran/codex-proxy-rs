@@ -700,7 +700,8 @@ impl CodexCredentialAdmin {
     pub(crate) fn prepare_turn_state_pin_rotation(
         &self,
         current: LoadedCredential,
-        enabled: bool,
+        pin_turn_state: Option<bool>,
+        turn_state_auto_hunt: Option<Option<super::types::TurnStateAutoHunt>>,
     ) -> Result<PreparedCodexCredentialRotation, CodexCredentialAdminError> {
         if current.account.provider().as_str() != PROVIDER_NAME
             || current.account.authentication_kind() != CODEX_AUTHENTICATION_KIND_OAUTH
@@ -709,9 +710,19 @@ impl CodexCredentialAdmin {
         }
         let mut data = CodexCredentialCodec::decode_complete(&current.credential)
             .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
-        data.oauth_mut()
-            .ok_or(CodexCredentialAdminError::InvalidCredential)?
-            .turn_state_pin = enabled.then(|| uuid::Uuid::new_v4().to_string());
+        let oauth = data
+            .oauth_mut()
+            .ok_or(CodexCredentialAdminError::InvalidCredential)?;
+        if let Some(enabled) = pin_turn_state {
+            oauth.turn_state_pin = enabled.then(|| uuid::Uuid::new_v4().to_string());
+        }
+        if let Some(auto_hunt) = turn_state_auto_hunt {
+            oauth.turn_state_auto_hunt = auto_hunt;
+        }
+        // 续期只对开启中的固定有意义；关掉固定时不留下会继续发请求的续期任务。
+        if oauth.turn_state_pin.is_none() {
+            oauth.turn_state_auto_hunt = None;
+        }
         let credential = CodexCredentialCodec::encode_complete(data)
             .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
         let profile = ProviderAccountUpdate {

@@ -30,7 +30,7 @@ use gateway_admin::model::provider_credentials::{
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
 use gateway_admin::ports::provider::{
     ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind, TurnStateHuntObservation,
-    TurnStateHuntTicket,
+    TurnStateHuntTicket, TurnStateRenewal,
 };
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
@@ -472,11 +472,12 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 }),
             ));
         }
-        if command
+        let settings_material = command
             .provider_material
             .expose_to_provider()
-            .expose_to_provider()
-            .contains_key("pin_turn_state")
+            .expose_to_provider();
+        if settings_material.contains_key("pin_turn_state")
+            || settings_material.contains_key("turn_state_auto_hunt")
         {
             return prepare_turn_state_pin_rotation(
                 current,
@@ -590,6 +591,60 @@ impl ProviderAdmin for OpenAiAdminProvider {
         }
     }
 
+    async fn turn_state_hunt_renewals(
+        &self,
+        now: SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        let Ok(provider) = ProviderKind::new(PROVIDER_NAME) else {
+            return Vec::new();
+        };
+        let Ok(accounts) = self.accounts.list_for_provider(&provider).await else {
+            return Vec::new();
+        };
+        let mut due = Vec::new();
+        for account in accounts {
+            // 停用或凭据失效的账号发不出请求，续期只会白白失败。
+            if !account.enabled()
+                || account.authentication_kind() != "oauth"
+                || account.credential_state() != gateway_core::account::CredentialState::Ready
+            {
+                continue;
+            }
+            let Ok(current) = self.accounts.load_current_credential(account.id()).await else {
+                continue;
+            };
+            let Ok(crate::credential::CodexCredentialData::OAuth(data)) =
+                CodexCredentialCodec::decode_complete(&current.credential)
+            else {
+                continue;
+            };
+            let (Some(auto), Some(generation)) = (&data.turn_state_auto_hunt, &data.turn_state_pin)
+            else {
+                continue;
+            };
+            let Ok(upstream_model) = UpstreamModelId::new(auto.model.clone()) else {
+                continue;
+            };
+            let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
+            let fresh = self
+                .turn_state_pins
+                .account_wide_captured_at(account.id().as_str(), &binding, &auto.model, now)
+                .is_some_and(|captured_at| {
+                    captured_at + crate::turn_state_pin::MAX_PIN_AGE > now + margin
+                });
+            if !fresh {
+                due.push(TurnStateRenewal {
+                    account_id: account.id().clone(),
+                    upstream_model,
+                    attempts: auto.attempts,
+                    include_direct: auto.include_direct,
+                });
+            }
+        }
+        due
+    }
+
     async fn turn_state_hunt_pin(
         &self,
         ticket: &TurnStateHuntTicket,
@@ -677,6 +732,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 let value = serde_json::json!({
                     "guanlanReviveAvailable": guanlan_revive_available,
                     "pinTurnState": data.turn_state_pin.is_some(),
+                    "turnStateAutoHunt": data.turn_state_auto_hunt.as_ref().map(|auto| serde_json::json!({
+                        "modelId": auto.model,
+                        "attempts": auto.attempts,
+                        "includeDirect": auto.include_direct,
+                    })),
                     "turnStatePins": pins,
                     "turnStateCaptureRule": rule,
                     "maxAgeSeconds": crate::turn_state_pin::MAX_PIN_AGE.as_secs(),
@@ -1058,7 +1118,38 @@ fn prepared_rotation(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TurnStatePinDocument {
-    pin_turn_state: bool,
+    pin_turn_state: Option<bool>,
+    turn_state_auto_hunt: Option<TurnStateAutoHuntDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStateAutoHuntDocument {
+    enabled: bool,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    attempts: u8,
+    #[serde(default)]
+    include_direct: bool,
+}
+
+impl TurnStateAutoHuntDocument {
+    fn into_setting(
+        self,
+    ) -> Result<Option<crate::credential::TurnStateAutoHunt>, ProviderAdminError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if UpstreamModelId::new(self.model.clone()).is_err() || !(1..=20).contains(&self.attempts) {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        Ok(Some(crate::credential::TurnStateAutoHunt {
+            model: self.model,
+            attempts: self.attempts,
+            include_direct: self.include_direct,
+        }))
+    }
 }
 
 fn prepare_turn_state_pin_rotation(
@@ -1070,7 +1161,14 @@ fn prepare_turn_state_pin_rotation(
         serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
     let prepared = CodexCredentialAdmin
-        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
+        .prepare_turn_state_pin_rotation(
+            current,
+            document.pin_turn_state,
+            document
+                .turn_state_auto_hunt
+                .map(TurnStateAutoHuntDocument::into_setting)
+                .transpose()?,
+        )
         .map_err(map_credential_admin_error)?;
     prepared_rotation(prepared, provider_kind)
         .map(PreparedCredentialRotation::preserving_credential_state)

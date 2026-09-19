@@ -813,6 +813,42 @@ mod actions {
     }
 
     #[test]
+    fn rotate_should_validate_turn_state_auto_hunt_and_reject_mixed_material() {
+        let request = |auto: serde_json::Value| -> RotateAccountRequest {
+            serde_json::from_value(json!({
+                "provider": "openai",
+                "accountId": "acct_1",
+                "turnStateAutoHunt": auto
+            }))
+            .expect("decode rotate request")
+        };
+        request(json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 5, "includeDirect": false }))
+            .validate()
+            .expect("valid auto hunt");
+        request(json!({ "enabled": false }))
+            .validate()
+            .expect("disabling needs no parameters");
+        for invalid in [
+            json!({ "enabled": true, "modelId": " ", "attempts": 5 }),
+            json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 0 }),
+            json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 21 }),
+        ] {
+            assert_eq!(
+                request(invalid).validate().unwrap_err().field(),
+                "turnStateAutoHunt"
+            );
+        }
+        let mixed: RotateAccountRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "accountId": "acct_1",
+            "accessToken": "token",
+            "turnStateAutoHunt": { "enabled": false }
+        }))
+        .expect("decode rotate request");
+        assert_eq!(mixed.validate().unwrap_err().field(), "pinTurnState");
+    }
+
+    #[test]
     fn turn_state_hunt_query_should_default_and_bound_attempts() {
         use gateway_api::admin::accounts::TurnStateHuntQuery;
 

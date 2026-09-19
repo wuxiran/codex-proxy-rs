@@ -662,6 +662,14 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 401/429、模型不存在或策略拒绝视为账号级失败并中止整个遍历；同一出口连续两次传输失败或 403 则跳过该出口；
 账号被线上流量占用而未发出的尝试不计次数，连续五次后中止。
 
+**自动续期。** `POST /api/admin/accounts/rotate` 接受 `turnStateAutoHunt: { enabled, modelId, attempts, includeDirect }`
+（`enabled: false` 关闭；不要同时提交 `pinTurnState`，重新提交开关会更换代次并作废已钉住的 state）。参数保存在账号凭据中，
+令牌刷新时保留，关闭「固定自身 state」时一并清除；详情的 `credentialConfiguration.turnStateAutoHunt` 返回当前参数或 null。
+开启后服务端每 60 秒检查一次：该账号该模型的账号级 state 在本进程内缺失（含服务重启后）或将在 5 分钟内到期时，
+以系统身份用同样参数重新遍历——当前绑定的出口排最前，续不上就继续打其它出口，命中后照常换绑并替换旧 state。
+整轮都未命中则 5 分钟后重试，上游拒绝账号（401/429 等）则 15 分钟后重试；停用或凭据失效的账号不续期。
+state 只存在于进程内存，续期任务不加跨实例租约，每个实例各自维护。
+
 
 OAuth start 使用：
 

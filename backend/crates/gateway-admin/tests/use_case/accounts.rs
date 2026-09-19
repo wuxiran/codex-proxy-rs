@@ -85,6 +85,8 @@ pub(super) struct FakeProviderAdmin {
     personal_info_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// `Some` 时支持遍历代理找 state；值是当前凭据绑定，测试可中途改写模拟凭据刷新。
     pub(super) hunt_binding: Mutex<Option<String>>,
+    /// 续期任务每个周期看到的到期账号。
+    pub(super) hunt_renewals: Mutex<Vec<gateway_admin::ports::provider::TurnStateRenewal>>,
 }
 
 impl FakeProviderAdmin {
@@ -110,6 +112,7 @@ impl FakeProviderAdmin {
             subscription_result: Mutex::new(Ok(None)),
             personal_info_barrier: Mutex::new(None),
             hunt_binding: Mutex::new(None),
+            hunt_renewals: Mutex::new(Vec::new()),
         })
     }
 
@@ -283,6 +286,14 @@ impl ProviderAdmin for FakeProviderAdmin {
             super::turn_state_hunt::EXPECTED_LENGTH,
             binding,
         ))
+    }
+
+    async fn turn_state_hunt_renewals(
+        &self,
+        _: std::time::SystemTime,
+        _: std::time::Duration,
+    ) -> Vec<gateway_admin::ports::provider::TurnStateRenewal> {
+        self.hunt_renewals.lock().unwrap().clone()
     }
 
     fn turn_state_hunt_inspect(

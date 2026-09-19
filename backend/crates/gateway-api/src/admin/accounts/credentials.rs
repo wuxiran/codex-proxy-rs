@@ -314,11 +314,25 @@ impl AccountDeletionRequest {
     }
 }
 
+/// 账号级 state 的自动续期设置；`enabled: false` 关闭并清除参数。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateAutoHuntRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub attempts: u8,
+    #[serde(default)]
+    pub include_direct: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateAccountRequest {
     pub guanlan_revive: Option<bool>,
     pub pin_turn_state: Option<bool>,
+    pub turn_state_auto_hunt: Option<TurnStateAutoHuntRequest>,
     pub provider: String,
     pub account_id: String,
     pub access_token: Option<String>,
@@ -345,6 +359,7 @@ impl RotateAccountRequest {
         if self.guanlan_revive.is_some() {
             if self.guanlan_revive != Some(true)
                 || self.pin_turn_state.is_some()
+                || self.turn_state_auto_hunt.is_some()
                 || self.access_token.is_some()
                 || self.refresh_token.is_some()
                 || self.id_token.is_some()
@@ -357,7 +372,7 @@ impl RotateAccountRequest {
             }
             return Ok(());
         }
-        if self.pin_turn_state.is_some() {
+        if self.pin_turn_state.is_some() || self.turn_state_auto_hunt.is_some() {
             if self.access_token.is_some()
                 || self.refresh_token.is_some()
                 || self.id_token.is_some()
@@ -366,6 +381,12 @@ impl RotateAccountRequest {
                 || self.transport.is_some()
             {
                 return Err(WireValidationError::new("pinTurnState"));
+            }
+            if let Some(auto) = &self.turn_state_auto_hunt
+                && auto.enabled
+                && (auto.model_id.trim().is_empty() || !(1..=20).contains(&auto.attempts))
+            {
+                return Err(WireValidationError::new("turnStateAutoHunt"));
             }
             return Ok(());
         }
@@ -407,8 +428,21 @@ impl RotateAccountRequest {
         let mut material = Map::new();
         if self.guanlan_revive == Some(true) {
             material.insert("guanlan_revive".to_owned(), Value::Bool(true));
-        } else if let Some(enabled) = self.pin_turn_state {
-            material.insert("pin_turn_state".to_owned(), Value::Bool(enabled));
+        } else if self.pin_turn_state.is_some() || self.turn_state_auto_hunt.is_some() {
+            if let Some(enabled) = self.pin_turn_state {
+                material.insert("pin_turn_state".to_owned(), Value::Bool(enabled));
+            }
+            if let Some(auto) = self.turn_state_auto_hunt {
+                material.insert(
+                    "turn_state_auto_hunt".to_owned(),
+                    serde_json::json!({
+                        "enabled": auto.enabled,
+                        "model": auto.model_id,
+                        "attempts": auto.attempts,
+                        "include_direct": auto.include_direct,
+                    }),
+                );
+            }
         } else if let Some(base_url) = self.base_url {
             material.insert("base_url".to_owned(), Value::String(base_url));
             material.insert(

@@ -1,5 +1,5 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
+import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { computed, ref, shallowRef, watch } from 'vue'
 import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountTurnState } from '@/api'
@@ -24,6 +24,7 @@ export function useAccountEditor(options: {
   const recaptureTurnState = shallowRef(false)
   const turnStatePins = ref<TurnStatePinStatus[]>([])
   const turnStateCaptureRule = ref<TurnStateCaptureRule | null>(null)
+  const turnStateAutoHunt = ref<TurnStateAutoHunt | null>(null)
   const notes = shallowRef('')
   const schedulingEnabled = shallowRef(true)
   const concurrencyLimit = shallowRef('')
@@ -54,6 +55,7 @@ export function useAccountEditor(options: {
         savedPinTurnState.value = configuration.pinTurnState
         turnStatePins.value = configuration.turnStatePins
         turnStateCaptureRule.value = configuration.turnStateCaptureRule ?? null
+        turnStateAutoHunt.value = configuration.turnStateAutoHunt ?? null
       }
       else {
         apiKey.value = { ...emptyApiKeyAccountForm(), ...configuration }
@@ -70,10 +72,24 @@ export function useAccountEditor(options: {
   }
 
   /** 遍历命中后服务端已改了绑定并钉住 state：刷新展示，并防止随后的「保存」把它们冲掉。 */
-  async function afterTurnStateHunt(boundChanged: boolean) {
+  async function setTurnStateAutoHunt(autoRenew: TurnStateAutoHunt | null) {
     const accountId = editingAccountId.value
     if (!accountId)
       return
+    // 只改续期参数，不带 pinTurnState：重新提交开关会更换世代、作废刚钉住的 state。
+    await updateAccountTurnState({
+      accountId,
+      turnStateAutoHunt: autoRenew ? { enabled: true, ...autoRenew } : { enabled: false },
+    })
+    await loadConfiguration(accountId)
+  }
+
+  async function afterTurnStateHunt(boundChanged: boolean, autoRenew: TurnStateAutoHunt | null) {
+    const accountId = editingAccountId.value
+    if (!accountId)
+      return
+    if (autoRenew || turnStateAutoHunt.value)
+      await setTurnStateAutoHunt(autoRenew).catch(() => {})
     proxyMode.value = 'preserve'
     proxyId.value = ''
     recaptureTurnState.value = false
@@ -98,6 +114,7 @@ export function useAccountEditor(options: {
     recaptureTurnState.value = false
     turnStatePins.value = []
     turnStateCaptureRule.value = null
+    turnStateAutoHunt.value = null
     proxyMode.value = 'preserve'
     proxyId.value = ''
     schedulingEnabled.value = account.enabled
@@ -197,6 +214,8 @@ export function useAccountEditor(options: {
     pinTurnState,
     savedPinTurnState,
     afterTurnStateHunt,
+    turnStateAutoHunt,
+    stopTurnStateAutoHunt: () => setTurnStateAutoHunt(null),
     recaptureTurnState,
     turnStatePins,
     turnStateCaptureRule,

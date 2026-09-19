@@ -187,6 +187,8 @@ const {
   pinTurnState: editingPinTurnState,
   savedPinTurnState: editingSavedPinTurnState,
   afterTurnStateHunt,
+  turnStateAutoHunt: editingTurnStateAutoHunt,
+  stopTurnStateAutoHunt,
   recaptureTurnState: editingRecaptureTurnState,
   turnStatePins: editingTurnStatePins,
   turnStateCaptureRule: editingTurnStateCaptureRule,
@@ -480,6 +482,7 @@ const {
       :turn-state-pins="editingTurnStatePins"
       :turn-state-capture-rule="editingTurnStateCaptureRule"
       :saved-pin-turn-state="editingSavedPinTurnState"
+      :turn-state-auto-hunt="editingTurnStateAutoHunt"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"
@@ -487,6 +490,7 @@ const {
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
       @turn-state-hunted="afterTurnStateHunt"
+      @stop-turn-state-auto-hunt="stopTurnStateAutoHunt"
       @save="saveAccountEdit"
     />
 
