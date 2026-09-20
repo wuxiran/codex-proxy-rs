@@ -185,9 +185,64 @@ fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
         attempts,
         include_direct,
         only_proxy_id: None,
+        ephemeral: None,
+        bind_to: None,
         require_schedulable: false,
         context: context("hunt"),
     }
+}
+
+/// 带完整地址（含凭据/国家段）和账号数的代理记录：自动撞的模板与静态池测试要用。
+fn proxy_with(id: &str, url: &str, usable: bool, account_count: u64) -> ProxyRecord {
+    let now = Utc::now();
+    ProxyRecord {
+        location: None,
+        id: id.to_owned(),
+        name: id.to_owned(),
+        proxy: OutboundProxy::parse(url).unwrap(),
+        revision: revision(1),
+        account_count,
+        last_test_at: Some(now),
+        last_test: Some(ProxyTestResult {
+            success: usable,
+            latency_ms: 1,
+            exit_ip: None,
+            message: String::new(),
+        }),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn auto_request(
+    template_proxy_id: &str,
+    countries: &[gateway_admin::model::accounts::HuntCountry],
+    static_proxy_ids: &[&str],
+    max_ips: u16,
+) -> gateway_admin::model::accounts::TurnStateAutoHuntRequest {
+    gateway_admin::model::accounts::TurnStateAutoHuntRequest {
+        account_id: ProviderAccountId::new("acct_test").unwrap(),
+        upstream_model: UpstreamModelId::new("gpt-6-astra").unwrap(),
+        template_proxy_id: template_proxy_id.to_owned(),
+        countries: countries.to_vec(),
+        static_proxy_ids: static_proxy_ids.iter().map(|s| (*s).to_owned()).collect(),
+        max_ips,
+        context: context("auto-hunt"),
+    }
+}
+
+async fn run_auto(
+    setup: &Setup,
+    request: gateway_admin::model::accounts::TurnStateAutoHuntRequest,
+) -> Vec<TurnStateHuntEvent> {
+    setup
+        .services
+        .accounts()
+        .auto_turn_state_hunt(request)
+        .await
+        .expect("auto hunt stream")
+        .collect()
+        .await
 }
 
 async fn run(setup: &Setup, command: TurnStateHuntCommand) -> Vec<TurnStateHuntEvent> {
@@ -642,6 +697,152 @@ async fn naming_an_unusable_proxy_is_rejected_instead_of_walking_the_rest() {
             .expect("unusable proxy");
         assert_eq!(error.kind(), AdminErrorKind::Invalid);
     }
+    assert!(probe.egresses().is_empty());
+}
+
+/// 自动撞：探测走即时生成的临时出口（都指向模板主机），命中后绑定并按**静态**出口钉，
+/// 而不是命中它的那个临时轮换出口。静态池里账号数最少的优先。
+#[tokio::test]
+async fn auto_hunt_probes_ephemeral_egresses_and_pins_the_least_used_static() {
+    use gateway_admin::model::accounts::HuntCountry;
+    let probe = ScriptedProbe::new([
+        Reply::NoState,
+        Reply::NoState,
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy_with(
+                "template",
+                "http://user_area-US:pass@proxy.smartproxy.test:3120/",
+                true,
+                0,
+            ),
+            proxy_with("static-busy", "http://127.0.0.1:8003/", true, 5),
+            proxy_with("static-free", "http://127.0.0.1:8002/", true, 0),
+        ],
+        None,
+    )
+    .await;
+
+    let events = run_auto(
+        &setup,
+        auto_request(
+            "template",
+            &[HuntCountry::Us],
+            &["static-busy", "static-free"],
+            5,
+        ),
+    )
+    .await;
+
+    // 每个临时 IP 打 1 次，命中即止：3 次探测，全部走模板主机（凭据/国家段已被 endpoint 抹去）。
+    assert_eq!(
+        probe.egresses(),
+        vec![
+            Some("http://proxy.smartproxy.test:3120/".to_owned()),
+            Some("http://proxy.smartproxy.test:3120/".to_owned()),
+            Some("http://proxy.smartproxy.test:3120/".to_owned()),
+        ]
+    );
+    // 钉在账号数最少的静态出口上，而不是命中它的临时出口。
+    assert_eq!(
+        *setup.provider.hunt_pinned_egress.lock().unwrap(),
+        Some(Some("http://127.0.0.1:8002/".to_owned()))
+    );
+    let log = recorded(&setup.log);
+    let bind = log
+        .iter()
+        .position(|event| *event == "store.batch_update_accounts")
+        .expect("account bound");
+    let pin = log
+        .iter()
+        .position(|event| *event == "provider.hunt_pin")
+        .expect("state pinned");
+    assert!(bind < pin);
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 自动撞：全程未命中则打满 `max_ips` 个临时 IP 后收尾，不多打。
+#[tokio::test]
+async fn auto_hunt_stops_after_max_ips_without_a_hit() {
+    use gateway_admin::model::accounts::HuntCountry;
+    let probe = ScriptedProbe::new([
+        Reply::NoState,
+        Reply::NoState,
+        Reply::NoState,
+        Reply::NoState,
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy_with(
+                "template",
+                "http://user_area-US:pass@proxy.smartproxy.test:3120/",
+                true,
+                0,
+            ),
+            proxy_with("static-free", "http://127.0.0.1:8002/", true, 0),
+        ],
+        None,
+    )
+    .await;
+
+    let events = run_auto(
+        &setup,
+        auto_request(
+            "template",
+            &[HuntCountry::Us, HuntCountry::Jp],
+            &["static-free"],
+            4,
+        ),
+    )
+    .await;
+
+    assert_eq!(probe.egresses().len(), 4);
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: false, .. })
+    ));
+}
+
+/// 自动撞：静态池里没有测试通过的出口时直接拒绝，不发任何探测。
+#[tokio::test]
+async fn auto_hunt_rejects_when_no_static_is_usable() {
+    use gateway_admin::model::accounts::HuntCountry;
+    let probe = ScriptedProbe::new([]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy_with(
+                "template",
+                "http://user_area-US:pass@proxy.smartproxy.test:3120/",
+                true,
+                0,
+            ),
+            proxy_with("static-untested", "http://127.0.0.1:8002/", false, 0),
+        ],
+        None,
+    )
+    .await;
+
+    let error = setup
+        .services
+        .accounts()
+        .auto_turn_state_hunt(auto_request(
+            "template",
+            &[HuntCountry::Us],
+            &["static-untested"],
+            5,
+        ))
+        .await
+        .err()
+        .expect("no usable static");
+    assert_eq!(error.kind(), AdminErrorKind::Invalid);
     assert!(probe.egresses().is_empty());
 }
 

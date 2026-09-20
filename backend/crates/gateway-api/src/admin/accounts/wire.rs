@@ -715,8 +715,113 @@ impl TurnStateHuntQuery {
             attempts: self.attempts,
             include_direct: self.include_direct,
             only_proxy_id: self.proxy_id,
+            ephemeral: None,
+            bind_to: None,
             // 管理员手动遍历可以用于诊断已停用的账号。
             require_schedulable: false,
+            context,
+        })
+    }
+}
+
+/// 自动撞 state 的 query：从一条轮换代理模板即时生成多国临时出口反复撞，命中即切静态。
+/// 事件形状与遍历完全一致（前端在自动模式下把 egress 事件聚合成滚动计数）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateAutoHuntQuery {
+    pub account_id: String,
+    pub model_id: String,
+    /// 轮换代理模板的代理 id（已存的一条轮换代理，如 dongtai-US）；后端读它的地址当模板。
+    pub template_proxy_id: String,
+    /// 逗号分隔的国家代码（US/JP/DE/PH）。
+    pub countries: String,
+    /// 逗号分隔的静态出口 id：命中后从中挑一个测试通过、账号数最少的改绑。
+    pub static_proxy_ids: String,
+    /// 最多生成多少个临时 IP（额度闸）。
+    pub max_ips: u16,
+}
+
+impl TurnStateAutoHuntQuery {
+    fn parsed_countries(
+        &self,
+    ) -> Result<Vec<gateway_admin::model::accounts::HuntCountry>, WireValidationError> {
+        use gateway_admin::model::accounts::HuntCountry;
+        let mut countries = Vec::new();
+        for token in self
+            .countries
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let country =
+                HuntCountry::parse(token).ok_or_else(|| WireValidationError::new("countries"))?;
+            if !countries.contains(&country) {
+                countries.push(country);
+            }
+        }
+        if countries.is_empty() {
+            return Err(WireValidationError::new("countries"));
+        }
+        Ok(countries)
+    }
+
+    fn parsed_static_ids(&self) -> Result<Vec<String>, WireValidationError> {
+        let ids: Vec<String> = self
+            .static_proxy_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| id.len() > 128 || id.chars().any(char::is_control))
+        {
+            return Err(WireValidationError::new("staticProxyIds"));
+        }
+        Ok(ids)
+    }
+
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.template_proxy_id.trim().is_empty()
+            || self.template_proxy_id.len() > 128
+            || self.template_proxy_id.chars().any(char::is_control)
+        {
+            return Err(WireValidationError::new("templateProxyId"));
+        }
+        if self.max_ips == 0
+            || self.max_ips
+                > gateway_admin::model::accounts::TurnStateHuntCommand::MAX_EPHEMERAL_IPS
+        {
+            return Err(WireValidationError::new("maxIps"));
+        }
+        self.parsed_countries()?;
+        self.parsed_static_ids()?;
+        Ok(())
+    }
+
+    /// 凭据（模板代理地址）与静态出口的选取留给 use case 层：这里只解析出请求。
+    pub(super) fn into_request(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::accounts::TurnStateAutoHuntRequest, WireValidationError> {
+        self.validate()?;
+        let countries = self.parsed_countries()?;
+        let static_ids = self.parsed_static_ids()?;
+        Ok(gateway_admin::model::accounts::TurnStateAutoHuntRequest {
+            account_id: ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            upstream_model: UpstreamModelId::new(self.model_id)
+                .map_err(|_| WireValidationError::new("modelId"))?,
+            template_proxy_id: self.template_proxy_id,
+            countries,
+            static_proxy_ids: static_ids,
+            max_ips: self.max_ips,
             context,
         })
     }

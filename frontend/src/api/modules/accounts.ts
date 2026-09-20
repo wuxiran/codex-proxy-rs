@@ -702,6 +702,32 @@ export function turnStateHuntStreamUrl(params: TurnStateHuntParam) {
   return `${API_BASE_URL}/api/admin/accounts/turn-state-hunt?${query}`
 }
 
+/** 自动撞 state：从轮换代理模板即时生成多国临时出口反复撞，命中即切静态。事件形状同遍历。 */
+export interface TurnStateAutoHuntParam {
+  accountId: string
+  modelId: string
+  /** 轮换代理模板的代理 id（如 dongtai-US）。 */
+  templateProxyId: string
+  /** 出口国家代码，US/JP/DE/PH。 */
+  countries: string[]
+  /** 命中后可改绑的静态出口 id；后端挑其中账号数最少的一个。 */
+  staticProxyIds: string[]
+  /** 最多生成多少个临时 IP（额度闸）。 */
+  maxIps: number
+}
+
+export function turnStateAutoHuntStreamUrl(params: TurnStateAutoHuntParam) {
+  const query = new URLSearchParams({
+    accountId: params.accountId,
+    modelId: params.modelId,
+    templateProxyId: params.templateProxyId,
+    countries: params.countries.join(','),
+    staticProxyIds: params.staticProxyIds.join(','),
+    maxIps: String(params.maxIps),
+  })
+  return `${API_BASE_URL}/api/admin/accounts/turn-state-auto-hunt?${query}`
+}
+
 export interface TurnStateCaptureRule {
   defaultLength: number | null
   modelLengths: Record<string, number>

@@ -59,6 +59,10 @@ where
             get(hunt_account_turn_state::<S>),
         )
         .route(
+            "/api/admin/accounts/turn-state-auto-hunt",
+            get(auto_hunt_account_turn_state::<S>),
+        )
+        .route(
             "/api/admin/accounts/oauth/start",
             post(start_account_authorization::<S>),
         )
@@ -623,6 +627,44 @@ where
         .admin_services()
         .accounts()
         .turn_state_hunt(command)
+        .await
+        .map_err(map_service_error)?
+        .map(|event| Ok(Event::default().data(turn_state_hunt_event_data(event).to_string())));
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// 自动撞 state：从轮换代理模板即时生成多国临时出口反复撞，命中即切静态。与遍历同为
+/// 会改账号绑定的 GET（EventSource），故沿用同一套 SSE / 同源守卫。
+async fn auto_hunt_account_turn_state<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    headers: axum::http::HeaderMap,
+    AdminQuery(query): AdminQuery<TurnStateAutoHuntQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let accepts_event_stream = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    if !accepts_event_stream {
+        return Err(map_wire_error(WireValidationError::new("accept")));
+    }
+    let cross_origin = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| !site.eq_ignore_ascii_case("same-origin"));
+    if cross_origin {
+        return Err(map_wire_error(WireValidationError::new("origin")));
+    }
+    let request = query
+        .into_request(auth.context().mutation_context())
+        .map_err(map_wire_error)?;
+    let stream = state
+        .admin_services()
+        .accounts()
+        .auto_turn_state_hunt(request)
         .await
         .map_err(map_service_error)?
         .map(|event| Ok(Event::default().data(turn_state_hunt_event_data(event).to_string())));

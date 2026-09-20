@@ -359,6 +359,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
 | `GET` | `/api/admin/accounts/turn-state-hunt` | `accountId`、`modelId`、`attempts`（1–200，默认 5）、`includeDirect`、`proxyId`（可选，只遍历这一个代理） | 通过 SSE 遍历已测试通过的代理找符合长度规则的 state；命中后绑定该代理并钉住 state |
+| `GET` | `/api/admin/accounts/turn-state-auto-hunt` | `accountId`、`modelId`、`templateProxyId`（轮换代理模板）、`countries`（逗号，US/JP/DE/PH）、`staticProxyIds`（逗号）、`maxIps`（1–2000） | 从轮换代理模板即时生成多国临时出口反复撞（每个 IP 打 1 次），命中后改绑到静态池里账号数最少的出口、并按该静态出口的指纹钉住 state；事件形状与 `turn-state-hunt` 一致 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
