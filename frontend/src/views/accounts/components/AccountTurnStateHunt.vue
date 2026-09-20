@@ -69,12 +69,16 @@ const STATE_TEXT: Record<TurnStateHuntRow['state'], string> = {
   hit: '命中',
   miss: '未命中',
   skipped: '已跳过',
+  aborted: '已中止',
+  notRun: '未执行',
 }
 
 function stateText(row: TurnStateHuntRow) {
   if (row.state !== 'skipped')
     return STATE_TEXT[row.state]
-  return row.skipped === 'unavailable' ? '已跳过：代理不可用' : '已跳过：出口不通'
+  if (row.skipped === 'unavailable')
+    return '已跳过：代理不可用'
+  return row.skipped === 'capacity' ? '已跳过：上游暂无容量' : '已跳过：出口不通'
 }
 
 function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {

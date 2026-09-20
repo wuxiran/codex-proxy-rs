@@ -701,14 +701,10 @@ async fn renewal_never_probes_an_account_that_was_disabled_meanwhile() {
     assert!(!changed(&setup.log));
 }
 
-/// 模型没容量、网关本地故障都与出口无关：不能拿它们当理由把所有代理打一遍。
+/// 网关本地故障与出口无关：不能拿它当理由把所有代理打一遍。
 #[tokio::test]
-async fn capacity_and_local_failures_abort_instead_of_walking_every_egress() {
+async fn local_failures_abort_instead_of_walking_every_egress() {
     for (kind, code) in [
-        (
-            ProviderErrorKind::UpstreamCapacityUnavailable,
-            "upstream_capacity",
-        ),
         (
             ProviderErrorKind::ProviderInfrastructureUnavailable,
             "system_error",
@@ -733,6 +729,126 @@ async fn capacity_and_local_failures_abort_instead_of_walking_every_egress() {
         );
         assert!(!changed(&setup.log));
     }
+}
+
+/// 上游的「无容量」多是秒级过载：一次抖动不能让整轮落空（自动续期尤其如此），换下一个出口继续。
+#[tokio::test(start_paused = true)]
+async fn transient_capacity_moves_on_instead_of_aborting() {
+    let probe = ScriptedProbe::new([
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("first", 8001, true), proxy("second", 8002, true)],
+        None,
+    )
+    .await;
+
+    let events = run(&setup, command(1, false)).await;
+
+    assert_eq!(probe.egresses(), vec![endpoint(8001), endpoint(8002)]);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnStateHuntEvent::EgressFinished { proxy_id: Some(id), skipped: Some("capacity"), matched: false, .. } if id == "first"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 同一出口上还有尝试次数时就地再试：无容量与出口无关，不计入「出口不通」。
+#[tokio::test(start_paused = true)]
+async fn capacity_is_retried_within_the_attempt_budget_of_the_same_egress() {
+    let probe = ScriptedProbe::new([
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("only", 8001, true), proxy("unused", 8002, true)],
+        None,
+    )
+    .await;
+
+    let events = run(&setup, command(5, false)).await;
+
+    assert_eq!(
+        probe.egresses(),
+        vec![endpoint(8001), endpoint(8001), endpoint(8001)]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 连续多次都无容量才是真的没有容量：到此为止，不把剩下的出口白打一遍。
+#[tokio::test(start_paused = true)]
+async fn sustained_capacity_aborts_after_a_bounded_streak() {
+    let probe = ScriptedProbe::new([
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy("a", 8001, true),
+            proxy("b", 8002, true),
+            proxy("c", 8003, true),
+            proxy("d", 8004, true),
+        ],
+        None,
+    )
+    .await;
+
+    let events = run(&setup, command(1, false)).await;
+
+    assert_eq!(
+        probe.egresses(),
+        vec![endpoint(8001), endpoint(8002), endpoint(8003)]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Failed {
+            code: "upstream_capacity",
+            ..
+        })
+    ));
+    assert!(!changed(&setup.log));
+}
+
+/// 中间只要有一次请求拿到了上游应答，就说明上游有容量：连续计数清零，不会被零散抖动累计到中止。
+#[tokio::test(start_paused = true)]
+async fn an_upstream_answer_resets_the_capacity_streak() {
+    let probe = ScriptedProbe::new([
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::NoState,
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::Rejected(ProviderErrorKind::UpstreamCapacityUnavailable),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        (1..=6)
+            .map(|n| proxy(&format!("p{n}"), 8000 + n, true))
+            .collect(),
+        None,
+    )
+    .await;
+
+    let events = run(&setup, command(1, false)).await;
+
+    assert_eq!(probe.egresses().len(), 6);
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
 }
 
 /// 续期途中账号被停用：同一出口上剩下的尝试也不再发，不只是「下一个出口前」才停。

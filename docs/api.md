@@ -713,7 +713,9 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 `pinned{model,length,expiresAt}`、`hunt_complete{success,requests}`、`error{code,message}`。直连的 `proxyId` 为 null。
 `length` 仅供筛选；state 的值及其任何摘要永不输出，也不写入日志。
 失败按 Provider 的原始分类判断：凭据失效、无权限/封号、额度耗尽、限流、模型不支持、请求不合法视为账号级失败并中止
-整个遍历（`account_rejected`）；上游明确拒绝该模型的容量（`upstream_capacity`）、网关本地的账号存储/租约/凭据故障（`system_error`）同样中止——它们与出口无关；
+整个遍历（`account_rejected`）；网关本地的账号存储/租约/凭据故障（`system_error`）同样中止——它与出口无关。
+上游明确拒绝该模型的容量多为秒级过载：每次等待 3 秒后继续（同一出口还有尝试次数就地再试，否则该出口以
+`skipped: "capacity"` 结束并换下一个），跨出口连续 3 次才以 `upstream_capacity` 中止；期间任何一次请求拿到上游应答即清零。
 只有传输失败、超时、Cloudflare 拦截、协议不合法才视为出口问题，同一出口连续两次即跳过。`attempt.error.message`
 是按分类给出的固定文案，不含上游原文；`requests` 只统计真正发往上游的请求。
 账号被线上流量占用而未发出的尝试不计次数，连续五次后中止。
@@ -725,7 +727,7 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 开启续期要求固定已开启，关闭「固定自身 state」时一并清除；详情的 `credentialConfiguration.turnStateAutoHunt` 返回当前参数或 null。
 开启后服务端每 60 秒检查一次：该账号该模型的账号级 state 在本进程内缺失（含服务重启后）或将在 5 分钟内到期时，
 以系统身份用同样参数重新遍历——当前绑定的出口排最前，续不上就继续打其它出口，命中后照常换绑并替换旧 state。
-整轮都未命中则 5 分钟后重试，上游拒绝账号则 15 分钟后重试。停用或凭据失效的账号不续期：轮到它时会按当时的事实和参数重新确认，
+整轮都未命中则 5 分钟后重试，上游拒绝账号则 15 分钟后重试，因上游无容量中止则 60 秒后重试（必须远短于 5 分钟的续期提前量，否则一次过载就会让 state 在下次重试前过期）。停用或凭据失效的账号不续期：轮到它时会按当时的事实和参数重新确认，
 续期途中被停用会在下一个请求前停手（`account_unschedulable`，不计退避，重新启用后立即恢复）。
 续期途中才关闭续期开关的，本轮（最多「出口数 × 次数」个请求）仍会走完。
 state 只存在于进程内存，续期任务不加跨实例租约，每个实例各自维护。

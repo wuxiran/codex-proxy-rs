@@ -11,8 +11,8 @@ export interface TurnStateHuntAttempt {
 
 export interface TurnStateHuntRow extends TurnStateHuntProxy {
   key: string
-  state: 'pending' | 'running' | 'hit' | 'miss' | 'skipped'
-  skipped: 'unavailable' | 'unreachable' | null
+  state: 'pending' | 'running' | 'hit' | 'miss' | 'skipped' | 'aborted' | 'notRun'
+  skipped: 'unavailable' | 'unreachable' | 'capacity' | null
   attempts: TurnStateHuntAttempt[]
 }
 
@@ -96,8 +96,19 @@ export function useAccountTurnStateHunt() {
       case 'error':
         status.value = 'error'
         message.value = event.message
+        settleRows()
         close()
         break
+    }
+  }
+
+  /** 遍历提前结束（中止、断线、取消）时收尾：不能把「探测中」「等待」留在界面上，那看起来像还在跑。 */
+  function settleRows() {
+    for (const item of rows.value) {
+      if (item.state === 'running')
+        item.state = 'aborted'
+      else if (item.state === 'pending')
+        item.state = 'notRun'
     }
   }
 
@@ -127,6 +138,7 @@ export function useAccountTurnStateHunt() {
       if (status.value === 'running' || status.value === 'finalizing') {
         const started = rows.value.length > 0
         status.value = 'error'
+        settleRows()
         message.value = started
           ? '连接中断；若已命中，绑定与钉住仍会在服务端完成，请重新打开账号查看'
           : '无法开始遍历：请确认已开启并保存「固定自身 state」、至少有一个测试通过的代理，且该账号没有其它遍历在运行'
@@ -139,6 +151,7 @@ export function useAccountTurnStateHunt() {
       return
     close()
     status.value = 'cancelled'
+    settleRows()
     message.value = '已取消。若取消的瞬间恰好命中，服务端可能仍在完成绑定与钉住；稍后会按服务端的实际状态刷新下方的代理与固定列表，请以刷新后的内容为准（可重新打开账号再次确认）'
   }
 

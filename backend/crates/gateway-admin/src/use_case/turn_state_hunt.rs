@@ -41,6 +41,11 @@ const BUSY_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_BUSY_RETRIES: u8 = 5;
 /// 同一出口连续失败到此数即认为出口不通，换下一个。
 const MAX_EGRESS_FAILURES: u8 = 2;
+/// 上游的「该模型暂无容量」多是秒级的瞬时过载：歇一下再发往往就通。
+const CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// 连续这么多次都被上游以无容量拒绝，才认定确实没有容量并中止整轮；
+/// 少于它就继续遍历，避免一次抖动让整轮（尤其是自动续期）落空。
+const MAX_CAPACITY_STREAK: u8 = 3;
 
 /// 同一账号同时只允许一个遍历任务；离开作用域即释放。
 pub(super) type ActiveHunts = Arc<Mutex<BTreeSet<ProviderAccountId>>>;
@@ -72,6 +77,8 @@ struct Hunt {
     request: AccountProbeRequest,
     events: tokio::sync::mpsc::Sender<TurnStateHuntEvent>,
     requests: u32,
+    /// 跨出口累计的连续「上游无容量」次数；任何一次请求拿到上游应答就清零。
+    capacity_streak: u8,
 }
 
 enum Outcome {
@@ -142,6 +149,7 @@ impl DefaultAccountsService {
             ticket,
             events,
             requests: 0,
+            capacity_streak: 0,
         };
         // 独立任务：页面断开只会让遍历在下一次尝试前停下，命中后的「绑定 + 钉住」不会被半途丢弃。
         tokio::spawn(async move {
@@ -341,6 +349,9 @@ impl Hunt {
                     self.requests += 1;
                     used += 1;
                     (busy, failures) = (0, 0);
+                    self.capacity_streak = 0;
+                    // 这个出口后来拿到了应答：此前的「无容量」不再是它落空的原因。
+                    skipped = None;
                     let observed = self
                         .provider
                         .turn_state_hunt_inspect(&self.ticket, &result.response_headers);
@@ -403,6 +414,21 @@ impl Hunt {
                 }),
             })
             .await;
+            if class == FailureClass::Capacity {
+                self.capacity_streak += 1;
+                if self.capacity_streak >= MAX_CAPACITY_STREAK {
+                    self.log_egress(&egress.view, &lengths, false);
+                    // 连续多次都无容量：不是抖动，再打剩下的出口只会白耗额度。
+                    self.fail("upstream_capacity", "上游该模型暂无容量，稍后再试")
+                        .await;
+                    return Outcome::Stop;
+                }
+                // 无容量与出口无关，不计入出口失败；歇一下再继续，仍受「每个代理最多尝试」约束。
+                skipped = Some("capacity");
+                tokio::time::sleep(CAPACITY_RETRY_DELAY).await;
+                continue;
+            }
+            skipped = None;
             if let Some((code, message)) = class.abort() {
                 self.log_egress(&egress.view, &lengths, false);
                 // 这些失败换出口也不会好，继续只会白耗额度。
@@ -654,7 +680,8 @@ fn not_sent_because_busy(error: &AccountProbeError) -> bool {
 enum FailureClass {
     /// 换出口也不会好：凭据失效、被封、额度耗尽、限流、模型不支持、请求本身不合法。
     Account,
-    /// 上游明确拒绝的是这个模型的容量。传输层已对它做过有界重试，逐个出口再打一遍没有意义。
+    /// 上游明确拒绝的是这个模型的容量，与出口无关。它多为瞬时过载，所以不立刻中止：
+    /// 歇一下继续遍历，连续 [`MAX_CAPACITY_STREAK`] 次才认定确实没有容量。
     Capacity,
     /// 本机的账号存储、租约协调或凭据数据不可用，或请求被取消：与出口无关，整轮中止。
     System,
@@ -710,7 +737,8 @@ impl FailureClass {
     const fn abort(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Account => Some(("account_rejected", "上游拒绝了该账号的请求，遍历已中止")),
-            Self::Capacity => Some(("upstream_capacity", "上游该模型暂无容量，稍后再试")),
+            // 是否中止由连续次数决定，见 `try_egress`。
+            Self::Capacity => None,
             Self::System => Some(("system_error", "网关本地错误，遍历已中止")),
             Self::Egress => None,
         }
