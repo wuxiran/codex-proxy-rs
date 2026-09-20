@@ -90,14 +90,14 @@ impl TurnStateRenewalTask {
             let account_id = renewal.account_id.clone();
             let stream = self
                 .accounts
-                .turn_state_hunt(TurnStateHuntCommand {
+                .renewal_turn_state_hunt(TurnStateHuntCommand {
                     account_id: renewal.account_id,
                     upstream_model: renewal.upstream_model,
                     attempts: renewal.attempts,
                     include_direct: renewal.include_direct,
-                    // 续期不限定代理：命中时账号已绑到那个出口，「已绑出口排最前」自然先打它。
+                    // 有轮换代理模板时续期改走「自动撞」（见 renewal_turn_state_hunt）；
+                    // 没有模板时回退遍历，此处传的就是遍历用的基础命令。
                     only_proxy_id: None,
-                    // 续期走已存代理遍历，不用自动撞的临时出口，也不改绑到别处。
                     ephemeral: None,
                     bind_to: None,
                     require_schedulable: true,

@@ -172,6 +172,15 @@ pub trait AccountsService: Send + Sync {
     ) -> Result<TurnStateHuntEventStream, AdminError> {
         Err(AdminError::invalid("当前服务不支持自动撞 state"))
     }
+
+    /// 自动续期专用：存在轮换代理模板时走「自动撞」的快速多国临时出口，命中切静态；
+    /// 否则回退到遍历已存代理。默认实现走遍历，供不支持的服务复用。
+    async fn renewal_turn_state_hunt(
+        &self,
+        command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        self.turn_state_hunt(command).await
+    }
 }
 
 #[derive(Clone)]
@@ -1000,6 +1009,13 @@ impl AccountsService for DefaultAccountsService {
         request: crate::model::accounts::TurnStateAutoHuntRequest,
     ) -> Result<TurnStateHuntEventStream, AdminError> {
         self.start_auto_turn_state_hunt(request).await
+    }
+
+    async fn renewal_turn_state_hunt(
+        &self,
+        command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        self.start_renewal_turn_state_hunt(command).await
     }
 }
 

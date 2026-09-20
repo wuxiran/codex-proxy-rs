@@ -31,7 +31,7 @@ use crate::{
             BatchUpdateAccounts, CredentialState, TurnStateHuntAttemptError, TurnStateHuntCommand,
             TurnStateHuntEgress, TurnStateHuntEvent, TurnStateHuntEventStream,
         },
-        proxies::{AccountProxySelection, ProxyListQuery},
+        proxies::{AccountProxySelection, ProxyListQuery, ProxyRecord},
     },
     ports::provider::{ProviderAdmin, TurnStateHuntTicket},
 };
@@ -46,6 +46,9 @@ const CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// 连续这么多次都被上游以无容量拒绝，才认定确实没有容量并中止整轮；
 /// 少于它就继续遍历，避免一次抖动让整轮（尤其是自动续期）落空。
 const MAX_CAPACITY_STREAK: u8 = 3;
+/// 命中收尾时若发现令牌刚好刷新（凭据变了），重新取票继续撞，最多这么多次；
+/// 繁忙的 Business 号令牌刷新频繁，整轮因此中止会让它永远绑不上 state。
+const MAX_TICKET_REFRESHES: u8 = 3;
 
 /// 同一账号同时只允许一个遍历任务；离开作用域即释放。
 pub(super) type ActiveHunts = Arc<Mutex<BTreeSet<ProviderAccountId>>>;
@@ -81,11 +84,21 @@ struct Hunt {
     requests: u32,
     /// 跨出口累计的连续「上游无容量」次数；任何一次请求拿到上游应答就清零。
     capacity_streak: u8,
+    /// 命中收尾时因令牌刷新而重新取票的次数；超过 [`MAX_TICKET_REFRESHES`] 才放弃。
+    ticket_refreshes: u8,
 }
 
 enum Outcome {
     Continue,
     Stop,
+}
+
+/// 命中收尾的结果。
+enum FinalizeOutcome {
+    /// 已收尾（钉住成功、或因确凿原因失败并已发事件）：停止整轮。
+    Committed,
+    /// 令牌刚好刷新、已重新取票：丢弃这次命中，继续用新票撞下一个出口。
+    Retry,
 }
 
 /// 实际发出探测的那个出口。命中后要绑定的必须就是它：同一个代理 ID 在探测之后
@@ -168,6 +181,7 @@ impl DefaultAccountsService {
             events,
             requests: 0,
             capacity_streak: 0,
+            ticket_refreshes: 0,
         };
         // 独立任务：页面断开只会让遍历在下一次尝试前停下，命中后的「绑定 + 钉住」不会被半途丢弃。
         tokio::spawn(async move {
@@ -285,6 +299,81 @@ impl DefaultAccountsService {
             bind_to: Some(bind_to),
             require_schedulable: false,
             context: request.context,
+        };
+        self.start_turn_state_hunt(command).await
+    }
+
+    /// 自动续期：若代理池里有轮换代理模板（用户名含 `_area-` 的 smartproxy 式地址），
+    /// 就走「自动撞」的快速多国临时出口、命中切静态；否则回退到遍历已存代理。
+    /// 续期在 System 身份下运行，账号被停用/凭据失效时不发请求。
+    pub(super) async fn start_renewal_turn_state_hunt(
+        &self,
+        sweep_command: TurnStateHuntCommand,
+    ) -> Result<TurnStateHuntEventStream, AdminError> {
+        use crate::model::accounts::{EphemeralHunt, HuntCountry};
+        /// 续期每轮最多试多少个临时 IP；命中即止。远小于手动自动撞的上限，控制额度。
+        const RENEWAL_EPHEMERAL_IPS: u16 = 60;
+
+        // 收集测试通过的代理：轮换模板 vs 可作静态目标的固定出口。
+        let mut template_url: Option<String> = None;
+        let mut statics: Vec<ProxyRecord> = Vec::new();
+        let page_size =
+            PageSize::new(PageSize::MAX).map_err(|_| AdminError::internal("分页大小不合法"))?;
+        let mut page = 1;
+        loop {
+            let listed = self
+                .proxies
+                .list(ProxyListQuery {
+                    page,
+                    page_size,
+                    search: String::new(),
+                })
+                .await
+                .map_err(|error| map_store_error(error, "proxies"))?;
+            let fetched = listed.items.len();
+            for record in listed.items {
+                if !record.last_test.as_ref().is_some_and(|test| test.success) {
+                    continue;
+                }
+                if record.proxy.expose_url().contains("_area-") {
+                    // 第一条轮换代理即模板；其余轮换代理不作静态目标。
+                    template_url.get_or_insert_with(|| record.proxy.expose_url().to_owned());
+                } else {
+                    statics.push(record);
+                }
+            }
+            if fetched < usize::from(PageSize::MAX) {
+                break;
+            }
+            page += 1;
+        }
+
+        // 有模板 + 至少一个静态出口才走自动撞；否则回退遍历。
+        let (Some(template_url), false) = (template_url, statics.is_empty()) else {
+            return self.start_turn_state_hunt(sweep_command).await;
+        };
+        statics.sort_by(|a, b| {
+            a.account_count
+                .cmp(&b.account_count)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let bind_to = statics[0].id.clone();
+        let command = TurnStateHuntCommand {
+            attempts: 1,
+            include_direct: false,
+            only_proxy_id: None,
+            ephemeral: Some(EphemeralHunt {
+                template_url,
+                countries: vec![
+                    HuntCountry::Us,
+                    HuntCountry::Jp,
+                    HuntCountry::De,
+                    HuntCountry::Ph,
+                ],
+                count: RENEWAL_EPHEMERAL_IPS,
+            }),
+            bind_to: Some(bind_to),
+            ..sweep_command
         };
         self.start_turn_state_hunt(command).await
     }
@@ -533,6 +622,7 @@ impl Hunt {
                     })
                     .await;
                     if observed.matched {
+                        // 命中事件先发（保持「Completed 收尾在最后」的次序），再进收尾。
                         self.log_egress(&view, &lengths, true);
                         self.emit(TurnStateHuntEvent::EgressFinished {
                             proxy_id: proxy_id.clone(),
@@ -541,9 +631,14 @@ impl Hunt {
                             skipped: None,
                         })
                         .await;
-                        self.finalize(&probed, used, &result.response_headers, captured_at)
-                            .await;
-                        return Outcome::Stop;
+                        match self
+                            .finalize(&probed, used, &result.response_headers, captured_at)
+                            .await
+                        {
+                            FinalizeOutcome::Committed => return Outcome::Stop,
+                            // 令牌刚好刷新、已重新取票：这次命中不作数，继续撞下一个出口。
+                            FinalizeOutcome::Retry => return Outcome::Continue,
+                        }
                     }
                     continue;
                 }
@@ -636,9 +731,51 @@ impl Hunt {
         attempt_index: u8,
         response_headers: &[ProviderResponseHeader],
         captured_at: SystemTime,
-    ) {
+    ) -> FinalizeOutcome {
         let account_id = self.command.account_id.clone();
         let proxy_id = probed.proxy_id.clone();
+        if !self.still_schedulable().await {
+            self.fail(
+                "account_unschedulable",
+                "账号已停用或凭据已失效，未改动账号",
+            )
+            .await;
+            return FinalizeOutcome::Committed;
+        }
+        // 命中收尾前先核对凭据：这次命中的 state 是在收尾这一刻的凭据下观测的才可信。
+        // 令牌刚好在命中前后刷新（繁忙 Business 号很常见）时，不要整轮中止——重新取票、
+        // 丢弃这次命中、继续用新票撞下一个出口，最多 [`MAX_TICKET_REFRESHES`] 次。
+        match self
+            .provider
+            .turn_state_hunt_prepare(&account_id, &self.command.upstream_model)
+            .await
+        {
+            Ok(current) if current == self.ticket => {}
+            Ok(current) => {
+                self.ticket_refreshes += 1;
+                if self.ticket_refreshes > MAX_TICKET_REFRESHES {
+                    self.fail(
+                        "credential_changed",
+                        "凭据在遍历期间反复变化（令牌频繁刷新），请稍后重试",
+                    )
+                    .await;
+                    return FinalizeOutcome::Committed;
+                }
+                self.ticket = current;
+                tracing::info!(
+                    target: "turn_state_hunt",
+                    account_id = account_id.as_str(),
+                    refreshes = self.ticket_refreshes,
+                    "命中时令牌刚好刷新，已重新取票，丢弃本次命中继续撞"
+                );
+                return FinalizeOutcome::Retry;
+            }
+            Err(_) => {
+                self.fail("credential_changed", "凭据在遍历期间已变化，请重新遍历")
+                    .await;
+                return FinalizeOutcome::Committed;
+            }
+        }
         // 提交边界：命中事件送达之后才进入不可取消的收尾。页面在探测途中已经断开
         // （用户点了取消）时事件送不出去，此时什么都不改，兑现「取消不改动账号」。
         let hit = TurnStateHuntEvent::Hit {
@@ -652,28 +789,7 @@ impl Hunt {
                 account_id = account_id.as_str(),
                 "遍历命中时页面已取消，未改动账号"
             );
-            return;
-        }
-        if !self.still_schedulable().await {
-            self.fail(
-                "account_unschedulable",
-                "账号已停用或凭据已失效，未改动账号",
-            )
-            .await;
-            return;
-        }
-        // 遍历期间凭据被刷新或重新捕获，观测到的 state 不再属于当前凭据。
-        match self
-            .provider
-            .turn_state_hunt_prepare(&account_id, &self.command.upstream_model)
-            .await
-        {
-            Ok(current) if current == self.ticket => {}
-            _ => {
-                self.fail("credential_changed", "凭据在遍历期间已变化，请重新遍历")
-                    .await;
-                return;
-            }
+            return FinalizeOutcome::Committed;
         }
         // 目标出口 = 要绑定并按其指纹钉 state 的那个。自动撞在轮换 IP 上命中，却要落到稳定的
         // 静态家宽（`bind_to`，state 已确认可移植）；普通遍历则就是命中的那个出口。
@@ -692,7 +808,7 @@ impl Hunt {
                         "要改绑的静态出口不存在或未测试通过，未改动账号",
                     )
                     .await;
-                    return;
+                    return FinalizeOutcome::Committed;
                 }
             },
             None => ProbedEgress {
@@ -712,13 +828,13 @@ impl Hunt {
             if !unchanged {
                 self.fail("egress_changed", "该代理在遍历期间被修改，请重新遍历")
                     .await;
-                return;
+                return FinalizeOutcome::Committed;
             }
         }
         let Ok(already_bound) = self.bound_to(&target).await else {
             self.fail("bind_failed", "读取账号当前绑定失败，未改动账号")
                 .await;
-            return;
+            return FinalizeOutcome::Committed;
         };
         if !already_bound {
             let selection = target_proxy_id
@@ -755,7 +871,7 @@ impl Hunt {
                     "账号当前绑定的不是目标出口，未钉住 state，请刷新后重试",
                 )
                 .await;
-                return;
+                return FinalizeOutcome::Committed;
             }
         }
         tracing::info!(
@@ -818,6 +934,7 @@ impl Hunt {
                 .await;
             }
         }
+        FinalizeOutcome::Committed
     }
 
     fn log_egress(&self, egress: &TurnStateHuntEgress, lengths: &[Option<usize>], matched: bool) {
