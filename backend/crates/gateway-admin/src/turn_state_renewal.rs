@@ -97,6 +97,9 @@ impl TurnStateRenewalTask {
                     include_direct: renewal.include_direct,
                     // 续期不限定代理：命中时账号已绑到那个出口，「已绑出口排最前」自然先打它。
                     only_proxy_id: None,
+                    // 续期走已存代理遍历，不用自动撞的临时出口，也不改绑到别处。
+                    ephemeral: None,
+                    bind_to: None,
                     require_schedulable: true,
                     context: Self::system_context(),
                 })
