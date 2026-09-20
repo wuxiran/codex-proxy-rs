@@ -674,6 +674,9 @@ pub struct TurnStateHuntQuery {
     pub attempts: u8,
     #[serde(default)]
     pub include_direct: bool,
+    /// 只遍历这一个代理；缺省遍历全部。
+    #[serde(default)]
+    pub proxy_id: Option<String>,
 }
 
 const fn default_hunt_attempts() -> u8 {
@@ -691,6 +694,11 @@ impl TurnStateHuntQuery {
         {
             return Err(WireValidationError::new("attempts"));
         }
+        if self.proxy_id.as_deref().is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(WireValidationError::new("proxyId"));
+        }
         Ok(())
     }
 
@@ -706,6 +714,7 @@ impl TurnStateHuntQuery {
                 .map_err(|_| WireValidationError::new("modelId"))?,
             attempts: self.attempts,
             include_direct: self.include_direct,
+            only_proxy_id: self.proxy_id,
             // 管理员手动遍历可以用于诊断已停用的账号。
             require_schedulable: false,
             context,

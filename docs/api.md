@@ -358,7 +358,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
-| `GET` | `/api/admin/accounts/turn-state-hunt` | `accountId`、`modelId`、`attempts`（1–20，默认 5）、`includeDirect` | 通过 SSE 遍历已测试通过的代理找符合长度规则的 state；命中后绑定该代理并钉住 state |
+| `GET` | `/api/admin/accounts/turn-state-hunt` | `accountId`、`modelId`、`attempts`（1–200，默认 5）、`includeDirect`、`proxyId`（可选，只遍历这一个代理） | 通过 SSE 遍历已测试通过的代理找符合长度规则的 state；命中后绑定该代理并钉住 state |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -646,7 +646,7 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 
 上游是否返回符合规则长度的 state 与出口有关。`GET /api/admin/accounts/turn-state-hunt` 对单个 OpenAI OAuth 账号
 依次经每个 `lastTest.success` 为 true 的代理发真实上游请求（`includeDirect=true` 时再加直连），账号当前绑定的出口排最前，
-每个出口最多 `attempts` 次。探测只替换单次请求的出口，不改账号已保存的绑定，也不计入 Provider 熔断和账号探测失败事实。
+每个出口最多 `attempts` 次。给出 `proxyId` 时只遍历该代理（不存在或未通过测试则 400，不会退回成遍历全部，也不再尝试直连）：轮换出口每次请求换一个 IP，值得单独打上百次，固定出口反复打同一个 IP 没有意义，所以管理端只在指定单个代理时放开到 200 次。自动续期保存的 `attempts` 上限仍为 20。探测只替换单次请求的出口，不改账号已保存的绑定，也不计入 Provider 熔断和账号探测失败事实。
 要求该账号已开启并保存 `pinTurnState`，且模型在 `turnStateCaptureRule` 中有长度规则，否则直接返回 400；同一账号同时只允许一个遍历（409）。
 这是会改状态的 GET（EventSource 只能发 GET），请求必须带 `Accept: text/event-stream`，且浏览器请求的
 `Sec-Fetch-Site` 必须是 `same-origin`（挡掉同站兄弟子域），否则返回 400。

@@ -34,22 +34,44 @@ const includeDirect = ref(false)
 const autoRenew = ref(true)
 
 const { proxies } = useProxyCatalog()
-const usableProxies = computed(() => proxies.value.filter(proxy => proxy.lastTest?.success === true).length)
+const usable = computed(() => proxies.value.filter(proxy => proxy.lastTest?.success === true))
+const usableProxies = computed(() => usable.value.length)
+
+// 轮换出口每次请求换一个 IP，值得单独打上百次；固定出口同一个 IP 反复打没有意义，
+// 所以只有指定了单个代理才放开到 200 次，遍历全部时仍是 20 次。
+const ALL_PROXIES = 'all'
+const AUTO_RENEW_MAX_ATTEMPTS = 20
+const onlyProxyId = ref(ALL_PROXIES)
+const proxyOptions = computed(() => [
+  { label: '全部已测试通过的代理', value: ALL_PROXIES },
+  ...usable.value.map(proxy => ({ label: `只撞：${proxy.name}`, value: proxy.id })),
+])
+const single = computed(() => onlyProxyId.value !== ALL_PROXIES)
+const maxAttempts = computed(() => single.value ? 200 : 20)
+watch(maxAttempts, (max) => {
+  if (attempts.value > max)
+    attempts.value = max
+})
+watch(usable, (value) => {
+  if (single.value && !value.some(proxy => proxy.id === onlyProxyId.value))
+    onlyProxyId.value = ALL_PROXIES
+})
 
 const hunt = useAccountTurnStateHunt()
 const { status, rows, expectedLength, requests, message } = hunt
 const busy = computed(() => status.value === 'running' || status.value === 'finalizing')
 const canStart = computed(() => !busy.value
   && Boolean(modelId.value)
-  && attempts.value >= 1 && attempts.value <= 20
-  && (usableProxies.value > 0 || includeDirect.value))
+  && attempts.value >= 1 && attempts.value <= maxAttempts.value
+  && (usableProxies.value > 0 || (includeDirect.value && !single.value)))
 
 function start() {
   hunt.start({
     accountId: props.accountId,
     modelId: modelId.value,
     attempts: attempts.value,
-    includeDirect: includeDirect.value,
+    includeDirect: includeDirect.value && !single.value,
+    proxyId: single.value ? onlyProxyId.value : null,
   })
 }
 
@@ -58,7 +80,8 @@ watch(status, (value) => {
     emit('cancelled')
   if (value === 'success') {
     emit('hunted', hunt.boundChanged.value, autoRenew.value
-      ? { modelId: modelId.value, attempts: attempts.value, includeDirect: includeDirect.value }
+      // 续期参数的上限仍是 20 次：命中后账号已绑到该出口，续期会最先打它。
+      ? { modelId: modelId.value, attempts: Math.min(attempts.value, AUTO_RENEW_MAX_ATTEMPTS), includeDirect: includeDirect.value }
       : null)
   }
 })
@@ -110,11 +133,15 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
         <BaseSelect v-model="modelId" class="min-w-56" size="sm" aria-label="模型" :options="modelOptions" :disabled="busy" />
       </div>
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
-        <span>每个代理最多尝试</span>
-        <BaseNumberInput v-model="attempts" label="每个代理最多尝试次数" :min="1" :max="20" unit="次" :disabled="busy" />
+        <span>范围</span>
+        <BaseSelect v-model="onlyProxyId" class="min-w-56" size="sm" aria-label="遍历范围" :options="proxyOptions" :disabled="busy" />
+      </div>
+      <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
+        <span>{{ single ? '最多尝试（轮换出口可到 200）' : '每个代理最多尝试' }}</span>
+        <BaseNumberInput v-model="attempts" label="每个代理最多尝试次数" :min="1" :max="maxAttempts" unit="次" :disabled="busy" />
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
-        <BaseCheckbox v-model="includeDirect" label="同时尝试直连" show-label :disabled="busy" />
+        <BaseCheckbox v-model="includeDirect" label="同时尝试直连" show-label :disabled="busy || single" />
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
         <BaseCheckbox v-model="autoRenew" label="到期前自动续期" show-label :disabled="busy" />

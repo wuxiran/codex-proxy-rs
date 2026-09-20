@@ -100,7 +100,9 @@ impl DefaultAccountsService {
         command: TurnStateHuntCommand,
     ) -> Result<TurnStateHuntEventStream, AdminError> {
         if command.attempts == 0 || command.attempts > TurnStateHuntCommand::MAX_ATTEMPTS {
-            return Err(AdminError::invalid("每个代理的尝试次数必须在 1 到 20 之间"));
+            return Err(AdminError::invalid(
+                "每个代理的尝试次数必须在 1 到 200 之间",
+            ));
         }
         let (stored, provider) = self.provider_for_account(&command.account_id).await?;
         let ticket = provider
@@ -110,12 +112,20 @@ impl DefaultAccountsService {
         let operation = provider
             .connection_test_operation(&command.upstream_model, CONNECTION_TEST_INPUT)
             .map_err(|error| map_provider_error(error, "provider turn state hunt"))?;
-        let egresses = self
+        let mut egresses = self
             .hunt_egresses(
                 stored.account.outbound_proxy.as_ref(),
                 command.include_direct,
             )
             .await?;
+        if let Some(only) = command.only_proxy_id.as_deref() {
+            egresses.retain(|egress| egress.view.proxy_id.as_deref() == Some(only));
+            if egresses.is_empty() {
+                return Err(AdminError::invalid(
+                    "指定的代理不存在或尚未通过测试，请先在代理页测试通过",
+                ));
+            }
+        }
         if egresses.is_empty() {
             return Err(AdminError::invalid(
                 "没有已通过测试的代理，请先在代理页测试通过后再遍历",

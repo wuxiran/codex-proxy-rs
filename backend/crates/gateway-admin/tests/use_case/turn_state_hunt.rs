@@ -184,6 +184,7 @@ fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
         upstream_model: UpstreamModelId::new("gpt-6-astra").unwrap(),
         attempts,
         include_direct,
+        only_proxy_id: None,
         require_schedulable: false,
         context: context("hunt"),
     }
@@ -398,7 +399,7 @@ async fn hunt_is_rejected_up_front_when_it_cannot_run() {
         None,
     )
     .await;
-    for attempts in [0, 21] {
+    for attempts in [0, 201] {
         let error = setup
             .services
             .accounts()
@@ -581,6 +582,67 @@ async fn egress_level_failure_moves_on_to_the_next_egress() {
         events.last(),
         Some(TurnStateHuntEvent::Completed { success: true, .. })
     ));
+}
+
+/// 轮换出口每次请求换一个 IP，值得单独打很多次；指定后只遍历它，别的代理一次都不碰。
+#[tokio::test]
+async fn only_the_named_proxy_is_probed_when_one_is_given() {
+    let probe = ScriptedProbe::new([
+        Reply::NoState,
+        Reply::NoState,
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("fixed", 8001, true), proxy("rotating", 8002, true)],
+        None,
+    )
+    .await;
+
+    let events = run(
+        &setup,
+        TurnStateHuntCommand {
+            only_proxy_id: Some("rotating".to_owned()),
+            ..command(50, false)
+        },
+    )
+    .await;
+
+    assert_eq!(
+        probe.egresses(),
+        vec![endpoint(8002), endpoint(8002), endpoint(8002)]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 指定的代理不存在或没通过测试：直接拒绝，不能悄悄退回成遍历全部。
+#[tokio::test]
+async fn naming_an_unusable_proxy_is_rejected_instead_of_walking_the_rest() {
+    let probe = ScriptedProbe::new([]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("good", 8001, true), proxy("untested", 8002, false)],
+        None,
+    )
+    .await;
+
+    for only in ["untested", "missing"] {
+        let error = setup
+            .services
+            .accounts()
+            .turn_state_hunt(TurnStateHuntCommand {
+                only_proxy_id: Some(only.to_owned()),
+                ..command(5, true)
+            })
+            .await
+            .err()
+            .expect("unusable proxy");
+        assert_eq!(error.kind(), AdminErrorKind::Invalid);
+    }
+    assert!(probe.egresses().is_empty());
 }
 
 /// 页面取消后在途探测才命中：取消承诺的是「账号未改动」，不能再绑定或钉住。
