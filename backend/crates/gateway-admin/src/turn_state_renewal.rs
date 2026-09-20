@@ -95,6 +95,8 @@ impl TurnStateRenewalTask {
                     upstream_model: renewal.upstream_model,
                     attempts: renewal.attempts,
                     include_direct: renewal.include_direct,
+                    // 续期不限定代理：命中时账号已绑到那个出口，「已绑出口排最前」自然先打它。
+                    only_proxy_id: None,
                     require_schedulable: true,
                     context: Self::system_context(),
                 })

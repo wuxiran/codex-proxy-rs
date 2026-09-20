@@ -334,13 +334,16 @@ pub struct TurnStateHuntCommand {
     pub upstream_model: gateway_core::routing::UpstreamModelId,
     pub attempts: u8,
     pub include_direct: bool,
+    /// 只在这一个代理上遍历。轮换出口（每次请求换一个 IP）值得单独打上百次，
+    /// 而固定出口同一个 IP 反复打没有意义，所以高次数只应落在指定的那一个上。
+    pub only_proxy_id: Option<String>,
     /// 后台续期为 true：账号被停用或凭据失效后，开始前与每个出口前都会停手。
     pub require_schedulable: bool,
     pub context: super::MutationContext,
 }
 
 impl TurnStateHuntCommand {
-    pub const MAX_ATTEMPTS: u8 = 20;
+    pub const MAX_ATTEMPTS: u8 = 200;
 }
 
 /// 遍历中的一个出口；`proxy_id == None` 表示直连。`endpoint` 不含代理凭据。

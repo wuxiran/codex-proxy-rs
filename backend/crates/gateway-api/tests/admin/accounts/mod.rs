@@ -835,7 +835,7 @@ mod actions {
         for invalid in [
             json!({ "enabled": true, "modelId": " ", "attempts": 5 }),
             json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 0 }),
-            json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 21 }),
+            json!({ "enabled": true, "modelId": "gpt-6-astra", "attempts": 201 }),
         ] {
             assert_eq!(
                 request(invalid).validate().unwrap_err().field(),
@@ -862,7 +862,7 @@ mod actions {
         assert_eq!(query.attempts, 5);
         assert!(!query.include_direct);
         query.validate().expect("defaults are valid");
-        for attempts in [0, 21] {
+        for attempts in [0, 201] {
             let query: TurnStateHuntQuery = serde_json::from_value(json!({
                 "accountId": "acct_1",
                 "modelId": "gpt-6-astra",

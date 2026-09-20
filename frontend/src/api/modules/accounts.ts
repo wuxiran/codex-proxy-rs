@@ -705,6 +705,8 @@ export interface TurnStateHuntParam {
   modelId: string
   attempts: number
   includeDirect: boolean
+  /** 只遍历这一个代理；缺省遍历全部已测试通过的代理。 */
+  proxyId?: string | null
 }
 
 export function turnStateHuntStreamUrl(params: TurnStateHuntParam) {
@@ -714,6 +716,8 @@ export function turnStateHuntStreamUrl(params: TurnStateHuntParam) {
     attempts: String(params.attempts),
     includeDirect: String(params.includeDirect),
   })
+  if (params.proxyId)
+    query.set('proxyId', params.proxyId)
   return `${API_BASE_URL}/api/admin/accounts/turn-state-hunt?${query}`
 }
 
