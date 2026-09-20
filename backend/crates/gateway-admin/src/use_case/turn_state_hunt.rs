@@ -67,6 +67,8 @@ struct Egress {
     view: TurnStateHuntEgress,
     /// 账号当前已保存的绑定是否就是这个出口。
     bound: bool,
+    /// 自动撞的临时出口：不来自已存代理，探测时直接用这个地址，命中不绑定它（改绑静态）。
+    ephemeral: Option<OutboundProxy>,
 }
 
 struct Hunt {
@@ -112,20 +114,26 @@ impl DefaultAccountsService {
         let operation = provider
             .connection_test_operation(&command.upstream_model, CONNECTION_TEST_INPUT)
             .map_err(|error| map_provider_error(error, "provider turn state hunt"))?;
-        let mut egresses = self
-            .hunt_egresses(
-                stored.account.outbound_proxy.as_ref(),
-                command.include_direct,
-            )
-            .await?;
-        if let Some(only) = command.only_proxy_id.as_deref() {
-            egresses.retain(|egress| egress.view.proxy_id.as_deref() == Some(only));
-            if egresses.is_empty() {
-                return Err(AdminError::invalid(
-                    "指定的代理不存在或尚未通过测试，请先在代理页测试通过",
-                ));
+        let egresses = if let Some(ephemeral) = command.ephemeral.as_ref() {
+            // 自动撞：即时生成临时出口，不读已存代理，也不看 only_proxy_id。
+            Self::ephemeral_egresses(ephemeral)?
+        } else {
+            let mut egresses = self
+                .hunt_egresses(
+                    stored.account.outbound_proxy.as_ref(),
+                    command.include_direct,
+                )
+                .await?;
+            if let Some(only) = command.only_proxy_id.as_deref() {
+                egresses.retain(|egress| egress.view.proxy_id.as_deref() == Some(only));
+                if egresses.is_empty() {
+                    return Err(AdminError::invalid(
+                        "指定的代理不存在或尚未通过测试，请先在代理页测试通过",
+                    ));
+                }
             }
-        }
+            egresses
+        };
         if egresses.is_empty() {
             return Err(AdminError::invalid(
                 "没有已通过测试的代理，请先在代理页测试通过后再遍历",
@@ -200,6 +208,7 @@ impl DefaultAccountsService {
                     .filter(|record| record.last_test.as_ref().is_some_and(|test| test.success))
                     .map(|record| Egress {
                         bound: bound == Some(&record.proxy),
+                        ephemeral: None,
                         view: TurnStateHuntEgress {
                             proxy_id: Some(record.id),
                             name: record.name,
@@ -215,6 +224,7 @@ impl DefaultAccountsService {
         if include_direct {
             egresses.push(Egress {
                 bound: bound.is_none(),
+                ephemeral: None,
                 view: TurnStateHuntEgress {
                     proxy_id: None,
                     name: "直连".to_owned(),
@@ -225,6 +235,124 @@ impl DefaultAccountsService {
         egresses.sort_by_key(|egress| !egress.bound);
         Ok(egresses)
     }
+
+    /// 自动撞：解析请求（读模板代理地址、挑测试通过且账号数最少的静态出口），
+    /// 落成一条带 `ephemeral`/`bind_to` 的命令，复用遍历的循环、容量退避、取消与命中收尾。
+    pub(super) async fn start_auto_turn_state_hunt(
+        &self,
+        request: crate::model::accounts::TurnStateAutoHuntRequest,
+    ) -> Result<crate::model::accounts::TurnStateHuntEventStream, AdminError> {
+        use crate::model::accounts::{EphemeralHunt, TurnStateHuntCommand};
+
+        let template = self
+            .proxies
+            .get(&request.template_proxy_id)
+            .await
+            .map_err(|_| AdminError::invalid("找不到轮换代理模板，请先在代理页添加并测试通过"))?;
+        // 静态池：只保留测试通过的；账号数最少者优先，稳定 tie-break 用 id。命中后改绑它。
+        let mut candidates = Vec::new();
+        for id in &request.static_proxy_ids {
+            if let Ok(record) = self.proxies.get(id).await
+                && record.last_test.as_ref().is_some_and(|test| test.success)
+            {
+                candidates.push(record);
+            }
+        }
+        candidates.sort_by(|a, b| {
+            a.account_count
+                .cmp(&b.account_count)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let bind_to = candidates
+            .first()
+            .map(|record| record.id.clone())
+            .ok_or_else(|| {
+                AdminError::invalid("没有可用的静态出口：请确认所选静态代理已测试通过")
+            })?;
+
+        let command = TurnStateHuntCommand {
+            account_id: request.account_id,
+            upstream_model: request.upstream_model,
+            // 每个临时 IP 只打 1 次（同地址复用会 strip turn-state）；IP 数由 count 控制。
+            attempts: 1,
+            include_direct: false,
+            only_proxy_id: None,
+            ephemeral: Some(EphemeralHunt {
+                template_url: template.proxy.expose_url().to_owned(),
+                countries: request.countries,
+                count: request.max_ips,
+            }),
+            bind_to: Some(bind_to),
+            require_schedulable: false,
+            context: request.context,
+        };
+        self.start_turn_state_hunt(command).await
+    }
+
+    /// 从模板即时生成 `count` 个「一 IP 一条唯一 session」的临时出口，国家随机取自 `countries`。
+    fn ephemeral_egresses(
+        ephemeral: &crate::model::accounts::EphemeralHunt,
+    ) -> Result<Vec<Egress>, AdminError> {
+        use rand_core::{OsRng, RngCore as _};
+        if ephemeral.countries.is_empty() {
+            return Err(AdminError::invalid("请至少选择一个国家"));
+        }
+        let count = ephemeral.count.min(TurnStateHuntCommand::MAX_EPHEMERAL_IPS);
+        let mut egresses = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let country = ephemeral.countries
+                [usize::try_from(OsRng.next_u32()).unwrap_or(0) % ephemeral.countries.len()];
+            let session = format!("{:016x}", OsRng.next_u64());
+            let url = ephemeral_proxy_url(&ephemeral.template_url, country.area_code(), &session)
+                .ok_or_else(|| {
+                AdminError::invalid("轮换代理模板地址不合法，无法生成临时出口")
+            })?;
+            let proxy = OutboundProxy::parse(&url)
+                .map_err(|_| AdminError::invalid("生成的临时出口地址不合法，请检查模板"))?;
+            egresses.push(Egress {
+                bound: false,
+                view: TurnStateHuntEgress {
+                    proxy_id: None,
+                    name: format!("{} · 动态", country.area_code()),
+                    endpoint: Some(proxy.endpoint()),
+                },
+                ephemeral: Some(proxy),
+            });
+        }
+        Ok(egresses)
+    }
+}
+
+/// 把轮换代理模板地址改造成一次性出口：用户名里的 `_area-`/`_session-`/`_life-` 段全部换成
+/// 目标国家与一次性 session。仅支持 smartproxy 式下划线用户名（`base_key-value_key-value`）。
+fn ephemeral_proxy_url(template: &str, country: &str, session: &str) -> Option<String> {
+    let (scheme, after) = template.split_once("://")?;
+    let (authority, path) = after
+        .split_once('/')
+        .map_or((after, None), |(a, p)| (a, Some(p)));
+    // 主机不含 '@'，凭据里的 '@' 也不在 smartproxy 账号中出现：从右侧切开凭据与主机。
+    let (creds, host) = authority.rsplit_once('@')?;
+    let (user, pass) = creds
+        .split_once(':')
+        .map_or((creds, None), |(u, p)| (u, Some(p)));
+    let area = format!("area-{country}");
+    let sess = format!("session-{session}");
+    let mut segments: Vec<&str> = user
+        .split('_')
+        .filter(|segment| {
+            !(segment.starts_with("area-")
+                || segment.starts_with("session-")
+                || segment.starts_with("life-"))
+        })
+        .collect();
+    segments.push(&area);
+    segments.push(&sess);
+    let new_user = segments.join("_");
+    let creds = pass.map_or_else(|| new_user.clone(), |pass| format!("{new_user}:{pass}"));
+    Some(match path {
+        Some(path) => format!("{scheme}://{creds}@{host}/{path}"),
+        None => format!("{scheme}://{creds}@{host}/"),
+    })
 }
 
 impl Hunt {
@@ -289,6 +417,22 @@ impl Hunt {
 
     async fn try_egress(&mut self, egress: Egress, index: usize, total: usize) -> Outcome {
         let proxy_id = egress.view.proxy_id.clone();
+        // 自动撞的临时出口：地址就地生成、不在库里，直接用它探测，不做「重新读取代理」的核对。
+        if let Some(proxy) = egress.ephemeral.clone() {
+            return self
+                .probe_egress(
+                    ProbedEgress {
+                        proxy_id: None,
+                        revision: None,
+                        proxy: Some(proxy),
+                    },
+                    None,
+                    egress.view.clone(),
+                    index,
+                    total,
+                )
+                .await;
+        }
         // 列表之后代理可能被删除、改地址或测试失效，逐个重新读取。
         let (probed, location) = match &proxy_id {
             None => (
@@ -320,8 +464,22 @@ impl Hunt {
                 }
             },
         };
+        self.probe_egress(probed, location, egress.view.clone(), index, total)
+            .await
+    }
+
+    /// 对一个已解析出的出口发探测：发 `attempts` 次真实请求，命中即收尾。已存出口与临时出口共用。
+    async fn probe_egress(
+        &mut self,
+        probed: ProbedEgress,
+        location: Option<gateway_core::account::RequestLocation>,
+        view: TurnStateHuntEgress,
+        index: usize,
+        total: usize,
+    ) -> Outcome {
+        let proxy_id = probed.proxy_id.clone();
         self.emit(TurnStateHuntEvent::EgressStarted {
-            egress: egress.view.clone(),
+            egress: view.clone(),
             index,
             total,
         })
@@ -375,7 +533,7 @@ impl Hunt {
                     })
                     .await;
                     if observed.matched {
-                        self.log_egress(&egress.view, &lengths, true);
+                        self.log_egress(&view, &lengths, true);
                         self.emit(TurnStateHuntEvent::EgressFinished {
                             proxy_id: proxy_id.clone(),
                             attempts: used,
@@ -427,7 +585,7 @@ impl Hunt {
             if class == FailureClass::Capacity {
                 self.capacity_streak += 1;
                 if self.capacity_streak >= MAX_CAPACITY_STREAK {
-                    self.log_egress(&egress.view, &lengths, false);
+                    self.log_egress(&view, &lengths, false);
                     // 连续多次都无容量：不是抖动，再打剩下的出口只会白耗额度。
                     self.fail("upstream_capacity", "上游该模型暂无容量，稍后再试")
                         .await;
@@ -440,7 +598,7 @@ impl Hunt {
             }
             skipped = None;
             if let Some((code, message)) = class.abort() {
-                self.log_egress(&egress.view, &lengths, false);
+                self.log_egress(&view, &lengths, false);
                 // 这些失败换出口也不会好，继续只会白耗额度。
                 self.fail(code, message).await;
                 return Outcome::Stop;
@@ -451,7 +609,7 @@ impl Hunt {
                 break;
             }
         }
-        self.log_egress(&egress.view, &lengths, false);
+        self.log_egress(&view, &lengths, false);
         self.emit(TurnStateHuntEvent::EgressFinished {
             proxy_id,
             attempts: used,
@@ -517,11 +675,38 @@ impl Hunt {
                 return;
             }
         }
-        // 代理在探测之后被改过（地址或测试状态）：同一个 ID 已经不是探测过的那个出口。
-        if let Some(id) = &proxy_id {
+        // 目标出口 = 要绑定并按其指纹钉 state 的那个。自动撞在轮换 IP 上命中，却要落到稳定的
+        // 静态家宽（`bind_to`，state 已确认可移植）；普通遍历则就是命中的那个出口。
+        let target = match self.command.bind_to.clone() {
+            Some(static_id) => match self.service.proxies.get(&static_id).await {
+                Ok(record) if record.last_test.as_ref().is_some_and(|test| test.success) => {
+                    ProbedEgress {
+                        proxy_id: Some(record.id),
+                        revision: Some(record.revision),
+                        proxy: Some(record.proxy),
+                    }
+                }
+                _ => {
+                    self.fail(
+                        "static_unavailable",
+                        "要改绑的静态出口不存在或未测试通过，未改动账号",
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => ProbedEgress {
+                proxy_id: probed.proxy_id.clone(),
+                revision: probed.revision,
+                proxy: probed.proxy.clone(),
+            },
+        };
+        let target_proxy_id = target.proxy_id.clone();
+        // 目标是已存代理（普通遍历命中的、或自动撞要切的静态）时，核对它在收尾这一刻仍是原样、测试通过。
+        if let Some(id) = &target_proxy_id {
             let unchanged = self.service.proxies.get(id).await.is_ok_and(|record| {
-                Some(record.revision) == probed.revision
-                    && Some(&record.proxy) == probed.proxy.as_ref()
+                Some(record.revision) == target.revision
+                    && Some(&record.proxy) == target.proxy.as_ref()
                     && record.last_test.as_ref().is_some_and(|test| test.success)
             });
             if !unchanged {
@@ -530,13 +715,13 @@ impl Hunt {
                 return;
             }
         }
-        let Ok(already_bound) = self.bound_to(probed).await else {
+        let Ok(already_bound) = self.bound_to(&target).await else {
             self.fail("bind_failed", "读取账号当前绑定失败，未改动账号")
                 .await;
             return;
         };
         if !already_bound {
-            let selection = proxy_id
+            let selection = target_proxy_id
                 .clone()
                 .map_or(AccountProxySelection::Direct, AccountProxySelection::Saved);
             let bound = self
@@ -563,11 +748,11 @@ impl Hunt {
                 );
             }
             // 绑定调用的返回值不足为凭（提交与发布分两步，也可能被并发改绑），
-            // 以回读到的账号绑定为准：不是探测过的出口就不钉。
-            if !self.bound_to(probed).await.unwrap_or(false) {
+            // 以回读到的账号绑定为准：不是目标出口就不钉。
+            if !self.bound_to(&target).await.unwrap_or(false) {
                 self.fail(
                     "bind_mismatch",
-                    "账号当前绑定的不是刚探测的出口，未钉住 state，请刷新后重试",
+                    "账号当前绑定的不是目标出口，未钉住 state，请刷新后重试",
                 )
                 .await;
                 return;
@@ -576,12 +761,12 @@ impl Hunt {
         tracing::info!(
             target: "turn_state_hunt",
             account_id = account_id.as_str(),
-            proxy_id = proxy_id.as_deref().unwrap_or("direct"),
+            proxy_id = target_proxy_id.as_deref().unwrap_or("direct"),
             changed = !already_bound,
-            "遍历命中，账号已绑定到该出口"
+            "遍历命中，账号已绑定到目标出口"
         );
         self.emit(TurnStateHuntEvent::Bound {
-            proxy_id: proxy_id.clone(),
+            proxy_id: target_proxy_id.clone(),
             changed: !already_bound,
         })
         .await;
@@ -591,7 +776,7 @@ impl Hunt {
                 &self.ticket,
                 response_headers,
                 captured_at,
-                probed.proxy.as_ref(),
+                target.proxy.as_ref(),
             )
             .await
         {
@@ -752,5 +937,40 @@ impl FailureClass {
             Self::System => Some(("system_error", "网关本地错误，遍历已中止")),
             Self::Egress => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_url_tests {
+    use super::ephemeral_proxy_url;
+
+    #[test]
+    fn injects_country_and_session_replacing_existing_tokens() {
+        let url = ephemeral_proxy_url(
+            "http://user_area-US_life-30_session-old:pass@host.example:3120/",
+            "JP",
+            "abc123",
+        )
+        .expect("valid template");
+        // 旧的 area/session/life 段被剥掉，换成目标国家与一次性 session；base 段与其余部分保留。
+        assert_eq!(
+            url,
+            "http://user_area-JP_session-abc123:pass@host.example:3120/"
+        );
+    }
+
+    #[test]
+    fn appends_tokens_when_username_has_none() {
+        let url = ephemeral_proxy_url("http://base:pass@host.example:3120/", "DE", "s1")
+            .expect("valid template");
+        assert_eq!(
+            url,
+            "http://base_area-DE_session-s1:pass@host.example:3120/"
+        );
+    }
+
+    #[test]
+    fn rejects_a_template_without_credentials() {
+        assert!(ephemeral_proxy_url("http://host.example:3120/", "US", "s1").is_none());
     }
 }

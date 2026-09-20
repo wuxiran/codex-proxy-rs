@@ -339,11 +339,79 @@ pub struct TurnStateHuntCommand {
     pub only_proxy_id: Option<String>,
     /// 后台续期为 true：账号被停用或凭据失效后，开始前与每个出口前都会停手。
     pub require_schedulable: bool,
+    /// 自动撞：不遍历已存代理，而是从一条轮换代理模板即时生成 `count` 个「一 IP 一条唯一
+    /// session」的临时出口（多国随机）。`Some` 时忽略 `only_proxy_id` 与已存代理列表。
+    /// 每个临时出口只打 1 次：同一地址第二次会复用连接并被上游 strip 掉 turn-state。
+    pub ephemeral: Option<EphemeralHunt>,
+    /// 命中后改绑到的静态出口 id；`None` 时沿用命中的那个出口（普通遍历的既有行为）。
+    /// 自动撞必须给它：命中在轮换 IP 上，但要落到稳定的静态家宽发请求（state 已确认可移植）。
+    pub bind_to: Option<String>,
     pub context: super::MutationContext,
+}
+
+/// 自动撞的高层请求：凭据（模板代理地址）与静态出口的选取由 use case 层解析后
+/// 再落成一条带 `ephemeral`/`bind_to` 的 [`TurnStateHuntCommand`]。
+#[derive(Debug, Clone)]
+pub struct TurnStateAutoHuntRequest {
+    pub account_id: gateway_core::account::ProviderAccountId,
+    pub upstream_model: gateway_core::routing::UpstreamModelId,
+    /// 轮换代理模板的已存代理 id。
+    pub template_proxy_id: String,
+    pub countries: Vec<HuntCountry>,
+    /// 命中后可改绑的静态出口候选 id；use case 取其中测试通过、账号数最少的一个。
+    pub static_proxy_ids: Vec<String>,
+    pub max_ips: u16,
+    pub context: super::MutationContext,
+}
+
+/// 自动撞的临时出口生成参数。
+#[derive(Debug, Clone)]
+pub struct EphemeralHunt {
+    /// 轮换代理模板地址（含凭据）。其用户名里的 `_area-XX`/`_session-...` 段会被替换为
+    /// 目标国家与一次性 session；没有 `_area-` 段时直接追加。仅支持 smartproxy 式下划线用户名。
+    pub template_url: String,
+    /// 每次随机从中选一个国家出口。非空，取值见 [`HuntCountry`]。
+    pub countries: Vec<HuntCountry>,
+    /// 生成多少个临时 IP（= 最多试多少个出口）。命中即止。
+    pub count: u16,
+}
+
+/// 自动撞支持的出口国家。值是 smartproxy 的 `_area-` 代码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuntCountry {
+    Us,
+    Jp,
+    De,
+    Ph,
+}
+
+impl HuntCountry {
+    #[must_use]
+    pub const fn area_code(self) -> &'static str {
+        match self {
+            Self::Us => "US",
+            Self::Jp => "JP",
+            Self::De => "DE",
+            Self::Ph => "PH",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "US" => Some(Self::Us),
+            "JP" => Some(Self::Jp),
+            "DE" => Some(Self::De),
+            "PH" => Some(Self::Ph),
+            _ => None,
+        }
+    }
 }
 
 impl TurnStateHuntCommand {
     pub const MAX_ATTEMPTS: u8 = 200;
+    /// 自动撞最多生成的临时 IP 数上限（额度闸）。
+    pub const MAX_EPHEMERAL_IPS: u16 = 2000;
 }
 
 /// 遍历中的一个出口；`proxy_id == None` 表示直连。`endpoint` 不含代理凭据。
