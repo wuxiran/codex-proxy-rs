@@ -118,6 +118,8 @@ function continueToImport() {
           :label="view.importInput.label"
           :placeholder="view.importInput.placeholder"
           :uploadable="view.importInput.uploadable"
+          :provider="form.provider"
+          :mode="mode"
           :disabled="busy"
         />
       </template>
