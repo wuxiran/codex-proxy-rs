@@ -674,7 +674,7 @@ export type TurnStateHuntEvent
   = | { type: 'hunt_start', model: string, expectedLength: number, attempts: number, proxies: TurnStateHuntProxy[] }
     | ({ type: 'proxy_start', index: number, total: number } & TurnStateHuntProxy)
     | { type: 'attempt', proxyId: string | null, index: number, length: number | null, matched: boolean, error: TurnStateHuntAttemptError | null }
-    | { type: 'proxy_done', proxyId: string | null, attempts: number, matched: boolean, skipped: 'unavailable' | 'unreachable' | null }
+    | { type: 'proxy_done', proxyId: string | null, attempts: number, matched: boolean, skipped: 'unavailable' | 'unreachable' | 'capacity' | null }
     | { type: 'hit', proxyId: string | null, attemptIndex: number, length: number }
     | { type: 'bound', proxyId: string | null, changed: boolean }
     | { type: 'pinned', model: string, length: number, expiresAt: string }

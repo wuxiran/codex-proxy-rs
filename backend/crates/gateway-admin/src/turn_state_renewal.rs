@@ -23,6 +23,9 @@ pub const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
 pub const RENEWAL_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// 一整轮遍历都没续上后的等待：每轮最多「出口数 × 次数」个真实请求，不能每分钟重来。
 const MISS_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// 上游无容量是瞬时过载：退避必须远短于 [`RENEWAL_MARGIN`]，否则一次抖动就把到期前
+/// 唯一的续期机会用掉，state 会在下一次重试之前过期。
+const CAPACITY_BACKOFF: Duration = Duration::from_secs(60);
 /// 上游拒绝账号（401/429 等）后的等待；换出口也不会好。
 const REJECTED_BACKOFF: Duration = Duration::from_secs(15 * 60);
 const SYSTEM_REQUEST_ID: &str = "turn-state-renewal";
@@ -114,6 +117,10 @@ impl TurnStateRenewalTask {
                         code: "account_rejected",
                         ..
                     }) => Some(REJECTED_BACKOFF),
+                    Some(TurnStateHuntEvent::Failed {
+                        code: "upstream_capacity",
+                        ..
+                    }) => Some(CAPACITY_BACKOFF),
                     // 停用是本地事实，不是上游的拒绝：不记退避。停用期间它本就不在到期名单里，
                     // 管理员重新启用后应当立刻恢复续期，而不是被一段旧退避挡住。
                     Some(TurnStateHuntEvent::Failed {
