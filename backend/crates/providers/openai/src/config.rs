@@ -309,7 +309,9 @@ pub struct CodexReviveSettings {
 impl Default for CodexReviveSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // 默认开启：观澜（有签名导出）的号在凭据 401 失效后自动复活；无签名导出的号
+            // 会被 supports_account 直接跳过，所以只会碰观澜号。可在配置里显式关掉。
+            enabled: true,
             base_url: "https://zzledu.kdns.fr/api/revive/v1".to_owned(),
             verify_workers: 50,
             task_workers: 10,
