@@ -21,7 +21,12 @@ const options = computed(() => [
   ...proxies.value.map(proxy => ({
     label: `${proxy.name}${proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
     value: proxy.id,
-    description: proxy.endpoint,
+    // 出口地区与质量等级只帮助挑选，不改变「未通过测试不可选」的规则。
+    description: [
+      proxy.endpoint,
+      proxy.lastTest?.exitGeo?.country,
+      proxy.quality ? `质量 ${proxy.quality.grade}` : null,
+    ].filter(Boolean).join(' · '),
     disabled: proxy.lastTest?.success !== true,
   })),
 ])

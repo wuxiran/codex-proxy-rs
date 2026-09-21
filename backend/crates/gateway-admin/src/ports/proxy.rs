@@ -6,7 +6,8 @@ use crate::model::{
     MutationContext, Revision,
     proxies::{
         ImportProxyBinding, NewProxy, ProxyAccountListQuery, ProxyAccountPage, ProxyListQuery,
-        ProxyMutation, ProxyPage, ProxyRecord, ProxyTestResult, UpdateProxy,
+        ProxyMutation, ProxyPage, ProxyQualityProbe, ProxyQualityReport, ProxyRecord,
+        ProxyTestResult, UpdateProxy,
     },
 };
 
@@ -50,6 +51,16 @@ pub trait ProxyStore: Send + Sync {
         result: ProxyTestResult,
         context: &MutationContext,
     ) -> AdminStoreResult<ProxyRecord>;
+    /// 同一事务写入质量报告与其基础连通性结果，修订号不匹配时冲突。
+    async fn record_quality(
+        &self,
+        id: &str,
+        revision: Revision,
+        report: ProxyQualityReport,
+        context: &MutationContext,
+    ) -> AdminStoreResult<ProxyRecord>;
+    /// 最近一次完整报告；从未检测或连接地址变更后为空。
+    async fn quality_report(&self, id: &str) -> AdminStoreResult<Option<ProxyQualityReport>>;
 }
 
 /// 离开作用域时释放保护，错误返回和请求取消也遵循相同规则。
@@ -63,4 +74,11 @@ pub struct ProxyImportReservation {
 #[async_trait]
 pub trait ProxyProbe: Send + Sync {
     async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult;
+    /// 默认只有基础连通性；具备上游目标探测的实现覆盖此方法。
+    async fn quality(&self, proxy: &OutboundProxy) -> ProxyQualityProbe {
+        ProxyQualityProbe {
+            base: self.test(proxy).await,
+            items: Vec::new(),
+        }
+    }
 }

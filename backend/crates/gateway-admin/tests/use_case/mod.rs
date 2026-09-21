@@ -102,6 +102,7 @@ pub(super) struct AdminHarness {
     backup: BackupStorePorts,
     providers: Vec<Arc<dyn ProviderAdmin>>,
     probe: Arc<dyn AccountProbe>,
+    proxy_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     system: Arc<dyn SystemOperations>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
 }
@@ -115,6 +116,7 @@ impl AdminHarness {
             client_session_ttl_minutes: 1_440,
             accounts: unavailable.clone(),
             proxies: Arc::new(proxies::TestProxies::default()),
+            proxy_probe: Arc::new(proxies::TestProxies::default()),
             account_runtime: unavailable.clone(),
             account_groups: Arc::new(UnavailableAccountGroupStore),
             auth: Arc::new(BootstrapAuthStore::default()),
@@ -212,6 +214,14 @@ impl AdminHarness {
         self
     }
 
+    pub(super) fn proxy_probe(
+        mut self,
+        probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
+    ) -> Self {
+        self.proxy_probe = probe;
+        self
+    }
+
     pub(super) fn system(mut self, system: Arc<dyn SystemOperations>) -> Self {
         self.system = system;
         self
@@ -248,7 +258,7 @@ impl AdminHarness {
                 providers: self.providers,
                 snapshot: Arc::new(NoopSnapshot),
                 account_probe: self.probe,
-                proxy_probe: Arc::new(proxies::TestProxies::default()),
+                proxy_probe: self.proxy_probe,
                 client_distribution: Arc::new(NoopClientDistribution),
                 system: self.system,
                 client_key_verifier: self.client_key_verifier,

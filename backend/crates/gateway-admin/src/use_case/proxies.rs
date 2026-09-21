@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
@@ -7,7 +7,7 @@ use gateway_core::{
     routing::ProviderKind,
     runtime::SnapshotControl,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{map_store_error, publish_committed};
 use crate::{
@@ -60,7 +60,30 @@ pub trait ProxiesService: Send + Sync {
     ) -> Result<ProxyRecord, AdminError>;
     /// 探测未保存的连接地址，不写入代理记录或修改账号绑定。
     async fn probe(&self, proxy: &OutboundProxy) -> Result<ProxyTestResult, AdminError>;
+    /// 经代理探测各上游目标并评分；同时刷新连通性结果。
+    async fn quality_check(
+        &self,
+        id: &str,
+        revision: Revision,
+        context: &MutationContext,
+    ) -> Result<ProxyQualityOutcome, AdminError>;
+    async fn quality_report(&self, id: &str) -> Result<Option<ProxyQualityReport>, AdminError>;
+    /// 逐条创建；重复或不合法的条目跳过，不让整批失败。
+    async fn create_batch(
+        &self,
+        commands: Vec<NewProxy>,
+        context: &MutationContext,
+    ) -> Result<ProxyBatchCreate, AdminError>;
+    /// 逐条删除；仍被账号使用或已被修改的条目跳过。
+    async fn delete_batch(
+        &self,
+        items: Vec<ProxyBatchDeleteItem>,
+        context: &MutationContext,
+    ) -> Result<ProxyBatchDelete, AdminError>;
 }
+
+/// 批量操作由前端并发发起；短暂排队比立即拒绝更符合预期，仍以超时兜底防止堆积。
+const TEST_SLOT_WAIT: Duration = Duration::from_secs(20);
 
 pub(crate) struct DefaultProxiesService {
     store: Arc<dyn ProxyStore>,
@@ -83,6 +106,24 @@ impl DefaultProxiesService {
             snapshot,
             providers,
             test_slots: Semaphore::new(4),
+        }
+    }
+
+    async fn test_slot(&self) -> Result<SemaphorePermit<'_>, AdminError> {
+        match tokio::time::timeout(TEST_SLOT_WAIT, self.test_slots.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(AdminError::new(
+                AdminErrorKind::RateLimited,
+                "代理测试繁忙，请稍后重试",
+            )),
+        }
+    }
+
+    /// 已提交的条目必须发布，即使本批随后中断。
+    async fn publish_batch(&self, revision: Option<Revision>) -> Result<(), AdminError> {
+        match revision {
+            Some(revision) => publish_committed(self.snapshot.as_ref(), revision).await,
+            None => Ok(()),
         }
     }
 }
@@ -231,10 +272,129 @@ impl ProxiesService for DefaultProxiesService {
     }
 
     async fn probe(&self, proxy: &OutboundProxy) -> Result<ProxyTestResult, AdminError> {
-        let _permit = self.test_slots.try_acquire().map_err(|_| {
-            AdminError::new(AdminErrorKind::RateLimited, "代理测试繁忙，请稍后重试")
-        })?;
+        let _permit = self.test_slot().await?;
         Ok(self.probe.test(proxy).await)
+    }
+
+    async fn quality_check(
+        &self,
+        id: &str,
+        revision: Revision,
+        context: &MutationContext,
+    ) -> Result<ProxyQualityOutcome, AdminError> {
+        let _permit = self.test_slot().await?;
+        let record = self
+            .store
+            .get(id)
+            .await
+            .map_err(|error| map_store_error(error, "proxy"))?;
+        if record.revision != revision {
+            return Err(AdminError::conflict("代理已被修改，请刷新后重新检测"));
+        }
+        let probe = self.probe.quality(&record.proxy).await;
+        let report = ProxyQualityReport::finalize(probe, chrono::Utc::now());
+        let record = self
+            .store
+            .record_quality(id, revision, report.clone(), context)
+            .await
+            .map_err(|error| map_store_error(error, "proxy"))?;
+        Ok(ProxyQualityOutcome { record, report })
+    }
+
+    async fn quality_report(&self, id: &str) -> Result<Option<ProxyQualityReport>, AdminError> {
+        validate_id(id)?;
+        self.store
+            .quality_report(id)
+            .await
+            .map_err(|error| map_store_error(error, "proxy"))
+    }
+
+    async fn create_batch(
+        &self,
+        commands: Vec<NewProxy>,
+        context: &MutationContext,
+    ) -> Result<ProxyBatchCreate, AdminError> {
+        if commands.is_empty() || commands.len() > MAX_PROXY_BATCH_ITEMS {
+            return Err(AdminError::invalid("批量添加需要 1 至 200 条代理"));
+        }
+        let mut result = ProxyBatchCreate {
+            config_revision: None,
+            created: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for mut command in commands {
+            let reference = command.proxy.endpoint();
+            let Ok(name) = validate_name(&command.name) else {
+                result.skipped.push(ProxyBatchSkip {
+                    reference,
+                    reason: "代理名称需要 1 至 100 个字符".to_owned(),
+                });
+                continue;
+            };
+            command.name = name;
+            match self.store.create(command, context).await {
+                Ok(mutation) => {
+                    result.config_revision = Some(mutation.config_revision);
+                    result.created.push(mutation.record);
+                }
+                Err(error) if error.kind() == AdminStoreErrorKind::Conflict => {
+                    result.skipped.push(ProxyBatchSkip {
+                        reference,
+                        reason: "代理地址已存在".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    self.publish_batch(result.config_revision).await?;
+                    return Err(map_store_error(error, "proxy"));
+                }
+            }
+        }
+        self.publish_batch(result.config_revision).await?;
+        Ok(result)
+    }
+
+    async fn delete_batch(
+        &self,
+        items: Vec<ProxyBatchDeleteItem>,
+        context: &MutationContext,
+    ) -> Result<ProxyBatchDelete, AdminError> {
+        if items.is_empty() || items.len() > MAX_PROXY_BATCH_ITEMS {
+            return Err(AdminError::invalid("批量删除需要 1 至 200 条代理"));
+        }
+        for item in &items {
+            validate_id(&item.id)?;
+        }
+        let mut result = ProxyBatchDelete {
+            config_revision: None,
+            deleted_ids: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for item in items {
+            match self.store.delete(&item.id, item.revision, context).await {
+                Ok(revision) => {
+                    result.config_revision = Some(revision);
+                    result.deleted_ids.push(item.id);
+                }
+                Err(error) if error.kind() == AdminStoreErrorKind::Conflict => {
+                    result.skipped.push(ProxyBatchSkip {
+                        reference: item.id,
+                        reason: "代理仍有账号使用，或已被修改".to_owned(),
+                    });
+                }
+                Err(error) if error.kind() == AdminStoreErrorKind::NotFound => {
+                    result.skipped.push(ProxyBatchSkip {
+                        reference: item.id,
+                        reason: "代理不存在或已被删除".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    self.publish_batch(result.config_revision).await?;
+                    return Err(map_store_error(error, "proxy"));
+                }
+            }
+        }
+        self.publish_batch(result.config_revision).await?;
+        Ok(result)
     }
 
     async fn test(
@@ -243,9 +403,7 @@ impl ProxiesService for DefaultProxiesService {
         revision: Revision,
         context: &MutationContext,
     ) -> Result<ProxyRecord, AdminError> {
-        let _permit = self.test_slots.try_acquire().map_err(|_| {
-            AdminError::new(AdminErrorKind::RateLimited, "代理测试繁忙，请稍后重试")
-        })?;
+        let _permit = self.test_slot().await?;
         let record = self
             .store
             .get(id)
@@ -260,6 +418,13 @@ impl ProxiesService for DefaultProxiesService {
             .await
             .map_err(|error| map_store_error(error, "proxy"))
     }
+}
+
+fn validate_id(id: &str) -> Result<(), AdminError> {
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        return Err(AdminError::invalid("代理 ID 不合法"));
+    }
+    Ok(())
 }
 
 fn validate_name(value: &str) -> Result<String, AdminError> {
