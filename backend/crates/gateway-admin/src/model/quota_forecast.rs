@@ -3,7 +3,9 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::provider_credentials::{AccountUsagePeriod, ProviderQuota, ProviderQuotaWindow};
-use super::quota_forecast_sampling::{QuotaForecastMethod, QuotaForecastSample};
+use super::quota_forecast_sampling::{
+    QuotaForecastCurvePoint, QuotaForecastMethod, QuotaForecastSample,
+};
 
 const DAY_SECONDS: u64 = 86_400;
 const MIN_USED_PERCENT: f64 = 5.0;
@@ -31,6 +33,22 @@ pub struct AccountQuotaForecast {
     /// 剩余估算始终属于源窗口，不随目标周期折算。
     pub remaining_tokens: Option<u64>,
     pub remaining_usd: Option<f64>,
+    /// 源窗口起点，供消耗曲线确定横轴；窗口边界无效时为空。
+    pub window_start_at: Option<DateTime<Utc>>,
+    /// 源窗口内已观测的已用比例；与能否预测无关，样本不足时仍可展示。
+    pub curve: Vec<QuotaForecastCurvePoint>,
+    pub burn_percent_per_hour: Option<f64>,
+    pub exhaustion: Option<QuotaExhaustion>,
+}
+
+/// 按近期消耗速率外推的耗尽结论，始终属于源窗口。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuotaExhaustion {
+    /// 上游已报告额度用尽，是事实而非估算。
+    Reached,
+    At(DateTime<Utc>),
+    /// 按当前速率，窗口重置前不会用尽。
+    AfterReset,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +91,10 @@ pub fn account_quota_forecasts(
             estimated_usd: None,
             remaining_tokens: None,
             remaining_usd: None,
+            window_start_at: None,
+            curve: Vec::new(),
+            burn_percent_per_hour: None,
+            exhaustion: None,
         };
         if let Some((window, source_period)) = selected {
             forecast.project(
@@ -136,6 +158,14 @@ impl AccountQuotaForecast {
             self.unavailable_reason = Some("额度窗口已过期或边界无效，请刷新账号额度后重试。");
             return;
         };
+        self.window_start_at = Some(start);
+        self.curve = sample
+            .map(|sample| {
+                let mut curve = sample.curve.clone();
+                curve.retain(|point| start <= point.observed_at && point.observed_at <= now);
+                curve
+            })
+            .unwrap_or_default();
         if !observed_at.is_some_and(|observed| start <= observed && observed <= now) {
             self.unavailable_reason = Some("缺少本周期的额度快照，请先刷新账号额度。");
             return;
@@ -155,6 +185,9 @@ impl AccountQuotaForecast {
             self.unavailable_reason = Some("已用比例未知，请刷新额度后查看预测。");
             return;
         };
+        if window.limit_reached || percent >= 100.0 {
+            self.exhaustion = Some(QuotaExhaustion::Reached);
+        }
         let Some(usage) = usage.filter(|usage| usage.request_count > 0) else {
             self.unavailable_reason = Some("本周期没有网关用量记录，暂时无法预测额度。");
             return;
@@ -173,6 +206,7 @@ impl AccountQuotaForecast {
         };
         self.low_sample = sample.sampled_percent < LOW_SAMPLE_PERCENT
             || (method == QuotaForecastMethod::Incremental && sample.block_count < 2);
+        self.project_exhaustion(sample, percent, reset_at);
         // 漏记和个别缺失只影响精度，仍按已记录数值估算，不按请求数补齐未知消耗。
         // 预测是近似展示值；不复用为账单金额，也不把月折算当成自然月或额外余额。
         let capacity_factor = 100.0 / sample.sampled_percent;
@@ -189,6 +223,36 @@ impl AccountQuotaForecast {
         } else {
             None
         };
+    }
+}
+
+impl AccountQuotaForecast {
+    /// 复用已通过 5 个百分点门槛的同一配对样本做线性外推；不另设更宽松的速率口径。
+    fn project_exhaustion(
+        &mut self,
+        sample: &QuotaForecastSample,
+        percent: f64,
+        reset_at: DateTime<Utc>,
+    ) {
+        let seconds = (sample.end_at - sample.start_at).num_milliseconds() as f64 / 1000.0;
+        let rate = sample.sampled_percent / seconds;
+        if seconds <= 0.0 || !rate.is_finite() || rate <= 0.0 {
+            return;
+        }
+        self.burn_percent_per_hour = Some(rate * 3600.0);
+        if self.exhaustion.is_some() {
+            return;
+        }
+        let remaining_ms = (100.0 - percent) / rate * 1000.0;
+        // 超出可表示范围的外推必然晚于重置，不需要精确时刻。
+        let at = Some(remaining_ms)
+            .filter(|value| value.is_finite() && *value < i64::MAX as f64)
+            .and_then(|value| Duration::try_milliseconds(value.round() as i64))
+            .and_then(|duration| sample.end_at.checked_add_signed(duration));
+        self.exhaustion = Some(match at {
+            Some(at) if at < reset_at => QuotaExhaustion::At(at),
+            _ => QuotaExhaustion::AfterReset,
+        });
     }
 }
 

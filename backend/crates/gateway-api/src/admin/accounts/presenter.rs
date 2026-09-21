@@ -1,7 +1,9 @@
 //! Admin 领域结果到安全 HTTP wire 的展示投影。
 
 use super::*;
-use gateway_admin::model::quota_forecast::{AccountQuotaForecast, AccountQuotaForecastReport};
+use gateway_admin::model::quota_forecast::{
+    AccountQuotaForecast, AccountQuotaForecastReport, QuotaExhaustion,
+};
 
 pub(super) fn account_page_data(
     result: AccountDirectoryPage,
@@ -177,6 +179,36 @@ fn quota_forecast_view(forecast: AccountQuotaForecast) -> AccountQuotaForecastVi
         remaining_tokens_display: display_optional_tokens(forecast.remaining_tokens),
         remaining_usd: forecast.remaining_usd,
         remaining_usd_display: forecast_usd_display(forecast.remaining_usd),
+        window_start_at: forecast.window_start_at.map(|value| china_rfc3339(&value)),
+        curve: forecast
+            .curve
+            .iter()
+            .map(|point| QuotaForecastCurvePointView {
+                observed_at: china_rfc3339(&point.observed_at),
+                used_percent: point.used_percent,
+            })
+            .collect(),
+        burn_percent_per_hour: forecast.burn_percent_per_hour,
+        burn_percent_per_hour_display: forecast
+            .burn_percent_per_hour
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.2}%/h")),
+        exhaustion: forecast.exhaustion.map(|exhaustion| match exhaustion {
+            QuotaExhaustion::Reached => QuotaExhaustionView {
+                kind: "reached",
+                at: None,
+                at_display: None,
+            },
+            QuotaExhaustion::At(at) => QuotaExhaustionView {
+                kind: "at",
+                at: Some(china_rfc3339(&at)),
+                at_display: Some(china_datetime(&at)),
+            },
+            QuotaExhaustion::AfterReset => QuotaExhaustionView {
+                kind: "afterReset",
+                at: None,
+                at_display: None,
+            },
+        }),
     }
 }
 

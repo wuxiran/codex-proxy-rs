@@ -331,6 +331,27 @@ pub struct AccountQuotaForecastView {
     pub remaining_tokens_display: String,
     pub remaining_usd: Option<f64>,
     pub remaining_usd_display: String,
+    pub window_start_at: Option<String>,
+    pub curve: Vec<QuotaForecastCurvePointView>,
+    pub burn_percent_per_hour: Option<f64>,
+    pub burn_percent_per_hour_display: String,
+    pub exhaustion: Option<QuotaExhaustionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaForecastCurvePointView {
+    pub observed_at: String,
+    pub used_percent: f64,
+}
+
+/// `at` 仅在 `kind == "at"` 时存在；其余结论没有可展示的时刻。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaExhaustionView {
+    pub kind: &'static str,
+    pub at: Option<String>,
+    pub at_display: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

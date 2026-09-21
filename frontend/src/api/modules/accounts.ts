@@ -199,6 +199,22 @@ export interface AccountQuotaForecast {
   remainingTokensDisplay: string
   remainingUsd: number | null
   remainingUsdDisplay: string
+  windowStartAt: string | null
+  curve: AccountQuotaCurvePoint[]
+  burnPercentPerHour: number | null
+  burnPercentPerHourDisplay: string
+  exhaustion: AccountQuotaExhaustion | null
+}
+
+export interface AccountQuotaCurvePoint {
+  observedAt: string
+  usedPercent: number
+}
+
+export interface AccountQuotaExhaustion {
+  kind: 'at' | 'afterReset' | 'reached'
+  at: string | null
+  atDisplay: string | null
 }
 
 export interface AccountQuotaForecastResponse {
