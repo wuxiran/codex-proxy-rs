@@ -453,12 +453,46 @@ Images、独立 Search 及管理员连接测试不受该文本模型限制；连
 | `POST` | `/api/admin/proxies/create` | `{ name, proxyUrl, location? }` | `201 { record, configRevision }` |
 | `POST` | `/api/admin/proxies/update` | `{ id, revision, name, proxyUrl?, location? }` | `{ record, configRevision }` |
 | `POST` | `/api/admin/proxies/test` | `{ id, revision }` | 最新代理记录 / Proxy record with test result |
+| `POST` | `/api/admin/proxies/probe` | `{ proxyUrl }` | `lastTest` 同形结果；只探测未保存的地址，不写入任何记录 |
+| `POST` | `/api/admin/proxies/quality-check` | `{ id, revision }` | `{ record, report }` |
+| `GET` | `/api/admin/proxies/quality-report` | `id` | `{ report }`，从未检测时 `report` 为 `null` |
 | `POST` | `/api/admin/proxies/delete` | `{ id, revision }` | `{ configRevision }` |
+| `POST` | `/api/admin/proxies/batch-create` | `{ items: [{ name?, proxyUrl }] }`（1-200 条） | `{ created, skipped, configRevision }` |
+| `POST` | `/api/admin/proxies/batch-delete` | `{ items: [{ id, revision }] }`（1-200 条） | `{ deletedIds, skipped, configRevision }` |
 
 `record` 包含 `id`、`name`、`endpoint`、`hasAuthentication`、`revision`、`accountCount`、`location`、
-`lastTestAt`、`lastTest: { success, latencyMs, exitIp, message }`、`createdAt`、`updatedAt`。
+`lastTestAt`、`lastTest: { success, latencyMs, exitIp, exitGeo, message }`、`quality`、`createdAt`、`updatedAt`。
 未测试时 `lastTestAt` / `lastTest` 为 `null`。连通性失败返回 HTTP 200 和 `lastTest.success=false`；
-记录版本过期、重复 URL、删除已绑定的代理返回 409，并发测试满载返回 429。
+记录版本过期、重复 URL、删除已绑定的代理返回 409。测试与质量检测共用每进程 4 个槽位，
+槽位占满时请求排队最多 20 秒，仍未取得槽位才返回 429，因此客户端超时应大于「排队 + 探测」。
+
+`exitGeo` 为 `null` 或 `{ country, countryCode, region, city }`，由出口 IP 推断，仅用于展示，与用于
+Responses 的 `location` 无关。地区查询是尽力而为：失败、被限流或返回不可信内容时 `exitGeo` 为 `null`，
+不改变 `success`，也不计入 `latencyMs`。国家代码为两位大写字母；`region`、`city` 可为 `null`。
+
+`quality` 为 `null` 或最近一次质量检测的结论 `{ score, grade, status, summary, checkedAt }`，随列表下发；
+逐项明细只在 `report` 中返回。`report` 在结论之外包含 `exitIp`、`exitGeo`、`baseLatencyMs`、
+`passedCount`、`warnCount`、`failedCount`、`challengeCount` 和
+`items: [{ target, status, httpStatus, latencyMs, message, cfRay }]`。
+
+质量检测先做一次完整的连通性测试（`target: "base_connectivity"`，其结果同时写入 `lastTest`），
+连通后经同一代理并发请求固定的上游目标；连通失败时不再请求上游。目标为编译期常量，不接受请求传入：
+`chatgpt`（Codex 后端）、`openai_auth`（登录与令牌）、`openai_api`、`xai`。请求不带凭据、不跟随重定向，
+每个目标 15 秒超时：
+
+- 返回 2xx 或该目标预期的无凭据状态（如 401）记为 `pass`，表示目标可达；
+- 403 / 429 且带 `cf-mitigated: challenge` 响应头或挑战页特征记为 `challenge`，并附 `cfRay`；
+- 其余 429 记为 `warn`；其他状态码、超时或连接失败记为 `fail`。
+
+`score = 100 − 10×warn − 22×fail − 30×challenge`（下限 0）；`grade` 为 A（≥90）、B（≥75）、C（≥60）、
+D（≥40）、F。`status` 按 `challenge` > `failed` > `warn` > `healthy` 取最严重的一项。
+评分通过不表示账号权限或额度可用。连接配置改变时，质量结论与测试结果一起清除；普通测试不清除质量结论。
+
+批量添加逐条处理，单条失败不影响其余条目：地址不合法（`reference` 为「第 N 条」）或与已有代理重复
+（`reference` 为脱敏端点）计入 `skipped: [{ reference, reason }]`，响应不回显任何凭据。`name` 省略时取
+脱敏端点的 `host:port`。批量删除同样逐条处理：仍被账号使用、版本过期或已不存在的代理计入 `skipped`
+（`reference` 为代理 ID）。没有任何条目成功时 `configRevision` 为 `null`。
+新建的代理尚未测试，绑定账号前仍需通过连接测试。
 
 代理列表只返回关联账号数量。关联账号按需查询，每项包含 `id`、`name`、`email`、`provider`、`enabled`、
 `authenticationKind`、`planType`、`planTypeDisplay` 和 `groups: [{ id, name, color, enabled }]`，
@@ -483,7 +517,7 @@ Images、独立 Search 及管理员连接测试不受该文本模型限制；连
 不改变用户普通文本、epoch 时间戳、真实出口 IP、服务或管理端时区、数据驻留约束及 xAI 请求。
 
 测试固定经代理访问双栈端点 `https://api64.ipify.org?format=json`，返回本次连接实际使用的 IPv4 或 IPv6 出口地址，
-不分别验证两种地址族的连通性。超时 15 秒，每进程最多同时测试 4 条。
+不分别验证两种地址族的连通性，超时 15 秒。成功后再经同一代理查询一次出口地区（5 秒超时）。
 探测器复用 OpenAI 的证书信任配置：优先读取非空的 `CODEX_CA_CERTIFICATE`，
 其次读取 `SSL_CERT_FILE`，并保留系统根证书；证书配置错误不会回退为不验证证书。
 出口测试通过不表示 Provider 账号权限或额度可用；账号可用性使用账号连接测试。

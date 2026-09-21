@@ -10,10 +10,12 @@ use axum::{
 use gateway_admin::model::{
     PageSize, Revision,
     proxies::{
-        NewProxy, ProxyAccountListQuery, ProxyListQuery, ProxyMutation, ProxyRecord,
-        ProxyTestResult, UpdateProxy,
+        MAX_PROXY_BATCH_ITEMS, NewProxy, ProxyAccountListQuery, ProxyBatchDeleteItem,
+        ProxyBatchSkip, ProxyExitGeo, ProxyListQuery, ProxyMutation, ProxyQualityReport,
+        ProxyQualitySnapshot, ProxyRecord, ProxyTestResult, UpdateProxy,
     },
 };
+use gateway_core::account::OutboundProxy;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -86,13 +88,151 @@ struct ProbeRequest {
     proxy_url: AccountProxyUpdate,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QualityReportQuery {
+    id: String,
+}
+
+// 批量条目逐条解析：一条地址不合法只跳过该条，不让整批 422。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchCreateItem {
+    name: Option<String>,
+    proxy_url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchCreateRequest {
+    items: Vec<BatchCreateItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchDeleteRequest {
+    items: Vec<IdRequest>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExitGeoView {
+    country: String,
+    country_code: String,
+    region: Option<String>,
+    city: Option<String>,
+}
+
+impl From<ProxyExitGeo> for ExitGeoView {
+    fn from(geo: ProxyExitGeo) -> Self {
+        Self {
+            country: geo.country,
+            country_code: geo.country_code,
+            region: geo.region,
+            city: geo.city,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyTestView {
     success: bool,
     latency_ms: u64,
     exit_ip: Option<String>,
+    exit_geo: Option<ExitGeoView>,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualitySnapshotView {
+    score: u8,
+    grade: String,
+    status: &'static str,
+    summary: String,
+    checked_at: String,
+}
+
+impl From<ProxyQualitySnapshot> for QualitySnapshotView {
+    fn from(snapshot: ProxyQualitySnapshot) -> Self {
+        Self {
+            score: snapshot.score,
+            grade: snapshot.grade.to_string(),
+            status: snapshot.status.as_str(),
+            summary: snapshot.summary,
+            checked_at: snapshot.checked_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualityItemView {
+    target: String,
+    status: &'static str,
+    http_status: Option<u16>,
+    latency_ms: Option<u64>,
+    message: String,
+    cf_ray: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualityReportView {
+    #[serde(flatten)]
+    snapshot: QualitySnapshotView,
+    exit_ip: Option<String>,
+    exit_geo: Option<ExitGeoView>,
+    base_latency_ms: Option<u64>,
+    passed_count: u32,
+    warn_count: u32,
+    failed_count: u32,
+    challenge_count: u32,
+    items: Vec<QualityItemView>,
+}
+
+impl From<ProxyQualityReport> for QualityReportView {
+    fn from(report: ProxyQualityReport) -> Self {
+        Self {
+            snapshot: report.snapshot.into(),
+            exit_ip: report.exit_ip.map(|ip| ip.to_string()),
+            exit_geo: report.exit_geo.map(Into::into),
+            base_latency_ms: report.base_latency_ms,
+            passed_count: report.passed_count,
+            warn_count: report.warn_count,
+            failed_count: report.failed_count,
+            challenge_count: report.challenge_count,
+            items: report
+                .items
+                .into_iter()
+                .map(|item| QualityItemView {
+                    target: item.target,
+                    status: item.status.as_str(),
+                    http_status: item.http_status,
+                    latency_ms: item.latency_ms,
+                    message: item.message,
+                    cf_ray: item.cf_ray,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchSkipView {
+    reference: String,
+    reason: String,
+}
+
+impl From<ProxyBatchSkip> for BatchSkipView {
+    fn from(skip: ProxyBatchSkip) -> Self {
+        Self {
+            reference: skip.reference,
+            reason: skip.reason,
+        }
+    }
 }
 
 impl From<ProxyTestResult> for ProxyTestView {
@@ -101,6 +241,7 @@ impl From<ProxyTestResult> for ProxyTestView {
             success: result.success,
             latency_ms: result.latency_ms,
             exit_ip: result.exit_ip.map(|ip| ip.to_string()),
+            exit_geo: result.exit_geo.map(Into::into),
             message: result.message,
         }
     }
@@ -132,6 +273,7 @@ struct ProxyView {
     account_count: u64,
     last_test_at: Option<String>,
     last_test: Option<ProxyTestView>,
+    quality: Option<QualitySnapshotView>,
     created_at: String,
     updated_at: String,
 }
@@ -149,6 +291,7 @@ impl From<ProxyRecord> for ProxyView {
             account_count: record.account_count,
             last_test_at: record.last_test_at.map(|at| at.to_rfc3339()),
             last_test: record.last_test.map(Into::into),
+            quality: record.quality.map(Into::into),
             created_at: record.created_at.to_rfc3339(),
             updated_at: record.updated_at.to_rfc3339(),
         }
@@ -199,6 +342,13 @@ where
         .route("/api/admin/proxies/delete", post(delete::<S>))
         .route("/api/admin/proxies/test", post(test::<S>))
         .route("/api/admin/proxies/probe", post(probe::<S>))
+        .route("/api/admin/proxies/quality-check", post(quality_check::<S>))
+        .route(
+            "/api/admin/proxies/quality-report",
+            get(quality_report::<S>),
+        )
+        .route("/api/admin/proxies/batch-create", post(batch_create::<S>))
+        .route("/api/admin/proxies/batch-delete", post(batch_delete::<S>))
 }
 
 fn revision(value: u64) -> Result<Revision, AdminError> {
@@ -465,5 +615,153 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(ProxyView::from(result)),
+    ))
+}
+
+async fn quality_check<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<IdRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .proxies()
+        .quality_check(
+            &request.id,
+            revision(request.revision)?,
+            &auth.context().mutation_context(),
+        )
+        .await
+        .map_err(map_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "record": ProxyView::from(result.record),
+            "report": QualityReportView::from(result.report),
+        })),
+    ))
+}
+
+async fn quality_report<S>(
+    _: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<QualityReportQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let report = state
+        .admin_services()
+        .proxies()
+        .quality_report(&query.id)
+        .await
+        .map_err(map_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "report": report.map(QualityReportView::from),
+        })),
+    ))
+}
+
+/// 名称缺省为脱敏端点的 `host:port`，与单条添加时用户通常的命名一致。
+fn default_batch_name(proxy: &OutboundProxy) -> String {
+    let endpoint = proxy.endpoint();
+    endpoint
+        .split_once("://")
+        .map_or(endpoint.as_str(), |(_, rest)| rest)
+        .trim_end_matches('/')
+        .chars()
+        .take(100)
+        .collect()
+}
+
+async fn batch_create<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<BatchCreateRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    if request.items.is_empty() || request.items.len() > MAX_PROXY_BATCH_ITEMS {
+        return Err(AdminError::bad_request("批量添加需要 1 至 200 条代理"));
+    }
+    let mut commands = Vec::new();
+    let mut skipped = Vec::new();
+    for (index, item) in request.items.into_iter().enumerate() {
+        // 解析失败的原文可能带凭据，只回报行号。
+        match OutboundProxy::parse(item.proxy_url.trim()) {
+            Ok(proxy) => commands.push(NewProxy {
+                location: None,
+                name: item
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| default_batch_name(&proxy)),
+                proxy,
+            }),
+            Err(_) => skipped.push(BatchSkipView {
+                reference: format!("第 {} 条", index + 1),
+                reason: "代理地址不合法".to_owned(),
+            }),
+        }
+    }
+    let mut created = Vec::new();
+    let mut config_revision = None;
+    if !commands.is_empty() {
+        let result = state
+            .admin_services()
+            .proxies()
+            .create_batch(commands, &auth.context().mutation_context())
+            .await
+            .map_err(map_error)?;
+        created = result.created.into_iter().map(ProxyView::from).collect();
+        skipped.extend(result.skipped.into_iter().map(BatchSkipView::from));
+        config_revision = result.config_revision.map(|revision| revision.get());
+    }
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "created": created,
+            "skipped": skipped,
+            "configRevision": config_revision,
+        })),
+    ))
+}
+
+async fn batch_delete<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<BatchDeleteRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let items = request
+        .items
+        .into_iter()
+        .map(|item| {
+            Ok(ProxyBatchDeleteItem {
+                revision: revision(item.revision)?,
+                id: item.id,
+            })
+        })
+        .collect::<Result<Vec<_>, AdminError>>()?;
+    let result = state
+        .admin_services()
+        .proxies()
+        .delete_batch(items, &auth.context().mutation_context())
+        .await
+        .map_err(map_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "deletedIds": result.deleted_ids,
+            "skipped": result.skipped.into_iter().map(BatchSkipView::from).collect::<Vec<_>>(),
+            "configRevision": result.config_revision.map(|revision| revision.get()),
+        })),
     ))
 }

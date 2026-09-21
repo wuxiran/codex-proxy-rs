@@ -2006,6 +2006,7 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
         success: true,
         latency_ms: 1,
         exit_ip: Some("203.0.113.5".parse().unwrap()),
+        exit_geo: None,
         message: "Connected".to_owned(),
     };
     proxies

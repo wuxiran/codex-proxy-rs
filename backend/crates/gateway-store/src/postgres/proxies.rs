@@ -124,6 +124,7 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
                     latency_ms: u64::try_from(latency.ok_or_else(invalid)?)
                         .map_err(|_| invalid())?,
                     exit_ip: ip.map(|ip| ip.parse().map_err(|_| invalid())).transpose()?,
+                    exit_geo: exit_geo_from_row(&row)?,
                     message: row
                         .try_get::<Option<String>, _>("last_test_message")
                         .map_err(|_| invalid())?
@@ -131,9 +132,161 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
                 })
             })
             .transpose()?,
+        quality: quality_snapshot_from_row(&row)?,
         created_at: row.try_get("created_at").map_err(|_| invalid())?,
         updated_at: row.try_get("updated_at").map_err(|_| invalid())?,
     })
+}
+
+fn exit_geo_from_row(row: &PgRow) -> StoreResult<Option<ProxyExitGeo>> {
+    let country: Option<String> = row.try_get("last_test_country").map_err(|_| invalid())?;
+    country
+        .map(|country| {
+            Ok(ProxyExitGeo {
+                country,
+                country_code: row
+                    .try_get::<Option<String>, _>("last_test_country_code")
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?,
+                region: row.try_get("last_test_region").map_err(|_| invalid())?,
+                city: row.try_get("last_test_city").map_err(|_| invalid())?,
+            })
+        })
+        .transpose()
+}
+
+fn quality_snapshot_from_row(row: &PgRow) -> StoreResult<Option<ProxyQualitySnapshot>> {
+    let checked_at: Option<chrono::DateTime<chrono::Utc>> =
+        row.try_get("quality_checked_at").map_err(|_| invalid())?;
+    checked_at
+        .map(|checked_at| {
+            let text = |column: &str| -> StoreResult<String> {
+                row.try_get::<Option<String>, _>(column)
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)
+            };
+            let score: i16 = row
+                .try_get::<Option<i16>, _>("quality_score")
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+            Ok(ProxyQualitySnapshot {
+                score: u8::try_from(score).map_err(|_| invalid())?,
+                grade: text("quality_grade")?.chars().next().ok_or_else(invalid)?,
+                status: ProxyQualityStatus::parse(&text("quality_status")?).ok_or_else(invalid)?,
+                summary: text("quality_summary")?,
+                checked_at,
+            })
+        })
+        .transpose()
+}
+
+/// 报告文档只保存列表结论之外的明细，结论以列为准，避免两处各执一词。
+fn quality_report_document(report: &ProxyQualityReport) -> serde_json::Value {
+    serde_json::json!({
+        "exitIp": report.exit_ip.map(|ip| ip.to_string()),
+        "exitGeo": report.exit_geo.as_ref().map(|geo| serde_json::json!({
+            "country": geo.country,
+            "countryCode": geo.country_code,
+            "region": geo.region,
+            "city": geo.city,
+        })),
+        "baseLatencyMs": report.base_latency_ms,
+        "passedCount": report.passed_count,
+        "warnCount": report.warn_count,
+        "failedCount": report.failed_count,
+        "challengeCount": report.challenge_count,
+        "items": report.items.iter().map(|item| serde_json::json!({
+            "target": item.target,
+            "status": item.status.as_str(),
+            "httpStatus": item.http_status,
+            "latencyMs": item.latency_ms,
+            "message": item.message,
+            "cfRay": item.cf_ray,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn quality_report_from_document(
+    snapshot: ProxyQualitySnapshot,
+    document: &serde_json::Value,
+) -> StoreResult<ProxyQualityReport> {
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+    let count = |key: &str| -> StoreResult<u32> {
+        document[key]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(invalid)
+    };
+    let geo = &document["exitGeo"];
+    Ok(ProxyQualityReport {
+        snapshot,
+        exit_ip: text(&document["exitIp"])
+            .map(|ip| ip.parse().map_err(|_| invalid()))
+            .transpose()?,
+        exit_geo: (!geo.is_null())
+            .then(|| -> StoreResult<_> {
+                Ok(ProxyExitGeo {
+                    country: text(&geo["country"]).ok_or_else(invalid)?,
+                    country_code: text(&geo["countryCode"]).ok_or_else(invalid)?,
+                    region: text(&geo["region"]),
+                    city: text(&geo["city"]),
+                })
+            })
+            .transpose()?,
+        base_latency_ms: document["baseLatencyMs"].as_u64(),
+        passed_count: count("passedCount")?,
+        warn_count: count("warnCount")?,
+        failed_count: count("failedCount")?,
+        challenge_count: count("challengeCount")?,
+        items: document["items"]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|item| {
+                Ok(ProxyQualityItem {
+                    target: text(&item["target"]).ok_or_else(invalid)?,
+                    status: item["status"]
+                        .as_str()
+                        .and_then(ProxyQualityItemStatus::parse)
+                        .ok_or_else(invalid)?,
+                    http_status: item["httpStatus"]
+                        .as_u64()
+                        .and_then(|value| u16::try_from(value).ok()),
+                    latency_ms: item["latencyMs"].as_u64(),
+                    message: text(&item["message"]).unwrap_or_default(),
+                    cf_ray: text(&item["cfRay"]),
+                })
+            })
+            .collect::<StoreResult<_>>()?,
+    })
+}
+
+/// 连通性结果的五个基础列之后依次绑定地区四列；失败结果的地区恒为空以满足表约束。
+const RECORD_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_message = $6, last_test_country = $7, last_test_country_code = $8,      last_test_region = $9, last_test_city = $10";
+
+fn bind_test_result<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    result: ProxyTestResult,
+) -> StoreResult<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
+    let geo = result.exit_geo.filter(|_| result.success);
+    let (country, code, region, city) = match geo {
+        Some(geo) => (
+            Some(geo.country),
+            Some(geo.country_code),
+            geo.region,
+            geo.city,
+        ),
+        None => (None, None, None, None),
+    };
+    Ok(query
+        .bind(result.success)
+        .bind(i64::try_from(result.latency_ms).map_err(|_| invalid())?)
+        .bind(result.exit_ip.map(|ip| ip.to_string()))
+        .bind(result.message)
+        .bind(country)
+        .bind(code)
+        .bind(region)
+        .bind(city))
 }
 
 pub(crate) fn location_from_row(
@@ -599,7 +752,17 @@ impl ProxyStore for PgProxyRepository {
              last_test_success = case when $4 is not null and $4 <> proxy_url then null else last_test_success end,
              last_test_latency_ms = case when $4 is not null and $4 <> proxy_url then null else last_test_latency_ms end,
              last_test_ip = case when $4 is not null and $4 <> proxy_url then null else last_test_ip end,
-             last_test_message = case when $4 is not null and $4 <> proxy_url then null else last_test_message end
+             last_test_message = case when $4 is not null and $4 <> proxy_url then null else last_test_message end,
+             last_test_country = case when $4 is not null and $4 <> proxy_url then null else last_test_country end,
+             last_test_country_code = case when $4 is not null and $4 <> proxy_url then null else last_test_country_code end,
+             last_test_region = case when $4 is not null and $4 <> proxy_url then null else last_test_region end,
+             last_test_city = case when $4 is not null and $4 <> proxy_url then null else last_test_city end,
+             quality_checked_at = case when $4 is not null and $4 <> proxy_url then null else quality_checked_at end,
+             quality_score = case when $4 is not null and $4 <> proxy_url then null else quality_score end,
+             quality_grade = case when $4 is not null and $4 <> proxy_url then null else quality_grade end,
+             quality_status = case when $4 is not null and $4 <> proxy_url then null else quality_status end,
+             quality_summary = case when $4 is not null and $4 <> proxy_url then null else quality_summary end,
+             quality_report = case when $4 is not null and $4 <> proxy_url then null else quality_report end
              where id = $1 and revision = $2")
             .bind(&command.id).bind(i64::try_from(command.revision.get()).map_err(|_| store_error(invalid()))?)
             .bind(&command.name).bind(command.proxy.as_ref().map(OutboundProxy::expose_url))
@@ -705,11 +868,17 @@ impl ProxyStore for PgProxyRepository {
         exclude_active_imports(&mut transaction, id)
             .await
             .map_err(store_error)?;
-        let updated = sqlx::query("update outbound_proxies set last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4, last_test_ip = $5, last_test_message = $6 where id = $1 and revision = $2")
-            .bind(id).bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?)
-            .bind(result.success).bind(i64::try_from(result.latency_ms).map_err(|_| store_error(invalid()))?)
-            .bind(result.exit_ip.map(|ip| ip.to_string())).bind(result.message)
-            .execute(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
+        let statement = format!(
+            "update outbound_proxies set {RECORD_TEST_SET} where id = $1 and revision = $2"
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(id)
+            .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);
+        let updated = bind_test_result(query, result)
+            .map_err(store_error)?
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| store_error(unavailable()))?;
         if updated.rows_affected() != 1 {
             return Err(store_error(conflict(id)));
         }
@@ -735,5 +904,108 @@ impl ProxyStore for PgProxyRepository {
             .await
             .map_err(|_| store_error(unavailable()))?;
         self.get(id).await
+    }
+
+    async fn record_quality(
+        &self,
+        id: &str,
+        revision: AdminRevision,
+        report: ProxyQualityReport,
+        context: &MutationContext,
+    ) -> AdminStoreResult<ProxyRecord> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| store_error(unavailable()))?;
+        exclude_active_imports(&mut transaction, id)
+            .await
+            .map_err(store_error)?;
+        let base = report
+            .items
+            .first()
+            .filter(|item| item.target == PROXY_QUALITY_BASE_TARGET)
+            .ok_or_else(|| store_error(invalid()))?;
+        // 质量检测的第一项就是一次完整的连通性测试，两组列必须在同一事务里一起前进。
+        let test = ProxyTestResult {
+            success: base.status == ProxyQualityItemStatus::Pass,
+            latency_ms: base.latency_ms.unwrap_or_default(),
+            exit_ip: report.exit_ip,
+            exit_geo: report.exit_geo.clone(),
+            message: if base.status == ProxyQualityItemStatus::Pass {
+                "连接成功".to_owned()
+            } else {
+                base.message.clone()
+            },
+        };
+        let statement = format!(
+            "update outbound_proxies set {RECORD_TEST_SET}, quality_checked_at = $11, quality_score = $12,              quality_grade = $13, quality_status = $14, quality_summary = $15, quality_report = $16              where id = $1 and revision = $2"
+        );
+        let document = quality_report_document(&report);
+        let query = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(id)
+            .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);
+        let updated = bind_test_result(query, test)
+            .map_err(store_error)?
+            .bind(report.snapshot.checked_at)
+            .bind(i16::from(report.snapshot.score))
+            .bind(report.snapshot.grade.to_string())
+            .bind(report.snapshot.status.as_str())
+            .bind(report.snapshot.summary)
+            .bind(sqlx::types::Json(document))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| store_error(unavailable()))?;
+        if updated.rows_affected() != 1 {
+            return Err(store_error(conflict(id)));
+        }
+        let current: i64 =
+            sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| store_error(unavailable()))?;
+        let current = Revision::new(u64::try_from(current).map_err(|_| store_error(invalid()))?)
+            .map_err(store_error)?;
+        audit(
+            &mut transaction,
+            context,
+            "quality_check",
+            id,
+            &["last_test", "quality"],
+            current,
+        )
+        .await
+        .map_err(store_error)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| store_error(unavailable()))?;
+        self.get(id).await
+    }
+
+    async fn quality_report(&self, id: &str) -> AdminStoreResult<Option<ProxyQualityReport>> {
+        let row = sqlx::query(
+            "select quality_checked_at, quality_score, quality_grade, quality_status,              quality_summary, quality_report from outbound_proxies where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| store_error(unavailable()))?
+        .ok_or_else(|| {
+            store_error(StoreError::NotFound {
+                entity: ENTITY,
+                id: id.to_owned(),
+            })
+        })?;
+        let Some(snapshot) = quality_snapshot_from_row(&row).map_err(store_error)? else {
+            return Ok(None);
+        };
+        let document: sqlx::types::Json<serde_json::Value> = row
+            .try_get::<Option<_>, _>("quality_report")
+            .map_err(|_| store_error(invalid()))?
+            .ok_or_else(|| store_error(invalid()))?;
+        quality_report_from_document(snapshot, &document.0)
+            .map(Some)
+            .map_err(store_error)
     }
 }

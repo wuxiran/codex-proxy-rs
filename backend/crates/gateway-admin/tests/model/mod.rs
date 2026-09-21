@@ -2,5 +2,6 @@
 
 mod backup;
 mod provider_credentials;
+mod proxies;
 mod quota_forecast;
 mod quota_forecast_sampling;
