@@ -102,6 +102,14 @@ pub struct QuotaForecastSample {
     pub pending_request_count: u64,
     pub discontinuous: bool,
     pub usage: QuotaForecastUsage,
+    /// 当前连续段的已用比例观测（含当前点），仅用于展示消耗曲线，不参与估算。
+    pub curve: Vec<QuotaForecastCurvePoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuotaForecastCurvePoint {
+    pub observed_at: DateTime<Utc>,
+    pub used_percent: f64,
 }
 
 /// 对同一额度段的累计点形成至少 5 个百分点的连续块，使用最近三个完整块及尾部。
@@ -133,6 +141,7 @@ pub fn select_forecast_sample(
         pending_request_count,
         discontinuous: false,
         usage: current.usage.clone(),
+        curve: Vec::new(),
     };
     history.push(current);
     let mut anchors: Vec<&QuotaForecastPoint> = Vec::new();
@@ -149,9 +158,15 @@ pub fn select_forecast_sample(
                 }
                 sample.discontinuous = true;
                 anchors.clear();
+                // 曲线与锚点同口径：回落之前的旧段不与新段连成一条线。
+                sample.curve.clear();
             }
         }
         high_water = Some(point);
+        sample.curve.push(QuotaForecastCurvePoint {
+            observed_at: point.observed_at,
+            used_percent: point.used_percent,
+        });
         if anchors
             .last()
             .is_none_or(|anchor| point.used_percent - anchor.used_percent >= MIN_BLOCK_PERCENT)

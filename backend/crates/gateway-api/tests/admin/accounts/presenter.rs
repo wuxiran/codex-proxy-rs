@@ -1,6 +1,9 @@
 use gateway_admin::model::{
     provider_credentials::AccountUsagePeriod,
-    quota_forecast::{AccountQuotaForecast, AccountQuotaForecastReport, QuotaForecastSource},
+    quota_forecast::{
+        AccountQuotaForecast, AccountQuotaForecastReport, QuotaExhaustion, QuotaForecastSource,
+    },
+    quota_forecast_sampling::QuotaForecastCurvePoint,
 };
 use gateway_api::admin::accounts::AccountQuotaForecastData;
 
@@ -27,8 +30,17 @@ fn quota_forecast_projection_only_exposes_capacity_and_preserves_null_zero() {
         estimated_usd: None,
         remaining_tokens: Some(0),
         remaining_usd: None,
+        window_start_at: Some(now),
+        curve: vec![QuotaForecastCurvePoint {
+            observed_at: now,
+            used_percent: 42.5,
+        }],
+        burn_percent_per_hour: Some(0.75),
+        exhaustion: Some(QuotaExhaustion::At(now)),
     };
     let mut monthly = forecast.clone();
+    monthly.exhaustion = Some(QuotaExhaustion::AfterReset);
+    monthly.burn_percent_per_hour = None;
     monthly.period = AccountUsagePeriod::Monthly;
     monthly.extrapolated = true;
     monthly.target_seconds = 30 * 86_400;
@@ -59,6 +71,24 @@ fn quota_forecast_projection_only_exposes_capacity_and_preserves_null_zero() {
             "usdDisplay": "$0.1234"
         })
     );
+    assert_eq!(week["windowStartAt"], "2026-09-12T08:00:00+08:00");
+    assert_eq!(
+        week["curve"],
+        serde_json::json!([{ "observedAt": "2026-09-12T08:00:00+08:00", "usedPercent": 42.5 }])
+    );
+    assert_eq!(week["burnPercentPerHourDisplay"], "0.75%/h");
+    assert_eq!(
+        week["exhaustion"],
+        serde_json::json!({
+            "kind": "at",
+            "at": "2026-09-12T08:00:00+08:00",
+            "atDisplay": "2026-09-12 08:00:00"
+        })
+    );
+    let month = &value["forecasts"][1];
+    assert_eq!(month["exhaustion"]["kind"], "afterReset");
+    assert!(month["exhaustion"]["at"].is_null());
+    assert_eq!(month["burnPercentPerHourDisplay"], "—");
     assert!(week.get("method").is_none());
     assert!(week.get("methodDisplay").is_none());
     assert!(value.get("generatedAtDisplay").is_none());
