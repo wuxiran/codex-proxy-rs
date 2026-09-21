@@ -128,8 +128,10 @@ fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
             success: usable,
             latency_ms: 1,
             exit_ip: None,
+            exit_geo: None,
             message: String::new(),
         }),
+        quality: None,
         created_at: now,
         updated_at: now,
     }
@@ -207,8 +209,10 @@ fn proxy_with(id: &str, url: &str, usable: bool, account_count: u64) -> ProxyRec
             success: usable,
             latency_ms: 1,
             exit_ip: None,
+            exit_geo: None,
             message: String::new(),
         }),
+        quality: None,
         created_at: now,
         updated_at: now,
     }

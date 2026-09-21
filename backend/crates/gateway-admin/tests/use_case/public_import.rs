@@ -68,8 +68,10 @@ fn proxy(id: &str, tested: Option<bool>) -> ProxyRecord {
             success,
             latency_ms: 10,
             exit_ip: None,
+            exit_geo: None,
             message: String::new(),
         }),
+        quality: None,
         created_at: now,
         updated_at: now,
     }
