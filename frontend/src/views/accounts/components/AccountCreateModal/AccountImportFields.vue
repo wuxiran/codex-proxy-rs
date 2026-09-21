@@ -5,17 +5,24 @@ import { onScopeDispose, ref, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
+import { isSupportedProvider } from '@/utils/providers'
+import { combineAccountFilesToEnvelope } from '../../utils/importDocuments'
 
 const props = defineProps<{
   label: string
   placeholder: string
   uploadable: boolean
   disabled: boolean
+  /** 当前所选账号平台；多文件合并时用来给每份文件归类。缺省（如免登录导入页）则只支持单文件。 */
+  provider?: string
+  /** 当前导入模式；只有「账号文件」(json) 模式支持一次丢入多个文件。 */
+  mode?: string
 }>()
 const text = defineModel<string>({ required: true })
 const fileError = ref('')
 const dragDepth = ref(0)
-const { open: openFile, onChange } = useFileDialog({ accept: 'application/json,.json', multiple: false, reset: true })
+// 「账号文件」模式允许一次丢入多个文件；其它可上传模式仍是单文件。
+const { open: openFile, onChange } = useFileDialog({ accept: 'application/json,.json', multiple: true, reset: true })
 
 let readVersion = 0
 onScopeDispose(() => {
@@ -29,31 +36,51 @@ watch(() => [props.disabled, props.uploadable], () => {
 
 onChange(readFiles)
 
-async function readFiles(files: FileList | null) {
+function isJsonFile(file: File) {
+  return file.name.toLowerCase().endsWith('.json') || file.type === 'application/json'
+}
+
+async function readFiles(fileList: FileList | null) {
   if (props.disabled || !props.uploadable)
     return
-  const file = files?.[0]
-  if (!file)
+  const files = fileList ? Array.from(fileList) : []
+  if (files.length === 0)
     return
   const version = ++readVersion
   fileError.value = ''
-  if (files.length !== 1) {
-    fileError.value = '请每次选择或拖入一个 JSON 文件'
-    return
-  }
-  if (!file.name.toLowerCase().endsWith('.json') && file.type !== 'application/json') {
+  const invalid = files.find(file => !isJsonFile(file))
+  if (invalid) {
     fileError.value = '请选择或拖入 JSON 格式的账号文件'
     return
   }
+  // 单文件（或非「账号文件」模式）：原样读入文本框，便于查看/微调。
+  if (files.length === 1 || props.mode !== 'json') {
+    try {
+      const contents = await files[0]!.text()
+      if (version === readVersion)
+        text.value = contents
+    }
+    catch {
+      if (version === readVersion)
+        fileError.value = '文件读取失败，请重新选择或拖入'
+    }
+    return
+  }
+  // 多文件「账号文件」：读全部并按所选平台合并成一个 { documents:[...] } 信封。
+  const provider = props.provider ?? ''
+  if (!isSupportedProvider(provider)) {
+    fileError.value = '请先选择账号平台，再一次丢入多个账号文件'
+    return
+  }
   try {
-    const contents = await file.text()
+    const contents = await Promise.all(files.map(async file => ({ name: file.name, text: await file.text() })))
     if (version !== readVersion)
       return
-    text.value = contents
+    text.value = combineAccountFilesToEnvelope(provider, contents)
   }
-  catch {
+  catch (error) {
     if (version === readVersion)
-      fileError.value = '文件读取失败，请重新选择或拖入'
+      fileError.value = error instanceof Error ? error.message : '文件读取失败，请重新选择或拖入'
   }
 }
 
@@ -91,7 +118,7 @@ function updateText(value: string) {
     :label="label"
     required
     :error="fileError || undefined"
-    :description="uploadable ? '可将一个 JSON 账号文件拖入下方输入框，或点击上传文件' : undefined"
+    :description="uploadable ? (mode === 'json' ? '可将一个或多个 JSON 账号文件拖入下方输入框，或点击上传文件（多个文件会合并为一次批量导入）' : '可将一个 JSON 账号文件拖入下方输入框，或点击上传文件') : undefined"
   >
     <template v-if="uploadable" #extra>
       <BaseButton size="sm" :disabled="disabled" @click="openFile()">

@@ -413,13 +413,114 @@ async fn unreachable_egress_is_skipped_and_account_level_failure_aborts() {
     assert!(!recorded(&setup.log).contains(&"store.batch_update_accounts"));
 }
 
+/// 自动续期：代理池里有轮换代理模板（用户名含 `_area-`）时，续期走「自动撞」——
+/// 探测都经模板主机的临时出口，命中后改绑到静态出口，而不是遍历那 N 个固定代理。
 #[tokio::test]
-async fn credential_change_during_hunt_discards_the_hit_without_binding() {
-    let probe = ScriptedProbe::new([Reply::State(EXPECTED_LENGTH)]);
-    let setup = setup(probe.clone(), vec![proxy("good", 8001, true)], None).await;
+async fn renewal_uses_the_rotating_template_and_binds_a_static_on_hit() {
+    let probe = ScriptedProbe::new([Reply::NoState, Reply::State(EXPECTED_LENGTH)]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy_with(
+                "rotating",
+                "http://user_area-US:pass@proxy.smartproxy.test:3120/",
+                true,
+                0,
+            ),
+            proxy_with("static-a", "http://127.0.0.1:8002/", true, 0),
+        ],
+        None,
+    )
+    .await;
+
+    let events = setup
+        .services
+        .accounts()
+        .renewal_turn_state_hunt(TurnStateHuntCommand {
+            require_schedulable: true,
+            ..command(1, false)
+        })
+        .await
+        .expect("renewal stream")
+        .collect::<Vec<_>>()
+        .await;
+
+    // 探测都走模板主机（临时出口，凭据/国家段已被 endpoint 抹去），不是那个固定静态。
+    assert!(
+        probe
+            .egresses()
+            .iter()
+            .all(|e| e.as_deref() == Some("http://proxy.smartproxy.test:3120/"))
+    );
+    // 命中后钉在静态出口上。
+    assert_eq!(
+        *setup.provider.hunt_pinned_egress.lock().unwrap(),
+        Some(Some("http://127.0.0.1:8002/".to_owned()))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+}
+
+/// 命中收尾时令牌刚好刷新一次：不整轮中止，重新取票、丢弃这次命中，继续用新票撞下一个出口并绑定。
+#[tokio::test]
+async fn a_token_refresh_at_the_hit_retickets_and_binds_on_the_next_egress() {
+    let probe = ScriptedProbe::new([Reply::State(EXPECTED_LENGTH), Reply::State(EXPECTED_LENGTH)]);
+    let setup = setup(
+        probe.clone(),
+        vec![proxy("first", 8001, true), proxy("second", 8002, true)],
+        None,
+    )
+    .await;
     let provider = setup.provider.clone();
+    // 每次探测前把凭据世代改成 binding-2；第一次命中时它与起始票（binding-1）不同 → 重新取票，
+    // 之后一直是 binding-2，第二个出口的命中就能钉住。
     *probe.on_probe.lock().unwrap() = Some(Box::new(move || {
         *provider.hunt_binding.lock().unwrap() = Some("binding-2".to_owned());
+    }));
+
+    let events = run(&setup, command(1, false)).await;
+
+    // 两个出口都打了：第一个命中被重新取票丢弃，第二个命中在新票下绑定成功。
+    assert_eq!(probe.egresses(), vec![endpoint(8001), endpoint(8002)]);
+    assert!(matches!(
+        events.last(),
+        Some(TurnStateHuntEvent::Completed { success: true, .. })
+    ));
+    assert!(recorded(&setup.log).contains(&"provider.hunt_pin"));
+}
+
+/// 令牌每次探测都刷新（凭据永不稳定）：重新取票有上限，超过后才以 credential_changed 中止，不绑定。
+#[tokio::test]
+async fn relentless_token_refresh_aborts_after_the_bounded_reticket_budget() {
+    let probe = ScriptedProbe::new([
+        Reply::State(EXPECTED_LENGTH),
+        Reply::State(EXPECTED_LENGTH),
+        Reply::State(EXPECTED_LENGTH),
+        Reply::State(EXPECTED_LENGTH),
+        Reply::State(EXPECTED_LENGTH),
+    ]);
+    let setup = setup(
+        probe.clone(),
+        vec![
+            proxy("p1", 8001, true),
+            proxy("p2", 8002, true),
+            proxy("p3", 8003, true),
+            proxy("p4", 8004, true),
+            proxy("p5", 8005, true),
+        ],
+        None,
+    )
+    .await;
+    let provider = setup.provider.clone();
+    let seq = Arc::new(Mutex::new(0u32));
+    // 每次探测都把世代改成一个全新的值：每个命中收尾都发现凭据变了 → 每次都重新取票。
+    *probe.on_probe.lock().unwrap() = Some(Box::new(move || {
+        let mut n = seq.lock().unwrap();
+        *n += 1;
+        // 用与起始票（binding-1）不同的前缀，保证每次命中收尾都看到「凭据变了」。
+        *provider.hunt_binding.lock().unwrap() = Some(format!("churn-{n}"));
     }));
 
     let events = run(&setup, command(1, false)).await;
