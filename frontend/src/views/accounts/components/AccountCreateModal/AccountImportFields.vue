@@ -13,10 +13,10 @@ const props = defineProps<{
   placeholder: string
   uploadable: boolean
   disabled: boolean
-  /** 当前所选账号平台；多文件合并时用来给每份文件归类。 */
-  provider: string
+  /** 当前所选账号平台；多文件合并时用来给每份文件归类。缺省（如免登录导入页）则只支持单文件。 */
+  provider?: string
   /** 当前导入模式；只有「账号文件」(json) 模式支持一次丢入多个文件。 */
-  mode: string
+  mode?: string
 }>()
 const text = defineModel<string>({ required: true })
 const fileError = ref('')
@@ -67,7 +67,8 @@ async function readFiles(fileList: FileList | null) {
     return
   }
   // 多文件「账号文件」：读全部并按所选平台合并成一个 { documents:[...] } 信封。
-  if (!isSupportedProvider(props.provider)) {
+  const provider = props.provider ?? ''
+  if (!isSupportedProvider(provider)) {
     fileError.value = '请先选择账号平台，再一次丢入多个账号文件'
     return
   }
@@ -75,7 +76,7 @@ async function readFiles(fileList: FileList | null) {
     const contents = await Promise.all(files.map(async file => ({ name: file.name, text: await file.text() })))
     if (version !== readVersion)
       return
-    text.value = combineAccountFilesToEnvelope(props.provider, contents)
+    text.value = combineAccountFilesToEnvelope(provider, contents)
   }
   catch (error) {
     if (version === readVersion)
