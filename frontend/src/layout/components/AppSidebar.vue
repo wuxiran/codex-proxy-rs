@@ -2,6 +2,7 @@
 import {
   ArrowUpCircle,
   ChartNoAxesColumn,
+  Coins,
   FolderTree,
   Info,
   KeyRound,
@@ -64,6 +65,7 @@ const navItems = [
   { label: '分组管理', icon: FolderTree, path: '/groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
+  { label: '成本核算', icon: Coins, path: '/costs' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
 ]

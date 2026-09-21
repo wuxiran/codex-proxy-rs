@@ -370,6 +370,8 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 - `status`: `normal`、`quota_exhausted`、`rate_limited`、`disabled`、`error`；
 - `sortBy`: `email`、`status`、`planType`、`usage`、`lastUsedAt`、`expiresAt`；
 - `sortDirection`: `asc`、`desc`。
+- `hideRetired`: 缺省为 `true`，隐藏管理员手动标记为下线的账号；传 `false` 查看全部。下线只是标记，
+  不影响 `summary` 计数、账号启用状态或调度。
 
 账号限流详情在 `quota` 中返回：`rateLimitReason` 为 `upstream_rate_limit`（上游临时限流）、
 `capacity_freeze`（容量错误触发自动冻结）或 `null`。`recoveryProbeRequired` 表示解除冻结是否需要成功探测；
@@ -525,6 +527,38 @@ D（≥40）、F。`status` 按 `challenge` > `failed` > `warn` > `healthy` 取�
 文件及 AT/RT 导入从凭据交换到落库期间保护所选代理；此时修改、删除或写入测试结果返回 409，
 避免已轮换的凭据因代理状态变化而丢失。完成导入或请求取消后自动释放保护。
 OAuth 等待回调期间不持有保护；提交仍拒绝已删除、连接配置改变或测试失败的代理。
+
+### 成本核算 / Cost Accounting
+
+所有端点要求管理员身份。购买价格不区分币种，按管理员口径与美元 1:1 对比；金额仅用于展示，
+不参与请求计费、额度或账号调度。
+
+| 方法 / Method | 路径 / Path | 请求 / Request | 结果 / Result |
+| --- | --- | --- | --- |
+| `GET` | `/api/admin/cost-accounting/daily` | `from`、`to`（`YYYY-MM-DD`，最长 366 天） | `{ days, totals }` |
+| `GET` | `/api/admin/cost-accounting/accounts` | `from`、`to`、`includeRetired`（缺省 `false`） | `{ items }` |
+| `POST` | `/api/admin/cost-accounting/purchase` | `{ accountId, price?, purchasedAt?, note? }` | 购买记录 |
+| `POST` | `/api/admin/cost-accounting/retire` | `{ accountIds, retired }`（1-200 个） | `{ accountIds }`，实际变更的账号 |
+
+日期按东八区自然日划分。「跑出」取成功请求按模型价格折算的 USD（与账号页「按模型价格计费」同一口径），
+只统计有购买记录的账号。`days[]` 每项包含 `day`、`purchasedCount`、`spend`、`usageUsd`、`requestCount`、
+`totalTokens`、`costPerUsd`、`cumulativeCostPerUsd`；`totals` 为区间合计。投入记在 `purchasedAt` 所在日，
+跑出记在请求实际发生的当日；`costPerUsd = spend ÷ usageUsd`，没有跑出时为 `null`，
+`cumulativeCostPerUsd` 从区间起点累计到当日。没有数据的日期也返回一行。
+
+请求日志只保留 `usage_retention_days` 天，因此每日金额会落表：每次查询先用日志重算区间内完整落在
+保留期内的日期并覆盖，更早的日期只读取上一次落表的结果。已下线或已删除账号的历史照常计入每日核算。
+
+`items[]` 每项包含购买记录 `accountId`、`name`、`email`、`price`、`purchasedAt`、`retiredAt`、`note`，
+区间内的 `usageUsd`、`requestCount`、`totalTokens`、`costPerUsd`，以及账号现状 `accountExists`、`enabled`、
+`credentialReady`、`quotaExhausted`、`planType`。购买记录不依赖账号行：账号删除后 `accountExists=false`，
+现状字段为 `null`，名称与邮箱取首次记录时的快照。
+
+`purchase` 省略的字段保持原值；`price: null`、`note: null` 清除对应值。`price` 为不超过两位小数的非负金额；
+`purchasedAt` 缺省取账号加入时间，不能晚于当前时间。账号不存在且此前没有记录时返回 404。
+
+`retire` 由管理员手动标记下线或恢复：系统不会因额度用满、禁用或凭据失效而自动下线。
+下线不停用账号、不改变调度；没有购买记录的账号下线时会建立一条无价格的记录，未知账号被忽略。
 
 ### 账号连接测试 SSE
 

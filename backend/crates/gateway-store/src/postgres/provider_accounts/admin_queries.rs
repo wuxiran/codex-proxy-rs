@@ -107,6 +107,12 @@ pub(crate) async fn load_admin_account_page(
                        from account_group_accounts membership
                       where membership.provider_account_id = a.id
                    )))
+              and (not $10::boolean or not exists (
+                     select 1
+                       from account_purchases purchase
+                      where purchase.account_ref = a.id
+                        and purchase.retired_at is not null
+                   ))
          ),
          filtered_total as (
            select count(*)::bigint as filtered_total from filtered
@@ -157,6 +163,7 @@ pub(crate) async fn load_admin_account_page(
         .bind(group_id)
         .bind(page_size)
         .bind(offset)
+        .bind(query.hide_retired)
         .fetch_all(pool)
         .await
         .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load admin account page")))?;

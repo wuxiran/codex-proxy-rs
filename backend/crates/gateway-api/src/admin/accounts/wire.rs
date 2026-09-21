@@ -56,6 +56,8 @@ pub struct ListQuery {
     pub status: Option<String>,
     pub sort_by: Option<String>,
     pub sort_direction: Option<String>,
+    /// 缺省隐藏已手动下线的账号；传 false 查看全部。
+    pub hide_retired: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,6 +199,7 @@ impl ListQuery {
             _ => return Err(WireValidationError::new("sort")),
         };
         Ok(AccountListQuery {
+            hide_retired: self.hide_retired.unwrap_or(true),
             page,
             page_size: PageSize::new(
                 u16::try_from(page_size).map_err(|_| WireValidationError::new("pageSize"))?,

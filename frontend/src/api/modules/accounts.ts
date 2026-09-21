@@ -397,6 +397,8 @@ interface AccountListParams {
   groupId?: string
   sortBy?: string
   sortDirection?: string
+  /** 缺省隐藏已手动下线的账号。 */
+  hideRetired?: boolean
 }
 
 interface AccountIdParam {

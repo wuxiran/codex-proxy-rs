@@ -52,6 +52,11 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/usage/index.vue'),
       },
       {
+        path: 'costs',
+        name: 'costs',
+        component: () => import('@/views/costs/index.vue'),
+      },
+      {
         path: 'theme',
         name: 'theme',
         component: () => import('@/views/theme/index.vue'),

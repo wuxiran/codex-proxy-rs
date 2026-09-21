@@ -1,9 +1,13 @@
 <script setup lang="ts">
+import type { AccountRow } from './constants'
 import { ChevronDown } from '@lucide/vue'
 import { useMediaQuery } from '@vueuse/core'
-import { ref } from 'vue'
+import { ref, shallowRef } from 'vue'
+import { setAccountsRetired } from '@/api'
 
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
+import AccountPurchaseModal from '@/components/AccountPurchaseModal.vue'
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
@@ -13,9 +17,11 @@ import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumn
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
+import { toast } from '@/components/base/BaseToast'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
+import { useAccountPurchases } from '@/composables/useAccountPurchases'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
 import AccountCreateModal from './components/AccountCreateModal/index.vue'
@@ -58,6 +64,7 @@ const {
   providerQuery,
   statusQuery,
   groupQuery,
+  showRetired,
   sort,
   accountSummary,
   accountPagination,
@@ -67,6 +74,44 @@ const {
   handleSortChange,
 } = useAccountsQuery()
 const { entries: accountConfigurations, reload: reloadConfigurations } = useAccountConfigurations(accounts)
+const { byAccountId: purchases, reload: reloadPurchases } = useAccountPurchases()
+const showPurchase = shallowRef(false)
+const purchaseAccount = shallowRef<AccountRow | null>(null)
+const retiringSelected = shallowRef(false)
+
+function openPurchase(account: AccountRow) {
+  purchaseAccount.value = account
+  showPurchase.value = true
+}
+
+async function handlePurchaseSaved() {
+  await Promise.all([reloadPurchases(), refreshAccountsSilently()])
+}
+
+/** 额度用满、被禁用或凭据失效的号多半已经跑完；只提示，下线与否由管理员决定。 */
+function retireHint(account: AccountRow) {
+  const purchase = purchases.value.get(account.id)
+  if (purchase?.retiredAt)
+    return 'retired'
+  const status = derivedAccountStatus(account)
+  return purchase?.price != null && ['quota_exhausted', 'disabled', 'error'].includes(status) ? 'finished' : null
+}
+
+async function retireSelected() {
+  if (retiringSelected.value || selectedIds.value.size === 0)
+    return
+  retiringSelected.value = true
+  try {
+    const result = await setAccountsRetired({ accountIds: [...selectedIds.value], retired: true })
+    toast.success(`已标记 ${result.accountIds.length} 个账号下线`)
+    selectedIds.value = new Set()
+    await handlePurchaseSaved()
+  }
+  catch {}
+  finally {
+    retiringSelected.value = false
+  }
+}
 
 const {
   groups,
@@ -248,6 +293,10 @@ const {
           @edit-selected="openBatchEdit"
         >
           <template #actions>
+            <BaseButton v-if="selectedIds.size > 0" variant="secondary" class="whitespace-nowrap" :loading="retiringSelected" @click="retireSelected">
+              标记下线 ({{ selectedIds.size }})
+            </BaseButton>
+            <BaseSwitch v-model="showRetired" label="显示已下线" show-label />
             <BaseTableColumnSettings
               :options="columnOptions"
               @change="setColumnVisible"
@@ -322,6 +371,16 @@ const {
                 :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
               />
+              <button
+                v-if="retireHint(row)"
+                type="button"
+                class="mt-1 block cursor-pointer rounded-cp border-0 px-1.5 py-0.5 text-cp-xs font-bold outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline"
+                :class="retireHint(row) === 'retired' ? 'bg-cp-fill-secondary text-cp-text-secondary' : 'bg-cp-warning-container text-cp-warning-on-container'"
+                :title="retireHint(row) === 'retired' ? '已手动下线，点击修改' : '这个号看起来已经跑完，可以标记下线'"
+                @click.stop="openPurchase(row)"
+              >
+                {{ retireHint(row) === 'retired' ? '已下线' : '可下线' }}
+              </button>
             </template>
 
             <template #enabled="{ row }">
@@ -393,6 +452,7 @@ const {
                 @reauthorize="openReauthorizeAccount"
                 @test="openConnectionTest"
                 @revive="handleReviveGuanlan"
+                @cost="openPurchase"
               />
             </template>
 
@@ -548,5 +608,12 @@ const {
         吗？
       </p>
     </BaseConfirmModal>
+
+    <AccountPurchaseModal
+      v-model="showPurchase"
+      :account="purchaseAccount ? { id: purchaseAccount.id, label: purchaseAccount.email ?? purchaseAccount.name, addedAt: purchaseAccount.addedAt } : null"
+      :purchase="purchaseAccount ? purchases.get(purchaseAccount.id) ?? null : null"
+      @saved="handlePurchaseSaved"
+    />
   </div>
 </template>

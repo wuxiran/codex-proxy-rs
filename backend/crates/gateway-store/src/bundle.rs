@@ -107,7 +107,10 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             admin_account_runtime,
             Arc::new(postgres::PgAccountGroupRepository::new(pool.clone())),
             Arc::new(postgres::PgProxyRepository::new(pool.clone())),
-        ),
+        )
+        .with_cost_accounting(Arc::new(postgres::PgCostAccountingRepository::new(
+            pool.clone(),
+        ))),
         Arc::new(AuthStoreAdapter {
             keys: postgres::PgAdminClientKeyStore::new(pool.clone()),
             security: postgres::PgAdminSecurityAuditRepository::new(pool.clone()),

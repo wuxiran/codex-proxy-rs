@@ -82,6 +82,7 @@ mod account_groups;
 mod accounts;
 mod auth;
 mod client_keys;
+mod cost_accounting;
 mod errors;
 mod observability;
 mod proxies;
@@ -157,7 +158,8 @@ impl AdminTestFixture {
                 unused.clone(),
                 account_groups.clone(),
                 Arc::new(proxies::MemoryProxies::default()),
-            ),
+            )
+            .with_cost_accounting(Arc::new(cost_accounting::MemoryCosts::default())),
             auth.clone(),
             client_keys.clone(),
             unused,

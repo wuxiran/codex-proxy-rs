@@ -57,6 +57,8 @@ pub struct AccountSort {
 /// 账号列表的存储查询条件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountListQuery {
+    /// 隐藏管理员手动标记为下线的账号；下线只是标记，不影响调度。
+    pub hide_retired: bool,
     pub page: u32,
     pub page_size: PageSize,
     pub provider_kind: Option<ProviderKind>,

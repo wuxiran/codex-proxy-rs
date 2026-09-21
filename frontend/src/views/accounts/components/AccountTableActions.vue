@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
-import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { Coins, KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
@@ -25,6 +25,7 @@ const emit = defineEmits<{
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
   revive: [accountId: string]
+  cost: [account: AccountRow]
 }>()
 </script>
 
@@ -97,6 +98,12 @@ const emit = defineEmits<{
               <KeyRound class="size-3.5 text-cp-text-quaternary" />
             </template>
             重新授权
+          </BaseMenuItem>
+          <BaseMenuItem @click.stop="(close(), emit('cost', account))">
+            <template #icon>
+              <Coins class="size-3.5 text-cp-text-quaternary" />
+            </template>
+            成本与下线
           </BaseMenuItem>
           <BaseMenuItem
             :loading="recovering"

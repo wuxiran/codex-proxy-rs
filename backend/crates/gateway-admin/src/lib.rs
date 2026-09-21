@@ -34,10 +34,10 @@ pub use use_case::key_usage::KeyUsageService;
 pub use use_case::{
     account_groups::AccountGroupService, accounts::AccountsService, auth::AuthService,
     backup::BackupService, client_distribution::ClientDistributionService,
-    client_keys::ClientKeyService, import_tasks::ImportTasksService,
-    observability::ObservabilityService, openai::OpenAiService, proxies::ProxiesService,
-    public_import::PublicImportService, settings::SettingsService, system::SystemService,
-    xai::XaiService,
+    client_keys::ClientKeyService, cost_accounting::CostAccountingService,
+    import_tasks::ImportTasksService, observability::ObservabilityService, openai::OpenAiService,
+    proxies::ProxiesService, public_import::PublicImportService, settings::SettingsService,
+    system::SystemService, xai::XaiService,
 };
 
 use model::{AdminError, AdminErrorKind};
@@ -190,6 +190,7 @@ pub enum AdminConfigError {
 #[derive(Clone)]
 pub struct AdminServices {
     proxies: Arc<dyn ProxiesService>,
+    cost_accounting: Arc<dyn CostAccountingService>,
     auth: Arc<dyn AuthService>,
     key_usage: Arc<dyn KeyUsageService>,
     accounts: Arc<dyn AccountsService>,
@@ -231,6 +232,11 @@ impl AdminServices {
     #[must_use]
     pub fn proxies(&self) -> &dyn ProxiesService {
         self.proxies.as_ref()
+    }
+
+    #[must_use]
+    pub fn cost_accounting(&self) -> &dyn CostAccountingService {
+        self.cost_accounting.as_ref()
     }
 
     #[must_use]
@@ -425,6 +431,9 @@ pub async fn initialize(
             account_groups.clone(),
         )),
         proxies,
+        cost_accounting: Arc::new(
+            use_case::cost_accounting::DefaultCostAccountingService::new(store.cost_accounting()),
+        ),
         auth,
         accounts: accounts.clone(),
         account_groups,

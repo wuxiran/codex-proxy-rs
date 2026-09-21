@@ -430,6 +430,7 @@ pub struct AdminAccountStorePorts {
     runtime: Arc<dyn AccountRuntimeStore>,
     groups: Arc<dyn AccountGroupStore>,
     proxies: Arc<dyn super::proxy::ProxyStore>,
+    cost_accounting: Arc<dyn super::cost_accounting::CostAccountingStore>,
 }
 
 impl AdminAccountStorePorts {
@@ -445,7 +446,18 @@ impl AdminAccountStorePorts {
             runtime,
             groups,
             proxies,
+            cost_accounting: Arc::new(super::cost_accounting::UnconfiguredCostAccounting),
         }
+    }
+
+    /// 成本核算是可选能力：未接入时相关接口明确返回不可用，不影响其余账号能力的装配。
+    #[must_use]
+    pub fn with_cost_accounting(
+        mut self,
+        store: Arc<dyn super::cost_accounting::CostAccountingStore>,
+    ) -> Self {
+        self.cost_accounting = store;
+        self
     }
 }
 
@@ -500,6 +512,11 @@ impl AdminStorePorts {
     #[must_use]
     pub fn proxies(&self) -> Arc<dyn super::proxy::ProxyStore> {
         self.accounts.proxies.clone()
+    }
+
+    #[must_use]
+    pub fn cost_accounting(&self) -> Arc<dyn super::cost_accounting::CostAccountingStore> {
+        self.accounts.cost_accounting.clone()
     }
 
     #[must_use]

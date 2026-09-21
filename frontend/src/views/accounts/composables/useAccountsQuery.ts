@@ -12,6 +12,8 @@ export function useAccountsQuery() {
   const providerQuery = shallowRef('')
   const statusQuery = shallowRef('')
   const groupQuery = shallowRef('')
+  // 已手动下线的号默认不显示；下线只是标记，随时可以切回来看。
+  const showRetired = shallowRef(false)
   const sort = shallowRef<BaseTableSort>()
   const accountSummary = shallowRef({
     total: 0,
@@ -32,6 +34,7 @@ export function useAccountsQuery() {
         provider: providerQuery.value || undefined,
         status: statusQuery.value || undefined,
         groupId: groupQuery.value || undefined,
+        hideRetired: !showRetired.value,
         sortBy: sort.value?.key,
         sortDirection: sort.value?.direction,
       }, options),
@@ -83,7 +86,7 @@ export function useAccountsQuery() {
     { debounce: 250 },
   )
 
-  watch([providerQuery, statusQuery, groupQuery], () => {
+  watch([providerQuery, statusQuery, groupQuery, showRetired], () => {
     query.page.value = 1
     void query.execute()
   })
@@ -104,6 +107,7 @@ export function useAccountsQuery() {
     providerQuery,
     statusQuery,
     groupQuery,
+    showRetired,
     sort,
     accountSummary,
     accountPagination,

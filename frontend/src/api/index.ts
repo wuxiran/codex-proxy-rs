@@ -13,6 +13,9 @@ export * from './modules/auth'
 // 备份管理
 export * from './modules/backups'
 
+// 成本核算
+export * from './modules/cost-accounting'
+
 // Dashboard 聚合
 export * from './modules/dashboard'
 
