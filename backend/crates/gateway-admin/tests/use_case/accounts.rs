@@ -73,6 +73,7 @@ pub(super) struct FakeProviderAdmin {
     retry_authorization_after_abort: Mutex<bool>,
     export_inputs: Mutex<Vec<ProviderExportCredentialInput>>,
     import_account_ids: Mutex<Vec<String>>,
+    import_authentication_kind: Mutex<String>,
     import_documents: Mutex<Vec<serde_json::Value>>,
     quota_requests: Mutex<Vec<ProviderQuotaRequest>>,
     quota_started: tokio::sync::Notify,
@@ -104,6 +105,7 @@ impl FakeProviderAdmin {
             retry_authorization_after_abort: Mutex::new(false),
             export_inputs: Mutex::new(Vec::new()),
             import_account_ids: Mutex::new(vec!["acct_prepared".to_owned()]),
+            import_authentication_kind: Mutex::new("oauth".to_owned()),
             import_documents: Mutex::new(Vec::new()),
             quota_requests: Mutex::new(Vec::new()),
             quota_started: tokio::sync::Notify::new(),
@@ -166,6 +168,13 @@ impl FakeProviderAdmin {
             .lock()
             .expect("provider import documents")
             .clone()
+    }
+
+    pub(super) fn set_import_authentication_kind(&self, kind: &str) {
+        *self
+            .import_authentication_kind
+            .lock()
+            .expect("import authentication kind") = kind.to_owned();
     }
 
     pub(super) fn set_import_account_ids(&self, account_ids: &[&str]) {
@@ -436,12 +445,18 @@ impl ProviderAdmin for FakeProviderAdmin {
             .lock()
             .expect("provider import account IDs")
             .clone();
+        let authentication_kind = self
+            .import_authentication_kind
+            .lock()
+            .expect("import authentication kind")
+            .clone();
         Ok(PreparedCredentialImport {
             provider_kind: self.kind.clone(),
             credentials: account_ids
                 .into_iter()
-                .map(|account_id| {
-                    prepared_create_with_id(self.kind.clone(), &account_id, "prepared-import")
+                .map(|account_id| PreparedCredentialCreate {
+                    authentication_kind: authentication_kind.clone(),
+                    ..prepared_create_with_id(self.kind.clone(), &account_id, "prepared-import")
                 })
                 .collect(),
         })
@@ -887,6 +902,9 @@ impl AccountStore for FakeAccountStore {
             .expect("import settings")
             .push(command.settings);
         self.record("store.commit_import");
+        if command.reject_existing {
+            self.record("store.reject_existing");
+        }
         self.record_context(context);
         self.require_commit()?;
         Ok(CredentialImportResult {

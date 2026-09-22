@@ -344,6 +344,45 @@ impl PgAdminAccountStore {
         })
     }
 
+    /// 与导入 upsert 的冲突键一致（provider_kind, upstream_user_id, coalesce(upstream_account_id, '')）；
+    /// 没有上游用户身份的条目不会与已有账号冲突，无需检查。
+    async fn reject_existing_identities(
+        &self,
+        prepared: &PreparedCredentialImport,
+    ) -> AdminStoreResult<()> {
+        for credential in &prepared.credentials {
+            let Some(user_id) = credential.upstream_user_id.as_deref() else {
+                continue;
+            };
+            let exists: bool = sqlx::query_scalar(
+                "select exists(
+                   select 1 from provider_accounts
+                   where provider_kind = $1 and upstream_user_id = $2
+                     and coalesce(upstream_account_id, '') = coalesce($3, '')
+                 )",
+            )
+            .bind(credential.provider_kind.as_str())
+            .bind(user_id)
+            .bind(credential.upstream_account_id.as_deref())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| {
+                admin_store_error(
+                    ENTITY,
+                    postgres_unavailable("check existing account identity"),
+                )
+            })?;
+            if exists {
+                return Err(AdminStoreError::new(
+                    AdminStoreErrorKind::Conflict,
+                    ENTITY,
+                    "account identity already exists",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn account_groups_by_account(
         &self,
         account_ids: &[String],
@@ -573,6 +612,9 @@ impl AccountStore for PgAdminAccountStore {
         command: CredentialImportCommit,
         context: &MutationContext,
     ) -> AdminStoreResult<CredentialImportResult> {
+        if command.reject_existing {
+            self.reject_existing_identities(&command.prepared).await?;
+        }
         self.commit_prepared_import(
             command.prepared,
             command.settings,

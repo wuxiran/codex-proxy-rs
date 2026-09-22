@@ -15,7 +15,10 @@ use crate::{
             PrepareCredentialRotation, RotateCredential, StartAuthorization,
         },
     },
-    ports::{provider::ProviderAdmin, store::AccountStore},
+    ports::{
+        provider::ProviderAdmin,
+        store::{AccountStore, AdminStoreErrorKind},
+    },
 };
 
 use super::{
@@ -29,6 +32,11 @@ use super::{
 #[async_trait]
 pub trait OpenAiService: Send + Sync {
     async fn import_document(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError>;
+    /// 只新建 OAuth 账号：API Key 账号与上游身份已存在的账号整批拒绝，供免登录入口使用。
+    async fn import_new_accounts(
         &self,
         command: ImportCredentials,
     ) -> Result<CredentialImportResult, AdminError>;
@@ -58,27 +66,10 @@ pub(crate) struct DefaultOpenAiService {
 }
 
 impl DefaultOpenAiService {
-    #[must_use]
-    pub(crate) fn new(
-        provider: Arc<dyn ProviderAdmin>,
-        accounts: Arc<dyn AccountStore>,
-        proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
-        snapshot: Arc<dyn SnapshotControl>,
-    ) -> Self {
-        Self {
-            provider,
-            accounts,
-            proxies,
-            snapshot,
-        }
-    }
-}
-
-#[async_trait]
-impl OpenAiService for DefaultOpenAiService {
-    async fn import_document(
+    async fn import(
         &self,
         command: ImportCredentials,
+        new_accounts_only: bool,
     ) -> Result<CredentialImportResult, AdminError> {
         let context = command.context;
         let proxy_reservation = super::import_proxy_binding(
@@ -104,6 +95,16 @@ impl OpenAiService for DefaultOpenAiService {
             &prepared,
             "OpenAI credential import",
         )?;
+        // 免登录入口的提交者不可信：自定义 base_url 的 API Key 账号会把业务流量引向提交者，
+        // 必须经管理员导入；OAuth 以外的认证类型一律拒绝。
+        if new_accounts_only
+            && prepared
+                .credentials
+                .iter()
+                .any(|credential| credential.authentication_kind != "oauth")
+        {
+            return Err(AdminError::invalid("此入口只接受 OAuth 账号"));
+        }
         let result = self
             .accounts
             .commit_credential_import(
@@ -111,11 +112,17 @@ impl OpenAiService for DefaultOpenAiService {
                     outbound_proxy,
                     prepared,
                     settings: command.settings,
+                    reject_existing: new_accounts_only,
                 },
                 &context,
             )
             .await
-            .map_err(|error| map_store_error(error, "OpenAI credential import"))?;
+            .map_err(|error| {
+                if new_accounts_only && error.kind() == AdminStoreErrorKind::Conflict {
+                    return AdminError::conflict("账号已存在，此入口不会覆盖已有账号");
+                }
+                map_store_error(error, "OpenAI credential import")
+            })?;
         drop(proxy_reservation);
         publish_credentials_and_observe_quota(
             &self.provider,
@@ -126,6 +133,38 @@ impl OpenAiService for DefaultOpenAiService {
         )
         .await?;
         Ok(result)
+    }
+
+    #[must_use]
+    pub(crate) fn new(
+        provider: Arc<dyn ProviderAdmin>,
+        accounts: Arc<dyn AccountStore>,
+        proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
+        snapshot: Arc<dyn SnapshotControl>,
+    ) -> Self {
+        Self {
+            provider,
+            accounts,
+            proxies,
+            snapshot,
+        }
+    }
+}
+
+#[async_trait]
+impl OpenAiService for DefaultOpenAiService {
+    async fn import_document(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError> {
+        self.import(command, false).await
+    }
+
+    async fn import_new_accounts(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError> {
+        self.import(command, true).await
     }
 
     async fn start_authorization(

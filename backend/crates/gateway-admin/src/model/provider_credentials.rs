@@ -131,6 +131,8 @@ pub struct CredentialImportCommit {
     pub outbound_proxy: Option<super::proxies::ImportProxyBinding>,
     pub settings: Option<AccountImportSettings>,
     pub prepared: PreparedCredentialImport,
+    /// 为真时上游身份已存在的账号整批拒绝，不走 upsert 覆盖（免登录入口使用）。
+    pub reject_existing: bool,
 }
 
 /// OAuth pending owner 的中立身份；不编码具体 Provider 的 Redis key 或 JSON。

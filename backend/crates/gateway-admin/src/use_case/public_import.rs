@@ -71,7 +71,8 @@ pub struct DefaultPublicImportService {
     openai: Arc<dyn OpenAiService>,
     proxies: Arc<dyn ProxiesService>,
     groups: Arc<dyn AccountGroupService>,
-    // 串行化读改写，避免并发保存互相覆盖；跨槽位靠原子 rename 保证文件完整。
+    // 读改写整体在锁内完成，避免并发保存把刚轮换掉的令牌写回；跨槽位靠原子 rename 保证文件完整
+    // （管理请求只进入 active 槽位，排空中的旧槽位不接新的管理写入）。
     write_lock: tokio::sync::Mutex<()>,
 }
 
@@ -115,6 +116,11 @@ impl DefaultPublicImportService {
             return Ok(config);
         }
         let _guard = self.write_lock.lock().await;
+        self.load_or_create_locked()
+    }
+
+    /// 调用方必须持有 `write_lock`。
+    fn load_or_create_locked(&self) -> Result<PublicImportConfig, AdminError> {
         if let Some(config) = self.load()? {
             return Ok(config);
         }
@@ -259,8 +265,8 @@ impl PublicImportService for DefaultPublicImportService {
         if self.group_names(&command.group_ids).await?.len() != command.group_ids.len() {
             return Err(AdminError::invalid("目标分组不存在，请刷新后重试"));
         }
-        let current = self.load_or_create().await?;
         let _guard = self.write_lock.lock().await;
+        let current = self.load_or_create_locked()?;
         let config = PublicImportConfig {
             enabled: command.enabled,
             token: current.token,
@@ -280,8 +286,8 @@ impl PublicImportService for DefaultPublicImportService {
         &self,
         context: &MutationContext,
     ) -> Result<PublicImportConfig, AdminError> {
-        let current = self.load_or_create().await?;
         let _guard = self.write_lock.lock().await;
+        let current = self.load_or_create_locked()?;
         let config = PublicImportConfig {
             token: generate_token(),
             updated_at: Utc::now(),
@@ -337,7 +343,7 @@ impl PublicImportService for DefaultPublicImportService {
             );
             let imported = self
                 .openai
-                .import_document(ImportCredentials {
+                .import_new_accounts(ImportCredentials {
                     outbound_proxy_id: Some(proxy.id.clone()),
                     settings: Some(AccountImportSettings {
                         notes: None,

@@ -106,6 +106,7 @@ impl XaiService for DefaultXaiService {
                     outbound_proxy,
                     prepared,
                     settings: command.settings,
+                    reject_existing: false,
                 },
                 &context,
             )
