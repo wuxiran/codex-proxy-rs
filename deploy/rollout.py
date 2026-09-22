@@ -155,10 +155,33 @@ def ensure_logs_dir(slot):
     os.chown(path, RUNTIME_UID, RUNTIME_UID)
 
 
-def compose_up(path):
+def compose_up(path, wait_seconds=180):
     run(['docker', 'compose', '-f', str(path), 'config', '--quiet'])
     run(['docker', 'compose', '-f', str(path), 'up', '-d', '--no-deps', '--no-build',
-         '--wait', '--wait-timeout', '180', SERVICE], timeout=240)
+         '--wait', '--wait-timeout', str(wait_seconds), SERVICE], timeout=wait_seconds + 60)
+
+
+def check_additive_migrations(applied, expected, db_backup):
+    """带迁移发版的前提：库里已有的迁移原样是新清单的前缀，且刚做过全库备份。
+
+    新槽位启动时执行新增迁移，旧槽位继续在新 schema 上服务到排空结束，因此只允许
+    经人工确认对旧版本兼容（只增不改）的迁移走这条路。迁移后旧镜像无法再启动
+    （sqlx 拒绝库里存在它不认识的迁移），回滚只能用备份恢复数据库。
+    """
+    changed = sorted(v for v in applied if expected.get(v) != applied[v])
+    if changed:
+        raise SystemExit(f'库里已应用的迁移与新清单不一致（{changed}），拒绝发版')
+    added = sorted((v for v in expected if v not in applied), key=int)
+    if not added:
+        raise SystemExit('没有新增迁移，不需要 --allow-additive-migrations')
+    if not db_backup:
+        raise SystemExit('带迁移发版必须提供 --db-backup（发版前的 pg_dump）')
+    backup = pathlib.Path(db_backup)
+    if not backup.is_file() or backup.stat().st_size == 0:
+        raise SystemExit(f'数据库备份不存在或为空: {backup}')
+    if time.time() - backup.stat().st_mtime > 2 * 3600:
+        raise SystemExit(f'数据库备份超过 2 小时，重新备份后再发: {backup}')
+    log('migrations', added=added, dbBackup=str(backup))
 
 
 def stop_detached(name):
@@ -233,8 +256,12 @@ def cmd_deploy(args):
     expected = json.loads(pathlib.Path(args.migrations).read_text())
     rows = psql("select version, encode(checksum, 'hex') from _sqlx_migrations order by version;")
     applied = dict(line.split('|', 1) for line in rows.splitlines())
-    if applied != expected:
-        raise SystemExit('新镜像的迁移清单与数据库不一致：含迁移的版本不能走先起后停，改走维护窗口')
+    migrating = applied != expected
+    if migrating and not args.allow_additive_migrations:
+        raise SystemExit('新镜像的迁移清单与数据库不一致：含迁移的版本不能走先起后停，改走维护窗口；'
+                         '确认迁移只增不改后可用 --allow-additive-migrations --db-backup <dump>')
+    if migrating:
+        check_additive_migrations(applied, expected, args.db_backup)
     # 备份 worker 按单副本设计，新实例启动时会无锁「恢复」进行中的备份。
     if int(psql("select count(*) from backup_records where status in ('dumping', 'uploading');")):
         raise SystemExit('有备份任务正在执行，结束后再发版')
@@ -259,7 +286,8 @@ def cmd_deploy(args):
     write_atomic(compose_path(target), json.dumps(slot_spec(source_spec, target, image), indent=2) + '\n', mode=0o600)
     switched = False
     try:
-        compose_up(compose_path(target))
+        # 新增迁移在新槽位启动时执行，给足时间。
+        compose_up(compose_path(target), wait_seconds=900 if migrating else 180)
         fresh = inspect(target_name)
         assert fresh['State']['Health']['Status'] == 'healthy', '新槽位未就绪'
         assert fresh['Config']['Image'] == image, '新槽位镜像不符'
@@ -383,6 +411,9 @@ def main():
     deploy.add_argument('--metadata', help='构建产物 metadata.json（image / remoteArchive / *Sha256）')
     deploy.add_argument('--image', help='已 docker load 的镜像 tag；与 --metadata 二选一')
     deploy.add_argument('--migrations', required=True, help='migrations-manifest 生成的清单')
+    deploy.add_argument('--allow-additive-migrations', action='store_true',
+                        help='允许新增（只增不改、对旧版本兼容）的迁移随先起后停发布')
+    deploy.add_argument('--db-backup', help='发版前的数据库备份文件；带迁移发版时必填')
     deploy.set_defaults(handler=cmd_deploy)
     commands.add_parser('retire-legacy').set_defaults(handler=cmd_retire_legacy)
     commands.add_parser('rollback').set_defaults(handler=cmd_rollback)
