@@ -235,9 +235,11 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "client_api_keys",
             "client_key_budget_windows",
             "client_key_charge_events",
+            "model_request_billing",
             "model_requests",
             "ops_events",
             "outbound_proxies",
+            "outbound_proxy_quality",
             "provider_accounts",
             "runtime_settings",
         ]
