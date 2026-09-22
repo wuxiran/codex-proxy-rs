@@ -763,6 +763,7 @@ impl ModelRequestRepository for PgExecutionStore {
                  billing_model = excluded.billing_model,
                  calculated_cost_amount = excluded.calculated_cost_amount,
                  calculated_cost_currency = excluded.calculated_cost_currency
+             returning model_request_id
            ), recovery_target as (
              select prior.id
              from model_requests prior

@@ -278,6 +278,9 @@ fn quality_report_from_document(
 /// 连通性结果的五个基础列之后依次绑定地区四列；失败结果的地区恒为空以满足表约束。
 // 父表 outbound_proxies 只保连通性 + 上游双栈列；geo（country/code/region/city）迁子表，见 upsert_test_geo。
 const RECORD_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_ipv4 = $6, last_test_ipv6 = $7, last_test_message = $8";
+// 质量检测复用连通性基础探测，但 ProxyQualityReport 不携带双栈地址；用 coalesce 保留上次测得的
+// last_test_ipv4/ipv6，避免「先普通测试拿到双栈、再点质量检测把双栈清空」的回归。
+const RECORD_QUALITY_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_ipv4 = coalesce($6, last_test_ipv4), last_test_ipv6 = coalesce($7, last_test_ipv6), last_test_message = $8";
 
 fn bind_test_result<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
@@ -991,9 +994,10 @@ impl ProxyStore for PgProxyRepository {
                 base.message.clone()
             },
         };
-        // 连通性+双栈写父表；geo + 质量快照/报告写子表 outbound_proxy_quality（同事务）。
-        let statement =
-            format!("update outbound_proxies set {RECORD_TEST_SET} where id = $1 and revision = $2");
+        // 连通性写父表（双栈用 coalesce 保留上次结果）；geo + 质量快照/报告写子表（同事务）。
+        let statement = format!(
+            "update outbound_proxies set {RECORD_QUALITY_TEST_SET} where id = $1 and revision = $2"
+        );
         let query = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(id)
             .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);

@@ -24,8 +24,8 @@ pub(crate) fn account_usage_by_windows_sql() -> String {
                 mr.id as request_id,
                 coalesce(mr.upstream_model_id, mr.requested_model_id) as model,
                 jsonb_build_array(mr.requested_model_id, mr.upstream_model_id,
-                                 mr.response_model, mr.billing_model)::text as model_key,
-                mr.calculated_cost_amount, mr.calculated_cost_currency,
+                                 mrb.response_model, mrb.billing_model)::text as model_key,
+                mrb.calculated_cost_amount, mrb.calculated_cost_currency,
                 mr.outcome, mr.input_tokens, mr.output_tokens, mr.cached_tokens,
                 mr.cache_write_tokens, mr.reasoning_tokens,
                 mr.image_input_tokens, mr.image_output_tokens,
@@ -37,6 +37,7 @@ pub(crate) fn account_usage_by_windows_sql() -> String {
             and mr.started_at >= requested.window_start
             and mr.started_at < requested.window_end
             and {completed_usage}
+           left join model_request_billing mrb on mrb.model_request_id = mr.id
      )
      select account_id,
             window_key,
