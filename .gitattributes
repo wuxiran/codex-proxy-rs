@@ -1,0 +1,4 @@
+# 迁移按字节冻结：sqlx 以文件原始字节算 checksum，任何换行转换都会让已部署库拒绝启动。
+# 本 fork 的 0001–0011 在生产库里以 CRLF 字节应用，必须原样保留（见 backend/migrations/README.md）。
+backend/migrations/*.sql -text
+backend/migrations/.frozen-sha256 text eol=lf
