@@ -926,7 +926,8 @@ impl CodexCanonicalDecoder {
                 )
             })
         {
-            billing_model = Some(model.clone());
+            // 计价身份是实际参与估价的发送模型；响应回显只进 response_model。
+            billing_model = Some(self.upstream_model.clone());
             output.push(GatewayEvent::CalculatedCost(breakdown.calculated_cost()));
         }
         // 仅接受上游明确返回的精确 USD ticks；零费用也属于已提供。

@@ -788,7 +788,8 @@ impl GrokCanonicalDecoder {
                 )
             })
         {
-            billing_model = Some(model.clone());
+            // 计价身份是实际参与估价的发送模型；响应回显只进 response_model。
+            billing_model = Some(self.upstream_model.clone());
             output.push(GatewayEvent::CalculatedCost(cost));
         }
         let incomplete = event_type == "response.incomplete"

@@ -1158,7 +1158,7 @@ fn billing_should_not_emit_partial_totals_for_unpriced_tool_outputs() {
 }
 
 #[test]
-fn billing_identity_preserves_luna_response_and_never_forges_upstream_cost() {
+fn billing_identity_prices_sent_model_keeps_luna_response_and_never_forges_upstream_cost() {
     for ticks in [None, Some(0), Some(123)] {
         let mut usage = json!({"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"total_tokens":110});
         if let Some(ticks) = ticks {
@@ -1174,7 +1174,8 @@ fn billing_identity_preserves_luna_response_and_never_forges_upstream_cost() {
             .expect("decode billing identity");
         let facts = canonical_facts(&events);
         assert!(facts.iter().any(|event| matches!(event, GatewayEvent::Completed(meta)
-            if meta.observed_model() == Some("gpt-5.6-luna") && meta.billing_model() == Some("gpt-5.6-luna"))));
+            // 本地估价按发送模型 astra 计算，计费身份必须与之一致；luna 只是响应回显。
+            if meta.observed_model() == Some("gpt-5.6-luna") && meta.billing_model() == Some("gpt-6-astra"))));
         assert!(
             facts
                 .iter()
