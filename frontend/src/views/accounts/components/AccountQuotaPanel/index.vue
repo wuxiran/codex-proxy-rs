@@ -19,6 +19,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   refreshQuota: [accountId: string]
+  quotaReset: [accountId: string]
   accountUpdated: [account: AccountRow]
 }>()
 
@@ -62,7 +63,7 @@ const profileOpen = shallowRef(false)
         <AccountResetCredits
           v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'"
           :account="account"
-          @account-updated="emit('accountUpdated', $event)"
+          @consumed="emit('quotaReset', $event)"
         />
         <BaseIconButton
           variant="ghost"
