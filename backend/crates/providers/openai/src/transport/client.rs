@@ -33,7 +33,7 @@ use super::response_meta::CodexResponseMetadata;
 use super::tls::{CustomCaError, build_reqwest_client_with_custom_ca, custom_ca_env_cache_key};
 use super::websocket::{
     CodexWebSocketExchangeError, CodexWebSocketPool, CodexWebSocketPoolKey,
-    CodexWebSocketRateLimitUpdates, CodexWebSocketRequest, CodexWebSocketTurnStateUpdate,
+    CodexWebSocketRateLimitUpdates, CodexWebSocketRequest, CodexWebSocketResponseMetadataUpdates,
     PreparedWebSocket, WebSocketOriginBreaker, WebSocketPoolDecision,
 };
 
@@ -589,8 +589,8 @@ pub struct CodexTransportMetrics {
 /// 响应头之后在 live 流中采集的结构化限流更新。
 pub type CodexRateLimitUpdates = CodexWebSocketRateLimitUpdates;
 
-/// 响应头之后在 live 流中采集的 turn state 更新。
-pub type CodexTurnStateUpdate = CodexWebSocketTurnStateUpdate;
+/// 响应头之后在 live 流中采集的请求级 metadata 更新。
+pub type CodexResponseMetadataUpdates = CodexWebSocketResponseMetadataUpdates;
 
 /// Codex Responses 上游 live SSE 响应。
 pub struct CodexBackendStreamingResponse {
@@ -608,8 +608,8 @@ pub struct CodexBackendStreamingResponse {
     pub rate_limit_headers: Vec<(String, String)>,
     /// live stream 期间捕获的结构化限流更新。
     pub rate_limit_updates: Option<CodexRateLimitUpdates>,
-    /// live stream 期间捕获的 turn-state 更新。
-    pub turn_state_update: Option<CodexTurnStateUpdate>,
+    /// live stream 期间捕获的请求级 metadata 更新。
+    pub response_metadata_updates: Option<CodexResponseMetadataUpdates>,
     /// WebSocket 连接池决策。
     pub websocket_pool_decision: Option<WebSocketPoolDecision>,
     /// 上游诊断元数据。
@@ -663,6 +663,7 @@ pub struct CodexBackendClient {
     pub(super) client: Client,
     pub(super) direct_client: Client,
     pub(super) base_url: String,
+    pub(super) official_base_url: String,
     pub(super) protocol: OpenAiUpstreamProtocol,
     pub(super) profile: CodexWireProfileState,
     pub(super) websocket_pool: Option<Arc<CodexWebSocketPool>>,
@@ -673,6 +674,34 @@ pub struct CodexBackendClient {
 }
 
 impl CodexBackendClient {
+    /// 覆盖官方账号接口基址，用于隔离上游联调与协议测试。
+    #[must_use]
+    pub fn with_official_base_url(mut self, official_base_url: impl Into<String>) -> Self {
+        self.official_base_url = official_base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// 自定义账号路由明确不存在时才回退一次；调用方继续解释最后一次响应。
+    pub(super) async fn send_account_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        fallback: reqwest::RequestBuilder,
+    ) -> CodexClientResult<ReqwestResponse> {
+        let response = request.send().await.map_err(CodexClientError::HttpJson)?;
+        if response.status() != StatusCode::NOT_FOUND
+            || self.base_url.trim_end_matches('/') == self.official_base_url.trim_end_matches('/')
+        {
+            return Ok(response);
+        }
+        tracing::debug!(
+            endpoint = response.url().path(),
+            "custom account endpoint returned 404; falling back to official endpoint"
+        );
+        drop(response);
+        // 消费可能已在回退端完成，传输失败不能被先前的 404 覆盖。
+        fallback.send().await.map_err(CodexClientError::HttpJson)
+    }
+
     pub(crate) fn with_authentication(
         mut self,
         authentication: &crate::credential::CodexRuntimeAuthentication,

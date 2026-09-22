@@ -1,5 +1,6 @@
 import type { rotationOptions } from '../constants'
 import type { RequestLocation } from '@/api'
+import type { ClientProfileSelection, XaiClientProfileSelection } from '@/api/modules/client-profiles'
 import { computed, reactive, ref, shallowRef } from 'vue'
 
 import { getSettings, updateSettings } from '@/api'
@@ -11,6 +12,8 @@ import { normalizeRequestLocation, requestLocationError } from '@/utils/request-
 
 type RotationStrategy = (typeof rotationOptions)[number]['value']
 
+const MIB = 1024 * 1024
+
 export function useSettingsForm() {
   const loading = shallowRef(true)
   const saveAction = useAsyncAction()
@@ -19,6 +22,8 @@ export function useSettingsForm() {
   const mappings = ref<Array<{ requestedModel: string, upstreamModel: string }>>([])
   const savedRequestLocation = shallowRef<RequestLocation>()
   const form = reactive({
+    openaiClientProfile: null as ClientProfileSelection | null,
+    xaiClientProfile: null as XaiClientProfileSelection | null,
     requestLocationEnabled: false,
     requestLocation: { country: '', region: '', city: '', timezone: '' },
     refreshMarginSeconds: null as number | null,
@@ -28,6 +33,7 @@ export function useSettingsForm() {
     maxWaitingPerKey: null as number | null,
     maxWaitingPerAccount: null as number | null,
     concurrencyWaitTimeoutSeconds: null as number | null,
+    responsesMaxDecompressedBodyMiB: null as number | null,
 
     rotationStrategy: '' as RotationStrategy | '',
     minCodexDesktopVersion: '',
@@ -45,7 +51,25 @@ export function useSettingsForm() {
     accountAutoFreezeAdaptiveConcurrency: true,
   })
 
-  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
+  function snapshot() {
+    return {
+      form: { ...form, requestLocation: { ...form.requestLocation } },
+      mappings: mappings.value.map(row => ({ ...row })),
+    }
+  }
+
+  const saved = shallowRef<ReturnType<typeof snapshot>>()
+  const loaded = computed(() => saved.value !== undefined)
+  const hasChanges = computed(() => loaded.value && JSON.stringify(snapshot()) !== JSON.stringify(saved.value))
+
+  function resetSettings() {
+    if (!saved.value || saving.value)
+      return
+    Object.assign(form, saved.value.form, { requestLocation: { ...saved.value.form.requestLocation } })
+    mappings.value = saved.value.mappings.map(row => ({ ...row }))
+  }
+
+  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
     return computed({
       get: () => (form[key] === null ? '' : String(form[key])),
       set: (value: string) => {
@@ -65,6 +89,7 @@ export function useSettingsForm() {
   const requestIntervalMsValue = numericModel('requestIntervalMs')
   const maxWaitingPerKeyValue = numericModel('maxWaitingPerKey')
   const maxWaitingPerAccountValue = numericModel('maxWaitingPerAccount')
+  const responsesMaxDecompressedBodyMiBValue = numericModel('responsesMaxDecompressedBodyMiB')
   const concurrencyWaitTimeoutSecondsValue = numericModel('concurrencyWaitTimeoutSeconds')
   const accountAutoFreezeThresholdValue = numericModel('accountAutoFreezeThreshold')
   const accountAutoFreezeWindowSecondsValue = numericModel('accountAutoFreezeWindowSeconds')
@@ -89,9 +114,12 @@ export function useSettingsForm() {
     form.maxWaitingPerKey = data.maxWaitingPerKey
     form.maxWaitingPerAccount = data.maxWaitingPerAccount
     form.concurrencyWaitTimeoutSeconds = data.concurrencyWaitTimeoutSeconds
+    form.responsesMaxDecompressedBodyMiB = data.responsesMaxDecompressedBodyBytes / MIB
 
     form.rotationStrategy = data.rotationStrategy
     form.minCodexDesktopVersion = data.minCodexDesktopVersion ?? ''
+    form.openaiClientProfile = data.openaiClientProfile
+    form.xaiClientProfile = data.xaiClientProfile
     form.minCodexCliVersion = data.minCodexCliVersion ?? ''
     form.usageRetentionDays = data.usageRetentionDays
     form.opsEventRetentionDays = data.opsEventRetentionDays
@@ -107,6 +135,7 @@ export function useSettingsForm() {
       requestedModel,
       upstreamModel: String(upstreamModel),
     }))
+    saved.value = snapshot()
   }
 
   async function loadSettings(silent = false) {
@@ -156,16 +185,21 @@ export function useSettingsForm() {
   }
 
   async function saveSettings() {
-    if (saving.value || loading.value || !savedRequestLocation.value)
+    if (saving.value || loading.value || !savedRequestLocation.value || !form.openaiClientProfile || !form.xaiClientProfile)
       return
-    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
+    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
     if (refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
-      toast.warning('请完整填写运行参数和调度策略')
+      toast.warning('请完整填写并发、队列、凭据刷新参数和调度策略')
+      return
+    }
+    if (responsesMaxDecompressedBodyMiB === null || !Number.isInteger(responsesMaxDecompressedBodyMiB) || responsesMaxDecompressedBodyMiB < 1
+      || !Number.isSafeInteger(responsesMaxDecompressedBodyMiB * MIB)) {
+      toast.warning('Responses 解压上限应为有效的正整数（MiB）')
       return
     }
     if (![maxWaitingPerKey, maxWaitingPerAccount].every(value => Number.isInteger(value) && value >= 0 && value <= 1000)
       || !Number.isInteger(concurrencyWaitTimeoutSeconds) || concurrencyWaitTimeoutSeconds < 1 || concurrencyWaitTimeoutSeconds > 120) {
-      toast.warning('最大排队数应为 0～1000 的整数，最长排队时间应为 1～120 秒的整数')
+      toast.warning('队列容量应为 0～1000 的整数，排队超时应为 1～120 秒的整数')
       return
     }
     if (minCodexDesktopVersionError.value || minCodexCliVersionError.value) {
@@ -182,13 +216,13 @@ export function useSettingsForm() {
       return
     }
     if (accountAutoFreezeThreshold === null || accountAutoFreezeWindowSeconds === null || accountAutoFreezeDurationSeconds === null) {
-      toast.warning('请完整填写账号自动冻结参数')
+      toast.warning('请完整填写过载保护参数')
       return
     }
     if (!Number.isInteger(accountAutoFreezeThreshold) || accountAutoFreezeThreshold < 2 || accountAutoFreezeThreshold > 1000
       || !Number.isInteger(accountAutoFreezeWindowSeconds) || accountAutoFreezeWindowSeconds < 60 || accountAutoFreezeWindowSeconds > 3600
       || !Number.isInteger(accountAutoFreezeDurationSeconds) || accountAutoFreezeDurationSeconds < 300 || accountAutoFreezeDurationSeconds > 604800) {
-      toast.warning('自动冻结阈值应为 2～1000，统计窗口为 60～3600 秒，冻结时长为 300～604800 秒')
+      toast.warning('失败次数阈值应为 2～1000，统计窗口为 60～3600 秒，冷却时长为 300～604800 秒')
       return
     }
     const probeModel = form.accountAutoFreezeProbeModel.trim()
@@ -196,8 +230,12 @@ export function useSettingsForm() {
       toast.warning('探测模型名称不能超过 128 个字符')
       return
     }
+    const xaiClientProfile = form.xaiClientProfile
+    const openaiClientProfile = form.openaiClientProfile
     await saveAction.run(async () => {
       const result = await updateSettings({
+        openaiClientProfile,
+        xaiClientProfile,
         requestLocationEnabled: form.requestLocationEnabled,
         requestLocation,
         modelMappings: mappingPayload(),
@@ -208,6 +246,7 @@ export function useSettingsForm() {
         maxWaitingPerKey,
         maxWaitingPerAccount,
         concurrencyWaitTimeoutSeconds,
+        responsesMaxDecompressedBodyBytes: responsesMaxDecompressedBodyMiB * MIB,
         rotationStrategy,
         minCodexDesktopVersion: form.minCodexDesktopVersion.trim() || null,
         minCodexCliVersion: form.minCodexCliVersion.trim() || null,
@@ -235,6 +274,8 @@ export function useSettingsForm() {
   return {
     loading,
     saving,
+    hasChanges,
+    resetSettings,
     error,
     form,
     mappings,
@@ -248,6 +289,7 @@ export function useSettingsForm() {
     maxWaitingPerKeyValue,
     maxWaitingPerAccountValue,
     concurrencyWaitTimeoutSecondsValue,
+    responsesMaxDecompressedBodyMiBValue,
     accountAutoFreezeThresholdValue,
     accountAutoFreezeWindowSecondsValue,
     accountAutoFreezeDurationSecondsValue,

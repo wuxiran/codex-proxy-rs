@@ -169,6 +169,8 @@ fn sensitive_response_views_do_not_require_debug_or_add_secret_fields() {
 #[test]
 fn billing_view_should_preserve_the_original_detail_contract() {
     let value = serde_json::to_value(BillingView {
+        long_context_billing_applied: false,
+        image: None,
         input_amount_display: "$0.03".to_owned(),
         output_amount_display: "$0.00".to_owned(),
         cache_read_amount_display: "$0.14".to_owned(),
@@ -630,6 +632,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         .lock()
         .expect("ops errors")
         .push(OpsError {
+            client_api_key_name: Some("Production".to_owned()),
             source: "model_request".to_owned(),
             event_id: "err_snapshot".to_owned(),
             request_id: Some("req_err".to_owned()),
@@ -700,6 +703,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         .await
         .expect("ops errors body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("ops errors JSON");
+    assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
     assert_eq!(
         serde_json::json!({
             "provider": value["data"]["items"][0]["provider"],
@@ -840,6 +844,7 @@ fn usage_record_with_account(
         upstream_transport: Some("http_sse".to_owned()),
         http_version: Some("h2".to_owned()),
         websocket_pool: None,
+        upstream_response_model: None,
         service_tier: None,
         provider_metadata_json: None,
         attempt_count: 1,
@@ -952,6 +957,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .lock()
         .expect("usage records")
         .push(UsageListRecord {
+            client_api_key_name: Some("Production".to_owned()),
             id: "request_endpoint".to_owned(),
             endpoint: "/v1/responses".to_owned(),
             client_transport: "websocket".to_owned(),
@@ -960,9 +966,11 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             provider_account_ref: Some("acct_snapshot".to_owned()),
             provider_account_name: Some("Snapshot Alpha".to_owned()),
             provider_account_email: Some("alpha@example.invalid".to_owned()),
+            provider_account_notes: Some("Team workspace".to_owned()),
             provider_account_authentication_kind: Some("oauth".to_owned()),
             upstream_model_id: Some("grok-4.5".to_owned()),
             upstream_transport: Some("http_sse".to_owned()),
+            upstream_response_model: Some("grok-4.6-build".to_owned()),
             service_tier: Some("default".to_owned()),
             input_tokens: Some(1),
             output_tokens: Some(1),
@@ -977,6 +985,9 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             cost_currency: None,
             billing: Some(UsageBilling::Calculated(Box::new(
                 CalculatedBillingBreakdown {
+                    long_context_billing_applied: true,
+                    custom_multiplier_bps: 10_000,
+                    image: None,
                     input_amount: usd("0.03"),
                     output_amount: usd("0.07"),
                     cache_read_amount: usd("0.00"),
@@ -1046,6 +1057,16 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .expect("usage response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
 
+    assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
+    assert_eq!(value["data"]["items"][0]["accountNotes"], "Team workspace");
+    assert_eq!(
+        value["data"]["items"][0]["billing"]["longContextBillingApplied"],
+        true
+    );
+    assert_eq!(
+        value["data"]["items"][1]["billing"]["longContextBillingApplied"],
+        false
+    );
     assert_eq!(
         value["data"]["items"][0]["billing"]["inputPriceDisplay"],
         "$10 / 1M Token"
@@ -1075,6 +1096,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             "imageOutputTokens": value["data"]["items"][0]["tokenDetails"]["imageOutputTokens"],
             "requestedModel": value["data"]["items"][0]["requestedModel"],
             "upstreamModel": value["data"]["items"][0]["upstreamModel"],
+            "upstreamResponseModel": value["data"]["items"][0]["upstreamResponseModel"],
             "reasoningEffort": value["data"]["items"][0]["reasoningEffort"],
             "reasoningPreset": value["data"]["items"][0]["reasoningPreset"],
             "subagentKind": value["data"]["items"][0]["subagentKind"],
@@ -1098,6 +1120,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             "imageOutputTokens": 9,
             "requestedModel": "grok-4.5",
             "upstreamModel": "grok-4.5",
+            "upstreamResponseModel": "grok-4.6-build",
             "reasoningEffort": "max",
             "reasoningPreset": "ultra",
             "subagentKind": "worker",

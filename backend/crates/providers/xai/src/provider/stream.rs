@@ -189,7 +189,8 @@ pub(super) fn cold_compaction_http_sse_stream(
         yield ProviderEvent::observation(observation.clone());
 
         let mut body = accepted.response.into_body();
-        let mut canonical = GrokCanonicalDecoder::new(upstream_model.as_str());
+        let mut canonical = GrokCanonicalDecoder::new(upstream_model.as_str())
+            .with_pricing(context.pricing().get("xai").and_then(|p| p.get(upstream_model.as_str())).cloned());
         let mut summary = GrokCompactionSummaryDecoder::new();
         let mut facts = CompactionFacts::default();
 
@@ -252,6 +253,10 @@ pub(super) fn cold_compaction_http_sse_stream(
             }
         }
 
+        if let Some(model) = canonical.response_model() {
+            observation = observation.with_upstream_response_model_if_valid(model);
+            yield ProviderEvent::observation(observation.clone());
+        }
         if let Some(tier) = canonical.response_service_tier() {
             observation = observation.with_service_tier_if_valid(tier.to_owned());
             yield ProviderEvent::observation(observation);
@@ -471,7 +476,8 @@ pub(super) fn cold_http_sse_stream(
         yield ProviderEvent::observation(observation.clone());
 
         let mut body = response.into_body();
-        let mut decoder = GrokCanonicalDecoder::for_request(upstream_model.as_str(), &request);
+        let mut decoder = GrokCanonicalDecoder::for_request(upstream_model.as_str(), &request)
+            .with_pricing(context.pricing().get("xai").and_then(|p| p.get(upstream_model.as_str())).cloned());
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
                 Err(provider_error(
@@ -534,6 +540,14 @@ pub(super) fn cold_http_sse_stream(
                         }),
                 );
             }
+            if let Some(model) = decoder.response_model()
+                && observation.upstream_response_model() != Some(model)
+            {
+                observation = observation.with_upstream_response_model_if_valid(model);
+                yield ProviderEvent::observation(observation.clone().with_timings(
+                    ProviderResponseTimings { first_token_ms, ..base_timings },
+                ));
+            }
             if let Some(tier) = decoder.response_service_tier()
                 && observation.service_tier() != Some(tier)
             {
@@ -593,6 +607,14 @@ pub(super) fn cold_http_sse_stream(
                         ..base_timings
                     }),
             );
+        }
+        if let Some(model) = decoder.response_model()
+            && observation.upstream_response_model() != Some(model)
+        {
+            observation = observation.with_upstream_response_model_if_valid(model);
+            yield ProviderEvent::observation(observation.clone().with_timings(
+                ProviderResponseTimings { first_token_ms, ..base_timings },
+            ));
         }
         if let Some(tier) = decoder.response_service_tier()
             && observation.service_tier() != Some(tier)

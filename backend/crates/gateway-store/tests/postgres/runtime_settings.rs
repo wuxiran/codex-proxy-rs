@@ -9,6 +9,8 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
+        openai_client_profile: None,
+        xai_client_profile: None,
         request_location_enabled: false,
         request_location: Default::default(),
         admin_api_key: None,
@@ -19,6 +21,7 @@ fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: "smart".to_owned(),
         model_mappings: BTreeMap::from([
             ("gpt-5.4".to_owned(), "gpt-5.5".to_owned()),
@@ -377,6 +380,176 @@ async fn auto_freeze_defaults_off_and_explicit_opt_in_round_trips() {
             .await
             .expect("settings")
             .account_auto_freeze_enabled
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn decompression_setting_should_persist_and_reach_snapshot_facts() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("decompression_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        before.responses_max_decompressed_body_bytes,
+        64 * 1024 * 1024
+    );
+    let mut update = settings_with_margin(3600);
+    update.responses_max_decompressed_body_bytes = 128 * 1024 * 1024;
+    repository.update_runtime_settings(update).await.unwrap();
+    let reloaded = PgRuntimeSettingsRepository::new(database.pool.clone())
+        .load_runtime_settings()
+        .await
+        .unwrap();
+    assert_eq!(
+        reloaded.responses_max_decompressed_body_bytes,
+        128 * 1024 * 1024
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.settings.responses_max_decompressed_body_bytes,
+        reloaded.responses_max_decompressed_body_bytes
+    );
+    assert!(snapshot.config_revision > before.config_revision);
+    for invalid in [0, u64::MAX] {
+        let mut update = settings_with_margin(3600);
+        update.responses_max_decompressed_body_bytes = invalid;
+        assert!(repository.update_runtime_settings(update).await.is_err());
+        assert_eq!(
+            repository
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .config_revision,
+            reloaded.config_revision
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_initialization_is_idempotent_and_old_updates_preserve_it() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profiles").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let provider = ProviderKind::new("openai").unwrap();
+    let document = |name| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":name})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let initial = document("imported");
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, initial.clone())
+            .await
+            .unwrap(),
+        initial
+    );
+    let revision = repository
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("ignored"))
+            .await
+            .unwrap(),
+        initial
+    );
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .config_revision,
+        revision
+    );
+    repository
+        .update_runtime_settings(settings_with_margin(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .openai_client_profile,
+        Some(initial)
+    );
+    let mut update = settings_with_margin(3600);
+    update.openai_client_profile = Some(document("edited"));
+    repository.update_runtime_settings(update).await.unwrap();
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("old-yaml"))
+            .await
+            .unwrap(),
+        document("edited")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn xai_profile_initialization_and_updates_preserve_other_providers() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("xai_profiles").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let document = |version: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"clientVersion":version})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let provider = ProviderKind::new("xai").unwrap();
+    repository
+        .initialize_request_profile(&provider, document("initial"))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("ignored"))
+            .await
+            .unwrap(),
+        document("initial")
+    );
+    let mut update = settings_with_margin(3600);
+    update.openai_client_profile = Some(document("openai"));
+    update.xai_client_profile = Some(document("xai"));
+    repository.update_runtime_settings(update).await.unwrap();
+    let mut update = settings_with_margin(3600);
+    update.xai_client_profile = Some(document("edited"));
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(settings.openai_client_profile, Some(document("openai")));
+    assert_eq!(settings.xai_client_profile, Some(document("edited")));
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("old-yaml"))
+            .await
+            .unwrap(),
+        document("edited")
     );
     database.close().await;
 }

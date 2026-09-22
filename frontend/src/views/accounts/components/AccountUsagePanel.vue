@@ -35,9 +35,9 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
 </script>
 
 <template>
-  <section class="grid min-w-0 gap-4 rounded-lg bg-cp-bg-container p-4 shadow-cp-tertiary">
-    <div class="min-w-0">
-      <div class="mb-3 flex shrink-0 items-baseline justify-between gap-3">
+  <section class="grid min-w-0 gap-4 rounded-lg bg-cp-bg-container p-4 shadow-cp-tertiary xl:min-h-0 xl:grid-cols-[0.52fr_1.48fr]">
+    <div class="min-w-0 xl:flex xl:min-h-0 xl:flex-col">
+      <div class="mb-3 flex shrink-0 items-center justify-between gap-3">
         <h3 class="m-0 text-cp-lg font-heavy text-cp-text">
           Tokens 结构
         </h3>
@@ -87,6 +87,7 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
             v-if="account.authenticationKind !== 'api_key'"
             label="预测周/月额度"
             size="sm"
+            class="h-5 w-5"
             aria-haspopup="dialog"
             @click="forecastOpen = true"
           >

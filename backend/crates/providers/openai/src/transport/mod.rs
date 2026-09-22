@@ -19,6 +19,7 @@ mod response_meta;
 pub(crate) mod session;
 pub mod subscription;
 mod time;
+pub(crate) use downstream::normalize_non_codex_request_body;
 pub(crate) use endpoints::valid_upstream_base_url;
 pub mod tls;
 pub mod usage;
@@ -35,7 +36,8 @@ pub use self::{
         CodexAccountSelectionTelemetry, CodexBackendClient, CodexBackendJsonResponse,
         CodexBackendSseStream, CodexBackendStreamingResponse, CodexBackendTransport,
         CodexClientError, CodexClientResult, CodexRateLimitUpdates, CodexRequestContext,
-        CodexTransportDecision, CodexTransportMetrics, CodexTurnStateUpdate, build_reqwest_client,
+        CodexResponseMetadataUpdates, CodexTransportDecision, CodexTransportMetrics,
+        build_reqwest_client,
     },
     diagnostics::{CodexUpstreamDiagnostics, CodexUpstreamSendPhase},
     endpoints::{
@@ -60,7 +62,10 @@ pub use self::{
         CodexRateLimitResetCreditsConsumeResult, MAX_CODEX_RESET_CREDITS_BODY_BYTES,
     },
     response_meta::CodexResponseMetadata,
-    usage::{MAX_CODEX_USAGE_BODY_BYTES, OpenAiBillingUsage, openai_billing_breakdown},
+    usage::{
+        MAX_CODEX_USAGE_BODY_BYTES, OpenAiBillingUsage, openai_billing_breakdown,
+        openai_billing_breakdown_with_override,
+    },
     websocket::{
         CodexWebSocketPool, CodexWebSocketPoolConfig, CodexWebSocketPoolKey, WebSocketPoolDecision,
     },

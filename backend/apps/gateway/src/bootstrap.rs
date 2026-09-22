@@ -17,8 +17,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     client: gateway_admin::ClientConfig,
     api: gateway_api::ApiConfig,
+    #[serde(default)]
     openai: provider_openai::OpenAiConfig,
-    xai: provider_xai::XaiConfig,
 }
 
 impl LoadableConfig for GatewayConfig {
@@ -46,9 +46,6 @@ impl LoadableConfig for GatewayConfig {
         self.openai
             .resolve_and_validate(&runtime_data_dir)
             .map_err(|_| ConfigError::InvalidField("openai"))?;
-        self.xai
-            .resolve_and_validate(source_dir)
-            .map_err(|_| ConfigError::InvalidField("xai"))?;
         Ok(())
     }
 }
@@ -64,7 +61,6 @@ pub async fn run() -> Result<(), BootstrapError> {
         client,
         api,
         openai,
-        xai,
     } = config;
 
     let public_import_dir = host.runtime_data_dir().join("public_import");
@@ -75,7 +71,7 @@ pub async fn run() -> Result<(), BootstrapError> {
     let provider_ports = store.provider_ports();
     let mut openai = provider_openai::initialize(openai, provider_ports.clone()).await?;
     host.report_startup_ready("OpenAI Provider");
-    let mut xai = provider_xai::initialize(xai, provider_ports).await?;
+    let mut xai = provider_xai::initialize(provider_ports).await?;
     host.report_startup_ready("xAI Provider");
     let providers = ProviderRegistry::new([openai.core_provider(), xai.core_provider()])?;
     let mut core = gateway_core::initialize(store.core_ports(), providers).await?;
@@ -85,6 +81,7 @@ pub async fn run() -> Result<(), BootstrapError> {
         client,
         store.admin_ports(),
         gateway_admin::AdminRuntimePorts {
+            pricing_source: std::sync::Arc::new(gateway_host::pricing::ModelsDevPricing),
             providers: vec![openai.admin_provider(), xai.admin_provider()],
             snapshot: core.snapshot_control(),
             account_probe: core.account_probe(),

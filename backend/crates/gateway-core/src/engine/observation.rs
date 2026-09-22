@@ -44,9 +44,10 @@ impl ResponseObservation {
             self.usage.merge(observed);
         }
         if let GatewayEvent::CalculatedCost(observed) = event {
+            // 保留计算总额（迁子表 model_request_billing），并在非上游报告口径时更新 cost 估算。
             self.billing.calculated_cost = Some(observed.total());
             if self.cost.source() != CostSource::ProviderReported {
-                self.cost = observed.into_estimate();
+                self.cost = observed.clone().into_estimate();
             }
         }
         if let GatewayEvent::ProviderCost(observed) = event {

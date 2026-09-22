@@ -99,11 +99,19 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
             </template>
             <template #identity="{ row }">
               <div class="grid min-w-0 gap-1">
-                <strong class="truncate text-cp text-cp-text">
-                  {{ row.name }}
-                </strong>
-                <span class="truncate text-cp-xs font-emphasis text-cp-text-quaternary">
-                  {{ row.description || '未填写描述' }}
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <strong class="truncate text-cp text-cp-text">
+                    {{ row.name }}
+                  </strong>
+                  <span
+                    v-if="row.disableFast"
+                    class="inline-flex h-6 shrink-0 items-center rounded-lg bg-cp-fill-tertiary px-2 text-cp-xs font-bold text-cp-text-secondary"
+                  >
+                    Fast 已关闭
+                  </span>
+                </div>
+                <span v-if="row.description" class="truncate text-cp-xs font-emphasis text-cp-text-quaternary">
+                  {{ row.description }}
                 </span>
               </div>
             </template>
@@ -179,14 +187,14 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
       @confirm="confirmBatchDelete"
     >
       <p class="m-0">
-        确定删除选中的 {{ selectedIds.size }} 个分组吗？账号本身不会被删除。
+        确定删除选中的 {{ selectedIds.size }} 个分组吗？账号本身不会被删除
       </p>
     </BaseConfirmModal>
 
     <BaseConfirmModal
       v-model="showDisableModal"
       title="禁用账号分组"
-      description="禁用后，使用该分组的 API 密钥将无法再使用其中的账号。"
+      description="禁用后，使用该分组的 API 密钥将无法再使用其中的账号"
       confirm-text="确认禁用"
       :loading="disabling"
       @confirm="confirmDisable"
@@ -198,7 +206,7 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
         将影响 {{ referencedKeyNames.length }} 个 API 密钥：{{ referencedKeyNames.join('、') }}
       </p>
       <p v-else-if="pendingDisableGroup?.clientKeyCount" class="mt-2 mb-0 text-cp-warning-text">
-        将影响 {{ pendingDisableGroup.clientKeyCount }} 个 API 密钥。
+        将影响 {{ pendingDisableGroup.clientKeyCount }} 个 API 密钥
       </p>
     </BaseConfirmModal>
 
@@ -212,7 +220,7 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
       @confirm="confirmDelete"
     >
       <p class="m-0">
-        确定删除“{{ pendingDeleteGroup?.name || '该分组' }}”吗？账号本身不会被删除。
+        确定删除“{{ pendingDeleteGroup?.name || '该分组' }}”吗？账号本身不会被删除
       </p>
     </BaseConfirmModal>
   </div>

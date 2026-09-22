@@ -43,7 +43,7 @@ import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
 const narrowTable = useMediaQuery('(max-width: 639px)')
-const { visibleColumns, columnOptions, setColumnVisible, resetColumns } = useTableColumns(
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(
   () => accountColumns.map(column => narrowTable.value && column.key === 'actions'
     ? { ...column, kind: 'custom' as const }
     : column),
@@ -251,6 +251,7 @@ const {
             <BaseTableColumnSettings
               :options="columnOptions"
               @change="setColumnVisible"
+              @reorder="setColumnOrder"
               @reset="resetColumns"
             />
           </template>

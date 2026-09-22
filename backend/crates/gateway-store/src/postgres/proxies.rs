@@ -28,9 +28,15 @@ use crate::{
 };
 
 const ENTITY: &str = "outbound proxy";
+// geo/质量列迁到子表 outbound_proxy_quality（fork 迁移 9002），读侧 LEFT JOIN 取回；
+// 按原列名投影，record()/exit_geo_from_row/quality_snapshot_from_row 无需改动。
+// quality_report(大 jsonb)不在列表/详情里读，仅 quality_report() 单查，故此处不投影。
 const SELECT: &str = "select p.*,
+    q.last_test_country, q.last_test_country_code, q.last_test_region, q.last_test_city,
+    q.quality_checked_at, q.quality_score, q.quality_grade, q.quality_status, q.quality_summary,
     (select count(*) from provider_accounts a where a.outbound_proxy_id = p.id) as account_count
-    from outbound_proxies p";
+    from outbound_proxies p
+    left join outbound_proxy_quality q on q.proxy_id = p.id";
 
 #[derive(Clone)]
 pub struct PgProxyRepository {
@@ -96,6 +102,8 @@ fn invalid() -> StoreError {
 fn record(row: PgRow) -> StoreResult<ProxyRecord> {
     let success: Option<bool> = row.try_get("last_test_success").map_err(|_| invalid())?;
     let ip: Option<String> = row.try_get("last_test_ip").map_err(|_| invalid())?;
+    let ipv4: Option<String> = row.try_get("last_test_ipv4").map_err(|_| invalid())?;
+    let ipv6: Option<String> = row.try_get("last_test_ipv6").map_err(|_| invalid())?;
     let latency: Option<i64> = row.try_get("last_test_latency_ms").map_err(|_| invalid())?;
     Ok(ProxyRecord {
         location: location_from_row(&row)?,
@@ -125,6 +133,12 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
                         .map_err(|_| invalid())?,
                     exit_ip: ip.map(|ip| ip.parse().map_err(|_| invalid())).transpose()?,
                     exit_geo: exit_geo_from_row(&row)?,
+                    exit_ipv4: ipv4
+                        .map(|ip| ip.parse().map_err(|_| invalid()))
+                        .transpose()?,
+                    exit_ipv6: ipv6
+                        .map(|ip| ip.parse().map_err(|_| invalid()))
+                        .transpose()?,
                     message: row
                         .try_get::<Option<String>, _>("last_test_message")
                         .map_err(|_| invalid())?
@@ -262,14 +276,27 @@ fn quality_report_from_document(
 }
 
 /// 连通性结果的五个基础列之后依次绑定地区四列；失败结果的地区恒为空以满足表约束。
-const RECORD_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_message = $6, last_test_country = $7, last_test_country_code = $8,      last_test_region = $9, last_test_city = $10";
+// 父表 outbound_proxies 只保连通性 + 上游双栈列；geo（country/code/region/city）迁子表，见 upsert_test_geo。
+const RECORD_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_ipv4 = $6, last_test_ipv6 = $7, last_test_message = $8";
 
 fn bind_test_result<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    result: ProxyTestResult,
+    result: &ProxyTestResult,
 ) -> StoreResult<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-    let geo = result.exit_geo.filter(|_| result.success);
-    let (country, code, region, city) = match geo {
+    Ok(query
+        .bind(result.success)
+        .bind(i64::try_from(result.latency_ms).map_err(|_| invalid())?)
+        .bind(result.exit_ip.map(|ip| ip.to_string()))
+        .bind(result.exit_ipv4.map(|ip| ip.to_string()))
+        .bind(result.exit_ipv6.map(|ip| ip.to_string()))
+        .bind(result.message.clone()))
+}
+
+/// 出口地区只在连通成功时保留；失败或无地区时四列均为空（与原「每次测试重置 geo」一致）。
+fn test_geo_columns(
+    result: &ProxyTestResult,
+) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    match result.exit_geo.clone().filter(|_| result.success) {
         Some(geo) => (
             Some(geo.country),
             Some(geo.country_code),
@@ -277,16 +304,35 @@ fn bind_test_result<'q>(
             geo.city,
         ),
         None => (None, None, None, None),
-    };
-    Ok(query
-        .bind(result.success)
-        .bind(i64::try_from(result.latency_ms).map_err(|_| invalid())?)
-        .bind(result.exit_ip.map(|ip| ip.to_string()))
-        .bind(result.message)
-        .bind(country)
-        .bind(code)
-        .bind(region)
-        .bind(city))
+    }
+}
+
+/// 把出口地区写进子表；仅更新 geo 四列，保留既有质量快照（对应原来「普通测试不动 quality 列」）。
+async fn upsert_test_geo(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: &str,
+    result: &ProxyTestResult,
+) -> StoreResult<()> {
+    let (country, code, region, city) = test_geo_columns(result);
+    sqlx::query(
+        "insert into outbound_proxy_quality
+           (proxy_id, last_test_country, last_test_country_code, last_test_region, last_test_city)
+         values ($1, $2, $3, $4, $5)
+         on conflict (proxy_id) do update set
+           last_test_country = excluded.last_test_country,
+           last_test_country_code = excluded.last_test_country_code,
+           last_test_region = excluded.last_test_region,
+           last_test_city = excluded.last_test_city",
+    )
+    .bind(id)
+    .bind(country)
+    .bind(code)
+    .bind(region)
+    .bind(city)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| unavailable())?;
+    Ok(())
 }
 
 pub(crate) fn location_from_row(
@@ -375,8 +421,8 @@ pub(crate) async fn resolve_proxy_selection(
             Ok((Some(id), Some(proxy.clone())))
         }
         AccountProxySelection::Saved(id) => {
-            let (value, tested) = sqlx::query_as::<_, (String, Option<bool>)>(
-                "select proxy_url, last_test_success from outbound_proxies where id = $1 for share",
+            let value: String = sqlx::query_scalar(
+                "select proxy_url from outbound_proxies where id = $1 for share",
             )
             .bind(id)
             .fetch_optional(&mut **transaction)
@@ -386,9 +432,6 @@ pub(crate) async fn resolve_proxy_selection(
                 entity: ENTITY,
                 id: id.clone(),
             })?;
-            if tested != Some(true) {
-                return Err(conflict(id));
-            }
             Ok((
                 Some(id.clone()),
                 Some(OutboundProxy::parse(&value).map_err(|_| invalid())?),
@@ -595,15 +638,15 @@ impl ProxyStore for PgProxyRepository {
             return Err(store_error(conflict(id)));
         }
         let record = match self.get(id).await {
-            Ok(record) if record.last_test.as_ref().is_some_and(|test| test.success) => record,
-            result => {
+            Ok(record) => record,
+            Err(error) => {
                 // 拒绝预留时先等待数据库释放锁，避免连接关闭尚未生效就误挡后续代理操作。
                 sqlx::query("select pg_advisory_unlock_shared(hashtextextended($1, 739219))")
                     .bind(id)
                     .execute(&mut connection)
                     .await
                     .map_err(|_| store_error(unavailable()))?;
-                return Err(result.err().unwrap_or_else(|| store_error(conflict(id))));
+                return Err(error);
             }
         };
         Ok(ProxyImportReservation {
@@ -745,6 +788,17 @@ impl ProxyStore for PgProxyRepository {
             if duplicate {
                 return Err(store_error(conflict(&command.id)));
             }
+            // URL 变更即清空该代理的 geo/质量子表行（等价于原来 update 把这些列一起置 NULL）。
+            // 在父表 update 之前执行，此时 proxy_url 仍是旧值，比对才成立。
+            sqlx::query(
+                "delete from outbound_proxy_quality q using outbound_proxies p
+                 where q.proxy_id = p.id and p.id = $1 and p.proxy_url <> $2",
+            )
+            .bind(&command.id)
+            .bind(proxy.expose_url())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| store_error(unavailable()))?;
         }
         let changed = sqlx::query(
             "update outbound_proxies set name = $3, proxy_url = coalesce($4, proxy_url), revision = revision + 1, updated_at = now(),
@@ -752,17 +806,9 @@ impl ProxyStore for PgProxyRepository {
              last_test_success = case when $4 is not null and $4 <> proxy_url then null else last_test_success end,
              last_test_latency_ms = case when $4 is not null and $4 <> proxy_url then null else last_test_latency_ms end,
              last_test_ip = case when $4 is not null and $4 <> proxy_url then null else last_test_ip end,
-             last_test_message = case when $4 is not null and $4 <> proxy_url then null else last_test_message end,
-             last_test_country = case when $4 is not null and $4 <> proxy_url then null else last_test_country end,
-             last_test_country_code = case when $4 is not null and $4 <> proxy_url then null else last_test_country_code end,
-             last_test_region = case when $4 is not null and $4 <> proxy_url then null else last_test_region end,
-             last_test_city = case when $4 is not null and $4 <> proxy_url then null else last_test_city end,
-             quality_checked_at = case when $4 is not null and $4 <> proxy_url then null else quality_checked_at end,
-             quality_score = case when $4 is not null and $4 <> proxy_url then null else quality_score end,
-             quality_grade = case when $4 is not null and $4 <> proxy_url then null else quality_grade end,
-             quality_status = case when $4 is not null and $4 <> proxy_url then null else quality_status end,
-             quality_summary = case when $4 is not null and $4 <> proxy_url then null else quality_summary end,
-             quality_report = case when $4 is not null and $4 <> proxy_url then null else quality_report end
+             last_test_ipv4 = case when $4 is not null and $4 <> proxy_url then null else last_test_ipv4 end,
+             last_test_ipv6 = case when $4 is not null and $4 <> proxy_url then null else last_test_ipv6 end,
+             last_test_message = case when $4 is not null and $4 <> proxy_url then null else last_test_message end
              where id = $1 and revision = $2")
             .bind(&command.id).bind(i64::try_from(command.revision.get()).map_err(|_| store_error(invalid()))?)
             .bind(&command.name).bind(command.proxy.as_ref().map(OutboundProxy::expose_url))
@@ -874,7 +920,7 @@ impl ProxyStore for PgProxyRepository {
         let query = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(id)
             .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);
-        let updated = bind_test_result(query, result)
+        let updated = bind_test_result(query, &result)
             .map_err(store_error)?
             .execute(&mut *transaction)
             .await
@@ -882,6 +928,10 @@ impl ProxyStore for PgProxyRepository {
         if updated.rows_affected() != 1 {
             return Err(store_error(conflict(id)));
         }
+        // 出口地区写子表（连通性+双栈已写父表）；两组数据在同一事务里一起前进。
+        upsert_test_geo(&mut transaction, id, &result)
+            .await
+            .map_err(store_error)?;
         let current: i64 =
             sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
                 .fetch_one(&mut *transaction)
@@ -932,33 +982,62 @@ impl ProxyStore for PgProxyRepository {
             latency_ms: base.latency_ms.unwrap_or_default(),
             exit_ip: report.exit_ip,
             exit_geo: report.exit_geo.clone(),
+            // 质量检测是单次探测，不做双栈；双栈列由 record_test 路径写入。
+            exit_ipv4: None,
+            exit_ipv6: None,
             message: if base.status == ProxyQualityItemStatus::Pass {
                 "连接成功".to_owned()
             } else {
                 base.message.clone()
             },
         };
-        let statement = format!(
-            "update outbound_proxies set {RECORD_TEST_SET}, quality_checked_at = $11, quality_score = $12,              quality_grade = $13, quality_status = $14, quality_summary = $15, quality_report = $16              where id = $1 and revision = $2"
-        );
-        let document = quality_report_document(&report);
+        // 连通性+双栈写父表；geo + 质量快照/报告写子表 outbound_proxy_quality（同事务）。
+        let statement =
+            format!("update outbound_proxies set {RECORD_TEST_SET} where id = $1 and revision = $2");
         let query = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(id)
             .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);
-        let updated = bind_test_result(query, test)
+        let updated = bind_test_result(query, &test)
             .map_err(store_error)?
-            .bind(report.snapshot.checked_at)
-            .bind(i16::from(report.snapshot.score))
-            .bind(report.snapshot.grade.to_string())
-            .bind(report.snapshot.status.as_str())
-            .bind(report.snapshot.summary)
-            .bind(sqlx::types::Json(document))
             .execute(&mut *transaction)
             .await
             .map_err(|_| store_error(unavailable()))?;
         if updated.rows_affected() != 1 {
             return Err(store_error(conflict(id)));
         }
+        let (country, code, region, city) = test_geo_columns(&test);
+        let document = quality_report_document(&report);
+        sqlx::query(
+            "insert into outbound_proxy_quality
+               (proxy_id, last_test_country, last_test_country_code, last_test_region, last_test_city,
+                quality_checked_at, quality_score, quality_grade, quality_status, quality_summary, quality_report)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             on conflict (proxy_id) do update set
+               last_test_country = excluded.last_test_country,
+               last_test_country_code = excluded.last_test_country_code,
+               last_test_region = excluded.last_test_region,
+               last_test_city = excluded.last_test_city,
+               quality_checked_at = excluded.quality_checked_at,
+               quality_score = excluded.quality_score,
+               quality_grade = excluded.quality_grade,
+               quality_status = excluded.quality_status,
+               quality_summary = excluded.quality_summary,
+               quality_report = excluded.quality_report",
+        )
+        .bind(id)
+        .bind(country)
+        .bind(code)
+        .bind(region)
+        .bind(city)
+        .bind(report.snapshot.checked_at)
+        .bind(i16::from(report.snapshot.score))
+        .bind(report.snapshot.grade.to_string())
+        .bind(report.snapshot.status.as_str())
+        .bind(report.snapshot.summary)
+        .bind(sqlx::types::Json(document))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| store_error(unavailable()))?;
         let current: i64 =
             sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
                 .fetch_one(&mut *transaction)
@@ -984,19 +1063,29 @@ impl ProxyStore for PgProxyRepository {
     }
 
     async fn quality_report(&self, id: &str) -> AdminStoreResult<Option<ProxyQualityReport>> {
-        let row = sqlx::query(
-            "select quality_checked_at, quality_score, quality_grade, quality_status,              quality_summary, quality_report from outbound_proxies where id = $1",
+        // 质量列已迁子表；先确认代理存在（区分 NotFound 与"无质量报告"），再读子表。
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from outbound_proxies where id = $1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| store_error(unavailable()))?;
+        if !exists {
+            return Err(store_error(StoreError::NotFound {
+                entity: ENTITY,
+                id: id.to_owned(),
+            }));
+        }
+        let Some(row) = sqlx::query(
+            "select quality_checked_at, quality_score, quality_grade, quality_status,              quality_summary, quality_report from outbound_proxy_quality where proxy_id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| store_error(unavailable()))?
-        .ok_or_else(|| {
-            store_error(StoreError::NotFound {
-                entity: ENTITY,
-                id: id.to_owned(),
-            })
-        })?;
+        else {
+            return Ok(None);
+        };
         let Some(snapshot) = quality_snapshot_from_row(&row).map_err(store_error)? else {
             return Ok(None);
         };

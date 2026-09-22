@@ -108,7 +108,7 @@ const triggerClasses = computed(() => [
         ? 'cursor-pointer bg-(--cp-input-active-bg) text-cp-text shadow-cp-input-active'
         : [
             'cursor-pointer bg-[var(--cp-input-bg)] text-cp-text',
-            'hover:bg-[var(--cp-input-hover-bg)] hover:shadow-cp-input-hover',
+            'hover:not-focus-visible:bg-[var(--cp-input-hover-bg)] hover:not-focus-visible:shadow-cp-input-hover',
             'focus-visible:bg-(--cp-input-active-bg) focus-visible:shadow-cp-input-active',
           ],
 ])
@@ -210,6 +210,17 @@ function moveActive(delta: number) {
   const current = indexes.indexOf(activeIndex.value)
   const next = current === -1 ? (delta > 0 ? 0 : indexes.length - 1) : current + delta
   activeIndex.value = indexes[(next + indexes.length) % indexes.length]
+  // 只有键盘导航主动定位；鼠标悬停不能把半露出的选项滚入视口。
+  scrollActiveIntoView()
+}
+
+function handleOptionFocus(index: number) {
+  const option = props.options[index]
+  if (!option || option.disabled)
+    return
+
+  activeIndex.value = index
+  scrollActiveIntoView()
 }
 
 function chooseOption(option: SelectOption, index: number) {
@@ -281,8 +292,6 @@ function optionClasses(option: SelectOption, index: number) {
           : 'cursor-pointer bg-transparent text-cp-text hover:bg-cp-bg-text-hover',
   ]
 }
-
-watch(activeIndex, scrollActiveIntoView, { flush: 'post' })
 
 watch(
   () => [props.options, props.size, model.value],
@@ -382,7 +391,7 @@ useEventListener(window, 'scroll', updatePopoverPositionThrottled, { capture: tr
                   :disabled="option.disabled"
                   :class="optionClasses(option, index)"
                   @mouseenter="activeIndex = option.disabled ? activeIndex : index"
-                  @focus="activeIndex = option.disabled ? activeIndex : index"
+                  @focus="handleOptionFocus(index)"
                   @mousedown.prevent
                   @click="chooseOption(option, index)"
                 >

@@ -124,16 +124,17 @@ pub(crate) fn literal_prefix_pattern(value: &str) -> String {
 }
 
 pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
-    "select mr.id, mr.endpoint, mr.client_transport, mr.requested_model_id,
+    "select mr.id, client_key.name as client_api_key_name, mr.endpoint, mr.client_transport, mr.requested_model_id,
             mr.provider_kind, mr.provider_account_ref,
             mr.provider_account_name_snapshot as provider_account_name,
             mr.provider_account_email_snapshot as provider_account_email,
+            account.notes as provider_account_notes,
             mr.provider_account_authentication_kind_snapshot
               as provider_account_authentication_kind,
-            mr.upstream_model_id, mr.upstream_transport, mr.service_tier,
+            mr.upstream_model_id, mr.upstream_transport, mr.upstream_response_model, mr.service_tier,
             mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
             mr.reasoning_tokens, mr.image_input_tokens, mr.image_output_tokens,
-            mr.total_tokens, mr.cost_source, mr.cost_amount::text, mr.cost_currency,
+            mr.total_tokens, mr.billing_snapshot_json, mr.cost_source, mr.cost_amount::text, mr.cost_currency,
             mr.transport_decision_wait_ms, mr.connect_ms, mr.headers_ms,
             mr.first_event_ms, mr.first_reasoning_ms, mr.first_text_ms, mr.first_token_ms,
             mr.provider_processing_ms, mr.latency_ms, mr.admission_decision_ms,
@@ -141,7 +142,9 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             host(mr.client_ip) as client_ip, mr.user_agent,
             mr.reasoning_effort, mr.reasoning_preset, mr.subagent_kind, mr.compact,
             mr.started_at
-     from model_requests mr";
+     from model_requests mr
+     left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
+     left join provider_accounts account on account.id = mr.provider_account_ref";
 
 pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
     "select mr.id, mr.client_api_key_ref, mr.config_revision,
@@ -154,14 +157,14 @@ pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
             mr.provider_account_authentication_kind_snapshot
               as provider_account_authentication_kind,
             mr.upstream_model_id, mr.upstream_transport, mr.http_version, mr.websocket_pool,
-            mr.service_tier, mr.provider_observation_json, mr.diagnostic_trace_json,
+            mr.service_tier, mr.upstream_response_model, mr.provider_observation_json, mr.diagnostic_trace_json,
             mr.attempt_count, mr.upstream_send_state, mr.downstream_committed_at,
             mr.outcome, mr.client_status_code, mr.upstream_status_code,
             mr.client_response_id, mr.upstream_request_id, mr.upstream_response_id,
             mr.error_kind, mr.provider_error_code, mr.error_message, mr.retry_after_ms,
             mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
             mr.reasoning_tokens, mr.image_input_tokens, mr.image_output_tokens,
-            mr.total_tokens, mr.cost_source, mr.cost_amount::text,
+            mr.total_tokens, mr.billing_snapshot_json, mr.cost_source, mr.cost_amount::text,
             mr.cost_currency, mr.transport_decision_wait_ms, mr.connect_ms, mr.headers_ms,
             mr.first_event_ms, mr.first_reasoning_ms, mr.first_text_ms, mr.first_token_ms,
             mr.provider_processing_ms, mr.latency_ms, mr.admission_decision_ms,

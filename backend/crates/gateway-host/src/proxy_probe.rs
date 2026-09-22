@@ -3,7 +3,7 @@
 //! 探测目标只来自编译期常量或组合根注入，从不接受请求传入的地址。
 
 use std::{
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,6 +27,15 @@ const QUALITY_TIMEOUT: Duration = Duration::from_secs(15);
 const QUALITY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
+/// 出口 IP 探测策略：单端点（返回 v4 或 v6），或分别对 v4/v6 专用端点并发探测得到真实双栈出口。
+enum ProbeStrategy {
+    Single(String),
+    Dual {
+        ipv4_endpoint: String,
+        ipv6_endpoint: String,
+    },
+}
+
 /// 无凭据请求的预期状态码即代表「目标可达」；实测校准后固定，不随请求变化。
 #[derive(Debug, Clone)]
 pub struct ProxyQualityTarget {
@@ -47,7 +56,8 @@ impl ProxyQualityTarget {
 }
 
 pub struct HttpProxyProbe {
-    endpoint: String,
+    // 出口 IP 走策略（单栈/双栈）；地区与质量目标是 fork 定制，可选开启。
+    strategy: ProbeStrategy,
     geo_endpoint: Option<String>,
     quality_targets: Vec<ProxyQualityTarget>,
     build_client: Arc<ProxyClientBuilder>,
@@ -58,27 +68,30 @@ type ProxyClientBuilder =
 
 impl Default for HttpProxyProbe {
     fn default() -> Self {
-        // 使用双栈端点，避免仅有 IPv6 出口的代理被 IPv4 专用检测服务误判为不可用。
-        Self::new("https://api64.ipify.org?format=json")
-            // 免费地区服务只提供明文 HTTP；请求经代理发出，既得到出口视角，也不消耗本机限额。
-            .with_geo_endpoint(
-                "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city&lang=zh-CN",
-            )
-            // 只检测网关真实会访问的上游：Codex 后端、令牌刷新、官方 API 与 xAI。
-            .with_quality_targets(vec![
-                ProxyQualityTarget::new(
-                    "chatgpt",
-                    "https://chatgpt.com/backend-api/codex/models",
-                    &[401, 404, 405],
-                ),
-                ProxyQualityTarget::new(
-                    "openai_auth",
-                    "https://auth.openai.com/oauth/token",
-                    &[302, 400, 401, 405],
-                ),
-                ProxyQualityTarget::new("openai_api", "https://api.openai.com/v1/models", &[401]),
-                ProxyQualityTarget::new("xai", "https://api.x.ai/v1/models", &[401]),
-            ])
+        // 分别向 IPv4/IPv6 专用端点并发探测，得到真实双栈出口；再叠加地区与质量检测。
+        Self::new_dual(
+            "https://api.ipify.org?format=json",
+            "https://api6.ipify.org?format=json",
+        )
+        // 免费地区服务只提供明文 HTTP；请求经代理发出，既得到出口视角，也不消耗本机限额。
+        .with_geo_endpoint(
+            "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city&lang=zh-CN",
+        )
+        // 只检测网关真实会访问的上游：Codex 后端、令牌刷新、官方 API 与 xAI。
+        .with_quality_targets(vec![
+            ProxyQualityTarget::new(
+                "chatgpt",
+                "https://chatgpt.com/backend-api/codex/models",
+                &[401, 404, 405],
+            ),
+            ProxyQualityTarget::new(
+                "openai_auth",
+                "https://auth.openai.com/oauth/token",
+                &[302, 400, 401, 405],
+            ),
+            ProxyQualityTarget::new("openai_api", "https://api.openai.com/v1/models", &[401]),
+            ProxyQualityTarget::new("xai", "https://api.x.ai/v1/models", &[401]),
+        ])
     }
 }
 
@@ -87,7 +100,20 @@ impl HttpProxyProbe {
     #[must_use]
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            strategy: ProbeStrategy::Single(endpoint.into()),
+            geo_endpoint: None,
+            quality_targets: Vec::new(),
+            build_client: Arc::new(|builder| builder.build().map_err(|_| "无法创建代理连接")),
+        }
+    }
+
+    #[must_use]
+    pub fn new_dual(ipv4_endpoint: impl Into<String>, ipv6_endpoint: impl Into<String>) -> Self {
+        Self {
+            strategy: ProbeStrategy::Dual {
+                ipv4_endpoint: ipv4_endpoint.into(),
+                ipv6_endpoint: ipv6_endpoint.into(),
+            },
             geo_endpoint: None,
             quality_targets: Vec::new(),
             build_client: Arc::new(|builder| builder.build().map_err(|_| "无法创建代理连接")),
@@ -134,8 +160,22 @@ impl HttpProxyProbe {
         (self.build_client)(builder)
     }
 
-    async fn exit_ip(&self, client: &reqwest::Client) -> Result<IpAddr, &'static str> {
-        let response = client.get(&self.endpoint).send().await.map_err(|error| {
+    /// 经指定代理请求指定出口检测端点；策略层用来分别探测 v4/v6。
+    async fn exit_ip_at(
+        &self,
+        proxy: &OutboundProxy,
+        endpoint: &str,
+    ) -> Result<IpAddr, &'static str> {
+        let client = self.client(proxy, Duration::from_secs(12))?;
+        self.exit_ip_from(&client, endpoint).await
+    }
+
+    async fn exit_ip_from(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> Result<IpAddr, &'static str> {
+        let response = client.get(endpoint).send().await.map_err(|error| {
             if error.is_timeout() {
                 "代理连接超时"
             } else {
@@ -183,28 +223,115 @@ impl HttpProxyProbe {
             .flatten()
     }
 
+    /// 按策略探测出口 IP：单栈返回 v4 或 v6；双栈并发探测得到真实 v4+v6。
+    /// 返回 (成功, exit_ip, exit_ipv4, exit_ipv6, 结论文案)，供 base() 叠加地区/耗时。
+    async fn probe_exit(
+        &self,
+        proxy: &OutboundProxy,
+    ) -> (
+        bool,
+        Option<IpAddr>,
+        Option<Ipv4Addr>,
+        Option<Ipv6Addr>,
+        String,
+    ) {
+        let timeout_limit = Duration::from_secs(15);
+        match &self.strategy {
+            ProbeStrategy::Single(endpoint) => {
+                let result = tokio::time::timeout(timeout_limit, self.exit_ip_at(proxy, endpoint))
+                    .await
+                    .unwrap_or(Err("代理连接超时"));
+                match result {
+                    Ok(ip) => {
+                        let (v4, v6) = match ip {
+                            IpAddr::V4(v4) => (Some(v4), None),
+                            IpAddr::V6(v6) => (None, Some(v6)),
+                        };
+                        (true, Some(ip), v4, v6, "连接成功".to_owned())
+                    }
+                    Err(err) => (false, None, None, None, err.to_owned()),
+                }
+            }
+            ProbeStrategy::Dual {
+                ipv4_endpoint,
+                ipv6_endpoint,
+            } => {
+                let probe_dual = async {
+                    tokio::join!(
+                        self.exit_ip_at(proxy, ipv4_endpoint),
+                        self.exit_ip_at(proxy, ipv6_endpoint),
+                    )
+                };
+                match tokio::time::timeout(timeout_limit, probe_dual).await {
+                    Ok((res_v4, res_v6)) => {
+                        let exit_ipv4: Option<Ipv4Addr> = match res_v4 {
+                            Ok(IpAddr::V4(v4)) => Some(v4),
+                            _ => None,
+                        };
+                        let exit_ipv6: Option<Ipv6Addr> = match res_v6 {
+                            Ok(IpAddr::V6(v6)) => Some(v6),
+                            _ => None,
+                        };
+                        if exit_ipv4.is_some() && exit_ipv6.is_some() {
+                            (
+                                true,
+                                exit_ipv4.map(IpAddr::V4),
+                                exit_ipv4,
+                                exit_ipv6,
+                                "连接成功（双栈可用）".to_owned(),
+                            )
+                        } else if let Some(v4) = exit_ipv4 {
+                            (
+                                true,
+                                Some(IpAddr::V4(v4)),
+                                Some(v4),
+                                None,
+                                "连接成功（仅 IPv4）".to_owned(),
+                            )
+                        } else if let Some(v6) = exit_ipv6 {
+                            (
+                                true,
+                                Some(IpAddr::V6(v6)),
+                                None,
+                                Some(v6),
+                                "连接成功（仅 IPv6）".to_owned(),
+                            )
+                        } else {
+                            let message = res_v4
+                                .err()
+                                .or(res_v6.err())
+                                .unwrap_or("代理连接失败")
+                                .to_owned();
+                            (false, None, None, None, message)
+                        }
+                    }
+                    Err(_) => (false, None, None, None, "代理连接超时".to_owned()),
+                }
+            }
+        }
+    }
+
     async fn base(&self, proxy: &OutboundProxy) -> (ProxyTestResult, Option<reqwest::Client>) {
         let started = Instant::now();
-        let client = self.client(proxy, Duration::from_secs(12));
-        let result = match &client {
-            Ok(client) => tokio::time::timeout(Duration::from_secs(15), self.exit_ip(client))
-                .await
-                .unwrap_or(Err("代理连接超时")),
-            Err(message) => Err(*message),
-        };
+        let (success, exit_ip, exit_ipv4, exit_ipv6, message) = self.probe_exit(proxy).await;
         let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let client = client.ok().filter(|_| result.is_ok());
+        // 地区/质量复用一个新客户端（与出口探测端点无关，只需相同代理配置）；失败则不查地区。
+        let client = success
+            .then(|| self.client(proxy, Duration::from_secs(12)).ok())
+            .flatten();
         let exit_geo = match &client {
             Some(client) => self.exit_geo(client).await,
             None => None,
         };
         (
             ProxyTestResult {
-                success: result.is_ok(),
+                success,
                 latency_ms,
-                exit_ip: result.as_ref().ok().copied(),
+                exit_ip,
                 exit_geo,
-                message: result.map_or_else(str::to_owned, |_| "连接成功".to_owned()),
+                exit_ipv4,
+                exit_ipv6,
+                message,
             },
             client,
         )

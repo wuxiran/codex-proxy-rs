@@ -32,6 +32,12 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/accounts/index.vue'),
       },
       {
+        // 免登录导入管理页（生成/轮换密链）；密链持有者面向的页面是 /import/:token。
+        path: 'public-import',
+        name: 'public-import-admin',
+        component: () => import('@/views/public-import-admin/index.vue'),
+      },
+      {
         path: 'proxies',
         name: 'proxies',
         component: () => import('@/views/proxies/index.vue'),
@@ -62,8 +68,23 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/settings/index.vue'),
       },
       {
+        path: 'settings/upstream',
+        name: 'settings-upstream',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
+        path: 'settings/access',
+        name: 'settings-access',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
         path: 'settings/backup',
         name: 'settings-backup',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
+        path: 'settings/pricing',
+        name: 'settings-pricing',
         component: () => import('@/views/settings/index.vue'),
       },
     ],

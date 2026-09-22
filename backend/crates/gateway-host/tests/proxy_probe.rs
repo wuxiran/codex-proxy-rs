@@ -283,3 +283,61 @@ fn cloudflare_challenge_needs_a_blocking_status_and_a_challenge_signal() {
         "just a moment"
     ));
 }
+
+#[tokio::test]
+async fn dual_stack_proxy_probe_reports_both_addresses_when_available() {
+    let proxy_server = MockServer::start().await;
+    Mock::given(path("/v4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ip": "203.0.113.8"})))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(path("/v6"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ip": "2001:db8::8"})))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    let proxy = OutboundProxy::parse(&proxy_server.uri()).unwrap();
+    let result = HttpProxyProbe::new_dual(
+        format!("{}/v4", proxy_server.uri()),
+        format!("{}/v6", proxy_server.uri()),
+    )
+    .test(&proxy)
+    .await;
+
+    assert!(result.success);
+    assert_eq!(result.exit_ipv4.unwrap().to_string(), "203.0.113.8");
+    assert_eq!(result.exit_ipv6.unwrap().to_string(), "2001:db8::8");
+    assert!(result.message.contains("双栈可用"));
+}
+
+#[tokio::test]
+async fn dual_stack_proxy_probe_reports_single_stack_when_only_one_succeeds() {
+    let proxy_server = MockServer::start().await;
+    Mock::given(path("/v4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ip": "203.0.113.8"})))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(path("/v6"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    let proxy = OutboundProxy::parse(&proxy_server.uri()).unwrap();
+    let result = HttpProxyProbe::new_dual(
+        format!("{}/v4", proxy_server.uri()),
+        format!("{}/v6", proxy_server.uri()),
+    )
+    .test(&proxy)
+    .await;
+
+    assert!(result.success);
+    assert_eq!(result.exit_ipv4.unwrap().to_string(), "203.0.113.8");
+    assert!(result.exit_ipv6.is_none());
+    assert!(result.message.contains("仅 IPv4"));
+}

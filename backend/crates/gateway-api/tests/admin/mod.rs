@@ -177,6 +177,7 @@ impl AdminTestFixture {
             ClientConfig::default(),
             stores,
             gateway_admin::AdminRuntimePorts {
+                pricing_source: Arc::new(StaticPricingSource),
                 providers,
                 snapshot: Arc::new(NoopSnapshot),
                 account_probe: Arc::new(NoopProbe),
@@ -274,6 +275,20 @@ impl MemoryAuthStore {
             session_id.to_owned(),
             AuthSession {
                 subject: gateway_admin::model::auth::SessionSubject::Admin {
+                    credential_fingerprint: {
+                        use base64::Engine as _;
+                        use sha2::Digest as _;
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                            sha2::Sha256::digest(
+                                self.password_hash
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .unwrap()
+                                    .as_bytes(),
+                            ),
+                        )
+                    },
                     admin_user_id: "admin_1".to_owned(),
                 },
                 expires_at: Utc::now() + Duration::hours(1),
@@ -302,6 +317,28 @@ impl MemoryAuthStore {
 impl AuthStore for MemoryAuthStore {
     async fn load_password_hash(&self, _: &str) -> AdminStoreResult<Option<String>> {
         Ok(self.password_hash.lock().expect("password hash").clone())
+    }
+
+    async fn change_password(
+        &self,
+        _: &str,
+        expected_hash: &str,
+        password_hash: &str,
+        audit: gateway_admin::model::auth::AdminAuditEvent,
+    ) -> AdminStoreResult<bool> {
+        if self.fail_audit.load(Ordering::SeqCst) {
+            return Err(unavailable("audit"));
+        }
+        let mut stored = self.password_hash.lock().unwrap();
+        let Some(credentials) = stored
+            .as_mut()
+            .filter(|value| value.as_str() == expected_hash)
+        else {
+            return Ok(false);
+        };
+        *credentials = password_hash.to_owned();
+        self.audits.lock().unwrap().push(audit);
+        Ok(true)
     }
 
     async fn create_password_hash_if_absent(
@@ -372,14 +409,31 @@ impl AuthStore for MemoryAuthStore {
 }
 
 pub(super) struct MemorySettingsStore {
+    pricing: Mutex<gateway_admin::model::pricing::StoredPricing>,
     settings: Mutex<RuntimeSettings>,
     api_key: Arc<Mutex<Option<AdminApiKey>>>,
+}
+
+struct StaticPricingSource;
+#[async_trait]
+impl gateway_admin::ports::pricing::PricingSource for StaticPricingSource {
+    async fn fetch(
+        &self,
+    ) -> Result<gateway_admin::model::pricing::PricingSyncPreview, gateway_admin::model::AdminError>
+    {
+        Ok(gateway_admin::model::pricing::PricingSyncPreview {
+            prices: serde_json::from_value(serde_json::json!({"openai":{"gpt-5.4":{
+                "multiplierBps":10000,"bands":{"standard":{"input":"2.5","output":"15","cacheRead":"0.25","cacheWrite":"0"}}
+            }}})).expect("prices"), skipped: vec![],
+        })
+    }
 }
 
 impl MemorySettingsStore {
     fn new(api_key: Arc<Mutex<Option<AdminApiKey>>>) -> Self {
         Self {
             settings: Mutex::new(test_runtime_settings()),
+            pricing: Mutex::default(),
             api_key,
         }
     }
@@ -391,6 +445,70 @@ impl MemorySettingsStore {
 
 #[async_trait]
 impl SettingsStore for MemorySettingsStore {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        Ok(self.pricing.lock().expect("pricing").clone())
+    }
+    async fn sync_pricing(
+        &self,
+        changes: gateway_admin::model::pricing::PricingSyncChanges,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let mut pricing = self.pricing.lock().expect("pricing");
+        for (provider, models) in changes {
+            let stored = pricing.synced.entry(provider).or_default();
+            for (model, price) in models {
+                if let Some(price) = price {
+                    stored.insert(model, price);
+                } else {
+                    stored.remove(&model);
+                }
+            }
+        }
+        pricing.synced.retain(|_, models| !models.is_empty());
+        pricing.synced_at = Some(Utc::now());
+        let mut settings = self.settings.lock().expect("settings");
+        settings.config_revision = next_revision(settings.config_revision);
+        Ok(settings.config_revision)
+    }
+    async fn update_pricing(
+        &self,
+        command: gateway_admin::model::pricing::UpdatePricing,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        use gateway_admin::model::pricing::PricingChange;
+        let mut pricing = self.pricing.lock().expect("pricing");
+        let gateway_admin::model::pricing::StoredPricing {
+            overrides, synced, ..
+        } = &mut *pricing;
+        let models = overrides.entry(command.provider.clone()).or_default();
+        let source = synced.entry(command.provider).or_default();
+        for model in command.models {
+            match &command.change {
+                PricingChange::Reset => {
+                    models.remove(&model);
+                }
+                PricingChange::Delete => {
+                    models.remove(&model);
+                    source.remove(&model);
+                }
+                PricingChange::Replace(p) => {
+                    models.insert(model, p.clone());
+                }
+                PricingChange::Multiplier(bps) => {
+                    models
+                        .entry(model)
+                        .or_insert_with(|| gateway_core::metering::ModelPriceOverride {
+                            multiplier_bps: 10_000,
+                            bands: Default::default(),
+                        })
+                        .multiplier_bps = *bps;
+                }
+            }
+        }
+        let mut settings = self.settings.lock().expect("settings");
+        settings.config_revision = next_revision(settings.config_revision);
+        Ok(settings.config_revision)
+    }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(self.settings.lock().expect("settings").clone())
     }
@@ -406,6 +524,8 @@ impl SettingsStore for MemorySettingsStore {
     ) -> AdminStoreResult<RuntimeSettings> {
         let mut settings = self.settings.lock().expect("settings");
         let updated = RuntimeSettings {
+            openai_client_profile: None,
+            xai_client_profile: None,
             request_location_enabled: command.request_location_enabled,
             request_location: command.request_location,
             config_revision: next_revision(settings.config_revision),
@@ -417,6 +537,7 @@ impl SettingsStore for MemorySettingsStore {
             max_waiting_per_key: command.max_waiting_per_key,
             max_waiting_per_account: command.max_waiting_per_account,
             concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+            responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
             rotation_strategy: command.rotation_strategy,
             min_codex_desktop_version: command.min_codex_desktop_version,
             min_codex_cli_version: command.min_codex_cli_version,
@@ -495,6 +616,7 @@ impl MemoryAccountGroupStore {
             (
                 primary_id.clone(),
                 AccountGroupRecord {
+                    disable_fast: false,
                     id: primary_id,
                     name: "Alpha routing".to_owned(),
                     description: Some("Primary traffic".to_owned()),
@@ -516,6 +638,7 @@ impl MemoryAccountGroupStore {
             (
                 secondary_id.clone(),
                 AccountGroupRecord {
+                    disable_fast: false,
                     id: secondary_id,
                     name: "Beta routing".to_owned(),
                     description: None,
@@ -631,6 +754,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut state = self.state.lock().expect("account groups");
         let now = Utc::now();
         let record = AccountGroupRecord {
+            disable_fast: command.disable_fast,
             id: command.id.clone(),
             name: command.name,
             description: command.description,
@@ -662,6 +786,9 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         record.name = command.name;
         record.description = command.description;
         record.color = command.color;
+        if let Some(disable_fast) = command.disable_fast {
+            record.disable_fast = disable_fast;
+        }
         record.updated_at = Utc::now();
         mutation(&mut state, command.id, true)
     }
@@ -713,6 +840,34 @@ fn mutation(
 
 #[async_trait]
 impl ClientKeyStore for MemoryClientKeyStore {
+    async fn reset_client_key_budget(
+        &self,
+        command: gateway_admin::model::client_keys::ResetClientKeyBudget,
+        _: &MutationContext,
+    ) -> AdminStoreResult<()> {
+        use gateway_admin::model::client_keys::ClientKeyBudgetPeriod;
+        let mut record = self.0.lock().unwrap();
+        let record = record
+            .as_mut()
+            .filter(|record| record.id == command.id)
+            .ok_or_else(|| {
+                AdminStoreError::new(AdminStoreErrorKind::NotFound, "client key", "missing key")
+            })?;
+        if matches!(
+            command.period,
+            ClientKeyBudgetPeriod::Daily | ClientKeyBudgetPeriod::All
+        ) {
+            record.budget.daily_used_usd = gateway_core::metering::Decimal::ZERO;
+        }
+        if matches!(
+            command.period,
+            ClientKeyBudgetPeriod::Weekly | ClientKeyBudgetPeriod::All
+        ) {
+            record.budget.weekly_used_usd = gateway_core::metering::Decimal::ZERO;
+        }
+        Ok(())
+    }
+
     async fn get_client_key(
         &self,
         id: &ClientApiKeyId,
@@ -738,9 +893,15 @@ impl ClientKeyStore for MemoryClientKeyStore {
         &self,
         id: &ClientApiKeyId,
     ) -> AdminStoreResult<Option<ClientKeySecret>> {
+        if let Some(record) = self.0.lock().expect("client key").clone() {
+            return Ok((record.id == *id)
+                .then(|| ClientKeySecret::new(record, format!("sk_{}", "a".repeat(43)))));
+        }
         let now = Utc::now();
         Ok(Some(ClientKeySecret::new(
             ClientKeyRecord {
+                openai_client_profile_override: None,
+                xai_client_profile_override: None,
                 budget: Default::default(),
                 id: id.clone(),
                 name: "revealed".to_owned(),
@@ -1109,6 +1270,15 @@ impl UnusedProvider {
 
 #[async_trait]
 impl ProviderAdmin for UnusedProvider {
+    fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
+        serde_json::from_value(serde_json::json!({
+            "builtin-model": {
+                "multiplierBps": 10000,
+                "bands": {"standard": {"input": "1", "output": "2", "cacheRead": "0", "cacheWrite": "1"}}
+            }
+        })).unwrap()
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }
@@ -1274,6 +1444,8 @@ fn test_runtime_settings() -> RuntimeSettings {
         ),
     ]);
     RuntimeSettings {
+        openai_client_profile: None,
+        xai_client_profile: None,
         request_location_enabled: false,
         request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
@@ -1285,6 +1457,7 @@ fn test_runtime_settings() -> RuntimeSettings {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::Smart,
         min_codex_desktop_version: None,
         min_codex_cli_version: None,

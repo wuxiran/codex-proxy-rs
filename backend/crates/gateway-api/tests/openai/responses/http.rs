@@ -41,7 +41,9 @@ use serde_json::{Value, json};
 use gateway_api::openai::responses::{collect_execution_response, stream_execution_response};
 use tower::ServiceExt;
 
-use crate::openai::{api_router, authenticated_client_for_provider};
+use crate::openai::{
+    api_router, authenticated_client_for_provider, authenticated_client_with_min_versions,
+};
 
 #[derive(Default)]
 struct Trace {
@@ -546,7 +548,7 @@ async fn invalid_compressed_http_requests_should_fail_before_execution() {
             super::request::encode_body("zstd", std::io::repeat(0).take(64 * 1024 * 1024 + 1))
                 .into(),
             "request_too_large",
-            "Decompressed request body exceeds the allowed size.",
+            "Decompressed request body exceeds the allowed size (67108864 bytes).",
         ),
     ] {
         let headers = HeaderMap::from_iter([
@@ -1696,7 +1698,7 @@ async fn streaming_upstream_error_event_should_be_translated_to_response_failed_
                     "status": "failed",
                     "error": {
                         "type": "service_unavailable_error",
-                        "code": "server_is_overloaded",
+                        "code": "server_error",
                         "message": "Our servers are currently overloaded. Please try again later.",
                         "param": null,
                         "future_error_field": {"keep": true}
@@ -1711,6 +1713,45 @@ async fn streaming_upstream_error_event_should_be_translated_to_response_failed_
             true,
         )
     );
+}
+
+#[tokio::test]
+async fn streaming_capacity_error_after_commit_offers_client_retry() {
+    for code in ["server_is_overloaded", "slow_down"] {
+        let trace = Arc::new(Trace::default());
+        let error = ProviderError::new(
+            ProviderErrorKind::UpstreamCapacityUnavailable,
+            UpstreamSendState::Sent,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "busy",
+            Some(code.to_owned()),
+            Some("service_unavailable_error".to_owned()),
+        ));
+        let session = FakeSession::streaming(
+            Arc::clone(&trace),
+            vec![
+                NextStep::Event(delivery(started(), CommitRequirement::CommitBeforeDelivery)),
+                NextStep::Error(EngineError::Provider(error)),
+            ],
+        );
+        let response = stream_execution_response(Box::new(session), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("SSE body");
+        let text = std::str::from_utf8(&body).expect("UTF-8");
+        let events = parse_sse_events(text).expect("SSE");
+        let failed = events
+            .iter()
+            .find(|event| event.event.as_deref() == Some("response.failed"))
+            .expect("failed event");
+        let failed: Value = serde_json::from_str(&failed.data).expect("JSON");
+        assert_eq!(failed["response"]["error"]["code"], "server_error");
+        assert_eq!(failed["response"]["error"]["message"], "busy");
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
 }
 
 #[tokio::test]
@@ -1968,6 +2009,112 @@ struct SessionExecution {
     session: Mutex<Option<Box<dyn ExecutionSession>>>,
 }
 
+#[tokio::test]
+async fn chatgpt_remote_responses_should_only_skip_missing_desktop_versions() {
+    for name in [
+        "codex_chatgpt_android_remote",
+        "codex_chatgpt_ios_remote",
+        "codex_chatgpt_future_os_remote",
+    ] {
+        for (version, expected_code) in [
+            (None, None),
+            (Some("26.908.70816"), None),
+            (Some("26.1.0"), Some("client_version_too_old")),
+            (Some("dev"), Some("client_version_unavailable")),
+        ] {
+            let trace = Arc::new(Trace::default());
+            let execution = Arc::new(SessionExecution {
+                client: authenticated_client_with_min_versions(
+                    "sk_remote_test",
+                    Some("26.908.70816"),
+                    Some("0.154.0"),
+                ),
+                session: Mutex::new(Some(Box::new(FakeSession::streaming(
+                    Arc::clone(&trace),
+                    vec![
+                        NextStep::Event(delivery(
+                            started(),
+                            CommitRequirement::CommitBeforeDelivery,
+                        )),
+                        NextStep::Event(delivery(completed(), CommitRequirement::AlreadyCommitted)),
+                        NextStep::FinalizeSuccess,
+                    ],
+                )))),
+            });
+            let mut request = Request::post("/v1/responses")
+                .header(AUTHORIZATION, "Bearer sk_remote_test")
+                .header("user-agent", format!(
+                    "Codex Desktop/0.154.0-alpha.6.2 (Windows 10.0.26200; x86_64) unknown ({name}; dev)"
+                ));
+            if let Some(version) = version {
+                request = request.header("version", version);
+            }
+            let response = api_router(execution.clone())
+                .await
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            json!({"model": "model-a", "input": "synthetic", "stream": true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if let Some(code) = expected_code {
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{name} {version:?}");
+                assert_eq!(value["error"]["code"], code);
+                assert!(execution.session.lock().unwrap().is_some());
+            } else {
+                assert_eq!(status, StatusCode::OK, "{name} {version:?}");
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                assert!(body.contains("event: response.completed\n"));
+                assert!(body.ends_with("data: [DONE]\n\n"));
+                assert!(trace.snapshot().contains(&"commit"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_remote_responses_should_still_require_client_key_authentication() {
+    let observed = Arc::new(Mutex::new(None));
+    let execution = Arc::new(ContextCaptureExecution {
+        observed: Arc::clone(&observed),
+        client: authenticated_client_with_min_versions(
+            "sk_context_test",
+            Some("26.908.70816"),
+            None,
+        ),
+    });
+    let router = api_router(execution).await;
+    for authorization in [None, Some("Bearer sk_invalid")] {
+        let mut request = Request::post("/v1/responses").header(
+            "user-agent",
+            "Codex Desktop/0.154.0-alpha.6.2 (codex_chatgpt_android_remote; dev)",
+        );
+        if let Some(authorization) = authorization {
+            request = request.header(AUTHORIZATION, authorization);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        json!({"model": "model-a", "input": "synthetic"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(observed.lock().unwrap().is_none());
+    }
+}
+
 impl ExecutionService for SessionExecution {
     fn authenticate(&self, _: &str) -> Result<AuthenticatedClient, ClientAuthenticationError> {
         Ok(self.client.clone())
@@ -2176,6 +2323,53 @@ async fn local_execution_failure_uses_the_existing_model_id() {
             assert_eq!(
                 response.headers()["x-codex-turn-state"],
                 "retained-turn-state"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn compressed_http_request_above_default_limit_should_reach_execution_after_increase() {
+    let body = json!({"model": "model-a", "input": "x".repeat(64 * 1024 * 1024)}).to_string();
+    let compressed = super::request::encode_body("zstd", body.as_bytes());
+    for limit in [64 * 1024 * 1024, 128 * 1024 * 1024] {
+        let observed = Arc::new(Mutex::new(None));
+        let execution = Arc::new(ContextCaptureExecution {
+            observed: Arc::clone(&observed),
+            client: crate::openai::authenticated_client_for_provider_with_limit(
+                "sk_context_test",
+                "openai",
+                limit,
+            ),
+        });
+        let response = api_router(execution)
+            .await
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header(AUTHORIZATION, "Bearer sk_context_test")
+                    .header(CONTENT_ENCODING, "zstd")
+                    .body(Body::from(compressed.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if limit == 64 * 1024 * 1024 {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(observed.lock().unwrap().is_none());
+            let error: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(error["error"]["code"], "request_too_large");
+        } else {
+            // 捕获执行服务刻意返回 500；断言完整输入到达执行层，而不是只验证路由状态码。
+            let captured = observed
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request reached execution");
+            assert_eq!(
+                captured.input.unwrap().as_str().unwrap().len(),
+                64 * 1024 * 1024
             );
         }
     }

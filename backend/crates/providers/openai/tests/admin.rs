@@ -44,7 +44,7 @@ use gateway_core::routing::{
     RuntimeSnapshot, UpstreamModelId,
 };
 use gateway_core::task::{WorkerContribution, WorkerKind, WorkerRunnable};
-use provider_openai::config::{CodexWireProfileConfig, OpenAiConfig};
+use provider_openai::config::OpenAiConfig;
 use provider_openai::credential::{CodexCredentialCodec, ImportCodexOAuthCredential};
 use provider_openai::transport::profile::APPCAST_POLL_INTERVAL;
 use secrecy::SecretString;
@@ -74,8 +74,10 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    // 6 = 原 5 个 + 观澜自动复活 worker（revive 默认开启后随之注册）。
-    assert_eq!(contributions.len(), 6);
+    // 8 = 6 个无条件 worker + oauth 刷新 + 观澜自动复活（revive 默认开启后随之注册）。
+    // 上游把客户端发布类 worker 拆成多个（7），我方在其上再加 revive（+1）。
+    assert_eq!(contributions.len(), 8);
+
     assert!(
         contributions
             .iter()
@@ -103,6 +105,8 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     };
     assert_eq!(schedule.interval(), APPCAST_POLL_INTERVAL);
     for (owner, interval) in [
+        ("openai-cli-release", APPCAST_POLL_INTERVAL),
+        ("openai-platform-desktop-release", APPCAST_POLL_INTERVAL),
         ("openai", Duration::from_secs(30)),
         (
             "openai-model-catalog",
@@ -289,13 +293,45 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
 }
 
 #[tokio::test]
+async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
+    use provider_openai::transport::{
+        OpenAiBillingUsage, openai_billing_breakdown, openai_billing_breakdown_with_override,
+    };
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let prices = bundle.admin_provider().pricing_catalog();
+    for model in ["gpt-4", "gpt-4o", "gpt-6-astra"] {
+        let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
+        let inherited = openai_billing_breakdown(model, usage, None).unwrap();
+        let copied =
+            openai_billing_breakdown_with_override(model, usage, None, Some(&prices[model]))
+                .unwrap();
+        assert_eq!(inherited.total_amount(), copied.total_amount(), "{model}");
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing() {
     let config = valid_config();
     let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
         .await
         .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
-    let profile = admin.dashboard_wire_profile().expect("wire profile");
+    let baseline = admin.dashboard_wire_profile().expect("official baseline");
+    assert_eq!(
+        baseline.release.as_ref().map(|release| release.status),
+        Some(DesktopReleaseStatus::Unchecked)
+    );
+    let selection = OpaqueProviderData::new(json!({
+        "client": "desktop", "platform": "macos", "versionMode": "fixed",
+        "codexVersion": "0.102.0", "desktopVersion": "1.2026.190", "desktopBuild": "19012345678",
+        "osVersion": "15.5.0", "arch": "arm64", "terminal": "xterm-256color"
+    }).as_object().unwrap().clone());
+    let profile = admin
+        .configured_wire_profile(&selection)
+        .expect("managed fixed profile");
     assert_eq!(profile.version, "0.102.0");
     assert_eq!(profile.build, None);
     assert_eq!(profile.target.os_type, "Mac OS");
@@ -312,10 +348,7 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             .map(|attribute| attribute.value.as_str()),
         Some("Codex Desktop; 1.2026.190")
     );
-    assert_eq!(
-        profile.release.as_ref().map(|release| release.status),
-        Some(DesktopReleaseStatus::Unchecked)
-    );
+    assert!(profile.release.is_none());
     let billing = admin
         .calculated_billing(&ProviderBillingInput {
             upstream_model_id: "gpt-4o".to_owned(),
@@ -353,6 +386,34 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
     assert_eq!(fast_billing.multiplier_percent, 170);
     assert_eq!(fast_billing.standard_amount.amount.as_str(), "2.5");
     assert_eq!(fast_billing.total_amount.amount.as_str(), "4.25");
+}
+
+#[tokio::test]
+async fn openai_legacy_billing_should_not_infer_long_context_flag() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .expect("OpenAI bundle");
+    let billing = bundle
+        .admin_provider()
+        .calculated_billing(&ProviderBillingInput {
+            upstream_model_id: "gpt-5.4".to_owned(),
+            service_tier: None,
+            input_tokens: Some(300_000),
+            output_tokens: Some(0),
+            cached_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total: CurrencyCost {
+                currency: "USD".to_owned(),
+                amount: "1.5".parse().expect("stored total"),
+            },
+        })
+        .expect("legacy billing")
+        .expect("matching billing breakdown");
+
+    assert_eq!(billing.total_amount.amount.as_str(), "1.5");
+    assert_eq!(billing.input_price_per_million.amount.as_str(), "5");
+    assert!(!billing.long_context_billing_applied);
 }
 
 #[tokio::test]
@@ -1085,6 +1146,121 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
 }
 
 #[tokio::test]
+async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution() {
+    for exhausted in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let account_id = "acct_admin_expired_window";
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: account_id.to_owned(),
+                name: "admin expired window".to_owned(),
+                secret: secret("admin-expired-window-access"),
+                verified_account: profile("chatgpt-admin-expired-window"),
+                next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                enabled: true,
+            })
+            .await;
+        let account = store.account(account_id).expect("stored account");
+        let past_reset_at = Utc::now().timestamp() - 60;
+        let observed_at = SystemTime::now() - Duration::from_secs(300);
+        let weekly_used = if exhausted { 100.0 } else { 74.0 };
+        let state = if exhausted {
+            QuotaState::exhausted(
+                QuotaEvidence::ProviderDenied,
+                observed_at,
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(past_reset_at as u64)),
+            )
+        } else {
+            QuotaState::allowed(observed_at)
+        };
+        store
+            .compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(
+                    json!({
+                        "rate_limit": {
+                            "allowed": !exhausted,
+                            "limit_reached": exhausted,
+                            "primary_window": {
+                                "used_percent": 15,
+                                "reset_at": past_reset_at + 18_000,
+                                "limit_window_seconds": 18_000,
+                            },
+                            "secondary_window": {
+                                "used_percent": weekly_used,
+                                "reset_at": past_reset_at,
+                                "limit_window_seconds": 604_800,
+                            }
+                        }
+                    })
+                    .as_object()
+                    .expect("quota object")
+                    .clone(),
+                ),
+                observed_at,
+                state,
+            })
+            .await
+            .expect("persist raw quota");
+
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .expect("OpenAI bundle");
+        let mut projected = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh: false,
+                rolling_usage: None,
+            })
+            .await
+            .expect("project quota");
+        assert_eq!(projected.limit_reached, exhausted);
+        // 账号接口还会归一化耗尽展示；过期周窗口不能把触顶错误转移到短期窗口。
+        projected.apply_limit_reached_display();
+        let primary = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(18_000))
+            .expect("primary");
+        let weekly = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(604_800))
+            .expect("weekly");
+        assert_eq!(
+            (primary.used_percent, primary.limit_reached),
+            (Some(15.0), false)
+        );
+        assert_eq!(
+            (weekly.used_percent, weekly.limit_reached),
+            (Some(weekly_used), exhausted)
+        );
+        assert_eq!(
+            weekly.reset_at.map(|reset| reset.timestamp()),
+            Some(past_reset_at)
+        );
+        let raw = store
+            .get_quotas(std::slice::from_ref(account.id()))
+            .await
+            .expect("raw quota")
+            .pop()
+            .expect("observation");
+        assert_eq!(raw.observed_at, observed_at);
+        assert_eq!(
+            raw.quota.expose_to_provider()["rate_limit"]["secondary_window"]["used_percent"],
+            weekly_used
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_rejects_unprepared_mutations_before_store_commit() {
     let store = Arc::new(MemoryAccountStore::default());
     store
@@ -1391,21 +1567,6 @@ struct TestOpenAiConfig {
 
 fn valid_config() -> TestOpenAiConfig {
     let mut config = OpenAiConfig::default();
-    config.wire_profile = CodexWireProfileConfig {
-        originator: "Codex Desktop".to_owned(),
-        codex_version: "0.102.0".to_owned(),
-        desktop_version: "1.2026.190".to_owned(),
-        desktop_build: "19012345678".to_owned(),
-        os_type: "Mac OS".to_owned(),
-        os_version: "15.5.0".to_owned(),
-        arch: "arm64".to_owned(),
-        terminal: "xterm-256color".to_owned(),
-        residency: None,
-        verified_at: Utc
-            .with_ymd_and_hms(2026, 7, 19, 0, 0, 0)
-            .single()
-            .expect("valid test time"),
-    };
     let runtime = tempfile::tempdir().expect("test runtime directory");
     config
         .resolve_and_validate(&runtime.path().join("deploy"))
@@ -1430,6 +1591,7 @@ impl ProviderArtifactProfileCachePort for TestArtifactProfiles {
     fn read<'a>(
         &'a self,
         _provider_kind: &'a ProviderKind,
+        _artifact_key: &'a str,
     ) -> BoxFuture<'a, Result<Option<ProviderArtifactProfile>, ProviderStoreError>> {
         Box::pin(async { Ok(None) })
     }

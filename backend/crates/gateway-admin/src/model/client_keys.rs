@@ -86,6 +86,8 @@ pub struct ClientKeyListQuery {
 /// 不含完整明文 Key 的管理投影。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyRecord {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -109,7 +111,7 @@ pub struct ClientKeyPage {
     pub next_cursor: Option<ClientKeyCursor>,
 }
 
-/// 仅在创建或显式 reveal 时跨越管理边界的明文 Key。
+/// 仅在创建或显式读取密钥配置时返回的明文 Key；Debug 隐去明文。
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientKeySecret {
     pub record: ClientKeyRecord,
@@ -144,6 +146,8 @@ impl fmt::Debug for ClientKeySecret {
 /// API 提交的 Client Key 创建命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateClientKey {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
     pub custom_key: Option<PlaintextClientApiKey>,
     pub name: String,
     pub label: Option<String>,
@@ -155,6 +159,8 @@ pub struct CreateClientKey {
 /// 管理用例生成 ID 与明文后的持久化命令。
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewClientKey {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -179,6 +185,8 @@ impl fmt::Debug for NewClientKey {
 /// 修改 Client Key 的公开策略字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientKey {
+    pub openai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
+    pub xai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -193,6 +201,21 @@ pub struct UpdateClientKey {
 pub struct SetClientKeyEnabled {
     pub id: ClientApiKeyId,
     pub enabled: bool,
+}
+
+/// 管理员选择的金额重置范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKeyBudgetPeriod {
+    Daily,
+    Weekly,
+    All,
+}
+
+/// 清零所选窗口已用金额，保留限额、到期时间与历史费用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetClientKeyBudget {
+    pub id: ClientApiKeyId,
+    pub period: ClientKeyBudgetPeriod,
 }
 
 /// 删除 Client Key。

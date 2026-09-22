@@ -83,6 +83,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/openai/search/http.rs",
         "src/openai/search/mod.rs",
         "src/openai/service.rs",
+        "src/openai/usage.rs",
         "src/session_cookie.rs",
     ];
     expected.sort_unstable();
@@ -135,6 +136,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/openai/responses/websocket/protocol.rs",
         "tests/openai/router.rs",
         "tests/openai/search/mod.rs",
+        "tests/openai/usage.rs",
     ];
     expected.sort_unstable();
 

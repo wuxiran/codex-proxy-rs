@@ -193,9 +193,6 @@ async fn pending_authorization(
                         .get(id)
                         .await
                         .map_err(|error| map_store_error(error, "proxy"))?;
-                    if !record.last_test.is_some_and(|test| test.success) {
-                        return Err(AdminError::conflict("请先测试代理连接"));
-                    }
                     proxy_id = Some(record.id);
                     Some(record.proxy)
                 }

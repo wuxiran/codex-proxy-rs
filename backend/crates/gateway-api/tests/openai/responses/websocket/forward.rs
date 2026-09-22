@@ -201,6 +201,54 @@ async fn non_structured_bodies_use_safe_fallback_without_losing_status_or_ids() 
 }
 
 #[tokio::test]
+async fn initial_capacity_failure_offers_client_retry_with_upstream_correlation() {
+    for code in ["server_is_overloaded", "slow_down"] {
+        for status in [400, 429, 503] {
+            let provider = upstream_failure(
+                status,
+                b"",
+                vec![
+                    header("x-request-id", b"req_capacity"),
+                    header("retry-after", b"7"),
+                ],
+            )
+            .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+                "busy",
+                Some(code.to_owned()),
+                Some("service_unavailable_error".to_owned()),
+            ));
+            let error = initial_error(EngineError::Provider(provider), Vec::new()).await;
+            assert_eq!(error["status"], 503);
+            assert_eq!(error["error"]["code"], "server_error");
+            assert_eq!(error["error"]["message"], "busy");
+            assert_eq!(error["headers"]["x-request-id"], "req_capacity");
+            assert_eq!(error["headers"]["retry-after"], "7");
+        }
+    }
+}
+
+#[tokio::test]
+async fn classified_capacity_error_without_special_code_returns_retryable_websocket_status() {
+    let provider = ProviderError::new(
+        ProviderErrorKind::UpstreamCapacityUnavailable,
+        UpstreamSendState::Sent,
+    )
+    .with_status(400)
+    .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+        "Selected model is at capacity. Please try a different model.",
+        None,
+        Some("server_error".to_owned()),
+    ));
+    let error = initial_error(EngineError::Provider(provider), Vec::new()).await;
+    assert_eq!(error["status"], 503);
+    assert_eq!(error["error"]["code"], "upstream_unavailable");
+    assert_eq!(
+        error["error"]["message"],
+        "Selected model is at capacity. Please try a different model."
+    );
+}
+
+#[tokio::test]
 async fn final_failure_headers_take_precedence_over_observed_opening_headers() {
     let provider = upstream_failure(403, b"", vec![header("x-oai-request-id", b"req_final")])
         .with_status(502)
@@ -446,4 +494,47 @@ async fn deliverable_business_failures_are_not_rewritten_or_followed_by_a_second
         assert_eq!(trace.next_calls.load(Ordering::Acquire), 2);
         socket.close(None).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn initial_quota_recovery_delivers_client_projection_instead_of_upstream_status() {
+    let detail = json!({"message":"Previous response was not found. Retrying the full request.","code":"previous_response_not_found","type":"invalid_request_error"});
+    let provider = ProviderError::new(ProviderErrorKind::QuotaExhausted, UpstreamSendState::Sent)
+        .with_status(429)
+        .with_retry_after(Duration::from_secs(129_600))
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            detail["message"].as_str().unwrap(),
+            Some("previous_response_not_found".to_owned()),
+            Some("invalid_request_error".to_owned()),
+        ))
+        .with_client_visible_upstream_response(
+            ClientVisibleUpstreamResponse::new(
+                400,
+                Some(b"application/json".to_vec()),
+                Bytes::from(json!({"error":detail}).to_string()),
+            )
+            .with_headers(vec![header("x-request-id", b"req-quota-rejected")]),
+        );
+    let error = initial_error(EngineError::Provider(provider), Vec::new()).await;
+    assert_eq!(error["status"], 400);
+    assert_eq!(error["error"], detail);
+    assert_eq!(error["headers"]["x-request-id"], "req-quota-rejected");
+    assert!(error["headers"].get("retry-after").is_none());
+}
+
+#[tokio::test]
+async fn locally_exhausted_account_pool_sends_one_official_usage_limit_error() {
+    let provider = ProviderError::new(
+        ProviderErrorKind::QuotaExhausted,
+        UpstreamSendState::NotSent,
+    )
+    .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+        "All eligible accounts have exhausted their quota.",
+        Some("usage_limit_reached".to_owned()),
+        Some("usage_limit_reached".to_owned()),
+    ));
+    let error = initial_error(EngineError::Provider(provider), Vec::new()).await;
+    assert_eq!(error["status"], 429);
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
+    assert_eq!(error["error"]["code"], "usage_limit_reached");
 }

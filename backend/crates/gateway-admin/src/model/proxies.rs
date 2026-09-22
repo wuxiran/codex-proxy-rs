@@ -71,6 +71,8 @@ pub struct ProxyTestResult {
     pub exit_ip: Option<std::net::IpAddr>,
     /// 地区查询失败不影响连通性结论，此时为空。
     pub exit_geo: Option<ProxyExitGeo>,
+    pub exit_ipv4: Option<std::net::Ipv4Addr>,
+    pub exit_ipv6: Option<std::net::Ipv6Addr>,
     pub message: String,
 }
 

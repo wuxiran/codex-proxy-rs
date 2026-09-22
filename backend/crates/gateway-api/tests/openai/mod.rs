@@ -6,6 +6,7 @@ mod models;
 mod responses;
 mod router;
 mod search;
+mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -135,8 +136,18 @@ pub(super) fn authenticated_client_for_provider(
     plaintext: &str,
     provider_name: &str,
 ) -> AuthenticatedClient {
+    authenticated_client_for_provider_with_limit(plaintext, provider_name, 64 * 1024 * 1024)
+}
+
+pub(super) fn authenticated_client_for_provider_with_limit(
+    plaintext: &str,
+    provider_name: &str,
+    bytes: usize,
+) -> AuthenticatedClient {
+    let snapshot = snapshot(plaintext, provider_name)
+        .with_responses_max_decompressed_body_bytes(std::num::NonZeroUsize::new(bytes).unwrap());
     let source = DefaultExecutionService::new(
-        RuntimeSnapshotHandle::new(snapshot(plaintext, provider_name)),
+        RuntimeSnapshotHandle::new(snapshot),
         Arc::new(UnusedExecutionStore),
         ProviderRegistry::default(),
         Arc::new(UnusedAdmissions),

@@ -58,7 +58,7 @@ use use_case::{
 const OPENAI_PROVIDER_KIND: &str = "openai";
 const XAI_PROVIDER_KIND: &str = "xai";
 const MINIMUM_INITIAL_PASSWORD_BYTES: usize = 12;
-const WEAK_INITIAL_PASSWORDS: &[&str] = &[
+const WEAK_ADMIN_PASSWORDS: &[&str] = &[
     "",
     "admin",
     "123456",
@@ -156,7 +156,7 @@ impl AdminConfig {
         let password = self.default_password.expose().trim();
         if password.len() < MINIMUM_INITIAL_PASSWORD_BYTES
             || password.contains('$')
-            || WEAK_INITIAL_PASSWORDS.contains(&password.to_ascii_lowercase().as_str())
+            || WEAK_ADMIN_PASSWORDS.contains(&password.to_ascii_lowercase().as_str())
         {
             return Err(AdminConfigError::WeakInitialPassword);
         }
@@ -309,6 +309,7 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
 pub struct AdminRuntimePorts {
+    pub pricing_source: Arc<dyn ports::pricing::PricingSource>,
     pub providers: Vec<Arc<dyn ProviderAdmin>>,
     pub snapshot: Arc<dyn SnapshotControl>,
     pub account_probe: Arc<dyn AccountProbe>,
@@ -332,6 +333,7 @@ pub async fn initialize(
     runtime: AdminRuntimePorts,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        pricing_source,
         providers,
         snapshot,
         account_probe: probe,
@@ -360,7 +362,7 @@ pub async fn initialize(
         config.session_ttl_minutes,
         client_config.session_ttl_minutes,
         store.auth(),
-        client_key_verifier,
+        client_key_verifier.clone(),
     ));
     auth.ensure_default_admin(config.default_password.expose())
         .await?;
@@ -385,10 +387,13 @@ pub async fn initialize(
         backup_ports.dump(),
         backup_ports.object_store(),
     );
+    let system = Arc::new(DefaultSystemService::new(system));
     let key_usage = Arc::new(use_case::key_usage::DefaultKeyUsageService::new(
         auth.clone(),
+        client_key_verifier,
         store.client_keys(),
         store.observability(),
+        system.clone(),
     ));
     let openai = Arc::new(DefaultOpenAiService::new(
         openai,
@@ -431,19 +436,22 @@ pub async fn initialize(
         client_keys: Arc::new(DefaultClientKeyService::new(
             store.client_keys(),
             snapshot.clone(),
+            registry.clone(),
         )),
         client_distribution: Arc::new(DefaultClientDistributionService::new(client_distribution)),
         observability: Arc::new(DefaultObservabilityService::new(
             store.observability(),
             store.accounts(),
             store.settings(),
-            registry,
+            registry.clone(),
         )),
         settings: Arc::new(DefaultSettingsService::new(
             store.settings(),
             snapshot.clone(),
+            registry,
+            pricing_source,
         )),
-        system: Arc::new(DefaultSystemService::new(system)),
+        system,
         openai,
         xai,
         import_tasks,

@@ -297,6 +297,7 @@ pub struct ProviderBillingInput {
 /// 控制面仅保留通用事实，具体 Provider 负责校验已持久化总额并恢复标准费用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageCalculatedBillingFact {
+    pub breakdown: Option<CalculatedBillingBreakdown>,
     pub bucket_start: DateTime<Utc>,
     pub provider_kind: String,
     pub upstream_model_id: String,
@@ -311,6 +312,9 @@ pub struct UsageCalculatedBillingFact {
 /// Provider 已确认的逐项费用与单价。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculatedBillingBreakdown {
+    pub long_context_billing_applied: bool,
+    pub image: Option<ImageBillingBreakdown>,
+    pub custom_multiplier_bps: u32,
     pub input_amount: CurrencyCost,
     pub output_amount: CurrencyCost,
     pub cache_read_amount: CurrencyCost,
@@ -323,6 +327,16 @@ pub struct CalculatedBillingBreakdown {
     pub cache_write_price_per_million: CurrencyCost,
     pub service_tier: Option<String>,
     pub multiplier_percent: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBillingBreakdown {
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub input_amount: CurrencyCost,
+    pub cache_read_amount: CurrencyCost,
+    pub input_price_per_million: CurrencyCost,
+    pub cache_read_price_per_million: CurrencyCost,
 }
 
 /// 单次请求的费用语义。
@@ -533,6 +547,7 @@ pub struct DashboardObservation {
 /// 使用记录表格的窄读模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub client_api_key_name: Option<String>,
     pub id: String,
     pub endpoint: String,
     pub client_transport: String,
@@ -541,9 +556,12 @@ pub struct UsageListRecord {
     pub provider_account_ref: Option<String>,
     pub provider_account_name: Option<String>,
     pub provider_account_email: Option<String>,
+    /// 账号当前备注，按内部账号 ID 关联，不属于请求历史快照。
+    pub provider_account_notes: Option<String>,
     pub provider_account_authentication_kind: Option<String>,
     pub upstream_model_id: Option<String>,
     pub upstream_transport: Option<String>,
+    pub upstream_response_model: Option<String>,
     pub service_tier: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -602,6 +620,7 @@ pub struct UsageRecord {
     pub upstream_transport: Option<String>,
     pub http_version: Option<String>,
     pub websocket_pool: Option<String>,
+    pub upstream_response_model: Option<String>,
     pub service_tier: Option<String>,
     /// Provider 已筛选的专有观测 JSON；管理领域保持不透明。
     pub provider_metadata_json: Option<String>,
@@ -760,6 +779,7 @@ pub struct DiagnosticObservation {
 /// 统一运维错误记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsError {
+    pub client_api_key_name: Option<String>,
     pub source: String,
     pub event_id: String,
     pub request_id: Option<String>,

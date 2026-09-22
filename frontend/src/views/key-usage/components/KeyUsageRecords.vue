@@ -24,7 +24,7 @@ const columns = computed(() => defineTableColumns<KeyUsageRecord>([
   { key: 'upstreamTransport', label: '上游', kind: 'status', size: 'md' },
   { key: 'clientTransport', label: '接入', kind: 'status', size: 'md' },
   { key: 'tokenDetails', label: 'TOKEN', kind: 'numeric', size: 'xl' },
-  { key: 'billing', label: '费用', kind: 'numeric', size: 'lg' },
+  { key: 'billing', label: '费用', kind: 'numeric', size: 'xl' },
   { key: 'latency', label: '延迟', kind: 'numeric', size: 'xl' },
   ...(kind.value === 'error' ? [{ key: 'statusCode', label: '状态', kind: 'status' as const }] : []),
   { key: 'createdAt', label: '时间', kind: 'datetime' },
@@ -39,7 +39,7 @@ const columns = computed(() => defineTableColumns<KeyUsageRecord>([
       <BaseSegmented v-model="kind" label="请求结果" :options="[{ label: '成功请求', value: 'success' }, { label: '错误记录', value: 'error' }]" />
     </template>
     <p v-if="error || stale" role="status" class="mt-0 mb-3 text-cp-sm text-cp-error-text">
-      {{ error || '请求日志刷新失败，暂时保留上次结果。' }}
+      {{ error || '请求日志刷新失败，暂时保留上次结果' }}
     </p>
     <div class="flex h-120 min-h-0 overflow-hidden">
       <BaseTable class="min-w-0 flex-1" :columns="columns" :rows="rows" :loading="loading" scrollbar-always-visible :empty-text="error ? '请求日志加载失败，请点击顶部刷新重试' : '所选条件下暂无记录'">

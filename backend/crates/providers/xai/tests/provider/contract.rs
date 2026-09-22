@@ -3482,3 +3482,55 @@ async fn attribution_metadata_projects_selected_proxy_before_any_inference() {
         assert!(!format!("{:?}", stream.metadata()).contains("synthetic"));
     }
 }
+
+#[tokio::test]
+async fn configured_request_profile_reaches_inference_headers() {
+    use provider_xai::transport::client_profile::{GrokClientProfileSelection, VersionMode};
+    let transport = StubInferenceTransport::success();
+    let provider = provider(StubSelector::success(), transport.clone()).await;
+    let selection = GrokClientProfileSelection {
+        version_mode: VersionMode::Fixed,
+        client_version: Some("9.8.7".to_owned()),
+        client_identifier: "profile-contract".to_owned(),
+        target_os: "windows".to_owned(),
+        target_arch: "arm64".to_owned(),
+        ..Default::default()
+    };
+    let resolved = provider
+        .resolve_request_profile(&selection.document().unwrap())
+        .unwrap();
+    let context = AttemptContext::new(
+        gateway_core::engine::RequestAttemptContext::new(
+            ModelRequestId::new("req_profile").unwrap(),
+            ClientApiKeyId::new("key_profile").unwrap(),
+        )
+        .with_request_profile(Some(resolved)),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + Duration::from_secs(30),
+        selection_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None),
+        None,
+        CancellationToken::new(),
+    );
+    let events = provider
+        .execute(provider_request("xai"), context)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(events.iter().all(Result::is_ok));
+    let requests = transport.requests.lock().unwrap();
+    let headers = requests[0].headers();
+    let header = |name| {
+        headers
+            .iter()
+            .find(|header| header.name() == name)
+            .unwrap()
+            .value()
+            .expose()
+    };
+    assert_eq!(header("x-grok-client-version"), "9.8.7");
+    assert_eq!(header("x-grok-client-identifier"), "profile-contract");
+    assert_eq!(header("x-grok-client-mode"), "headless");
+    assert_eq!(header("user-agent"), "grok-shell/9.8.7 (windows; aarch64)");
+}

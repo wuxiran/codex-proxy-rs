@@ -17,6 +17,8 @@ pub use gateway_core::account::RotationStrategy;
 /// 完整运行设置事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub config_revision: Revision,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -28,6 +30,7 @@ pub struct RuntimeSettings {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: RotationStrategy,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -47,6 +50,8 @@ pub struct RuntimeSettings {
 /// 原子替换运行设置的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceRuntimeSettings {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: ModelMappings,
@@ -57,6 +62,7 @@ pub struct ReplaceRuntimeSettings {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: RotationStrategy,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -120,5 +126,18 @@ impl fmt::Debug for RegeneratedAdminApiKey {
             .field("mutation", &self.mutation)
             .field("key", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl RuntimeSettings {
+    pub fn client_profile(
+        &self,
+        provider: &str,
+    ) -> Option<&gateway_core::account::OpaqueProviderData> {
+        match provider {
+            "openai" => self.openai_client_profile.as_ref(),
+            "xai" => self.xai_client_profile.as_ref(),
+            _ => None,
+        }
     }
 }

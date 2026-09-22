@@ -14,8 +14,10 @@ export interface OutboundProxyTest {
   success: boolean
   latencyMs: number
   exitIp: string | null
-  // 滚动发布期间旧后端不返回地区，按缺失处理。
+  // 滚动发布期间旧后端不返回地区/双栈字段，按缺失处理。
   exitGeo?: OutboundProxyExitGeo | null
+  exitIpv4?: string | null
+  exitIpv6?: string | null
   message: string
 }
 

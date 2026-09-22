@@ -184,6 +184,7 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
         &[
             "client_distribution",
             "config",
+            "pricing",
             "proxy_probe",
             "serve",
             "system_update",
@@ -195,10 +196,7 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
         "crates/providers/openai",
         &["config", "credential", "transport"],
     ),
-    (
-        "crates/providers/xai",
-        &["config", "credential", "transport"],
-    ),
+    ("crates/providers/xai", &["credential", "transport"]),
 ];
 
 /// 不对应单一生产模块、而是校验 crate/workspace 整体契约的根级测试场景。

@@ -268,6 +268,7 @@ impl ModelRequestTimings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequestFinalization {
+    pub billing_snapshot_json: Option<Value>,
     pub model_request_id: String,
     pub outcome: ModelRequestOutcome,
     pub upstream_send_state: UpstreamSendState,
@@ -282,6 +283,7 @@ pub struct ModelRequestFinalization {
     pub http_version: Option<String>,
     pub websocket_pool: Option<String>,
     pub service_tier: Option<String>,
+    pub upstream_response_model: Option<String>,
     pub provider_metadata_json: Option<Value>,
     pub diagnostic_trace_json: Option<Value>,
     pub error_kind: Option<String>,
@@ -346,6 +348,12 @@ impl ModelRequestFinalization {
             require_nonempty(ENTITY, "service_tier", service_tier)?;
             if service_tier.len() > 64 || service_tier.chars().any(char::is_control) {
                 return Err(invalid("service tier is invalid"));
+            }
+        }
+        if let Some(model) = self.upstream_response_model.as_deref() {
+            require_nonempty(ENTITY, "upstream_response_model", model)?;
+            if model.len() > 256 || model.chars().any(char::is_control) {
+                return Err(invalid("upstream response model is invalid"));
             }
         }
         if self
@@ -737,12 +745,24 @@ impl ModelRequestRepository for PgExecutionStore {
                  upstream_connection_exit_reason = $45,
                  upstream_connection_age_ms = $46,
                  upstream_connection_idle_ms = $47, diagnostic_trace_json = $48,
-                 response_model = $49, billing_model = $50,
-                 calculated_cost_amount = $51::numeric, calculated_cost_currency = $52
+                 upstream_response_model = $49, billing_snapshot_json = $50
              where id = $1 and outcome = 'running'
              returning id, client_api_key_ref, continuation_affinity_hash,
                        continuation_requested, provider_kind, upstream_transport,
                        outcome, started_at, completed_at
+           ), billing_upsert as (
+             -- 计价身份与本地计算成本迁入子表（fork 9001）；四值全空则不写子行（保留「未计算即空」语义）。
+             insert into model_request_billing
+                 (model_request_id, response_model, billing_model,
+                  calculated_cost_amount, calculated_cost_currency)
+             select id, $51, $52, $53::numeric, $54 from finalized
+             where $51 is not null or $52 is not null
+                or $53 is not null or $54 is not null
+             on conflict (model_request_id) do update set
+                 response_model = excluded.response_model,
+                 billing_model = excluded.billing_model,
+                 calculated_cost_amount = excluded.calculated_cost_amount,
+                 calculated_cost_currency = excluded.calculated_cost_currency
            ), recovery_target as (
              select prior.id
              from model_requests prior
@@ -829,7 +849,8 @@ impl ModelRequestRepository for PgExecutionStore {
            )
            select (select count(*) from finalized)::bigint
                 + (select count(*) * 0 from recovery_update)::bigint
-                + (select count(*) * 0 from session_transport_recovery_update)::bigint",
+                + (select count(*) * 0 from session_transport_recovery_update)::bigint
+                + (select count(*) * 0 from billing_upsert)::bigint",
         )
         .bind(&finalization.model_request_id)
         .bind(finalization.outcome.as_str())
@@ -930,6 +951,10 @@ impl ModelRequestRepository for PgExecutionStore {
             "upstream_connection_idle_ms",
         )?)
         .bind(finalization.diagnostic_trace_json.map(sqlx::types::Json))
+        // 父表两列（上游）：$49 upstream_response_model, $50 billing_snapshot_json
+        .bind(finalization.upstream_response_model)
+        .bind(finalization.billing_snapshot_json.map(sqlx::types::Json))
+        // 子表四列（我方，$51-$54）：response_model / billing_model / calculated_cost_*
         .bind(finalization.billing.response_model)
         .bind(finalization.billing.billing_model)
         .bind(
@@ -1224,6 +1249,10 @@ impl ExecutionStore for PgExecutionStore {
         let completed = ModelRequestRepository::finalize_model_request(
             self,
             ModelRequestFinalization {
+                billing_snapshot_json: finalization
+                    .cost
+                    .breakdown()
+                    .map(super::pricing::encode_billing_snapshot),
                 model_request_id: finalization.request_id.as_str().to_owned(),
                 outcome: outcome_from_core(finalization.outcome)?,
                 upstream_send_state: send_state_from_core(finalization.send_state),
@@ -1240,6 +1269,7 @@ impl ExecutionStore for PgExecutionStore {
                 http_version: finalization.http_version,
                 websocket_pool: finalization.websocket_pool,
                 service_tier: finalization.service_tier,
+                upstream_response_model: finalization.upstream_response_model,
                 provider_metadata_json,
                 diagnostic_trace_json: finalization
                     .diagnostic_trace_json

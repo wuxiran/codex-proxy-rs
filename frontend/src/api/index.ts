@@ -19,6 +19,9 @@ export * from './modules/dashboard'
 // 观澜 CDK 兑换
 export * from './modules/guanlanCdk'
 
+// 模型定价
+export * from './modules/pricing'
+
 export * from './modules/proxies'
 export * from './modules/public-import'
 

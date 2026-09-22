@@ -14,6 +14,7 @@ import {
   PanelLeftOpen,
   Settings,
   Sun,
+  Upload,
   Users,
 } from '@lucide/vue'
 import { usePreferredReducedMotion, useTimeoutFn } from '@vueuse/core'
@@ -60,6 +61,7 @@ const preferredMotion = usePreferredReducedMotion()
 const navItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
+  { label: '免登录导入', icon: Upload, path: '/public-import' },
   { label: '代理管理', icon: Network, path: '/proxies' },
   { label: '分组管理', icon: FolderTree, path: '/groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },

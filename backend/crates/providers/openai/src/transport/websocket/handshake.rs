@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gateway_protocol::openai::events;
-use tokio::time::timeout;
+use tokio::{io::BufWriter, time::timeout};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, client_async_tls_with_config, connect_async_tls_with_config,
 };
@@ -267,8 +267,12 @@ async fn dial_account(
     } else {
         host.to_owned()
     };
-    tokio_tungstenite::proxy::connect_via_proxy(stream, &config, &target, port)
+    // 依赖分两次写入 SOCKS 方法协商，再显式 flush；部分代理会提前拒绝半包。
+    // 仅在代理握手期间合并写入，不缓冲读取，也不改变后续 TLS/WS 的发送方式。
+    // 这只是兼容措施，不能保证网络层不再拆分 TCP 数据。
+    tokio_tungstenite::proxy::connect_via_proxy(BufWriter::new(stream), &config, &target, port)
         .await
+        .map(BufWriter::into_inner)
         .map_err(|_| invalid())
 }
 

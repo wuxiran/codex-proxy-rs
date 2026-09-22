@@ -91,8 +91,8 @@ use crate::transport::{
     CODEX_RESPONSES_PATH, CodexAccountSelectionTelemetry, CodexBackendClient,
     CodexBackendJsonResponse, CodexBackendStreamingResponse, CodexBackendTransport,
     CodexClientError, CodexRateLimitUpdates, CodexRequestContext, CodexResponseMetadata,
-    CodexTransportMetrics, CodexTurnStateUpdate, CodexUpstreamDiagnostics, CodexWebSocketPool,
-    endpoint_url,
+    CodexResponseMetadataUpdates, CodexTransportMetrics, CodexUpstreamDiagnostics,
+    CodexWebSocketPool, endpoint_url, normalize_non_codex_request_body,
 };
 
 mod encrypted_content;
@@ -100,6 +100,7 @@ mod execution;
 mod failure;
 mod observation;
 mod workers;
+pub(crate) use workers::ClientReleaseServices;
 
 use encrypted_content::*;
 use execution::*;
@@ -156,6 +157,20 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
+    fn client_for_request(
+        &self,
+        context: &AttemptContext,
+    ) -> Result<CodexBackendClient, ProviderError> {
+        let Some(profile) = context.request_profile() else {
+            return Ok(self.client.clone());
+        };
+        let profile = serde_json::from_value(Value::Object(profile.expose_to_provider().clone()))
+            .map_err(|_| {
+            provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
+        })?;
+        Ok(self.client.clone().with_request_profile(profile))
+    }
+
     // Provider 构造集中装配独立领域服务和透明传输依赖，拆分参数会模糊所有权。
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -224,6 +239,27 @@ impl fmt::Debug for CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
+    fn resolve_request_profile(
+        &self,
+        configuration: &gateway_core::account::OpaqueProviderData,
+    ) -> Result<gateway_core::account::OpaqueProviderData, ProviderError> {
+        let selection =
+            crate::transport::profile::selection::ClientProfileSelection::parse(configuration)
+                .map_err(|_| {
+                    provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    )
+                })?;
+        let profile = selection
+            .resolve(self.client.profile_state())
+            .map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?;
+        crate::transport::profile::selection::object(&profile)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))
+    }
+
     fn name(&self) -> &'static str {
         PROVIDER_NAME
     }
@@ -375,6 +411,8 @@ impl Provider for CodexProvider {
         let continuation_requested = generate.native_continuation_requested();
         let mut upstream_request = encode_generate_request(generate, upstream_model.as_str(), None)
             .map_err(map_request_error)?;
+        // 编码已生成独立请求；HTTP、WS 与重试在头部和计量之前共用此策略。
+        upstream_request.apply_fast_policy(context.disable_fast());
         if let Some(conversation_id) = previous_session
             .as_ref()
             .and_then(|state| state.conversation_id.as_ref())
@@ -534,6 +572,12 @@ impl Provider for CodexProvider {
                 .with_request_location(egress.location().cloned())
         });
         let egress_account = egress_account.as_ref().unwrap_or_else(|| lease.account());
+        if matches!(
+            lease.authentication(),
+            crate::credential::CodexRuntimeAuthentication::OAuth(_)
+        ) {
+            normalize_non_codex_request_body(upstream_request.body_mut());
+        }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = egress_account
             .request_location()
@@ -609,8 +653,9 @@ impl Provider for CodexProvider {
             AttemptTransport::Retry(retry_index) => retry_index.get(),
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
+        // 每请求客户端 profile（上游 client_for_request）叠加诊断出口账号（我方 egress_account）。
         let client = self
-            .client
+            .client_for_request(&context)?
             .for_account(egress_account)
             .map_err(|_| {
                 provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)

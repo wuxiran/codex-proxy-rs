@@ -677,11 +677,80 @@ pub(super) fn continuation_replay_required_error(reason: &'static str) -> Provid
     .with_diagnostic(ProviderDiagnostic::new(
         "previous response is unavailable in the selected upstream scope; client replay is required",
     ))
-    .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+    .with_client_visible_upstream_error(continuation_replay_error_detail())
+}
+
+/// 额度拒绝使当前账号无法继续原生历史，由客户端携带完整输入创建新链。
+/// 只投影客户端响应；真实上游分类、发送状态和错误正文继续用于隔离与记账。
+pub(super) fn quota_continuation_replay_error(
+    mut error: ProviderError,
+    request: &CodexResponsesRequest,
+    replay_boundary: ReplayBoundary,
+) -> ProviderError {
+    if request.previous_response_id().is_none()
+        || error.kind() != ProviderErrorKind::QuotaExhausted
+        || !error.replay_is_safe()
+        || error.send_state() == UpstreamSendState::Ambiguous
+        || !replay_boundary.permits_provider_proof()
+    {
+        return error;
+    }
+
+    let mut headers: Vec<ProviderResponseHeader> = error
+        .client_visible_upstream_response()
+        .map(|response| {
+            response
+                .headers()
+                .iter()
+                // 额度窗口的等待时间不适用于客户端重建历史。
+                .filter(|header| !header.name().eq_ignore_ascii_case("retry-after"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    // 流内拒绝没有原始 HTTP 失败响应，仍需把该次失败的关联 ID 交给 HTTP 客户端。
+    if !headers.iter().any(|header| {
+        header.name().eq_ignore_ascii_case("x-request-id")
+            || header.name().eq_ignore_ascii_case("x-oai-request-id")
+    }) && let Some(request_id) = error.upstream_request_id()
+    {
+        headers.push(ProviderResponseHeader::new(
+            "x-request-id",
+            Bytes::copy_from_slice(request_id.as_str().as_bytes()),
+        ));
+    }
+    let detail = continuation_replay_error_detail();
+    let body = json!({"error": {
+        "message": detail.message(),
+        "code": detail.code(),
+        "type": detail.error_type(),
+    }});
+    // 未交付的 response.created 与额度错误帧必须一起丢弃，否则原错误帧会
+    // 覆盖恢复投影。该拒绝发生在语义输出和 commit 之前，不能带走已交付事件。
+    drop(error.take_atomic_client_events());
+    error
+        .with_continuation_failure(ContinuationFailure::HistoryUnavailable)
+        .with_continuation_recovery_disposition(
+            ContinuationRecoveryDisposition::ClientReplayRequired,
+        )
+        .with_continuation_unavailable_reason("quota_exhausted")
+        .with_client_visible_upstream_error(detail)
+        .with_client_visible_upstream_response(
+            ClientVisibleUpstreamResponse::new(
+                reqwest::StatusCode::BAD_REQUEST.as_u16(),
+                Some(b"application/json".to_vec()),
+                Bytes::from(body.to_string()),
+            )
+            .with_headers(headers),
+        )
+}
+
+fn continuation_replay_error_detail() -> ClientVisibleUpstreamError {
+    ClientVisibleUpstreamError::new(
         PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
         Some(PREVIOUS_RESPONSE_NOT_FOUND_CODE.to_owned()),
         Some("invalid_request_error".to_owned()),
-    ))
+    )
 }
 
 pub(super) fn map_stream_error(error: CodexClientError) -> MappedProviderFailure {
@@ -1270,12 +1339,8 @@ pub(super) fn map_upstream_failure(
         ),
         error_message: failure.client_message,
         cyber_policy_failure,
-        // 仅上游明确返回的容量/服务不可用计数；本地连接保护也会映射为
-        // Unavailable，不能用通用 ProviderErrorKind 推断容量证据。
-        upstream_capacity_failure: matches!(
-            category,
-            CodexFailureCategory::CapacityUnavailable | CodexFailureCategory::Unavailable
-        ),
+        // 普通 5xx 与未知流内错误不足以证明容量拒绝，不能用于冻结账号。
+        upstream_capacity_failure: capacity_unavailable,
         set_cookie_headers: failure.set_cookie_headers,
         rate_limit_headers: failure.rate_limit_headers,
         observation,

@@ -111,7 +111,7 @@ async fn proxy_location_is_shared_preserved_cleared_and_removed_with_binding() {
                     revision: stale_revision,
                     name: saved.name.clone(),
                     proxy: None,
-                    location: Some(Some(location.clone()))
+                    location: Some(Some(location.clone())),
                 },
                 &context()
             )
@@ -162,6 +162,8 @@ fn success() -> ProxyTestResult {
         latency_ms: 10,
         exit_ip: Some("203.0.113.5".parse().unwrap()),
         exit_geo: None,
+        exit_ipv4: Some("203.0.113.5".parse().unwrap()),
+        exit_ipv6: None,
         message: "Connected".to_owned(),
     }
 }
@@ -489,37 +491,21 @@ async fn rejected_import_reservations_release_proxy_lock_before_returning() {
         return;
     };
     let store = PgProxyRepository::new(database.pool.clone());
-    let other_process = PgProxyRepository::new(database.pool.clone());
-    let context = context();
-    let saved = store
-        .create(
-            NewProxy {
-                location: None,
-                name: "未通过检测的出口".to_owned(),
-                proxy: OutboundProxy::parse("http://127.0.0.1:8080").unwrap(),
-            },
-            &context,
-        )
-        .await
-        .unwrap()
-        .record;
+    let id = "proxy_missing";
 
-    // 每次失败后立即写入检测结果，不等待连接关闭或重试锁冲突。
+    // 读取不存在的代理失败后，应立即允许其他事务取得同一资源的独占锁。
     for _ in 0..64 {
-        let error = store.reserve_import(&saved.id).await.err().unwrap();
-        assert_eq!(error.kind(), AdminStoreErrorKind::Conflict);
-        other_process
-            .record_test(
-                &saved.id,
-                saved.revision,
-                ProxyTestResult {
-                    success: false,
-                    ..success()
-                },
-                &context,
-            )
-            .await
-            .unwrap();
+        let error = store.reserve_import(id).await.err().unwrap();
+        assert_eq!(error.kind(), AdminStoreErrorKind::NotFound);
+        let mut transaction = database.pool.begin().await.unwrap();
+        let acquired: bool =
+            sqlx::query_scalar("select pg_try_advisory_xact_lock(hashtextextended($1, 739219))")
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        assert!(acquired);
+        transaction.commit().await.unwrap();
     }
     database.close().await;
 }
@@ -547,9 +533,17 @@ async fn import_reservation_blocks_proxy_mutations_until_rotated_credentials_are
         .await
         .unwrap()
         .record;
-    assert!(store.reserve_import(&saved.id).await.is_err());
+    assert!(saved.last_test.is_none());
     store
-        .record_test(&saved.id, saved.revision, success(), &context)
+        .record_test(
+            &saved.id,
+            saved.revision,
+            ProxyTestResult {
+                success: false,
+                ..success()
+            },
+            &context,
+        )
         .await
         .unwrap();
     let reservation = store.reserve_import(&saved.id).await.unwrap();
@@ -676,27 +670,33 @@ async fn managed_proxies_persist_bind_update_all_accounts_and_protect_stale_test
             .is_err()
     );
     let selection = AccountProxySelection::Saved(created.id.clone());
-    assert!(
-        admin
-            .update_account(update("acct_one", selection.clone()), &context)
-            .await
-            .is_err()
-    );
+    admin
+        .update_account(update("acct_one", selection.clone()), &context)
+        .await
+        .unwrap();
     let read = || async {
         sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>("select id, outbound_proxy_id, outbound_proxy_url, credential_revision from provider_accounts order by id")
             .fetch_all(&database.pool).await.unwrap()
     };
-    assert!(
-        read()
-            .await
-            .iter()
-            .all(|row| row.1.is_none() && row.2.is_none() && row.3 == 1)
-    );
+    let untested = read().await;
+    assert_eq!(untested[0].1.as_deref(), Some(created.id.as_str()));
+    assert_eq!(untested[0].2.as_deref(), Some(old_proxy.expose_url()));
+    assert!(untested[1].1.is_none() && untested[1].2.is_none());
+    assert!(untested.iter().all(|row| row.3 == 1));
     let tested = store
-        .record_test(&created.id, created.revision, success(), &context)
+        .record_test(
+            &created.id,
+            created.revision,
+            ProxyTestResult {
+                success: false,
+                ..success()
+            },
+            &context,
+        )
         .await
         .unwrap();
     assert!(tested.last_test_at.is_some());
+    assert!(!tested.last_test.unwrap().success);
     for id in ["acct_one", "acct_two"] {
         admin
             .update_account(update(id, selection.clone()), &context)
@@ -721,6 +721,10 @@ async fn managed_proxies_persist_bind_update_all_accounts_and_protect_stale_test
                 && row.3 == 1)
     );
 
+    store
+        .record_test(&created.id, created.revision, success(), &context)
+        .await
+        .unwrap();
     let renamed = store
         .update(
             UpdateProxy {

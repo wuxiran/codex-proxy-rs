@@ -136,6 +136,45 @@ fn compiler_should_reject_revision_changed_during_consistent_read() {
 }
 
 #[test]
+fn routing_plans_share_frozen_pricing_after_a_new_snapshot_is_published() {
+    use gateway_core::{metering::PricingOverrides, runtime::RuntimeSnapshotHandle};
+    let prices = |bps| -> Arc<PricingOverrides> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({"openai":{"gpt-5.5":{
+                "multiplierBps":bps,"bands":{}
+            }}}))
+            .unwrap(),
+        )
+    };
+    let original = prices(12500);
+    let handle = RuntimeSnapshotHandle::new(super::snapshot().with_pricing(original.clone()));
+    let frozen = handle.acquire().unwrap();
+    let plan = |snapshot: &gateway_core::routing::RuntimeSnapshot| {
+        snapshot
+            .plan(
+                &PublicModelId::new("gpt-5.4").unwrap(),
+                &super::operation(),
+                snapshot.all_account_scope(),
+                &gateway_core::routing::RoutingContext::default(),
+            )
+            .unwrap()
+    };
+    let old_plan = plan(&frozen);
+    handle.publish(super::snapshot().with_pricing(prices(20000)));
+    let new_plan = plan(&handle.acquire().unwrap());
+    assert!(Arc::ptr_eq(&old_plan.pricing(), &original));
+    assert!(Arc::ptr_eq(&plan(&frozen).pricing(), &original));
+    assert_eq!(
+        old_plan.pricing()["openai"]["gpt-5.5"].multiplier_bps,
+        12500
+    );
+    assert_eq!(
+        new_plan.pricing()["openai"]["gpt-5.5"].multiplier_bps,
+        20000
+    );
+}
+
+#[test]
 fn compiler_should_preserve_passthrough_when_provider_catalog_is_unavailable() {
     let compiler = RuntimeSnapshotCompiler::new(
         Arc::new(TestSnapshotStore::new(Ok(facts(3, 3)))),
@@ -406,4 +445,200 @@ fn global_request_location_should_be_frozen_when_snapshot_is_published() {
             .name(),
         "Asia/Tokyo"
     );
+}
+
+#[test]
+fn decompression_setting_should_validate_and_remain_frozen_across_publication() {
+    use gateway_core::runtime::RuntimeSnapshotHandle;
+    let compile = |version, bytes| {
+        let facts = SnapshotFacts::new(
+            revision(version),
+            revision(version),
+            SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+                .with_responses_max_decompressed_body_bytes(bytes),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        block_on(compiler(Arc::new(TestSnapshotStore::new(Ok(facts)))).compile())
+    };
+    for invalid in [0, u64::MAX] {
+        assert!(matches!(
+            compile(1, invalid),
+            Err(RuntimeSnapshotCompileError::InvalidData)
+        ));
+    }
+    let handle = RuntimeSnapshotHandle::new(compile(1, 64 * 1024 * 1024).unwrap());
+    let frozen = handle.acquire().unwrap();
+    handle.publish(compile(2, 128 * 1024 * 1024).unwrap());
+    assert_eq!(
+        handle
+            .acquire()
+            .unwrap()
+            .responses_max_decompressed_body_bytes(),
+        128 * 1024 * 1024
+    );
+    assert_eq!(
+        frozen.responses_max_decompressed_body_bytes(),
+        64 * 1024 * 1024
+    );
+    handle.publish(compile(3, 1024 * 1024).unwrap());
+    assert_eq!(
+        handle
+            .acquire()
+            .unwrap()
+            .responses_max_decompressed_body_bytes(),
+        1024 * 1024
+    );
+}
+
+#[test]
+fn disable_fast_uses_only_bound_groups_without_changing_account_scope() {
+    use gateway_core::account::ProviderAccountId;
+    use gateway_core::routing::AccountGroupId;
+    for disable_fast in [false, true] {
+        for group_enabled in [false, true] {
+            for bound in [false, true] {
+                let group_id = AccountGroupId::new("grp_00000000000000000000000000000001").unwrap();
+                let open_group_id =
+                    AccountGroupId::new("grp_00000000000000000000000000000002").unwrap();
+                let account_id = ProviderAccountId::new("acct_fast_policy").unwrap();
+                let facts = SnapshotFacts::new(
+                    revision(1),
+                    revision(1),
+                    SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None),
+                    vec![SnapshotClientPolicyFacts::new(
+                        ClientApiKeyId::new("key_fast_policy").unwrap(),
+                        PlaintextClientApiKey::new("sk_fast_policy").unwrap(),
+                        if bound {
+                            vec![group_id.clone(), open_group_id.clone()]
+                        } else {
+                            Vec::new()
+                        },
+                        RateLimits::unlimited(),
+                    )],
+                    vec![
+                        SnapshotAccountGroupFacts::new(
+                            group_id.clone(),
+                            "Restricted".to_owned(),
+                            group_enabled,
+                        )
+                        .with_disable_fast(disable_fast),
+                        SnapshotAccountGroupFacts::new(
+                            open_group_id.clone(),
+                            "Open".to_owned(),
+                            true,
+                        ),
+                    ],
+                    vec![SnapshotProviderAccountFacts::new(
+                        account_id.clone(),
+                        "alpha",
+                    )],
+                    vec![
+                        SnapshotAccountGroupMemberFacts::new(group_id, account_id.clone()),
+                        SnapshotAccountGroupMemberFacts::new(open_group_id, account_id.clone()),
+                    ],
+                );
+                let snapshot = block_on(
+                    RuntimeSnapshotCompiler::new(
+                        Arc::new(TestSnapshotStore::new(Ok(facts))),
+                        Arc::new(TestCatalog::Unavailable),
+                    )
+                    .compile(),
+                )
+                .unwrap();
+                let scope = snapshot
+                    .client_policies()
+                    .next()
+                    .unwrap()
+                    .account_scope()
+                    .clone();
+                assert!(scope.allows(&account_id));
+                let plan = snapshot
+                    .plan(
+                        &PublicModelId::new("public-model").unwrap(),
+                        &super::operation(),
+                        scope,
+                        &Default::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    plan.disable_fast(),
+                    disable_fast && bound,
+                    "disable_fast={disable_fast}, enabled={group_enabled}, bound={bound}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn key_profiles_replace_whole_global_choice_and_previous_snapshot_stays_frozen() {
+    use gateway_core::account::OpaqueProviderData;
+    let provider = ProviderKind::new("alpha").unwrap();
+    let document = |label| {
+        OpaqueProviderData::new(
+            serde_json::json!({"choice":label})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let build = |global, overridden| {
+        let profiles = BTreeMap::from([(provider.clone(), document(global))]);
+        let settings = SnapshotSettingsFacts::new(3, 0, "smart", BTreeMap::new(), None, None)
+            .with_request_profiles(profiles);
+        let inherited = SnapshotClientPolicyFacts::new(
+            ClientApiKeyId::new("key_inherited").unwrap(),
+            PlaintextClientApiKey::new("sk_inherited").unwrap(),
+            vec![],
+            RateLimits::unlimited(),
+        );
+        let independent = SnapshotClientPolicyFacts::new(
+            ClientApiKeyId::new("key_independent").unwrap(),
+            PlaintextClientApiKey::new("sk_independent").unwrap(),
+            vec![],
+            RateLimits::unlimited(),
+        )
+        .with_request_profiles(if overridden {
+            BTreeMap::from([(provider.clone(), document("override"))])
+        } else {
+            BTreeMap::new()
+        });
+        block_on(
+            compiler(Arc::new(TestSnapshotStore::new(Ok(SnapshotFacts::new(
+                revision(1),
+                revision(1),
+                settings,
+                vec![inherited, independent],
+                vec![],
+                vec![],
+                vec![],
+            )))))
+            .compile(),
+        )
+        .unwrap()
+    };
+    let values = |snapshot: &gateway_core::routing::RuntimeSnapshot| {
+        let mut values: Vec<_> = snapshot
+            .client_policies()
+            .map(|policy| {
+                policy
+                    .account_scope()
+                    .request_profile(&provider)
+                    .unwrap()
+                    .expose_to_provider()["choice"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        values.sort();
+        values
+    };
+    let previous = build("global-a", true);
+    assert_eq!(values(&build("global-b", true)), ["global-b", "override"]);
+    assert_eq!(values(&previous), ["global-a", "override"]);
+    assert_eq!(values(&build("global-b", false)), ["global-b", "global-b"]);
 }

@@ -277,6 +277,8 @@ impl ProxyProbe for SuccessfulProbe {
                 region: Some("加州".to_owned()),
                 city: None,
             }),
+            exit_ipv4: Some("203.0.113.2".parse().unwrap()),
+            exit_ipv6: None,
             message: "Connected".to_owned(),
         }
     }
@@ -431,8 +433,12 @@ async fn proxy_probe_checks_unsaved_address_without_creating_or_changing_records
     assert_eq!(
         probed["data"],
         json!({
-            "success": true, "latencyMs": 15, "exitIp": "203.0.113.2",
+            "success": true,
+            "latencyMs": 15,
+            "exitIp": "203.0.113.2",
             "exitGeo": {"country": "美国", "countryCode": "US", "region": "加州", "city": null},
+            "exitIpv4": "203.0.113.2",
+            "exitIpv6": null,
             "message": "Connected"
         })
     );

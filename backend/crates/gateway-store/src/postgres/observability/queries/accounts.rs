@@ -23,9 +23,9 @@ pub(crate) async fn provider_account_usage(
     statement.push_bind(query.split_model_identity);
     statement.push(
         " then jsonb_build_array(mr.requested_model_id, mr.upstream_model_id,
-                                 mr.response_model, mr.billing_model)::text
+                                 mrb.response_model, mrb.billing_model)::text
           else jsonb_build_array(null, coalesce(mr.upstream_model_id, mr.requested_model_id), null, null)::text end as model_key,
-                mr.calculated_cost_amount, mr.calculated_cost_currency,
+                mrb.calculated_cost_amount, mrb.calculated_cost_currency,
                   mr.cost_currency, mr.outcome, mr.input_tokens, mr.output_tokens,
                   mr.cached_tokens, mr.cache_write_tokens, mr.reasoning_tokens,
                   mr.image_input_tokens, mr.image_output_tokens,
@@ -39,6 +39,8 @@ pub(crate) async fn provider_account_usage(
     statement.push(" and mr.started_at < ");
     statement.push_bind(query.range.end);
     push_completed_usage_fact_filter(&mut statement, "mr");
+    // 计价身份/本地成本迁子表（fork 9001）：LEFT JOIN 取回，无子行时为 NULL（等价原父表列缺省）。
+    statement.push(" left join model_request_billing mrb on mrb.model_request_id = mr.id ");
     if let Some(account_ids) = &query.account_ids {
         statement.push(" where pa.id = any(");
         statement.push_bind(account_ids.clone());

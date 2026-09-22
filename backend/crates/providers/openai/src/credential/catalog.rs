@@ -272,6 +272,16 @@ impl CodexCredentialCatalogService {
         client_version: &str,
     ) -> ClientCatalogResult {
         let now = SystemTime::now();
+        let provider = gateway_core::routing::ProviderKind::new("openai")
+            .map_err(|_| CodexCredentialCatalogError::InvalidCredentialData)?;
+        let request_profile = match scope.request_profile(&provider) {
+            Some(configuration) => {
+                crate::transport::profile::selection::ClientProfileSelection::parse(configuration)
+                    .and_then(|selection| selection.resolve(&self.profile))
+                    .map_err(|_| CodexCredentialCatalogError::InvalidCredentialData)?
+            }
+            None => self.profile.snapshot(),
+        };
         let mut accounts = self.repository.list_for_provider().await?;
         accounts
             .retain(|account| scope.allows(account.id()) && eligible_catalog_account(account, now));
@@ -319,7 +329,7 @@ impl CodexCredentialCatalogService {
         });
         let mut last_error = CodexCredentialCatalogError::NoEligibleCredential;
         for account in accounts.iter().take(MAX_CATALOG_FETCH_ATTEMPTS) {
-            let profile = self.profile.snapshot();
+            let profile = request_profile.clone();
             let key = ClientCatalogKey {
                 account_id: account.id().clone(),
                 revision: account.revision(),
@@ -465,9 +475,20 @@ impl CodexCredentialCatalogService {
             .ok_or(CodexCredentialCatalogError::NoEligibleCredential)?;
         let scope = CodexCatalogScope::for_account(&account)?;
         let mut candidates =
-            catalog_candidates_by_scope(self.repository.list_for_provider().await?)?
-                .remove(&scope)
-                .unwrap_or_default();
+            match catalog_candidates_by_scope(self.repository.list_for_provider().await?) {
+                Ok(mut groups) => groups.remove(&scope).unwrap_or_default(),
+                // 全部账号都被调度列表过滤时按空候选处理，让下方目标账号补回继续生效。
+                Err(CodexCredentialCatalogError::NoEligibleCredential) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+        // 常规调度列表不含停用账号；管理端按账号查询模型要对停用账号返回真实上游
+        // 结果，这里把不在候选里的目标账号本身补回，仍按优先顺序先试目标账号。
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.id() == account_id)
+        {
+            candidates.push(account.clone());
+        }
         if candidates.is_empty() {
             return Err(CodexCredentialCatalogError::NoEligibleCredential);
         }

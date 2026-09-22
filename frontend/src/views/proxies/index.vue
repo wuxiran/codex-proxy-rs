@@ -49,7 +49,12 @@ const columns = defineTableColumns<OutboundProxyRecord>([
 ])
 const showForm = shallowRef(false)
 const editing = shallowRef<OutboundProxyRecord | null>(null)
-const form = reactive({ name: '', proxyUrl: '', customLocation: false, location: { country: '', region: '', city: '', timezone: '' } })
+const form = reactive({
+  name: '',
+  proxyUrl: '',
+  customLocation: false,
+  location: { country: '', region: '', city: '', timezone: '' },
+})
 const saveAction = useAsyncAction()
 const { loading: saving } = saveAction
 const deleteAction = useAsyncAction()
@@ -298,8 +303,18 @@ async function save() {
   await saveAction.run(async () => {
     // 编辑时留空保留已保存的地址和认证，不能用脱敏地址覆盖原连接。
     await (editing.value
-      ? updateProxy({ id: editing.value.id, revision: editing.value.revision, name, proxyUrl: proxyUrl || undefined, location })
-      : createProxy({ name, proxyUrl, location }))
+      ? updateProxy({
+          id: editing.value.id,
+          revision: editing.value.revision,
+          name,
+          proxyUrl: proxyUrl || undefined,
+          location,
+        })
+      : createProxy({
+          name,
+          proxyUrl,
+          location,
+        }))
     showForm.value = false
     form.proxyUrl = ''
     toast.success('代理已保存')
@@ -422,7 +437,7 @@ onMounted(() => void query.execute())
               <BaseCheckbox :model-value="selectedIds.has(row.id)" label="选择代理" @update:model-value="toggleSelection(row.id)" />
             </template>
             <template #name="{ row }">
-              <strong class="block truncate text-cp text-cp-text" :title="row.name">{{ row.name }}</strong>
+              <span class="block truncate text-cp text-cp-text" :title="row.name">{{ row.name }}</span>
             </template>
             <template #address="{ row }">
               <div class="grid min-w-0 gap-1">
@@ -452,13 +467,18 @@ onMounted(() => void query.execute())
               </div>
             </template>
             <template #exitIp="{ row }">
-              <div v-if="row.lastTest?.exitIp" class="grid min-w-0 gap-0.5">
+              <div v-if="row.lastTest && (row.lastTest.exitIpv4 || row.lastTest.exitIpv6 || row.lastTest.exitIp)" class="grid min-w-0 gap-0.5">
                 <span v-if="row.lastTest.exitGeo" class="flex min-w-0 items-center gap-1.5 text-cp-sm text-cp-text" :title="[row.lastTest.exitGeo.country, row.lastTest.exitGeo.region, row.lastTest.exitGeo.city].filter(Boolean).join(' / ')">
                   <!-- Windows 不渲染国旗 emoji，统一用地区码标签，跨平台一致。 -->
                   <span class="shrink-0 rounded-cp-sm bg-cp-fill-secondary px-1 font-mono text-[10px] leading-4 font-bold text-cp-text-secondary">{{ row.lastTest.exitGeo.countryCode }}</span>
                   <span class="truncate">{{ exitGeoLabel(row.lastTest.exitGeo) }}</span>
                 </span>
-                <span class="break-all font-mono text-cp-xs text-cp-text-secondary">{{ row.lastTest.exitIp }}</span>
+                <!-- 双栈出口逐条列出；无双栈字段时回落单一 exitIp。 -->
+                <template v-if="row.lastTest.exitIpv4 || row.lastTest.exitIpv6">
+                  <span v-if="row.lastTest.exitIpv4" class="break-all font-mono text-cp-xs text-cp-text-secondary" :title="`IPv4: ${row.lastTest.exitIpv4}`">{{ row.lastTest.exitIpv4 }}</span>
+                  <span v-if="row.lastTest.exitIpv6" class="break-all font-mono text-cp-xs text-cp-text-secondary" :title="`IPv6: ${row.lastTest.exitIpv6}`">{{ row.lastTest.exitIpv6 }}</span>
+                </template>
+                <span v-else-if="row.lastTest.exitIp" class="break-all font-mono text-cp-xs text-cp-text-secondary">{{ row.lastTest.exitIp }}</span>
               </div>
               <span v-else class="text-cp-text-quaternary">-</span>
             </template>

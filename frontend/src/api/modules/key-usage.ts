@@ -3,6 +3,16 @@ import type { DashboardHealthTimeline } from './dashboard'
 import type { UsageBilling, UsageLatencyDetails, UsageTokenDetails } from './usage'
 import request from '../request'
 
+export interface KeyUsageConfig {
+  name: string
+  plaintextKey: string
+}
+
+export interface KeyUsageVersion {
+  version: string
+  gitSha: string
+}
+
 export interface KeyUsageMetrics {
   requests: number
   inputTokens: number
@@ -82,6 +92,22 @@ export function getKeyUsageOverview(params: KeyUsageQuery, options: RequestOptio
     url: '/api/key-usage/overview',
     method: 'GET',
     params,
+    ...options,
+  })
+}
+
+export function getKeyUsageVersion(options: RequestOptions = {}) {
+  return request<KeyUsageVersion>({
+    url: '/api/key-usage/version',
+    method: 'GET',
+    ...options,
+  })
+}
+
+export function getKeyUsageConfig(options: RequestOptions = {}) {
+  return request<KeyUsageConfig>({
+    url: '/api/key-usage/config',
+    method: 'GET',
     ...options,
   })
 }

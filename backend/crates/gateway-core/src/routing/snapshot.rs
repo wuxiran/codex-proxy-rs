@@ -28,12 +28,15 @@ const MAXIMUM_CATALOG_STABILITY_ATTEMPTS: usize = 4;
 /// Store 在一个一致性读取中提供的调度设置事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSettingsFacts {
+    pricing: Arc<crate::metering::PricingOverrides>,
+    request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     request_location_enabled: bool,
     request_location: crate::account::RequestLocation,
     max_concurrent_per_account: u32,
     max_waiting_per_key: u32,
     max_waiting_per_account: u32,
     concurrency_wait_timeout_seconds: u32,
+    responses_max_decompressed_body_bytes: u64,
     request_interval_ms: u64,
     rotation_strategy: String,
     model_mappings: BTreeMap<String, String>,
@@ -42,6 +45,27 @@ pub struct SnapshotSettingsFacts {
 }
 
 impl SnapshotSettingsFacts {
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: crate::metering::PricingOverrides) -> Self {
+        self.pricing = Arc::new(pricing);
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_profiles(
+        mut self,
+        profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
+    ) -> Self {
+        self.request_profiles = profiles;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_responses_max_decompressed_body_bytes(mut self, bytes: u64) -> Self {
+        self.responses_max_decompressed_body_bytes = bytes;
+        self
+    }
+
     #[must_use]
     pub fn with_request_location(
         mut self,
@@ -76,12 +100,15 @@ impl SnapshotSettingsFacts {
         min_codex_cli_version: Option<String>,
     ) -> Self {
         Self {
+            request_profiles: BTreeMap::new(),
+            pricing: Arc::default(),
             request_location_enabled: false,
             request_location: crate::account::RequestLocation::default(),
             max_concurrent_per_account,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             request_interval_ms,
             rotation_strategy: rotation_strategy.into(),
             model_mappings,
@@ -94,6 +121,7 @@ impl SnapshotSettingsFacts {
 /// Store 读取到的一个启用 Client API Key 策略事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotClientPolicyFacts {
+    request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     key_id: ClientApiKeyId,
     plaintext_key: PlaintextClientApiKey,
     group_ids: Vec<AccountGroupId>,
@@ -101,6 +129,15 @@ pub struct SnapshotClientPolicyFacts {
 }
 
 impl SnapshotClientPolicyFacts {
+    #[must_use]
+    pub fn with_request_profiles(
+        mut self,
+        profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
+    ) -> Self {
+        self.request_profiles = profiles;
+        self
+    }
+
     #[must_use]
     pub fn new(
         key_id: ClientApiKeyId,
@@ -110,6 +147,7 @@ impl SnapshotClientPolicyFacts {
     ) -> Self {
         Self {
             key_id,
+            request_profiles: BTreeMap::new(),
             plaintext_key,
             group_ids,
             limits,
@@ -120,6 +158,7 @@ impl SnapshotClientPolicyFacts {
 /// Store 读取到的账号分组事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAccountGroupFacts {
+    disable_fast: bool,
     id: AccountGroupId,
     name: String,
     enabled: bool,
@@ -127,8 +166,19 @@ pub struct SnapshotAccountGroupFacts {
 
 impl SnapshotAccountGroupFacts {
     #[must_use]
+    pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
+        self.disable_fast = disable_fast;
+        self
+    }
+
+    #[must_use]
     pub fn new(id: AccountGroupId, name: String, enabled: bool) -> Self {
-        Self { id, name, enabled }
+        Self {
+            id,
+            name,
+            enabled,
+            disable_fast: false,
+        }
     }
 }
 
@@ -391,6 +441,12 @@ async fn compile_runtime_snapshot(
     {
         return Err(RuntimeSnapshotCompileError::InvalidData);
     }
+    let decompressed_body_limit =
+        isize::try_from(facts.settings.responses_max_decompressed_body_bytes)
+            .ok()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .and_then(std::num::NonZeroUsize::new)
+            .ok_or(RuntimeSnapshotCompileError::InvalidData)?;
     let queue_timeout =
         Duration::from_secs(u64::from(facts.settings.concurrency_wait_timeout_seconds));
     let client_queue_policy = ConcurrencyQueuePolicy {
@@ -428,6 +484,7 @@ async fn compile_runtime_snapshot(
     });
     let mut client_policies = Vec::with_capacity(facts.client_policies.len());
     for policy in facts.client_policies {
+        let mut disable_fast = false;
         let account_scope = if policy.group_ids.is_empty() {
             FrozenAccountScope::new(
                 Arc::clone(&account_directory),
@@ -444,6 +501,8 @@ async fn compile_runtime_snapshot(
                 let group = groups
                     .get(&group_id)
                     .ok_or(RuntimeSnapshotCompileError::InvalidData)?;
+                // 禁用分组仅影响选号；Key 仍绑定其 Fast 限制。
+                disable_fast |= group.disable_fast;
                 bound_groups.push(RoutingGroupSnapshot::new(
                     group.id.clone(),
                     group.name.clone(),
@@ -460,10 +519,16 @@ async fn compile_runtime_snapshot(
                     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)?,
             )
         };
+        let mut request_profiles = facts.settings.request_profiles.clone();
+        request_profiles.extend(policy.request_profiles);
         client_policies.push(ClientPolicy::new(
             policy.key_id,
             policy.plaintext_key,
-            Arc::new(account_scope),
+            Arc::new(
+                account_scope
+                    .with_disable_fast(disable_fast)
+                    .with_request_profiles(request_profiles),
+            ),
             true,
             policy.limits,
         ));
@@ -491,7 +556,9 @@ async fn compile_runtime_snapshot(
     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)
     .map(|snapshot| {
         snapshot
+            .with_pricing(facts.settings.pricing)
             .with_request_location(request_location)
+            .with_responses_max_decompressed_body_bytes(decompressed_body_limit)
             .with_client_queue_policy(client_queue_policy)
             .with_model_mappings(model_mappings)
             .with_account_directory(account_directory)
@@ -503,6 +570,8 @@ async fn compile_runtime_snapshot(
 /// 数据面使用的不可变配置快照。
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
+    pricing: Arc<crate::metering::PricingOverrides>,
+    responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
     request_location: Option<crate::account::RequestLocation>,
     revision: ConfigRevision,
     client_queue_policy: ConcurrencyQueuePolicy,
@@ -520,6 +589,26 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: Arc<crate::metering::PricingOverrides>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    #[must_use]
+    pub const fn responses_max_decompressed_body_bytes(&self) -> usize {
+        self.responses_max_decompressed_body_bytes.get()
+    }
+
+    #[must_use]
+    pub const fn with_responses_max_decompressed_body_bytes(
+        mut self,
+        bytes: std::num::NonZeroUsize,
+    ) -> Self {
+        self.responses_max_decompressed_body_bytes = bytes;
+        self
+    }
+
     #[must_use]
     pub fn with_request_location(
         mut self,
@@ -608,6 +697,9 @@ impl RuntimeSnapshot {
         client_policy_map.retain(|_, policy| policy.enabled());
 
         Ok(Self {
+            responses_max_decompressed_body_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
+                .expect("positive default limit"),
+            pricing: Arc::default(),
             request_location: None,
             revision,
             account_selection_policy,
@@ -919,6 +1011,7 @@ impl RuntimeSnapshot {
 
         Ok(RoutingPlan {
             config_revision: self.revision,
+            pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),
@@ -961,6 +1054,7 @@ impl RuntimeSnapshot {
         };
         Ok(RoutingPlan {
             config_revision: self.revision,
+            pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),

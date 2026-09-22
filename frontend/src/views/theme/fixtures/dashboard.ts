@@ -111,15 +111,18 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
 
   return {
     id: options.id,
+    clientApiKeyName: '演示 Key',
     provider: options.provider,
     authenticationKind: options.authenticationKind,
     accountId: `account_${options.id}`,
     accountEmail: options.accountEmail,
     accountName: options.accountEmail.split('@')[0] ?? null,
+    accountNotes: null,
     route: stream ? '/v1/responses' : '/v1/chat/completions',
     model: options.model,
     requestedModel: options.model,
     upstreamModel: options.model,
+    upstreamResponseModel: null,
     serviceTier: options.provider === 'openai' ? 'priority' : 'standard',
     clientTransport: options.clientTransport,
     upstreamTransport: options.upstreamTransport,
@@ -146,6 +149,7 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
       totalTokensDisplay: totalTokens.toLocaleString('zh-CN'),
     },
     billing: {
+      longContextBillingApplied: false,
       inputAmountDisplay: options.estimatedCost,
       outputAmountDisplay: options.estimatedCost,
       cacheReadAmountDisplay: '$0.0004',

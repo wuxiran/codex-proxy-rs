@@ -33,6 +33,13 @@ export interface UsageCostCoverage {
 }
 
 export interface UsageBilling {
+  longContextBillingApplied: boolean
+  image?: {
+    inputAmountDisplay: string
+    cacheReadAmountDisplay: string
+    inputPriceDisplay: string
+    cacheReadPriceDisplay: string
+  }
   inputAmountDisplay: string
   outputAmountDisplay: string
   cacheReadAmountDisplay: string
@@ -68,16 +75,19 @@ export interface UsageRecordMetadata {
 }
 
 export interface UsageListRecord {
+  clientApiKeyName: string | null
   id: string
   provider: string | null
   authenticationKind: string | null
   accountId: string | null
   accountEmail: string | null
   accountName: string | null
+  accountNotes: string | null
   route: string
   model: string | null
   requestedModel: string | null
   upstreamModel: string | null
+  upstreamResponseModel: string | null
   serviceTier: string | null
   clientTransport: string
   upstreamTransport: string | null
@@ -110,6 +120,7 @@ export interface UsageRecord {
   model: string | null
   requestedModel: string | null
   upstreamModel: string | null
+  upstreamResponseModel: string | null
   serviceTier: string | null
   statusCode: number | null
   clientTransport: string
@@ -252,6 +263,7 @@ export interface OpsErrorMetadata {
 }
 
 export interface OpsError {
+  clientApiKeyName: string | null
   id: string
   requestId: string | null
   clientApiKeyId: string | null

@@ -356,8 +356,10 @@ async fn core_adapter_should_persist_calculated_cost_exactly() {
     let repository = PgExecutionStore::new(database.pool.clone());
 
     let mut finalization = successful_core_finalization("req_calculated_cost");
+    finalization.downstream_committed_at = Some(std::time::SystemTime::now());
     finalization.websocket_pool = Some("reuse".to_owned());
     finalization.service_tier = Some("priority".to_owned());
+    finalization.upstream_response_model = Some("grok-4.6-build".to_owned());
     finalization.cost = CalculatedCost::from_usd_ticks(12_345)
         .expect("calculated cost")
         .into_estimate();
@@ -393,6 +395,121 @@ async fn core_adapter_should_persist_calculated_cost_exactly() {
             Some("priority".to_owned()),
         )
     );
+    let observation = observability_repository(&database.pool);
+    let detail = observation
+        .usage_record_detail("req_calculated_cost")
+        .await
+        .expect("request detail");
+    assert_eq!(
+        detail.request.upstream_model_id.as_deref(),
+        Some("grok-4.5")
+    );
+    assert_eq!(
+        detail.request.upstream_response_model.as_deref(),
+        Some("grok-4.6-build")
+    );
+    let page = observation
+        .list_usage_records(UsageRecordQuery {
+            range: ObservabilityRange::new(
+                Utc::now() - Duration::hours(1),
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+            filter: UsageRecordFilter::default(),
+            current_page: 1,
+            page_size: ObservabilityPageSize::new(10).unwrap(),
+        })
+        .await
+        .expect("request list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].upstream_response_model.as_deref(),
+        Some("grok-4.6-build")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() {
+    use gateway_core::metering::{
+        CalculatedCostAmounts, CalculatedCostBreakdown, CalculatedCostRates, CurrencyCode, Decimal,
+        Money,
+    };
+    let Some(database) = TestDatabase::create("billing_snapshot").await else {
+        return;
+    };
+    seed_running_request(&database.pool, "req_billing_snapshot")
+        .await
+        .unwrap();
+    let money = |ticks| {
+        Money::new(
+            Decimal::from_scaled(ticks).unwrap(),
+            CurrencyCode::new("USD").unwrap(),
+        )
+    };
+    let billing = CalculatedCostBreakdown::new(
+        CalculatedCostAmounts::new(
+            money(1_000_000),
+            money(2_000_000),
+            money(3_000_000),
+            money(0),
+            money(6_000_000),
+            money(6_000_000),
+        ),
+        CalculatedCostRates::new(
+            money(10_000_000_000),
+            money(20_000_000_000),
+            money(5_000_000_000),
+            money(0),
+        ),
+        Some("default".to_owned()),
+        100,
+    )
+    .with_long_context_billing(true)
+    .with_custom_multiplier(12500)
+    .unwrap();
+    let mut finalization = successful_core_finalization("req_billing_snapshot");
+    finalization.cost = billing.calculated_cost().into_estimate();
+    ExecutionStore::finalize_model_request(
+        &PgExecutionStore::new(database.pool.clone()),
+        finalization,
+    )
+    .await
+    .unwrap();
+    let observation = admin_observability_store(&database.pool);
+    let original = observation
+        .usage_record_detail("req_billing_snapshot")
+        .await
+        .unwrap();
+    let Some(admin_observability::UsageBilling::Calculated(saved)) = &original.request.billing
+    else {
+        panic!("persisted billing breakdown must be restored without provider recalculation");
+    };
+    assert!(saved.long_context_billing_applied);
+    assert_eq!(saved.custom_multiplier_bps, 12500);
+    assert_eq!(saved.total_amount.amount, "0.00075".parse().unwrap());
+    sqlx::query("update runtime_settings set pricing_overrides_json = $1 where id = 1")
+        .bind(json!({"openai":{"gpt-5.4":{"multiplierBps":90000,"bands":{}}}}))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let after = observation
+        .usage_record_detail("req_billing_snapshot")
+        .await
+        .unwrap();
+    assert_eq!(original.request.billing, after.request.billing);
+    sqlx::query("update model_requests set billing_snapshot_json = billing_snapshot_json - 'longContextBillingApplied' where id = 'req_billing_snapshot'")
+        .execute(&database.pool).await.unwrap();
+    let legacy = observation
+        .usage_record_detail("req_billing_snapshot")
+        .await
+        .unwrap();
+    let Some(admin_observability::UsageBilling::Calculated(legacy)) = legacy.request.billing else {
+        panic!("legacy billing snapshot must remain readable");
+    };
+    assert!(!legacy.long_context_billing_applied);
+    assert_eq!(legacy.total_amount, saved.total_amount);
+
     database.close().await;
 }
 
@@ -495,6 +612,7 @@ fn successful_core_finalization(id: &str) -> CoreModelRequestFinalization {
         upstream_transport: Some("websocket".to_owned()),
         http_version: Some("HTTP/2".to_owned()),
         websocket_pool: None,
+        upstream_response_model: None,
         service_tier: None,
         provider_metadata_json: None,
         error: None,
@@ -1232,6 +1350,7 @@ pub(super) fn early_failure(request: &CoreNewModelRequest) -> CoreModelRequestFi
         upstream_transport: None,
         http_version: None,
         websocket_pool: None,
+        upstream_response_model: None,
         service_tier: None,
         provider_metadata_json: None,
         diagnostic_trace_json: trace.snapshot().map(|value| value.to_string()),
@@ -1792,7 +1911,8 @@ async fn model_billing_identity_and_both_costs_survive_finalization() {
     ExecutionStore::finalize_model_request(&store, finalization)
         .await
         .unwrap();
-    let row: Value = sqlx::query_scalar("select jsonb_build_object('requested', requested_model_id, 'upstream', upstream_model_id, 'response', response_model, 'billing', billing_model, 'calculated', calculated_cost_amount::text, 'actual', cost_amount::text, 'source', cost_source) from model_requests where id = 'req_billing_identity'")
+    // 计价身份/本地成本已迁子表 model_request_billing（fork 9001），JOIN 取回。
+    let row: Value = sqlx::query_scalar("select jsonb_build_object('requested', mr.requested_model_id, 'upstream', mr.upstream_model_id, 'response', mrb.response_model, 'billing', mrb.billing_model, 'calculated', mrb.calculated_cost_amount::text, 'actual', mr.cost_amount::text, 'source', mr.cost_source) from model_requests mr left join model_request_billing mrb on mrb.model_request_id = mr.id where mr.id = 'req_billing_identity'")
         .fetch_one(&database.pool).await.unwrap();
     assert_eq!(
         row,
@@ -1816,15 +1936,18 @@ async fn billing_migration_preserves_historical_cost_provenance_without_guessing
     }
     sqlx::query("update model_requests set cost_source = case when id = 'req_history_calculated' then 'calculated' else 'provider_reported' end, cost_amount = 1.25, cost_currency = 'USD'")
         .execute(&database.pool).await.unwrap();
-    sqlx::raw_sql("alter table model_requests drop column response_model, drop column billing_model, drop column calculated_cost_amount, drop column calculated_cost_currency")
-        .execute(&database.pool).await.unwrap();
+    // 计价列迁子表后，回填逻辑在 9001；重建子表并重跑迁移，验证仅 cost_source='calculated' 的历史金额被迁入。
+    sqlx::raw_sql("drop table model_request_billing")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../../../migrations/0012_model_billing_observations.sql"
+        "../../../../migrations/9001_model_request_billing.sql"
     ))
     .execute(&database.pool)
     .await
     .unwrap();
-    let rows: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id', id, 'price', calculated_cost_amount::text, 'amount', cost_amount::text, 'source', cost_source, 'response', response_model, 'billing', billing_model) from model_requests order by id")
+    let rows: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id', mr.id, 'price', mrb.calculated_cost_amount::text, 'amount', mr.cost_amount::text, 'source', mr.cost_source, 'response', mrb.response_model, 'billing', mrb.billing_model) from model_requests mr left join model_request_billing mrb on mrb.model_request_id = mr.id order by mr.id")
         .fetch_all(&database.pool).await.unwrap();
     assert_eq!(
         rows[0],

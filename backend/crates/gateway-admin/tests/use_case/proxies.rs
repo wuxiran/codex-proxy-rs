@@ -16,6 +16,8 @@ pub(super) struct TestProxies {
     pub records: Option<std::sync::Arc<std::sync::Mutex<Vec<ProxyRecord>>>>,
     /// 记录每次导入预留的代理 ID。
     pub reserved: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    /// 上游用例的单记录 double：`records` 未设时 `get` 回退到它。
+    pub record: Option<ProxyRecord>,
 }
 
 struct ImportGuard(super::accounts::EventLog);
@@ -98,6 +100,7 @@ impl ProxyStore for TestProxies {
                     .find(|record| record.id == id)
                     .cloned()
             })
+            .or_else(|| self.record.clone().filter(|record| record.id == id))
             .ok_or_else(|| super::unavailable("proxy"))
     }
     async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
@@ -141,6 +144,62 @@ impl ProxyStore for TestProxies {
 impl ProxyProbe for TestProxies {
     async fn test(&self, _: &OutboundProxy) -> ProxyTestResult {
         panic!("unexpected proxy probe")
+    }
+}
+
+#[tokio::test]
+async fn authorization_uses_selected_proxy_regardless_of_probe_status() {
+    use super::accounts::{FakeAccountStore, FakeProviderAdmin, context, events, recorded};
+    use gateway_admin::model::provider_credentials::StartAuthorization;
+    use std::sync::Arc;
+
+    for kind in ["openai", "xai"] {
+        for probe_success in [None, Some(false), Some(true)] {
+            let events = events();
+            let now = chrono::Utc::now();
+            let services = super::AdminHarness::new()
+                .provider(FakeProviderAdmin::new(kind, events.clone()))
+                .accounts(FakeAccountStore::new(kind, events.clone()))
+                .proxies(Arc::new(TestProxies {
+                    record: Some(ProxyRecord {
+                        location: None,
+                        id: "proxy_oauth".to_owned(),
+                        name: "授权出口".to_owned(),
+                        proxy: OutboundProxy::parse("http://127.0.0.1:8080").unwrap(),
+                        revision: Revision::new(1).unwrap(),
+                        account_count: 0,
+                        last_test_at: probe_success.map(|_| now),
+                        last_test: probe_success.map(|success| ProxyTestResult {
+                            success,
+                            latency_ms: 10,
+                            exit_ip: None,
+                            exit_geo: None,
+                            exit_ipv4: None,
+                            exit_ipv6: None,
+                            message: "出口探测结果".to_owned(),
+                        }),
+                        quality: None,
+                        created_at: now,
+                        updated_at: now,
+                    }),
+                    ..Default::default()
+                }))
+                .build()
+                .await;
+            let command = StartAuthorization {
+                outbound_proxy: Some(AccountProxySelection::Saved("proxy_oauth".to_owned())),
+                context: context("oauth-proxy-status"),
+                name: "授权账号".to_owned(),
+                reauthorization: None,
+            };
+            let result = if kind == "openai" {
+                services.openai().start_authorization(command).await
+            } else {
+                services.xai().start_authorization(command).await
+            };
+            assert!(result.is_ok(), "{kind}, {probe_success:?}: {result:?}");
+            assert_eq!(recorded(&events), ["provider.start_authorization"]);
+        }
     }
 }
 
@@ -417,6 +476,8 @@ impl ProxyProbe for MemoryProxies {
             latency_ms: 120,
             exit_ip: Some("203.0.113.9".parse().unwrap()),
             exit_geo: None,
+            exit_ipv4: None,
+            exit_ipv6: None,
             message: "连接成功".to_owned(),
         }
     }

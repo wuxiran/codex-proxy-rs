@@ -11,6 +11,8 @@ fn base(success: bool) -> ProxyTestResult {
             region: None,
             city: Some("洛杉矶".to_owned()),
         }),
+        exit_ipv4: None,
+        exit_ipv6: None,
         message: if success {
             "连接成功"
         } else {

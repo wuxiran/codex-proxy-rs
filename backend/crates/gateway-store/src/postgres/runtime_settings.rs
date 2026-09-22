@@ -19,6 +19,8 @@ use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub config_revision: Revision,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
@@ -28,6 +30,7 @@ pub struct RuntimeSettings {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -107,6 +110,8 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
@@ -115,6 +120,7 @@ pub struct RuntimeSettingsUpdate {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -152,6 +158,8 @@ impl fmt::Debug for RuntimeSettingsUpdate {
 impl RuntimeSettingsUpdate {
     pub fn validate(&self) -> StoreResult<()> {
         if self.request_location.validate().is_err()
+            || self.responses_max_decompressed_body_bytes == 0
+            || isize::try_from(self.responses_max_decompressed_body_bytes).is_err()
             || self.refresh_margin_seconds == 0
             || self.refresh_concurrency == 0
             || self.max_concurrent_per_account == 0
@@ -225,11 +233,11 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
 
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-            "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
+            "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
                     refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                     rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
-                    min_codex_cli_version, updated_at, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
+                    min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
                     account_auto_freeze_enabled, account_auto_freeze_threshold,
                     account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                     account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
@@ -247,6 +255,30 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
 }
 
 impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
+    fn initialize_request_profile<'a>(
+        &'a self,
+        provider: &'a gateway_core::routing::ProviderKind,
+        initial: gateway_core::account::OpaqueProviderData,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<gateway_core::account::OpaqueProviderData, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            let document = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Map<String, serde_json::Value>>>(
+                "update runtime_settings set
+                    provider_request_profiles_json = case when provider_request_profiles_json ? $1 then provider_request_profiles_json
+                        else jsonb_set(provider_request_profiles_json, array[$1], $2) end,
+                    config_revision = config_revision + case when provider_request_profiles_json ? $1 then 0 else 1 end
+                 where id = 1 returning provider_request_profiles_json -> $1"
+            )
+            .bind(provider.as_str())
+            .bind(sqlx::types::Json(initial.expose_to_provider()))
+            .fetch_one(&self.pool).await
+            .map_err(|_| provider_unavailable("initialize Provider request profile"))?;
+            Ok(gateway_core::account::OpaqueProviderData::new(document.0))
+        })
+    }
+
     fn load_refresh_policy(
         &self,
     ) -> futures::future::BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
@@ -287,11 +319,11 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-        "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
+        "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
                 refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                 rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
-                min_codex_cli_version, updated_at, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
+                min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
                 account_auto_freeze_enabled, account_auto_freeze_threshold,
                 account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                 account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
@@ -342,6 +374,10 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      account_auto_freeze_adaptive_concurrency = $22,
                      request_location_json = $23,
                      request_location_enabled = $24,
+                     responses_max_decompressed_body_bytes = $25,
+                     provider_request_profiles_json = provider_request_profiles_json
+                         || case when $26::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $26::jsonb) end
+                         || case when $27::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $27::jsonb) end,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -379,6 +415,12 @@ pub(crate) async fn update_runtime_settings_in_transaction(
             .map_err(|_| invalid_location())?,
     ))
     .bind(update.request_location_enabled)
+    .bind(
+        i64::try_from(update.responses_max_decompressed_body_bytes)
+            .map_err(|_| invalid_numeric())?,
+    )
+    .bind(update.openai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
+    .bind(update.xai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -428,6 +470,9 @@ pub(crate) async fn update_admin_api_key_in_transaction(
 
 #[derive(sqlx::FromRow)]
 struct RuntimeSettingsRow {
+    provider_request_profiles_json: sqlx::types::Json<
+        std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    >,
     config_revision: i64,
     admin_api_key: Option<String>,
     refresh_margin_seconds: i64,
@@ -447,6 +492,7 @@ struct RuntimeSettingsRow {
     max_waiting_per_key: i64,
     max_waiting_per_account: i64,
     concurrency_wait_timeout_seconds: i64,
+    responses_max_decompressed_body_bytes: i64,
     account_auto_freeze_enabled: bool,
     account_auto_freeze_threshold: i64,
     account_auto_freeze_window_seconds: i64,
@@ -456,8 +502,18 @@ struct RuntimeSettingsRow {
     account_auto_freeze_adaptive_concurrency: bool,
 }
 
-fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
     Ok(RuntimeSettings {
+        openai_client_profile: row
+            .provider_request_profiles_json
+            .0
+            .remove("openai")
+            .map(gateway_core::account::OpaqueProviderData::new),
+        xai_client_profile: row
+            .provider_request_profiles_json
+            .0
+            .remove("xai")
+            .map(gateway_core::account::OpaqueProviderData::new),
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,
         refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
@@ -481,6 +537,7 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
         max_waiting_per_key: to_u32(row.max_waiting_per_key)?,
         max_waiting_per_account: to_u32(row.max_waiting_per_account)?,
         concurrency_wait_timeout_seconds: to_u32(row.concurrency_wait_timeout_seconds)?,
+        responses_max_decompressed_body_bytes: to_u64(row.responses_max_decompressed_body_bytes)?,
         account_auto_freeze_enabled: row.account_auto_freeze_enabled,
         account_auto_freeze_threshold: to_u32(row.account_auto_freeze_threshold)?,
         account_auto_freeze_window_seconds: to_u64(row.account_auto_freeze_window_seconds)?,

@@ -153,6 +153,7 @@ fn selector_with_runtime(
     cooldowns: Arc<dyn ProviderCooldownPort>,
 ) -> CodexCredentialSelector {
     let profile = CodexWireProfileState::new(CodexWireProfile {
+        client_kind: provider_openai::transport::profile::selection::ClientKind::Desktop,
         originator: "codex_cli_rs".to_owned(),
         codex_version: "0.144.0".to_owned(),
         desktop_version: "1.0.0".to_owned(),
@@ -1206,10 +1207,7 @@ fn native_continuation_surfaces_the_original_accounts_quota_status_to_the_coordi
         )
         .expect_err("the selector must surface the unavailable native account");
 
-    assert!(matches!(
-        error,
-        CredentialSelectionError::NoEligibleCredential
-    ));
+    assert!(matches!(error, CredentialSelectionError::QuotaExhausted));
 }
 
 #[test]
@@ -1278,10 +1276,7 @@ fn native_continuation_surfaces_the_original_accounts_quota_signal_to_the_coordi
         )
         .expect_err("the selector must surface the quota-limited native account");
 
-    assert!(matches!(
-        error,
-        CredentialSelectionError::NoEligibleCredential
-    ));
+    assert!(matches!(error, CredentialSelectionError::QuotaExhausted));
 }
 
 #[test]

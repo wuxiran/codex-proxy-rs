@@ -3,6 +3,12 @@ use gateway_core::{
     account::{CredentialRevision, OutboundProxy, ProviderAccount, ProviderAccountId},
     routing::ProviderKind,
 };
+use std::{
+    io::{self, Cursor, Read},
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, BufWriter, ReadBuf};
 
 fn account(id: &str, proxy: Option<&str>) -> ProviderAccount {
     ProviderAccount::new(
@@ -332,5 +338,117 @@ async fn https_account_proxy_starts_tls_and_rejection_never_falls_back_to_direct
                 .await
                 .is_err()
         );
+    }
+}
+
+// 以底层写入调用为边界模拟问题代理，避免将 TCP 单次读取误当成报文边界。
+struct GreetingSensitiveProxy {
+    greeting: Vec<u8>,
+    replies: Cursor<Vec<u8>>,
+    writes: Vec<Vec<u8>>,
+}
+
+impl GreetingSensitiveProxy {
+    fn new(authenticated: bool) -> Self {
+        let (greeting, mut replies) = if authenticated {
+            (vec![5, 2, 0, 2], vec![5, 2, 1, 0])
+        } else {
+            (vec![5, 1, 0], vec![5, 0])
+        };
+        replies.extend_from_slice(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]);
+        Self {
+            greeting,
+            replies: Cursor::new(replies),
+            writes: Vec::new(),
+        }
+    }
+}
+
+impl AsyncRead for GreetingSensitiveProxy {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.writes.first() != Some(&self.greeting) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy rejected partial method negotiation",
+            )));
+        }
+        // 回复逐字节交付，验证客户端不依赖响应的读取边界。
+        if buf.remaining() > 0 {
+            let mut byte = [0];
+            let count = Read::read(&mut self.replies, &mut byte)?;
+            buf.put_slice(&byte[..count]);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for GreetingSensitiveProxy {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.writes.push(buf.to_vec());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn socks_proxy_flush_contract_coalesces_greeting_without_losing_auth_or_connect() {
+    use tokio_tungstenite::proxy::connect_via_proxy;
+    use tungstenite::proxy::ProxyConfig;
+
+    // 直接验证锁定依赖与握手写缓冲的合同；生产接线由已有账号代理集成测试覆盖。
+    for scheme in ["socks5", "socks5h"] {
+        for authenticated in [false, true] {
+            let authentication = if authenticated { "user:pass@" } else { "" };
+            let config =
+                ProxyConfig::parse(&format!("{scheme}://{authentication}127.0.0.1:1080")).unwrap();
+            let raw = connect_via_proxy(
+                GreetingSensitiveProxy::new(authenticated),
+                &config,
+                "upstream.invalid",
+                443,
+            )
+            .await;
+            assert!(matches!(raw, Err(tungstenite::Error::Io(ref error))
+                if error.kind() == io::ErrorKind::UnexpectedEof));
+
+            let buffered = connect_via_proxy(
+                BufWriter::new(GreetingSensitiveProxy::new(authenticated)),
+                &config,
+                "upstream.invalid",
+                443,
+            )
+            .await
+            .unwrap();
+            assert!(
+                buffered.buffer().is_empty(),
+                "handshake must flush before unwrapping"
+            );
+            let stream = buffered.into_inner();
+            let mut expected = vec![stream.greeting];
+            if authenticated {
+                expected.push(b"\x01\x04user\x04pass".to_vec());
+            }
+            expected.push(b"\x05\x01\x00\x03\x10upstream.invalid\x01\xbb".to_vec());
+            assert_eq!(stream.writes, expected);
+            assert_eq!(
+                stream.replies.position(),
+                stream.replies.get_ref().len() as u64
+            );
+        }
     }
 }
