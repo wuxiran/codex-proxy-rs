@@ -17,8 +17,10 @@ fn decoder_should_bill_the_sent_model_independently_of_the_response_model() {
         ("grok-4.5", Some("grok-4.3"), None, Some(2_175_000)),
         ("grok-4.5", None, None, Some(2_175_000)),
         ("grok-future", Some("grok-4.5"), None, None),
-        ("grok-4.5", Some("grok-future"), Some(123), None),
-        ("grok-4.5", Some("grok-future"), Some(0), None),
+        // fork 双成本：本地计算费用按发送模型独立保留，即使上游已报告真实费用也照常算出，
+        // 二者并存（reported 才是结算口径，calculated 供观测/审计）。
+        ("grok-4.5", Some("grok-future"), Some(123), Some(2_175_000)),
+        ("grok-4.5", Some("grok-future"), Some(0), Some(2_175_000)),
     ] {
         let created = serde_json::json!({"type":"response.created","response":{"id":"resp_model_cost","model":returned}});
         let mut completed = serde_json::json!({
@@ -417,7 +419,8 @@ fn custom_pricing_scales_calculations_but_never_changes_reported_cost() {
     response["usage"]["cost_in_usd_ticks"] = serde_json::json!(123);
     let events = pricing_events_with_override(response, None, Some(pricing));
     assert_eq!(provider_cost_ticks(&events), Some(123));
-    assert_eq!(calculated_cost_ticks(&events), None);
+    // fork 双成本：上游报告真实费用(123)不改变本地按自定义计价算出的 calculated(6_900_000)，二者并存。
+    assert_eq!(calculated_cost_ticks(&events), Some(6_900_000));
 }
 
 #[test]
