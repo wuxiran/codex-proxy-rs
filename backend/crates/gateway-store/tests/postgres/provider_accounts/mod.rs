@@ -3565,9 +3565,19 @@ async fn account_billing_groups_full_identity_and_never_uses_estimate_as_actual(
         .await
         .unwrap();
         // 计价身份/本地成本已迁子表 model_request_billing（fork 9001）；父表只留 cost_source/cost_amount。
-        sqlx::query("update model_requests set cost_source = $2, cost_amount = $3::numeric where id = $1")
-            .bind(id).bind(if actual.is_some() {"provider_reported"} else {"calculated"}).bind(actual.unwrap_or(calculated))
-            .execute(&database.pool).await.unwrap();
+        sqlx::query(
+            "update model_requests set cost_source = $2, cost_amount = $3::numeric where id = $1",
+        )
+        .bind(id)
+        .bind(if actual.is_some() {
+            "provider_reported"
+        } else {
+            "calculated"
+        })
+        .bind(actual.unwrap_or(calculated))
+        .execute(&database.pool)
+        .await
+        .unwrap();
         sqlx::query("insert into model_request_billing (model_request_id, response_model, billing_model, calculated_cost_amount, calculated_cost_currency) values ($1, $2, $2, $3::numeric, 'USD') on conflict (model_request_id) do update set response_model = excluded.response_model, billing_model = excluded.billing_model, calculated_cost_amount = excluded.calculated_cost_amount, calculated_cost_currency = excluded.calculated_cost_currency")
             .bind(id).bind(model).bind(calculated)
             .execute(&database.pool).await.unwrap();

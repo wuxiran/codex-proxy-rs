@@ -298,7 +298,12 @@ fn bind_test_result<'q>(
 /// 出口地区只在连通成功时保留；失败或无地区时四列均为空（与原「每次测试重置 geo」一致）。
 fn test_geo_columns(
     result: &ProxyTestResult,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     match result.exit_geo.clone().filter(|_| result.success) {
         Some(geo) => (
             Some(geo.country),
