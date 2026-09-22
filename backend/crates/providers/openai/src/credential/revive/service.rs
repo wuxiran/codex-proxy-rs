@@ -247,28 +247,41 @@ impl CodexReviveService {
         let recovered = self.client.recover_signed_export(&bytes).await?;
         let mut applied = 0_u64;
         for tokens in recovered_accounts(&recovered) {
-            if let Some(account) = accounts
-                .iter()
-                .find(|account| account.upstream_user_id() == Some(tokens.user_id.as_str()))
-            {
-                self.apply_tokens(account, tokens).await?;
-                applied += 1;
+            // 同一 ChatGPT 用户可属于多个工作区：与手动复活一致，必须同时核对工作区身份，
+            // 否则令牌会写进同用户的另一个工作区账号。
+            let workspace =
+                crate::credential::types::parse_chatgpt_jwt_claims(&tokens.access_token)
+                    .ok()
+                    .and_then(|claims| claims.chatgpt_account_id);
+            let Some(account) = accounts.iter().find(|account| {
+                account.upstream_user_id() == Some(tokens.user_id.as_str())
+                    && workspace
+                        .as_deref()
+                        .is_none_or(|id| Some(id) == account.upstream_account_id())
+            }) else {
+                continue;
+            };
+            // 单个账号写回失败不影响同一导出里其他账号。
+            match self.apply_tokens(account, tokens).await {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    account_id = account.id().as_str(),
+                    error = %error,
+                    "OpenAI revive result could not be written back"
+                ),
             }
         }
         Ok(applied)
     }
 
+    /// 以发起复活时的账号快照做 CAS：复活期间凭据若已被重新授权或刷新，旧结果直接丢弃，
+    /// 不能读最新版本后再覆盖。返回是否真正写入。
     async fn apply_tokens(
         &self,
         account: &ProviderAccount,
         tokens: RecoveredOAuthTokens,
-    ) -> Result<(), CodexReviveError> {
-        let loaded = self
-            .repository
-            .store()
-            .load_current_credential(account.id())
-            .await
-            .map_err(|_| CodexReviveError::Repository)?;
+    ) -> Result<bool, CodexReviveError> {
         let expires_at = parse_access_token_expiration(&tokens.access_token).map(SystemTime::from);
         let secret = CodexOAuthSecret {
             access_token: SecretString::from(tokens.access_token),
@@ -277,11 +290,17 @@ impl CodexReviveService {
         };
         match self
             .repository
-            .rotate_refreshed_oauth_secret(&loaded.account, secret, expires_at, None)
+            .rotate_refreshed_oauth_secret(account, secret, expires_at, None)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(CredentialRepositoryError::RevisionConflict) => Ok(()),
+            Ok(_) => Ok(true),
+            Err(CredentialRepositoryError::RevisionConflict) => {
+                tracing::info!(
+                    account_id = account.id().as_str(),
+                    "credential changed during revive; discarding the stale revive result"
+                );
+                Ok(false)
+            }
             Err(_) => Err(CodexReviveError::Repository),
         }
     }
