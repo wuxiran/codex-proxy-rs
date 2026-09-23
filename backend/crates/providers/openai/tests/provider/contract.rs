@@ -10425,6 +10425,7 @@ async fn turn_state_pin_websocket_metadata_is_replayed_in_next_turn_payload() {
         ("business", "gpt-5.6-terra", 356),
         ("self_serve_business_prolite", "gpt-5.6-terra", 356),
         ("self_serve_business_usage_based", "gpt-6-astra", 332),
+        ("self_serve_business_prolite", "gpt-6-sol", 780),
     ] {
         let store = Arc::new(MemoryAccountStore::default());
         let mut account_profile = profile("chatgpt-ws-pin");

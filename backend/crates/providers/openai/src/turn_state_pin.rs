@@ -33,6 +33,7 @@ impl CaptureRule {
                     ("gpt-5.6-sol", 332),
                     ("gpt-5.6-terra", 356),
                     ("gpt-6-astra", 332),
+                    ("gpt-6-sol", 780),
                 ]),
             }
         } else {

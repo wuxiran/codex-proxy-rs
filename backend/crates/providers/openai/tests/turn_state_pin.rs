@@ -510,10 +510,11 @@ fn team_capture_rule_is_model_specific_and_pro_stays_292() {
             ("gpt-5.6-sol", 332),
             ("gpt-5.6-terra", 356),
             ("gpt-6-astra", 332),
+            ("gpt-6-sol", 780),
         ] {
             let expected = if plan == "pro" { 292 } else { team_length };
             assert_eq!(rule.expected_length(model), Some(expected));
-            for length in [292, 312, 332, 356] {
+            for length in [292, 312, 332, 356, 780] {
                 let pins = TurnStatePins::default();
                 let mut attempt = pins.attempt(
                     "account",

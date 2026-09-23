@@ -2566,7 +2566,7 @@ async fn turn_state_pin_team_admin_exposes_model_rules_without_enabling_capture(
             view.get("turnStateCaptureRule"),
             Some(&json!({
                 "defaultLength":null,
-                "modelLengths":{"gpt-5.5":332,"gpt-5.6-sol":332,"gpt-5.6-terra":356,"gpt-6-astra":332}
+                "modelLengths":{"gpt-5.5":332,"gpt-5.6-sol":332,"gpt-5.6-terra":356,"gpt-6-astra":332,"gpt-6-sol":780}
             }))
         );
     }
