@@ -787,6 +787,7 @@ impl CodexCredentialSelector {
                             };
                             gateway_core::request_log::record(
                                 gateway_core::request_log::RequestLogRecord {
+                                    id: request.attempt.request_id().as_str().to_owned(),
                                     at_ms: gateway_core::request_log::now_ms(),
                                     model: upstream_model.unwrap_or("-").to_owned(),
                                     cookie_action: cookie_action.to_owned(),
@@ -795,6 +796,10 @@ impl CodexCredentialSelector {
                                     ),
                                     unified,
                                     ticket_in,
+                                    set_cookie: None,
+                                    ticket_out: None,
+                                    ticket_len: None,
+                                    service_tier: None,
                                 },
                             );
                         }

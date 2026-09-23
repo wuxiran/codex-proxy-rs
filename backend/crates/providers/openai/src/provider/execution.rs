@@ -241,6 +241,25 @@ pub(super) fn same_client_turn(previous: Option<&str>, current: Option<&str>) ->
         .is_some_and(|(previous, current)| !previous.is_empty() && previous == current)
 }
 
+/// 组装请求日志的响应侧回填补丁：Set-Cookie(__cf_bm) 有无、上游票短指纹与票长、真 service_tier。
+/// 票优先取本回合捕获（含流内轮转）的 turn_state，退回 handshake 票；只存短指纹/长度，绝不存原文。
+fn codex_response_log_patch(
+    has_cfbm: bool,
+    capture: Option<&OpenAiSessionCapture>,
+    handshake_turn_state: Option<&str>,
+    service_tier: Option<&str>,
+) -> gateway_core::request_log::ResponsePatch {
+    let ticket = capture
+        .and_then(|c| c.turn_state.as_deref())
+        .or(handshake_turn_state);
+    gateway_core::request_log::ResponsePatch {
+        set_cookie: Some(has_cfbm),
+        ticket_out: ticket.map(gateway_core::request_log::fingerprint),
+        ticket_len: ticket.map(str::len),
+        service_tier: service_tier.map(str::to_owned),
+    }
+}
+
 pub(super) fn decode_openai_session_state(request: &GenerateRequest) -> Option<OpenAiSessionState> {
     request
         .provider_session_state(PROVIDER_NAME)
@@ -797,6 +816,13 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             });
             capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
         }
+        // 响应侧观测信号：在 response.body 被移动前，读一次 Set-Cookie(__cf_bm) 与 handshake 票。
+        // 真实 service_tier 要等解码后才有，故在成功出口处再一并回填（见 emit 处）。
+        let resp_has_cfbm = response
+            .set_cookie_headers
+            .iter()
+            .any(|h| h.trim_start().to_ascii_lowercase().starts_with("__cf_bm="));
+        let resp_handshake_turn_state = response.turn_state.clone();
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
             &request,
@@ -1106,6 +1132,16 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 yield event;
             }
             if completed {
+                // 成功出口（流内完成）：回填响应侧观测（Set-Cookie/票/真档位）。
+                gateway_core::request_log::update_response(
+                    &request_id,
+                    codex_response_log_patch(
+                        resp_has_cfbm,
+                        session_capture.as_ref(),
+                        resp_handshake_turn_state.as_deref(),
+                        decoder.response_service_tier(),
+                    ),
+                );
                 return;
             }
         }
@@ -1236,6 +1272,16 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             ))?;
             return;
         }
+        // 成功出口（流尾 finish）：回填响应侧观测（Set-Cookie/票/真档位）。
+        gateway_core::request_log::update_response(
+            &request_id,
+            codex_response_log_patch(
+                resp_has_cfbm,
+                session_capture.as_ref(),
+                resp_handshake_turn_state.as_deref(),
+                decoder.response_service_tier(),
+            ),
+        );
         let events = pre_commit_events.finish(events, timing_signals, completed);
         for event in events {
             yield event;
