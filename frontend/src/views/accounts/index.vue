@@ -16,6 +16,7 @@ import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
+import AccountAutoRefresh from './components/AccountAutoRefresh.vue'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
 import AccountCreateModal from './components/AccountCreateModal/index.vue'
@@ -54,6 +55,9 @@ const {
   accounts,
   loadAccounts,
   refreshAccountsSilently,
+  autoRefreshSeconds,
+  refreshing: refreshingAccounts,
+  refreshNow: refreshAccountsNow,
   searchQuery,
   providerQuery,
   statusQuery,
@@ -249,6 +253,11 @@ const {
           @edit-selected="openBatchEdit"
         >
           <template #actions>
+            <AccountAutoRefresh
+              v-model="autoRefreshSeconds"
+              :refreshing="refreshingAccounts"
+              @refresh="refreshAccountsNow"
+            />
             <BaseTableColumnSettings
               :options="columnOptions"
               @change="setColumnVisible"

@@ -1,5 +1,5 @@
 import type { BaseTableSort } from '@/components/base/BaseTable/columns'
-import { useDocumentVisibility, useIntervalFn, watchDebounced } from '@vueuse/core'
+import { useDocumentVisibility, useIntervalFn, useStorage, watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getAccounts } from '@/api'
@@ -7,8 +7,9 @@ import { usePagedQuery } from '@/composables/usePagedQuery'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
-/** 状态、并发、报错与用量随线上流量变化，列表按此间隔静默刷新。 */
-const AUTO_REFRESH_INTERVAL_MS = 15_000
+/** 自动刷新可选间隔（秒）；0 表示关闭。状态、并发、报错与用量随线上流量变化。 */
+export const AUTO_REFRESH_SECONDS = [0, 10, 15, 30, 60] as const
+const DEFAULT_AUTO_REFRESH_SECONDS = 15
 
 export function useAccountsQuery() {
   const searchQuery = shallowRef('')
@@ -95,16 +96,45 @@ export function useAccountsQuery() {
     void query.execute()
   })
 
+  // 间隔按浏览器记忆；非法值回退默认，避免被改坏的存储导致高频请求。
+  const autoRefreshSeconds = useStorage<number>(
+    'codex-proxy:accounts:auto-refresh-seconds',
+    DEFAULT_AUTO_REFRESH_SECONDS,
+    undefined,
+    { writeDefaults: false },
+  )
+  const autoRefreshInterval = computed(() => {
+    const seconds = AUTO_REFRESH_SECONDS.find(value => value === autoRefreshSeconds.value)
+      ?? DEFAULT_AUTO_REFRESH_SECONDS
+    return seconds * 1000
+  })
+  const refreshing = shallowRef(false)
+
   // 后台标签页不刷新；上一次请求未返回时跳过本轮，避免请求堆积。
   const visibility = useDocumentVisibility()
-  function refreshInBackground() {
-    if (visibility.value === 'visible' && !query.loading.value)
-      void query.execute({ silent: true })
+  async function refreshInBackground() {
+    if (visibility.value !== 'visible' || query.loading.value || refreshing.value)
+      return
+    refreshing.value = true
+    try {
+      await query.execute({ silent: true })
+    }
+    finally {
+      refreshing.value = false
+    }
   }
-  useIntervalFn(refreshInBackground, AUTO_REFRESH_INTERVAL_MS)
+  const autoRefresh = useIntervalFn(() => void refreshInBackground(), () => autoRefreshInterval.value || 60_000, {
+    immediate: false,
+  })
+  watch(autoRefreshInterval, (interval) => {
+    if (interval > 0)
+      autoRefresh.resume()
+    else
+      autoRefresh.pause()
+  }, { immediate: true })
   watch(visibility, (current, previous) => {
-    if (current === 'visible' && previous === 'hidden')
-      refreshInBackground()
+    if (current === 'visible' && previous === 'hidden' && autoRefreshInterval.value > 0)
+      void refreshInBackground()
   })
 
   return {
@@ -115,6 +145,9 @@ export function useAccountsQuery() {
     accounts: query.items,
     loadAccounts: query.execute,
     refreshAccountsSilently: () => query.execute({ silent: true }),
+    autoRefreshSeconds,
+    refreshing,
+    refreshNow: refreshInBackground,
     searchQuery,
     providerQuery,
     statusQuery,
