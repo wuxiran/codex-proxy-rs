@@ -60,6 +60,10 @@ pub struct RequestLogRecord {
     /// 好确认「网关节点信息是否藏在某张 cookie 里」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resp_cookies: Option<Vec<String>>,
+    /// 响应侧：本次上游下发的 `__cf_bm` 签发 TTL（秒，取 Set-Cookie 的 Max-Age，
+    /// 无 Max-Age 时用 Expires-now）。短（如 ~120s）= 降智节点特征，长（~1800s）= 好。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfbm_ttl: Option<u32>,
 }
 
 /// 响应侧回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
@@ -71,6 +75,7 @@ pub struct ResponsePatch {
     pub service_tier: Option<String>,
     pub served_model: Option<String>,
     pub resp_cookies: Option<Vec<String>>,
+    pub cfbm_ttl: Option<u32>,
 }
 
 fn buffer() -> &'static Mutex<VecDeque<RequestLogRecord>> {
@@ -114,6 +119,9 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
         }
         if patch.resp_cookies.is_some() {
             rec.resp_cookies = patch.resp_cookies;
+        }
+        if patch.cfbm_ttl.is_some() {
+            rec.cfbm_ttl = patch.cfbm_ttl;
         }
     }
 }
@@ -175,6 +183,7 @@ mod tests {
                 service_tier: None,
                 served_model: None,
                 resp_cookies: None,
+                cfbm_ttl: None,
             });
         }
         let recent = recent(1000);
@@ -204,6 +213,7 @@ mod tests {
             service_tier: None,
             served_model: None,
             resp_cookies: None,
+            cfbm_ttl: None,
         });
         // 第一次回填 cookie/票，第二次只回填档位+实际模型，前者都应保留。
         update_response(

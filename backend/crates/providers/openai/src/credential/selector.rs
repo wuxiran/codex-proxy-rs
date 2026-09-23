@@ -804,6 +804,7 @@ impl CodexCredentialSelector {
                                     service_tier: None,
                                     served_model: None,
                                     resp_cookies: None,
+                                    cfbm_ttl: None,
                                 },
                             );
                         }

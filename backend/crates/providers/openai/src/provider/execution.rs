@@ -251,6 +251,7 @@ fn codex_response_log_patch(
     service_tier: Option<&str>,
     served_model: Option<&str>,
     resp_cookies: &[String],
+    cfbm_ttl: Option<u32>,
 ) -> gateway_core::request_log::ResponsePatch {
     let ticket = capture
         .and_then(|c| c.turn_state.as_deref())
@@ -262,7 +263,41 @@ fn codex_response_log_patch(
         service_tier: service_tier.map(str::to_owned),
         served_model: served_model.map(str::to_owned),
         resp_cookies: (!resp_cookies.is_empty()).then(|| resp_cookies.to_vec()),
+        cfbm_ttl,
     }
+}
+
+/// 从未过滤的 Set-Cookie 头里取本次 `__cf_bm` 的**签发 TTL**（秒）：优先 Max-Age，
+/// 否则用 Expires - now。短（~120s）= 降智节点特征，长（~1800s）= 好。只读结构，不留原文。
+fn cfbm_issued_ttl_seconds(headers: &[String]) -> Option<u32> {
+    let raw = headers
+        .iter()
+        .map(|h| h.trim())
+        .find(|h| h.to_ascii_lowercase().starts_with("__cf_bm="))?;
+    let mut expires: Option<&str> = None;
+    for attr in raw.split(';').skip(1) {
+        let attr = attr.trim();
+        if let Some((k, v)) = attr.split_once('=') {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("max-age") {
+                if let Ok(secs) = v.trim().parse::<i64>() {
+                    return Some(secs.clamp(0, i64::from(u32::MAX)) as u32);
+                }
+            } else if k.eq_ignore_ascii_case("expires") {
+                expires = Some(v.trim());
+            }
+        }
+    }
+    let exp = expires?;
+    let when = chrono::DateTime::parse_from_rfc2822(exp)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(exp, "%a, %d %b %Y %H:%M:%S GMT")
+                .map(|n| n.and_utc())
+        })
+        .ok()?;
+    let secs = (when - chrono::Utc::now()).num_seconds();
+    (secs > 0).then(|| secs.clamp(0, i64::from(u32::MAX)) as u32)
 }
 
 /// 把未过滤的 Set-Cookie 头列表折成安全摘要：每项 `name@domain#值指纹`，绝不含原文。
@@ -296,6 +331,29 @@ fn summarize_set_cookies(headers: &[String]) -> Vec<String> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod cfbm_ttl_tests {
+    use super::cfbm_issued_ttl_seconds;
+
+    #[test]
+    fn parses_max_age_short_and_long() {
+        let short = vec!["__cf_bm=abc.def; Path=/; Max-Age=120; Domain=.chatgpt.com; HttpOnly".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&short), Some(120));
+        let long = vec!["__cf_bm=xyz; Max-Age=1800; Path=/".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&long), Some(1800));
+    }
+
+    #[test]
+    fn ignores_non_cfbm_and_missing() {
+        let other = vec!["_cfuvid=zzz; Max-Age=600".to_owned(), "cf_clearance=q; Max-Age=999".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&other), None);
+        assert_eq!(cfbm_issued_ttl_seconds(&[]), None);
+        // 有 __cf_bm 但既无 Max-Age 也无 Expires → None（不瞎猜）。
+        let no_ttl = vec!["__cf_bm=abc; Path=/; HttpOnly".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&no_ttl), None);
+    }
 }
 
 pub(super) fn decode_openai_session_state(request: &GenerateRequest) -> Option<OpenAiSessionState> {
@@ -863,6 +921,8 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         // 未过滤的全部 Set-Cookie 摘要（name@domain#值指纹，非原文），用于实测上游
         // 到底下发了哪些 cookie（含 cpr 平时按白名单丢掉的），排查节点信息是否藏在 cookie 里。
         let resp_cookie_summary = summarize_set_cookies(&response.set_cookie_headers);
+        // __cf_bm 签发 TTL（秒）：短=降智节点特征。在 raw Set-Cookie 移动前抠出来。
+        let resp_cfbm_ttl = cfbm_issued_ttl_seconds(&response.set_cookie_headers);
         let resp_handshake_turn_state = response.turn_state.clone();
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
@@ -1183,6 +1243,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         decoder.response_service_tier(),
                         decoder.response_model(),
                         &resp_cookie_summary,
+                        resp_cfbm_ttl,
                     ),
                 );
                 return;
@@ -1325,6 +1386,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 decoder.response_service_tier(),
                 decoder.response_model(),
                         &resp_cookie_summary,
+                        resp_cfbm_ttl,
             ),
         );
         let events = pre_commit_events.finish(events, timing_signals, completed);
