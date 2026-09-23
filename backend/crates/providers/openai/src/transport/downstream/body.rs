@@ -63,12 +63,49 @@ pub(in crate::transport) fn normalize_codex_request_body(body: &mut Map<String, 
             let Some(item) = item.as_object_mut() else {
                 continue;
             };
-            if item.get("type").and_then(Value::as_str) == Some("message")
-                && item.get("role").and_then(Value::as_str) == Some("system")
-            {
-                item.insert("role".to_owned(), Value::String("developer".to_owned()));
+            if item.get("type").and_then(Value::as_str) == Some("message") {
+                match item.get("role").and_then(Value::as_str) {
+                    Some("system") => {
+                        item.insert("role".to_owned(), Value::String("developer".to_owned()));
+                    }
+                    // Codex 后端要求 message 项必须带 role，缺失会返回 400
+                    // "Missing required parameter: 'input[N].role'"。补默认 user。
+                    None => {
+                        item.insert("role".to_owned(), Value::String("user".to_owned()));
+                    }
+                    _ => {}
+                }
             }
         }
+    }
+
+    // Codex 上游对 tools 形状有硬约束，以下均为已确认会 400 的形状，按兼容层职责就地清洗：
+    // 保留命名空间由上游内建（browser/container/python），下游不得在其中声明工具。
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        const RESERVED_NAMESPACES: [&str; 3] = ["browser", "container", "python"];
+        tools.retain(|tool| {
+            let Some(tool) = tool.as_object() else {
+                return true; // 非对象结构原样保留，交上游判定
+            };
+            if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                // 空 namespace（子 tools 为空/缺失）触发 "empty array" 400；命名空间名撞保留区也丢弃。
+                let non_empty = tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|children| !children.is_empty());
+                let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                return non_empty && !RESERVED_NAMESPACES.contains(&name);
+            }
+            // 函数工具名形如 `browser.xxx` 撞保留命名空间，触发 reserved 400，丢弃。
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                if let Some((prefix, _)) = name.split_once('.') {
+                    if RESERVED_NAMESPACES.contains(&prefix) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
     }
 
     for field in [
@@ -81,5 +118,67 @@ pub(in crate::transport) fn normalize_codex_request_body(body: &mut Map<String, 
         "prompt_cache_retention",
     ] {
         body.remove(field);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalize(value: Value) -> Map<String, Value> {
+        let mut body = value.as_object().unwrap().clone();
+        normalize_codex_request_body(&mut body);
+        body
+    }
+
+    #[test]
+    fn drops_empty_namespace_tool() {
+        let body = normalize(json!({
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "functions", "tools": []},
+            ]
+        }));
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "shell");
+    }
+
+    #[test]
+    fn drops_reserved_namespace_function_and_namespace() {
+        let body = normalize(json!({
+            "tools": [
+                {"type": "function", "name": "browser.open_url"},
+                {"type": "namespace", "name": "browser", "tools": [{"type": "function", "name": "x"}]},
+                {"type": "function", "name": "shell_command"},
+            ]
+        }));
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "shell_command");
+    }
+
+    #[test]
+    fn fills_missing_role_on_message_item() {
+        let body = normalize(json!({
+            "input": [
+                {"type": "message", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant", "content": []},
+            ]
+        }));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn keeps_valid_tools_and_namespaces_untouched() {
+        let body = normalize(json!({
+            "tools": [
+                {"type": "function", "name": "update_plan"},
+                {"type": "namespace", "name": "functions", "tools": [{"type": "function", "name": "exec"}]},
+            ]
+        }));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
     }
 }
