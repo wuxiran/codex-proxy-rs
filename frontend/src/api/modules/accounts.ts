@@ -153,6 +153,10 @@ export interface AccountTicket {
   /** 自买入（或入库）起按模型价格计费的累计美元金额。 */
   spentUsd: string | null
   spentUsdDisplay: string | null
+  /** 本轮失效后已自动复活的次数（上限 3）；成功或恢复正常后清零。 */
+  autoReviveAttempts: number
+  autoReviveLastAt: string | null
+  autoReviveLastError: string | null
 }
 
 export interface AccountTicketUpdate {

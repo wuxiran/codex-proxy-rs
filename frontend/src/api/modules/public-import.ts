@@ -82,3 +82,23 @@ export function submitPublicImport(token: string, data: Record<string, unknown>,
     ...options,
   })
 }
+
+export interface PublicTicketImport {
+  /** 每行 `邮箱----密码----2FA密钥`。 */
+  tickets: string[]
+  purchaseAmount: string
+  purchaseCurrency: 'CNY' | 'USD'
+  /** RFC 3339。 */
+  expiresAt: string
+}
+
+/** 票据导入：服务端逐个随机出口登录建号，并加密保存票据、买入价与到期时间。 */
+export function submitPublicTickets(token: string, data: PublicTicketImport, options: RequestOptions = {}) {
+  return request<PublicImportResult>({
+    url: '/api/public-import/tickets',
+    method: 'POST',
+    headers: { [TOKEN_HEADER]: token },
+    data,
+    ...options,
+  })
+}

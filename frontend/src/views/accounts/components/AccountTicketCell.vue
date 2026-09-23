@@ -38,8 +38,17 @@ const expiry = computed(() => {
       <span class="font-mono font-heavy text-cp-text">{{ ticket.spentUsdDisplay ?? '$0.00' }}</span>
     </span>
     <span v-if="expiry" class="whitespace-nowrap font-emphasis" :class="expiry.tone">{{ expiry.text }}</span>
-    <span v-if="ticket.hasTicket" class="whitespace-nowrap text-[10px] text-cp-text-tertiary" :title="ticket.ticketHint ?? undefined">
-      已存票据
+    <span
+      v-if="ticket.hasTicket"
+      class="whitespace-nowrap text-[10px]"
+      :class="ticket.autoReviveAttempts >= 3 ? 'text-cp-error-text' : 'text-cp-text-tertiary'"
+      :title="ticket.autoReviveLastError
+        ? `上次自动复活失败（${ticket.autoReviveLastAt ? formatDateTime(ticket.autoReviveLastAt) : ''}）：${ticket.autoReviveLastError}`
+        : (ticket.ticketHint ?? undefined)"
+    >
+      {{ ticket.autoReviveAttempts > 0
+        ? `自动复活 ${ticket.autoReviveAttempts}/3${ticket.autoReviveAttempts >= 3 ? '，已停止' : ''}`
+        : '已存票据 · 自动复活' }}
     </span>
     <span v-if="!ticket.purchaseDisplay && !expiry && !ticket.hasTicket" class="text-cp-text-quaternary">—</span>
   </div>

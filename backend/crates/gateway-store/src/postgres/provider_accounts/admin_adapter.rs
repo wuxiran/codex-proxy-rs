@@ -559,6 +559,9 @@ impl AccountStore for PgAdminAccountStore {
                 Option<String>,
                 Option<DateTime<Utc>>,
                 Option<String>,
+                i32,
+                Option<DateTime<Utc>>,
+                Option<String>,
             ),
         >(
             "select t.provider_account_id, t.purchase_amount::text, t.purchase_currency,
@@ -568,7 +571,8 @@ impl AccountStore for PgAdminAccountStore {
                        join model_request_billing mrb on mrb.model_request_id = mr.id
                       where mr.provider_account_id = t.provider_account_id
                         and mrb.calculated_cost_currency = 'USD'
-                        and mr.started_at >= coalesce(t.purchased_at, pa.created_at))
+                        and mr.started_at >= coalesce(t.purchased_at, pa.created_at)),
+                    t.auto_revive_attempts, t.auto_revive_last_at, t.auto_revive_last_error
                from account_tickets t
                join provider_accounts pa on pa.id = t.provider_account_id
               where t.provider_account_id = any($1::text[])",
@@ -588,6 +592,9 @@ impl AccountStore for PgAdminAccountStore {
                     hint,
                     ticket_at,
                     spent,
+                    revive_attempts,
+                    revive_at,
+                    revive_error,
                 )| {
                     let purchase_currency = currency
                         .as_deref()
@@ -610,6 +617,9 @@ impl AccountStore for PgAdminAccountStore {
                             ticket_hint: hint,
                             ticket_updated_at: ticket_at,
                             spent_usd: spent,
+                            auto_revive_attempts: revive_attempts,
+                            auto_revive_last_at: revive_at,
+                            auto_revive_last_error: revive_error,
                         },
                     ))
                 },
@@ -668,7 +678,8 @@ impl AccountStore for PgAdminAccountStore {
             TicketChange::Set { ciphertext, hint } => {
                 sqlx::query(
                     "update account_tickets
-                        set ticket_ciphertext = $2, ticket_hint = $3, ticket_updated_at = now()
+                        set ticket_ciphertext = $2, ticket_hint = $3, ticket_updated_at = now(),
+                            auto_revive_attempts = 0, auto_revive_last_error = null
                       where provider_account_id = $1",
                 )
                 .bind(&write.account_id)
@@ -691,6 +702,76 @@ impl AccountStore for PgAdminAccountStore {
             }
         }
         transaction.commit().await.map_err(unavailable)
+    }
+
+    async fn ticket_revive_candidates(
+        &self,
+        max_attempts: i32,
+        retry_before: DateTime<Utc>,
+        limit: i64,
+    ) -> AdminStoreResult<Vec<String>> {
+        let unavailable = |_| {
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("load ticket revive candidates"),
+            )
+        };
+        // 已恢复正常（含手动重新授权）的账号清零，下次失效时重新获得完整的自动复活次数。
+        sqlx::query(
+            "update account_tickets t
+                set auto_revive_attempts = 0, auto_revive_last_error = null
+               from provider_accounts pa
+              where pa.id = t.provider_account_id
+                and pa.credential_state = 'ready'
+                and t.auto_revive_attempts > 0",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        sqlx::query_scalar::<_, String>(
+            "select t.provider_account_id
+               from account_tickets t
+               join provider_accounts pa on pa.id = t.provider_account_id
+              where t.ticket_ciphertext is not null
+                and pa.provider_kind = 'openai'
+                and pa.authentication_kind = 'oauth'
+                and pa.credential_state in ('expired', 'invalid')
+                and t.auto_revive_attempts < $1
+                and (t.auto_revive_last_at is null or t.auto_revive_last_at < $2)
+              order by t.auto_revive_last_at nulls first, t.provider_account_id
+              limit $3",
+        )
+        .bind(max_attempts)
+        .bind(retry_before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(unavailable)
+    }
+
+    async fn record_ticket_revive(
+        &self,
+        account_id: &str,
+        error: Option<&str>,
+    ) -> AdminStoreResult<()> {
+        let query = if error.is_some() {
+            "update account_tickets
+                set auto_revive_attempts = auto_revive_attempts + 1,
+                    auto_revive_last_at = now(), auto_revive_last_error = $2
+              where provider_account_id = $1"
+        } else {
+            "update account_tickets
+                set auto_revive_attempts = 0, auto_revive_last_at = now(),
+                    auto_revive_last_error = null
+              where provider_account_id = $1"
+        };
+        sqlx::query(query)
+            .bind(account_id)
+            .bind(error.map(|error| error.chars().take(200).collect::<String>()))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("record ticket revive")))
     }
 
     async fn load_account_ticket_ciphertext(

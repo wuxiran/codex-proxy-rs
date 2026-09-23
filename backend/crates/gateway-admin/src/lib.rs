@@ -27,6 +27,7 @@ pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
 pub mod ticket_cipher;
+pub mod ticket_revive;
 pub mod turn_state_renewal;
 mod use_case;
 
@@ -407,6 +408,7 @@ pub async fn initialize(
         store.proxies(),
         snapshot.clone(),
     ));
+    let ticket_revive_openai = Arc::clone(&openai) as Arc<dyn use_case::openai::OpenAiService>;
     let xai = Arc::new(DefaultXaiService::new(
         xai,
         store.accounts(),
@@ -434,6 +436,7 @@ pub async fn initialize(
             openai.clone(),
             proxies.clone(),
             account_groups.clone(),
+            accounts.clone(),
         )),
         proxies,
         auth,
@@ -490,6 +493,13 @@ pub async fn initialize(
             Arc::clone(&accounts) as Arc<dyn AccountsService>
         ),
     )?);
+    worker_contributions.extend(ticket_revive_worker_contribution(
+        ticket_revive::TicketReviveTask::new(
+            Arc::clone(&accounts) as Arc<dyn AccountsService>,
+            ticket_revive_openai,
+            store.accounts(),
+        ),
+    )?);
     Ok(AdminBundle {
         services,
         worker_contributions,
@@ -544,6 +554,37 @@ fn turn_state_renewal_worker_contribution(
         },
     )
     .map_err(|_| AdminError::internal("state 续期 Worker 注册信息不合法"))?;
+    Ok(vec![WorkerContribution::Registration(registration)])
+}
+
+/// 票据自动复活 Worker 注册：加跨实例租约，同一时刻只有一个实例对失效账号登录。
+fn ticket_revive_worker_contribution(
+    task: ticket_revive::TicketReviveTask,
+) -> Result<Vec<WorkerContribution>, AdminError> {
+    let id = WorkerId::try_new(
+        WorkerKind::AccountFreezeRecovery,
+        ticket_revive::TICKET_REVIVE_WORKER_OWNER,
+    )
+    .map_err(|_| AdminError::internal("票据复活 Worker ID 不合法"))?;
+    let schedule = WorkerSchedule::try_new(
+        ticket_revive::TICKET_REVIVE_INTERVAL,
+        ticket_revive::WORKER_INITIAL_BACKOFF,
+        ticket_revive::WORKER_MAXIMUM_BACKOFF,
+        freeze_recovery::WORKER_LEASE_TTL,
+        freeze_recovery::WORKER_LEASE_RENEWAL,
+    )
+    .map_err(|_| AdminError::internal("票据复活 Worker 调度配置不合法"))?;
+    let lease = WorkerLeaseRequest::try_new(id.clone(), freeze_recovery::WORKER_LEASE_TTL)
+        .map_err(|_| AdminError::internal("票据复活 Worker 租约配置不合法"))?;
+    let registration = WorkerRegistration::try_new(
+        id,
+        WorkerRunnable::Scheduled {
+            schedule,
+            lease: Some(lease),
+            task: Box::new(task),
+        },
+    )
+    .map_err(|_| AdminError::internal("票据复活 Worker 注册信息不合法"))?;
     Ok(vec![WorkerContribution::Registration(registration)])
 }
 

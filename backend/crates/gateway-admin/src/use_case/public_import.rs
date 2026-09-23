@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use subtle::ConstantTimeEq as _;
 
-use super::{account_groups::AccountGroupService, openai::OpenAiService, proxies::ProxiesService};
+use super::{
+    account_groups::AccountGroupService, accounts::AccountsService, openai::OpenAiService,
+    proxies::ProxiesService,
+};
 use crate::model::{
     AdminError, MutationActor, MutationContext, PageSize,
     account_groups::AccountGroupListQuery,
@@ -33,7 +36,7 @@ use crate::model::{
     proxies::{ProxyListQuery, ProxyRecord},
     public_import::{
         MAX_PUBLIC_IMPORT_ACCOUNTS, PublicImportConfig, PublicImportEntry, PublicImportItem,
-        PublicImportItemStatus, PublicImportResult, UpdatePublicImportConfig,
+        PublicImportItemStatus, PublicImportResult, PublicTicketImport, UpdatePublicImportConfig,
     },
 };
 
@@ -64,6 +67,14 @@ pub trait PublicImportService: Send + Sync {
         request_id: &str,
         document: Map<String, Value>,
     ) -> Result<Option<PublicImportResult>, AdminError>;
+    /// 票据导入：逐行随机出口登录建号，并加密保存票据、买入价与到期时间。
+    /// 令牌无效或入口关闭时返回 `None`。
+    async fn import_tickets(
+        &self,
+        token: &str,
+        request_id: &str,
+        command: PublicTicketImport,
+    ) -> Result<Option<PublicImportResult>, AdminError>;
 }
 
 pub struct DefaultPublicImportService {
@@ -71,6 +82,7 @@ pub struct DefaultPublicImportService {
     openai: Arc<dyn OpenAiService>,
     proxies: Arc<dyn ProxiesService>,
     groups: Arc<dyn AccountGroupService>,
+    accounts: Arc<dyn AccountsService>,
     // 读改写整体在锁内完成，避免并发保存把刚轮换掉的令牌写回；跨槽位靠原子 rename 保证文件完整
     // （管理请求只进入 active 槽位，排空中的旧槽位不接新的管理写入）。
     write_lock: tokio::sync::Mutex<()>,
@@ -82,12 +94,14 @@ impl DefaultPublicImportService {
         openai: Arc<dyn OpenAiService>,
         proxies: Arc<dyn ProxiesService>,
         groups: Arc<dyn AccountGroupService>,
+        accounts: Arc<dyn AccountsService>,
     ) -> Self {
         Self {
             root,
             openai,
             proxies,
             groups,
+            accounts,
             write_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -395,6 +409,144 @@ impl PublicImportService for DefaultPublicImportService {
             items.push(item);
         }
         Ok(Some(PublicImportResult { items }))
+    }
+
+    async fn import_tickets(
+        &self,
+        token: &str,
+        request_id: &str,
+        command: PublicTicketImport,
+    ) -> Result<Option<PublicImportResult>, AdminError> {
+        let Some(config) = self.authorize(token)? else {
+            return Ok(None);
+        };
+        if command.tickets.is_empty() {
+            return Err(AdminError::invalid("请至少填写一条票据"));
+        }
+        if command.tickets.len() > MAX_PUBLIC_IMPORT_ACCOUNTS {
+            return Err(AdminError::invalid(format!(
+                "单次最多导入 {MAX_PUBLIC_IMPORT_ACCOUNTS} 个账号"
+            )));
+        }
+        // 必填且提前校验，避免登录建号成功后才发现成本信息不合法。
+        crate::model::account_tickets::normalize_amount(&command.purchase_amount)?;
+        crate::model::account_tickets::TicketCurrency::parse(&command.purchase_currency)?;
+        if command.expires_at <= Utc::now() {
+            return Err(AdminError::invalid("预计到期时间必须晚于当前时间"));
+        }
+        let proxies = self.eligible_proxies().await?;
+        if proxies.is_empty() {
+            return Err(AdminError::conflict("暂无通过测试的出站代理，请联系管理员"));
+        }
+        let context = MutationContext {
+            actor: MutationActor::System,
+            request_id: request_id.to_owned(),
+        };
+        let mut items = Vec::with_capacity(command.tickets.len());
+        for (position, line) in command.tickets.iter().enumerate() {
+            let proxy = &proxies[random_index(proxies.len())];
+            items.push(
+                self.import_one_ticket(&config, &context, &command, proxy, line, position + 1)
+                    .await,
+            );
+        }
+        Ok(Some(PublicImportResult { items }))
+    }
+}
+
+impl DefaultPublicImportService {
+    /// 单个票据：登录 → 只建新 OAuth 号 → 保存票据/成本/到期 → 按配置钉 state。
+    async fn import_one_ticket(
+        &self,
+        config: &PublicImportConfig,
+        context: &MutationContext,
+        command: &PublicTicketImport,
+        proxy: &ProxyRecord,
+        line: &secrecy::SecretString,
+        index: usize,
+    ) -> PublicImportItem {
+        use secrecy::ExposeSecret as _;
+        let failed = |name: Option<String>, message: &str| PublicImportItem {
+            index,
+            name,
+            status: PublicImportItemStatus::Failed,
+            imported_accounts: 0,
+            proxy_name: None,
+            state_pinned: false,
+            message: Some(message.to_owned()),
+        };
+        let secret =
+            match crate::model::account_tickets::TicketSecret::parse_line(line.expose_secret()) {
+                Ok(secret) => secret,
+                Err(error) => return failed(None, error.message()),
+            };
+        let name = Some(crate::model::account_tickets::mask_email(&secret.email));
+        let document = match self.openai.ticket_login(&secret, Some(&proxy.proxy)).await {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::warn!(target: "public_import", request_id = %context.request_id, index,
+                    proxy_id = %proxy.id, reason = %error.message(), "public ticket login failed");
+                return failed(name, error.message());
+            }
+        };
+        let imported = match self
+            .openai
+            .import_new_accounts(ImportCredentials {
+                outbound_proxy_id: Some(proxy.id.clone()),
+                settings: Some(AccountImportSettings {
+                    notes: None,
+                    enabled: true,
+                    concurrency_limit: None,
+                    weight: AccountWeight::DEFAULT,
+                    model_access: None,
+                    group_ids: config.group_ids.clone(),
+                }),
+                context: context.clone(),
+                document,
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return failed(name, error.message()),
+        };
+        for account_id in &imported.credential_ids {
+            let saved = self
+                .accounts
+                .update_account_ticket(crate::model::account_tickets::UpdateAccountTicket {
+                    context: context.clone(),
+                    account_id: account_id.clone(),
+                    purchase_amount: Some(command.purchase_amount.clone()),
+                    purchase_currency: Some(command.purchase_currency.clone()),
+                    purchased_at: Some(Utc::now()),
+                    expires_at: Some(command.expires_at),
+                    ticket_line: Some(line.clone()),
+                    clear_ticket: false,
+                })
+                .await;
+            if let Err(error) = saved {
+                // 账号已入库；票据没存上只影响之后的自动复活，不回滚导入。
+                tracing::warn!(target: "public_import", account_id = %account_id,
+                    reason = %error.message(), "imported account left without ticket");
+            }
+        }
+        let mut state_pinned = config.pin_turn_state && !imported.credential_ids.is_empty();
+        if config.pin_turn_state {
+            for account_id in &imported.credential_ids {
+                state_pinned &= self.pin_turn_state(context, account_id.clone()).await;
+            }
+        }
+        tracing::info!(target: "public_import", request_id = %context.request_id, index,
+            proxy_id = %proxy.id, accounts = imported.credential_ids.len(), state_pinned,
+            "public ticket import committed");
+        PublicImportItem {
+            index,
+            name,
+            status: PublicImportItemStatus::Imported,
+            imported_accounts: imported.credential_ids.len(),
+            proxy_name: Some(proxy.name.clone()),
+            state_pinned,
+            message: None,
+        }
     }
 }
 

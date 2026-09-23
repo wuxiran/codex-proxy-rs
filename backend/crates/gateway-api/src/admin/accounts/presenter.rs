@@ -615,6 +615,9 @@ pub(super) fn account_ticket_view(
         ticket_updated_at: ticket.ticket_updated_at.as_ref().map(china_rfc3339),
         spent_usd: ticket.spent_usd,
         spent_usd_display,
+        auto_revive_attempts: ticket.auto_revive_attempts,
+        auto_revive_last_at: ticket.auto_revive_last_at.as_ref().map(china_rfc3339),
+        auto_revive_last_error: ticket.auto_revive_last_error,
     }
 }
 

@@ -51,6 +51,10 @@ pub struct AccountTicketFacts {
     pub ticket_updated_at: Option<DateTime<Utc>>,
     /// 自买入（未填买入时间则自入库）起按模型价格计费的累计美元金额。
     pub spent_usd: Option<String>,
+    /// 本轮失效后已自动复活的次数（上限见自动复活任务）；成功或恢复正常后清零。
+    pub auto_revive_attempts: i32,
+    pub auto_revive_last_at: Option<DateTime<Utc>>,
+    pub auto_revive_last_error: Option<String>,
 }
 
 /// 票据的写入意图。

@@ -151,6 +151,33 @@ impl OpenAiAdminProvider {
         self
     }
 
+    /// 经 sidecar 用票据登录；失败只给固定文案，票据与上游原文不进日志。
+    async fn login_with_ticket(
+        &self,
+        email: &str,
+        password: &str,
+        totp_secret: &str,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<crate::credential::ticket_login::TicketLoginTokens, ProviderAdminError> {
+        let client = self.ticket_login.as_ref().ok_or_else(|| {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                .with_public_message("票据登录服务未配置")
+        })?;
+        client
+            .login(crate::credential::ticket_login::TicketLoginRequest {
+                email,
+                password,
+                totp_secret,
+                proxy_url: proxy.map(|proxy| proxy.expose_url()),
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "ticket login failed");
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message(error.public_message())
+            })
+    }
+
     /// 用票据（邮箱/密码/2FA）经 sidecar 重新登录，换回令牌后写回原账号。
     ///
     /// 登录走账号绑定的出口；新令牌必须属于同一个 ChatGPT 用户与工作区，否则拒绝写入，
@@ -178,30 +205,14 @@ impl OpenAiAdminProvider {
             return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
                 .with_public_message("只有 OAuth 账号可以用票据恢复"));
         }
-        let client = self.ticket_login.as_ref().ok_or_else(|| {
-            provider_admin_error(ProviderAdminErrorKind::Unavailable)
-                .with_public_message("票据登录服务未配置")
-        })?;
-        let tokens = client
-            .login(crate::credential::ticket_login::TicketLoginRequest {
-                email: field("email")?,
-                password: field("password")?,
-                totp_secret: field("totp_secret")?,
-                proxy_url: current
-                    .account
-                    .outbound_proxy()
-                    .map(|proxy| proxy.expose_url()),
-            })
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    account_id = %current.account.id(),
-                    error = %error,
-                    "ticket login failed"
-                );
-                provider_admin_error(ProviderAdminErrorKind::Unavailable)
-                    .with_public_message(error.public_message())
-            })?;
+        let tokens = self
+            .login_with_ticket(
+                field("email")?,
+                field("password")?,
+                field("totp_secret")?,
+                current.account.outbound_proxy(),
+            )
+            .await?;
         let claims =
             crate::credential::parse_chatgpt_jwt_claims(tokens.access_token.expose_secret())
                 .map_err(|_| {
@@ -616,6 +627,45 @@ impl ProviderAdmin for OpenAiAdminProvider {
         };
         Ok(PreparedAuthorizationCommit::new(mutation, credential)
             .with_authorization_guard(authorization_guard))
+    }
+
+    async fn ticket_login(
+        &self,
+        ticket: &gateway_admin::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, ProviderAdminError> {
+        let tokens = self
+            .login_with_ticket(
+                &ticket.email,
+                ticket.password.expose_secret(),
+                ticket.totp_secret.expose_secret(),
+                proxy,
+            )
+            .await?;
+        let mut account = serde_json::Map::new();
+        account.insert("email".to_owned(), Value::String(ticket.email.clone()));
+        account.insert("name".to_owned(), Value::String(ticket.email.clone()));
+        account.insert(
+            "access_token".to_owned(),
+            Value::String(tokens.access_token.expose_secret().to_owned()),
+        );
+        for (key, token) in [
+            ("refresh_token", &tokens.refresh_token),
+            ("id_token", &tokens.id_token),
+        ] {
+            if let Some(token) = token {
+                account.insert(
+                    key.to_owned(),
+                    Value::String(token.expose_secret().to_owned()),
+                );
+            }
+        }
+        let mut document = serde_json::Map::new();
+        document.insert(
+            "accounts".to_owned(),
+            Value::Array(vec![Value::Object(account)]),
+        );
+        Ok(ProviderDocument::new(OpaqueProviderData::new(document)))
     }
 
     async fn prepare_rotation(
