@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import type { AccountRow } from './constants'
 import { ChevronDown } from '@lucide/vue'
 import { useMediaQuery } from '@vueuse/core'
-import { ref } from 'vue'
 
+import { ref, shallowRef } from 'vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -32,6 +33,8 @@ import AccountRecentErrors from './components/AccountRecentErrors.vue'
 import AccountStateBindingCell from './components/AccountStateBindingCell.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
+import AccountTicketCell from './components/AccountTicketCell.vue'
+import AccountTicketModal from './components/AccountTicketModal.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountConfigurations } from './composables/useAccountConfigurations'
@@ -44,6 +47,12 @@ import { useAccountsTable } from './composables/useAccountsTable'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
+const ticketAccount = shallowRef<AccountRow | null>(null)
+const showTicketModal = shallowRef(false)
+function openTicket(account: AccountRow) {
+  ticketAccount.value = account
+  showTicketModal.value = true
+}
 const narrowTable = useMediaQuery('(max-width: 639px)')
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(
   () => accountColumns.map(column => narrowTable.value && column.key === 'actions'
@@ -324,6 +333,10 @@ const {
               />
             </template>
 
+            <template #ticket="{ row }">
+              <AccountTicketCell :ticket="row.ticket" />
+            </template>
+
             <template #status="{ row }">
               <div class="grid justify-items-start gap-1">
                 <AccountStatusBadge
@@ -418,6 +431,7 @@ const {
                 @reauthorize="openReauthorizeAccount"
                 @test="openConnectionTest"
                 @revive="handleReviveGuanlan"
+                @ticket="openTicket"
               />
             </template>
 
@@ -491,6 +505,12 @@ const {
       :saving="creatingAccount"
       @create="handleCreate"
       @generate-oauth="handleAuthorizeOAuth"
+    />
+
+    <AccountTicketModal
+      v-model="showTicketModal"
+      :account="ticketAccount"
+      @changed="refreshAccountsSilently"
     />
 
     <AccountEditModal

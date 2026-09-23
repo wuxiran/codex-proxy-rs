@@ -140,6 +140,32 @@ export interface AccountModelAccess {
   models: string[]
 }
 
+/** 账号成本、到期与票据状态；票据只回显打码邮箱。 */
+export interface AccountTicket {
+  purchaseAmount: string | null
+  purchaseCurrency: 'CNY' | 'USD' | null
+  purchaseDisplay: string | null
+  purchasedAt: string | null
+  expiresAt: string | null
+  hasTicket: boolean
+  ticketHint: string | null
+  ticketUpdatedAt: string | null
+  /** 自买入（或入库）起按模型价格计费的累计美元金额。 */
+  spentUsd: string | null
+  spentUsdDisplay: string | null
+}
+
+export interface AccountTicketUpdate {
+  accountId: string
+  purchaseAmount?: string | null
+  purchaseCurrency?: 'CNY' | 'USD' | null
+  purchasedAt?: string | null
+  expiresAt?: string | null
+  /** `邮箱----密码----2FA密钥`；不传保持原票据不变。 */
+  ticket?: string
+  clearTicket?: boolean
+}
+
 export interface Account {
   outboundProxyEndpoint: string | null
   id: string
@@ -164,6 +190,7 @@ export interface Account {
   concurrency: { inFlight: number | null, limit: number | null }
   /** 最近 24 小时已结束的请求数与报错次数（失败 + 未完成，客户端取消不计）。 */
   recentErrors: { requestCount: number, errorCount: number }
+  ticket: AccountTicket
   weight: number
   modelAccess: AccountModelAccess
   accessTokenExpiresAt: string | null
@@ -800,6 +827,33 @@ export function updateAccountTurnState(data: {
     url: '/api/admin/accounts/rotate',
     method: 'POST',
     data: { provider: 'openai', ...data },
+  })
+}
+
+export function getAccountTicket(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountTicket>({
+    url: '/api/admin/accounts/ticket',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function updateAccountTicket(data: AccountTicketUpdate) {
+  return request<AccountTicket>({
+    url: '/api/admin/accounts/ticket',
+    method: 'POST',
+    data,
+  })
+}
+
+/** 用票据经服务端登录换回令牌并写回原账号；登录含 2FA 与人机校验，耗时较长。 */
+export function restoreAccountFromTicket(data: AccountIdParam) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/ticket/restore',
+    method: 'POST',
+    data,
+    timeout: 4 * 60 * 1000,
   })
 }
 

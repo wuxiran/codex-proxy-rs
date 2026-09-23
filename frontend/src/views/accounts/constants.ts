@@ -42,6 +42,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
   { key: 'stateBinding', label: 'State 绑定 / 到期', kind: 'custom', size: '2xl' },
   { key: 'planType', label: '套餐', kind: 'status', sortable: true },
   { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
+  { key: 'ticket', label: '成本/到期', kind: 'custom', size: 'xl' },
   { key: 'groups', label: '账号分组', kind: 'status' },
   {
     key: 'lastUsedAt',
