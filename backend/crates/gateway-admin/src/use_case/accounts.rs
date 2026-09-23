@@ -268,6 +268,21 @@ impl DefaultAccountsService {
             .collect()
     }
 
+    /// 报错次数只用于展示，读取失败降级为零，不影响列表。
+    async fn recent_errors(
+        &self,
+        range: TimeRange,
+        account_ids: &[String],
+    ) -> BTreeMap<String, AccountRecentErrors> {
+        self.accounts
+            .load_account_request_outcomes(range, account_ids)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "account request outcomes are unavailable");
+                BTreeMap::new()
+            })
+    }
+
     async fn reset_credit_lock(
         &self,
         account_id: &ProviderAccountId,
@@ -442,6 +457,11 @@ impl DefaultAccountsService {
             .await
             .remove(&stored.account.id)
             .unwrap_or_default();
+        let recent_errors = self
+            .recent_errors(rolling_range, &ids)
+            .await
+            .remove(&stored.account.id)
+            .unwrap_or_default();
         Ok(AccountDirectoryItem {
             plan_type_display: self.providers.resolve_account_plan(
                 stored.account.provider_kind.as_str(),
@@ -449,10 +469,7 @@ impl DefaultAccountsService {
                 Some(&quota),
             ),
             concurrency,
-            recent_errors: rolling_usage
-                .as_ref()
-                .map(AccountRecentErrors::from_usage)
-                .unwrap_or_default(),
+            recent_errors,
             projection: stored.projection,
             usage,
             account: stored.account,
@@ -544,6 +561,7 @@ impl AccountsService for DefaultAccountsService {
                     .collect::<Vec<_>>(),
             )
             .await;
+        let mut recent_errors = self.recent_errors(rolling_range, &ids).await;
         let items = page
             .items
             .into_iter()
@@ -561,10 +579,7 @@ impl AccountsService for DefaultAccountsService {
                         Some(&quota),
                     ),
                     concurrency: concurrency.remove(&item.account.id).unwrap_or_default(),
-                    recent_errors: rolling_usage
-                        .get(&item.account.id)
-                        .map(AccountRecentErrors::from_usage)
-                        .unwrap_or_default(),
+                    recent_errors: recent_errors.remove(&item.account.id).unwrap_or_default(),
                     usage,
                     account: item.account,
                     projection: item.projection,

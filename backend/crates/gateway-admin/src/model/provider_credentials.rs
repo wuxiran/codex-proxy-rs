@@ -1110,21 +1110,11 @@ pub struct AccountConcurrency {
     pub limit: Option<u64>,
 }
 
-/// 最近 24 小时的请求与报错次数；报错指未成功完成的请求（失败、未完成、取消）。
+/// 最近 24 小时已结束的请求数与报错次数（失败 + 未完成；客户端取消不算报错）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountRecentErrors {
     pub request_count: u64,
     pub error_count: u64,
-}
-
-impl AccountRecentErrors {
-    #[must_use]
-    pub fn from_usage(usage: &AccountUsage) -> Self {
-        Self {
-            request_count: usage.request_count,
-            error_count: usage.request_count.saturating_sub(usage.success_count),
-        }
-    }
 }
 
 /// 统一账号目录的一行完整结果。

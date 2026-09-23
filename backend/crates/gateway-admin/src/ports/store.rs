@@ -111,6 +111,17 @@ pub trait AccountStore: Send + Sync {
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
 
+    /// 时间窗内每个账号已结束的请求数与报错数（失败 + 未完成；客户端取消不算报错）。
+    /// 用量统计只含有完整用量事实的请求，报错必须单独统计。
+    async fn load_account_request_outcomes(
+        &self,
+        _range: TimeRange,
+        _account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, crate::model::provider_credentials::AccountRecentErrors>>
+    {
+        Ok(BTreeMap::new())
+    }
+
     /// 从同一数据库语句取得截止快照的累计用量和有界历史观测。
     async fn load_quota_forecast_history(
         &self,

@@ -538,6 +538,50 @@ impl AccountStore for PgAdminAccountStore {
         self.usage_by_windows(windows).await
     }
 
+    async fn load_account_request_outcomes(
+        &self,
+        range: TimeRange,
+        account_ids: &[String],
+    ) -> AdminStoreResult<
+        BTreeMap<String, gateway_admin::model::provider_credentials::AccountRecentErrors>,
+    > {
+        if account_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "select provider_account_id,
+                    count(*) filter (where outcome <> 'running'),
+                    count(*) filter (where outcome in ('failed', 'incomplete'))
+               from model_requests
+              where provider_account_id = any($1::text[])
+                and started_at >= $2 and started_at < $3
+              group by provider_account_id",
+        )
+        .bind(account_ids)
+        .bind(range.start)
+        .bind(range.end)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| {
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("load account request outcomes"),
+            )
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(account_id, requests, errors)| {
+                (
+                    account_id,
+                    gateway_admin::model::provider_credentials::AccountRecentErrors {
+                        request_count: u64::try_from(requests).unwrap_or(0),
+                        error_count: u64::try_from(errors).unwrap_or(0),
+                    },
+                )
+            })
+            .collect())
+    }
+
     async fn load_quota_forecast_history(
         &self,
         window: &AccountUsageWindowQuery,

@@ -334,7 +334,7 @@ const {
                 <span
                   class="text-cp-xs font-emphasis tabular-nums"
                   :class="row.recentErrors.errorCount > 0 ? 'text-cp-error-text' : 'text-cp-text-tertiary'"
-                  :title="`最近 24 小时 ${row.recentErrors.requestCount} 次请求中未成功完成 ${row.recentErrors.errorCount} 次`"
+                  :title="`最近 24 小时已结束的 ${row.recentErrors.requestCount} 次请求中，失败或未完成 ${row.recentErrors.errorCount} 次（客户端取消不计）`"
                 >
                   24h 报错 {{ row.recentErrors.errorCount }}{{ errorRateDisplay(row.recentErrors) }}
                 </span>
