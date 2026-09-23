@@ -30,7 +30,9 @@ pub struct RequestLogRecord {
     pub cookie_action: String,
     /// 出口指纹短标识（不泄露代理原文）。
     pub egress: String,
-    /// 本次使用的统一 cookie 短标识（__cf_bm 的短哈希），如 unified-88。
+    /// 本次所用 `__cf_bm` cookie 值的短哈希桶（如 `cfbm-88`）。
+    /// ⚠️ 仅是 cookie 值的指纹，**不是** GPT 网关节点号（`chat.gateway.unified-N`）——
+    /// cpr 连固定 `chatgpt.com/backend-api`，拿不到真节点号。别当节点/满血依据。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unified: Option<String>,
     /// 使用的 turn-state 票短指纹（非原文），如 #hPdTPIqq。
@@ -45,9 +47,19 @@ pub struct RequestLogRecord {
     /// 响应侧：上游返回票据的字节长度（票长）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket_len: Option<usize>,
-    /// 响应侧：真实 service_tier（default/flex/priority），满血与否的唯一可信信号。
+    /// 响应侧：上游回的 service_tier（default/flex/priority）。现网常态 default，
+    /// **仅诊断**，不作满血判据（满血信号已被上游堵，被动判不了）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// 响应侧：上游实际服务的模型（`openai-model` 头 / body `response.model`）。
+    /// 与请求模型**分叉**（present 且 != 请求模型）= 猫腻信号（掺假/relay/降级上报）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+    /// 响应侧：**未过滤**的全部 Set-Cookie 摘要（每项 `name@domain#值指纹`，非原文）。
+    /// 用于实测上游到底下发了哪些 cookie（含 cpr 平时按白名单丢掉的），
+    /// 好确认「网关节点信息是否藏在某张 cookie 里」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resp_cookies: Option<Vec<String>>,
 }
 
 /// 响应侧回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
@@ -57,6 +69,8 @@ pub struct ResponsePatch {
     pub ticket_out: Option<String>,
     pub ticket_len: Option<usize>,
     pub service_tier: Option<String>,
+    pub served_model: Option<String>,
+    pub resp_cookies: Option<Vec<String>>,
 }
 
 fn buffer() -> &'static Mutex<VecDeque<RequestLogRecord>> {
@@ -94,6 +108,12 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
         }
         if patch.service_tier.is_some() {
             rec.service_tier = patch.service_tier;
+        }
+        if patch.served_model.is_some() {
+            rec.served_model = patch.served_model;
+        }
+        if patch.resp_cookies.is_some() {
+            rec.resp_cookies = patch.resp_cookies;
         }
     }
 }
@@ -153,6 +173,8 @@ mod tests {
                 ticket_out: None,
                 ticket_len: None,
                 service_tier: None,
+                served_model: None,
+                resp_cookies: None,
             });
         }
         let recent = recent(1000);
@@ -174,14 +196,16 @@ mod tests {
             model: "gpt-6-sol".into(),
             cookie_action: "inject".into(),
             egress: "egr-1".into(),
-            unified: Some("unified-1".into()),
+            unified: Some("cfbm-1".into()),
             ticket_in: Some("#aaaaaa".into()),
             set_cookie: None,
             ticket_out: None,
             ticket_len: None,
             service_tier: None,
+            served_model: None,
+            resp_cookies: None,
         });
-        // 第一次回填 cookie/票，第二次只回填档位，两者都应保留。
+        // 第一次回填 cookie/票，第二次只回填档位+实际模型，前者都应保留。
         update_response(
             id,
             ResponsePatch {
@@ -195,6 +219,7 @@ mod tests {
             id,
             ResponsePatch {
                 service_tier: Some("priority".into()),
+                served_model: Some("gpt-6-luna".into()),
                 ..Default::default()
             },
         );
@@ -206,6 +231,7 @@ mod tests {
         assert_eq!(found.ticket_len, Some(780));
         assert_eq!(found.ticket_out.as_deref(), Some("#bbbbbb"));
         assert_eq!(found.service_tier.as_deref(), Some("priority"));
+        assert_eq!(found.served_model.as_deref(), Some("gpt-6-luna"));
         // 未命中 id 不应 panic。
         update_response(
             "nope",

@@ -765,13 +765,15 @@ impl CodexCredentialSelector {
                         // 请求日志观测（诊断，只存短标识/短指纹，绝不存原文）。
                         {
                             use secrecy::ExposeSecret as _;
+                            // __cf_bm cookie 值的短哈希桶（cfbm-XX）。不是网关节点号，命名刻意
+                            // 避开 unified-N，防止和 chat.gateway.unified-N 真节点混淆。
                             let unified = cookies
                                 .iter()
                                 .find(|c| c.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME)
                                 .map(|c| {
                                     gateway_core::request_log::short_label(
                                         c.value.expose_secret(),
-                                        "unified",
+                                        "cfbm",
                                     )
                                 });
                             let ticket_in = runtime
@@ -800,6 +802,8 @@ impl CodexCredentialSelector {
                                     ticket_out: None,
                                     ticket_len: None,
                                     service_tier: None,
+                                    served_model: None,
+                                    resp_cookies: None,
                                 },
                             );
                         }
