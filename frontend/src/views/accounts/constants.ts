@@ -209,3 +209,11 @@ function accountProviderLabel(value?: string | null) {
 function optionalAccountCell(value: unknown) {
   return value === '—' || value === '-' ? '' : value
 }
+
+/** 报错率后缀：无请求时不显示比例。 */
+export function errorRateDisplay(errors: AccountRow['recentErrors']): string {
+  if (errors.requestCount === 0)
+    return ''
+  const rate = (errors.errorCount / errors.requestCount) * 100
+  return `（${rate < 10 && rate > 0 ? rate.toFixed(1) : Math.round(rate)}%）`
+}

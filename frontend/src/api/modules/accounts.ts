@@ -158,6 +158,10 @@ export interface Account {
   errorMessage: string | null
   enabled: boolean
   concurrencyLimit: number | null
+  /** 实时并发：inFlight 为空表示实时数据不可用；limit 为空表示不限（未单独设置时为全局默认）。 */
+  concurrency: { inFlight: number | null, limit: number | null }
+  /** 最近 24 小时的请求数与报错次数（未成功完成的请求）。 */
+  recentErrors: { requestCount: number, errorCount: number }
   weight: number
   modelAccess: AccountModelAccess
   accessTokenExpiresAt: string | null

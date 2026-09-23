@@ -39,7 +39,7 @@ import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
-import { accountColumns, derivedAccountStatus } from './constants'
+import { accountColumns, derivedAccountStatus, errorRateDisplay } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
 const narrowTable = useMediaQuery('(max-width: 639px)')
@@ -315,15 +315,30 @@ const {
             </template>
 
             <template #status="{ row }">
-              <AccountStatusBadge
-                :status="derivedAccountStatus(row)"
-                :error-reason="row.errorReason"
-                :error-message="row.errorMessage"
-                :rate-limited-until="row.quota.rateLimitedUntil"
-                :rate-limit-reason="row.quota.rateLimitReason"
-                :recovery-probe-required="row.quota.recoveryProbeRequired"
-                :next-refresh-at="row.nextRefreshAt"
-              />
+              <div class="grid justify-items-start gap-1">
+                <AccountStatusBadge
+                  :status="derivedAccountStatus(row)"
+                  :error-reason="row.errorReason"
+                  :error-message="row.errorMessage"
+                  :rate-limited-until="row.quota.rateLimitedUntil"
+                  :rate-limit-reason="row.quota.rateLimitReason"
+                  :recovery-probe-required="row.quota.recoveryProbeRequired"
+                  :next-refresh-at="row.nextRefreshAt"
+                />
+                <span
+                  class="text-cp-xs font-emphasis tabular-nums text-cp-text-tertiary"
+                  :title="row.concurrencyLimit === null ? '当前并发 / 并发上限（继承全局默认）' : '当前并发 / 并发上限'"
+                >
+                  并发 {{ row.concurrency.inFlight ?? '—' }}/{{ row.concurrency.limit ?? '不限' }}
+                </span>
+                <span
+                  class="text-cp-xs font-emphasis tabular-nums"
+                  :class="row.recentErrors.errorCount > 0 ? 'text-cp-error-text' : 'text-cp-text-tertiary'"
+                  :title="`最近 24 小时 ${row.recentErrors.requestCount} 次请求中未成功完成 ${row.recentErrors.errorCount} 次`"
+                >
+                  24h 报错 {{ row.recentErrors.errorCount }}{{ errorRateDisplay(row.recentErrors) }}
+                </span>
+              </div>
             </template>
 
             <template #enabled="{ row }">

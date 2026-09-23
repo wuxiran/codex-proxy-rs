@@ -23,11 +23,11 @@ use crate::{
         },
         observability::TimeRange,
         provider_credentials::{
-            AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,
-            AccountRefreshResult, ConsumeProviderResetCredit, PrepareCredentialRefresh,
-            ProviderModels, ProviderProfileAvatar, ProviderQuota, ProviderQuotaRequest,
-            ProviderQuotaWindow, ProviderResetCreditResult, ProviderResetCredits,
-            QuotaLocalUsageAttribution,
+            AccountConcurrency, AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle,
+            AccountPersonalInfo, AccountRecentErrors, AccountRefreshResult,
+            ConsumeProviderResetCredit, PrepareCredentialRefresh, ProviderModels,
+            ProviderProfileAvatar, ProviderQuota, ProviderQuotaRequest, ProviderQuotaWindow,
+            ProviderResetCreditResult, ProviderResetCredits, QuotaLocalUsageAttribution,
         },
         quota_forecast::{AccountQuotaForecastReport, account_quota_forecasts},
         quota_forecast_sampling::{QuotaForecastPoint, select_forecast_sample},
@@ -35,7 +35,7 @@ use crate::{
     ports::{
         provider::ProviderAdminRegistry,
         proxy::ProxyStore,
-        store::{AccountRuntimeStore, AccountStore},
+        store::{AccountRuntimeStore, AccountStore, SettingsStore},
     },
 };
 
@@ -187,6 +187,7 @@ pub trait AccountsService: Send + Sync {
 pub(crate) struct DefaultAccountsService {
     accounts: Arc<dyn AccountStore>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
+    settings: Arc<dyn SettingsStore>,
     providers: ProviderAdminRegistry,
     snapshot: Arc<dyn SnapshotControl>,
     pub(super) probe: Arc<dyn AccountProbe>,
@@ -201,6 +202,7 @@ impl DefaultAccountsService {
     pub(crate) fn new(
         accounts: Arc<dyn AccountStore>,
         account_runtime: Arc<dyn AccountRuntimeStore>,
+        settings: Arc<dyn SettingsStore>,
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
@@ -209,6 +211,7 @@ impl DefaultAccountsService {
         Self {
             accounts,
             account_runtime,
+            settings,
             providers,
             snapshot,
             probe,
@@ -216,6 +219,53 @@ impl DefaultAccountsService {
             hunts: super::turn_state_hunt::ActiveHunts::default(),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// 账号列表的并发列：实时占用来自 lease 存储，上限未单独设置时继承全局默认。
+    /// 两者都只用于展示，任一读取失败只降级为未知，不影响列表。
+    async fn concurrency(
+        &self,
+        accounts: &[&crate::model::accounts::AccountRecord],
+    ) -> BTreeMap<String, AccountConcurrency> {
+        let ids = accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let (runtime, settings) = futures::join!(
+            self.account_runtime.account_runtime(&ids),
+            self.settings.load_runtime_settings(),
+        );
+        let in_flight = match runtime {
+            Ok(runtime) => runtime.in_flight,
+            Err(error) => {
+                tracing::warn!(error = %error, "account concurrency in-flight is unavailable");
+                None
+            }
+        };
+        let default_limit = match settings {
+            Ok(settings) => Some(settings.max_concurrent_per_account),
+            Err(error) => {
+                tracing::warn!(error = %error, "default account concurrency is unavailable");
+                None
+            }
+        };
+        accounts
+            .iter()
+            .map(|account| {
+                let limit = account
+                    .concurrency_limit
+                    .map(|limit| u64::from(limit.get()))
+                    // 全局默认 0 表示不限。
+                    .or_else(|| default_limit.filter(|limit| *limit > 0).map(u64::from));
+                let concurrency = AccountConcurrency {
+                    in_flight: in_flight
+                        .as_ref()
+                        .map(|in_flight| in_flight.get(&account.id).copied().unwrap_or(0)),
+                    limit,
+                };
+                (account.id.clone(), concurrency)
+            })
+            .collect()
     }
 
     async fn reset_credit_lock(
@@ -387,12 +437,22 @@ impl DefaultAccountsService {
                     .usage_window()
                     .and_then(|(window, _)| window.local_usage.clone())
             });
+        let concurrency = self
+            .concurrency(&[&stored.account])
+            .await
+            .remove(&stored.account.id)
+            .unwrap_or_default();
         Ok(AccountDirectoryItem {
             plan_type_display: self.providers.resolve_account_plan(
                 stored.account.provider_kind.as_str(),
                 &mut stored.account.plan_type,
                 Some(&quota),
             ),
+            concurrency,
+            recent_errors: rolling_usage
+                .as_ref()
+                .map(AccountRecentErrors::from_usage)
+                .unwrap_or_default(),
             projection: stored.projection,
             usage,
             account: stored.account,
@@ -475,6 +535,15 @@ impl AccountsService for DefaultAccountsService {
         self.attach_quota_local_usage(&page.items, &mut quotas)
             .await?;
         let mut lifetime_usage = self.load_lifetime_usage(&page.items, &quotas).await?;
+        let mut concurrency = self
+            .concurrency(
+                &page
+                    .items
+                    .iter()
+                    .map(|item| &item.account)
+                    .collect::<Vec<_>>(),
+            )
+            .await;
         let items = page
             .items
             .into_iter()
@@ -491,6 +560,11 @@ impl AccountsService for DefaultAccountsService {
                         &mut item.account.plan_type,
                         Some(&quota),
                     ),
+                    concurrency: concurrency.remove(&item.account.id).unwrap_or_default(),
+                    recent_errors: rolling_usage
+                        .get(&item.account.id)
+                        .map(AccountRecentErrors::from_usage)
+                        .unwrap_or_default(),
                     usage,
                     account: item.account,
                     projection: item.projection,

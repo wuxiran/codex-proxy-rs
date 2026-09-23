@@ -262,6 +262,22 @@ pub struct AccountSummaryView {
     pub error: u64,
 }
 
+/// 账号实时并发；`inFlight` 为空表示实时数据不可用，`limit` 为空表示不限。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountConcurrencyView {
+    pub in_flight: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// 最近 24 小时的请求数与报错次数（未成功完成的请求）。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRecentErrorsView {
+    pub request_count: u64,
+    pub error_count: u64,
+}
+
 /// 一条安全账号视图。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -289,6 +305,10 @@ pub struct AccountView {
     pub error_message: Option<String>,
     pub enabled: bool,
     pub concurrency_limit: Option<u32>,
+    /// 实时并发：当前占用与生效上限（未单独设置时为全局默认）。
+    pub concurrency: AccountConcurrencyView,
+    /// 最近 24 小时的请求数与报错次数。
+    pub recent_errors: AccountRecentErrorsView,
     pub weight: u16,
     pub model_access: gateway_core::account::AccountModelAccess,
     pub access_token_expires_at: Option<String>,

@@ -1101,10 +1101,38 @@ impl fmt::Debug for ProviderExport {
     }
 }
 
+/// 账号实时并发：当前占用与生效上限。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountConcurrency {
+    /// 正在执行的请求数；实时 lease 存储不可用时为 `None`。
+    pub in_flight: Option<u64>,
+    /// 账号自身上限，未设置时继承全局默认；`None` 表示不限。
+    pub limit: Option<u64>,
+}
+
+/// 最近 24 小时的请求与报错次数；报错指未成功完成的请求（失败、未完成、取消）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountRecentErrors {
+    pub request_count: u64,
+    pub error_count: u64,
+}
+
+impl AccountRecentErrors {
+    #[must_use]
+    pub fn from_usage(usage: &AccountUsage) -> Self {
+        Self {
+            request_count: usage.request_count,
+            error_count: usage.request_count.saturating_sub(usage.success_count),
+        }
+    }
+}
+
 /// 统一账号目录的一行完整结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountDirectoryItem {
     pub account: AccountRecord,
+    pub concurrency: AccountConcurrency,
+    pub recent_errors: AccountRecentErrors,
     /// Provider 提供的套餐展示名称；未识别到套餐时为空。
     pub plan_type_display: Option<String>,
     pub projection: gateway_core::account::AccountStatusProjection,

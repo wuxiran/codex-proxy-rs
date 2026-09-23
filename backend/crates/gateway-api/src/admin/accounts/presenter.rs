@@ -62,6 +62,8 @@ pub(super) fn account_models_data(result: ProviderModels) -> AccountModelsData {
 pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> AccountView {
     let AccountDirectoryItem {
         account,
+        concurrency,
+        recent_errors,
         plan_type_display,
         projection,
         usage,
@@ -109,6 +111,14 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         error_message: projection.error_message,
         enabled: account.enabled,
         concurrency_limit: account.concurrency_limit.map(|limit| limit.get()),
+        concurrency: AccountConcurrencyView {
+            in_flight: concurrency.in_flight,
+            limit: concurrency.limit,
+        },
+        recent_errors: AccountRecentErrorsView {
+            request_count: recent_errors.request_count,
+            error_count: recent_errors.error_count,
+        },
         weight: account.weight.get(),
         model_access: account.model_access,
         outbound_proxy_endpoint: account
