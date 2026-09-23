@@ -241,13 +241,16 @@ pub(super) fn same_client_turn(previous: Option<&str>, current: Option<&str>) ->
         .is_some_and(|(previous, current)| !previous.is_empty() && previous == current)
 }
 
-/// 组装请求日志的响应侧回填补丁：Set-Cookie(__cf_bm) 有无、上游票短指纹与票长、真 service_tier。
-/// 票优先取本回合捕获（含流内轮转）的 turn_state，退回 handshake 票；只存短指纹/长度，绝不存原文。
+/// 组装请求日志的响应侧回填补丁：Set-Cookie(__cf_bm) 有无、上游票短指纹与票长、service_tier、
+/// 上游实际服务模型（用于「实际模型≠请求模型」的猫腻分叉判断）。
+/// 票优先取本回合捕获（含流内轮转）的 turn_state，退回 handshake 票；只存短指纹/长度/模型名，绝不存原文。
 fn codex_response_log_patch(
     has_cfbm: bool,
     capture: Option<&OpenAiSessionCapture>,
     handshake_turn_state: Option<&str>,
     service_tier: Option<&str>,
+    served_model: Option<&str>,
+    resp_cookies: &[String],
 ) -> gateway_core::request_log::ResponsePatch {
     let ticket = capture
         .and_then(|c| c.turn_state.as_deref())
@@ -257,7 +260,42 @@ fn codex_response_log_patch(
         ticket_out: ticket.map(gateway_core::request_log::fingerprint),
         ticket_len: ticket.map(str::len),
         service_tier: service_tier.map(str::to_owned),
+        served_model: served_model.map(str::to_owned),
+        resp_cookies: (!resp_cookies.is_empty()).then(|| resp_cookies.to_vec()),
     }
+}
+
+/// 把未过滤的 Set-Cookie 头列表折成安全摘要：每项 `name@domain#值指纹`，绝不含原文。
+/// 只暴露 cookie 的名字与域（判断有没有隐藏的网关/节点 cookie）+ 值的短指纹（判断是否轮换）。
+fn summarize_set_cookies(headers: &[String]) -> Vec<String> {
+    headers
+        .iter()
+        .filter_map(|raw| {
+            let raw = raw.trim();
+            let mut parts = raw.split(';');
+            let nv = parts.next()?.trim();
+            let (name, value) = nv.split_once('=')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let domain = parts
+                .filter_map(|attr| {
+                    let attr = attr.trim();
+                    attr.split_once('=').and_then(|(k, v)| {
+                        k.trim().eq_ignore_ascii_case("domain").then(|| v.trim().to_owned())
+                    })
+                })
+                .next()
+                .unwrap_or_default();
+            let fp = gateway_core::request_log::fingerprint(value.trim());
+            Some(if domain.is_empty() {
+                format!("{name}{fp}")
+            } else {
+                format!("{name}@{domain}{fp}")
+            })
+        })
+        .collect()
 }
 
 pub(super) fn decode_openai_session_state(request: &GenerateRequest) -> Option<OpenAiSessionState> {
@@ -822,6 +860,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .set_cookie_headers
             .iter()
             .any(|h| h.trim_start().to_ascii_lowercase().starts_with("__cf_bm="));
+        // 未过滤的全部 Set-Cookie 摘要（name@domain#值指纹，非原文），用于实测上游
+        // 到底下发了哪些 cookie（含 cpr 平时按白名单丢掉的），排查节点信息是否藏在 cookie 里。
+        let resp_cookie_summary = summarize_set_cookies(&response.set_cookie_headers);
         let resp_handshake_turn_state = response.turn_state.clone();
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
@@ -1140,6 +1181,8 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         session_capture.as_ref(),
                         resp_handshake_turn_state.as_deref(),
                         decoder.response_service_tier(),
+                        decoder.response_model(),
+                        &resp_cookie_summary,
                     ),
                 );
                 return;
@@ -1280,6 +1323,8 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 session_capture.as_ref(),
                 resp_handshake_turn_state.as_deref(),
                 decoder.response_service_tier(),
+                decoder.response_model(),
+                        &resp_cookie_summary,
             ),
         );
         let events = pre_commit_events.finish(events, timing_signals, completed);
