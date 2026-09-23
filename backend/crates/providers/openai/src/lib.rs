@@ -1,6 +1,7 @@
 //! OpenAI Provider 专属能力。
 
 mod admin;
+mod cf_cookie_pool;
 pub mod config;
 mod provider;
 mod session_transport;

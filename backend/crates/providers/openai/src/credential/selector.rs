@@ -125,6 +125,8 @@ pub struct CodexCredentialSelector {
     cookie_policy: CodexCookiePolicy,
     risk_recovery: Mutex<HashMap<String, RiskRecoveryState>>,
     account_feedback: Arc<AccountFeedbackStats>,
+    /// 按出口共享的 Cloudflare `__cf_bm` 池（进程内、跨账号复用）。
+    cf_pool: crate::cf_cookie_pool::CfCookiePool,
 }
 
 enum SessionAffinityLookup {
@@ -281,6 +283,7 @@ impl CodexCredentialSelector {
             risk_recovery: Mutex::new(HashMap::new()),
             waiting: ConcurrencyWaitQueue::default(),
             account_feedback,
+            cf_pool: crate::cf_cookie_pool::CfCookiePool::default(),
         }
     }
 
@@ -713,7 +716,7 @@ impl CodexCredentialSelector {
                                 .is_some_and(CodexSessionAffinity::session_id_present),
                             "OpenAI account selected"
                         );
-                        let cookies = runtime
+                        let mut cookies: Vec<RuntimeCodexCookie> = runtime
                             .cookies
                             .into_iter()
                             .filter(|cookie| {
@@ -729,6 +732,35 @@ impl CodexCredentialSelector {
                                     )
                             })
                             .collect();
+                        // 账号自己没有未过期 __cf_bm 时，从按出口共享的池借一张注入
+                        // （跨账号复用 Cloudflare 边缘 cookie，对应日志的「注入」；有则「沿用」自己的）。
+                        if !cookies
+                            .iter()
+                            .any(|cookie| cookie.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME)
+                        {
+                            let egress_fp = crate::turn_state_pin::egress_fingerprint(
+                                account.outbound_proxy().map(|proxy| proxy.expose_url()),
+                            );
+                            if let Some(cf) = self.cf_pool.borrow(&egress_fp)
+                                && self.cookie_policy.may_replay(
+                                    request.request_url,
+                                    &cf.domain,
+                                    &cf.path,
+                                    cf.host_only,
+                                    cf.secure,
+                                )
+                            {
+                                cookies.push(RuntimeCodexCookie {
+                                    name: cf.name,
+                                    value: cf.value,
+                                    domain: cf.domain,
+                                    path: cf.path,
+                                    host_only: cf.host_only,
+                                    secure: cf.secure,
+                                    expires_at: cf.expires_at,
+                                });
+                            }
+                        }
                         if !diagnostic
                             && observed_affinity_account.as_ref() == Some(account.id())
                             && let Some(key) = request.session_affinity_key
@@ -1225,6 +1257,10 @@ impl CodexCredentialSelector {
                 rejected: headers.len(),
             });
         };
+        // 出口指纹：CF `__cf_bm` 与出口绑定，按出口共享。
+        let egress_fp = crate::turn_state_pin::egress_fingerprint(
+            account.outbound_proxy().map(|proxy| proxy.expose_url()),
+        );
         for input in parsed.inputs {
             let scope = self.cookie_policy.validate_capture(
                 &input.response_origin,
@@ -1232,6 +1268,19 @@ impl CodexCredentialSelector {
                 &input.name,
                 &input.path,
             )?;
+            // 采集：新鲜的 __cf_bm 除写本账号外，tee 一份进按出口共享的池。
+            if !input.delete && input.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME {
+                self.cf_pool.harvest(
+                    &egress_fp,
+                    &input.name,
+                    input.value.clone(),
+                    scope.domain.clone(),
+                    input.path.clone(),
+                    scope.host_only,
+                    input.secure,
+                    input.expires_at,
+                );
+            }
             cookies.retain(|cookie| {
                 !(cookie.name == input.name
                     && cookie.domain == scope.domain
