@@ -13,9 +13,15 @@ use serde::Serialize;
 const CAP: usize = 300;
 
 /// 一条请求观测记录。字段都是短标识，不含机密。
+///
+/// 请求侧字段在 lease 组装时写入；响应侧字段（`set_cookie`/`ticket_out`/`ticket_len`/
+/// `service_tier`）在上游响应回来后由 [`update_response`] 按 `id` 回填。
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogRecord {
+    /// 关联 id（网关 request id），仅用于请求↔响应两阶段回填，不对外序列化。
+    #[serde(skip)]
+    pub id: String,
     /// 记录时刻（Unix 毫秒），前端本地格式化。
     pub at_ms: i64,
     /// 请求模型，如 gpt-6-sol。
@@ -30,6 +36,27 @@ pub struct RequestLogRecord {
     /// 使用的 turn-state 票短指纹（非原文），如 #hPdTPIqq。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket_in: Option<String>,
+    /// 响应侧：上游是否下发了 `__cf_bm`（Set-Cookie）。None=尚未观测/无响应。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_cookie: Option<bool>,
+    /// 响应侧：上游返回的 turn-state 票短指纹（非原文）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_out: Option<String>,
+    /// 响应侧：上游返回票据的字节长度（票长）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_len: Option<usize>,
+    /// 响应侧：真实 service_tier（default/flex/priority），满血与否的唯一可信信号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+}
+
+/// 响应侧回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
+#[derive(Default)]
+pub struct ResponsePatch {
+    pub set_cookie: Option<bool>,
+    pub ticket_out: Option<String>,
+    pub ticket_len: Option<usize>,
+    pub service_tier: Option<String>,
 }
 
 fn buffer() -> &'static Mutex<VecDeque<RequestLogRecord>> {
@@ -44,6 +71,30 @@ pub fn record(rec: RequestLogRecord) {
             buf.pop_front();
         }
         buf.push_back(rec);
+    }
+}
+
+/// 按 `id` 回填响应侧字段（最近匹配优先）。id 空或未命中则静默跳过。
+/// 只覆盖补丁里 `Some(..)` 的字段，避免第二次回填抹掉第一次的结果。
+pub fn update_response(id: &str, patch: ResponsePatch) {
+    if id.is_empty() {
+        return;
+    }
+    if let Ok(mut buf) = buffer().lock()
+        && let Some(rec) = buf.iter_mut().rev().find(|r| r.id == id)
+    {
+        if patch.set_cookie.is_some() {
+            rec.set_cookie = patch.set_cookie;
+        }
+        if patch.ticket_out.is_some() {
+            rec.ticket_out = patch.ticket_out;
+        }
+        if patch.ticket_len.is_some() {
+            rec.ticket_len = patch.ticket_len;
+        }
+        if patch.service_tier.is_some() {
+            rec.service_tier = patch.service_tier;
+        }
     }
 }
 
@@ -91,12 +142,17 @@ mod tests {
     fn ring_buffer_is_bounded_and_newest_first() {
         for i in 0..(CAP + 50) {
             record(RequestLogRecord {
+                id: format!("req-{i}"),
                 at_ms: i as i64,
                 model: "gpt-6-sol".into(),
                 cookie_action: "reuse".into(),
                 egress: "e".into(),
                 unified: None,
                 ticket_in: None,
+                set_cookie: None,
+                ticket_out: None,
+                ticket_len: None,
+                service_tier: None,
             });
         }
         let recent = recent(1000);
@@ -107,5 +163,33 @@ mod tests {
     #[test]
     fn short_label_is_stable() {
         assert_eq!(short_label("abc", "unified"), short_label("abc", "unified"));
+    }
+
+    #[test]
+    fn update_response_backfills_by_id_without_clobbering() {
+        let id = "corr-xyz";
+        record(RequestLogRecord {
+            id: id.into(),
+            at_ms: now_ms(),
+            model: "gpt-6-sol".into(),
+            cookie_action: "inject".into(),
+            egress: "egr-1".into(),
+            unified: Some("unified-1".into()),
+            ticket_in: Some("#aaaaaa".into()),
+            set_cookie: None,
+            ticket_out: None,
+            ticket_len: None,
+            service_tier: None,
+        });
+        // 第一次回填 cookie/票，第二次只回填档位，两者都应保留。
+        update_response(id, ResponsePatch { set_cookie: Some(true), ticket_out: Some("#bbbbbb".into()), ticket_len: Some(780), ..Default::default() });
+        update_response(id, ResponsePatch { service_tier: Some("priority".into()), ..Default::default() });
+        let found = recent(1000).into_iter().find(|r| r.id == id).expect("record present");
+        assert_eq!(found.set_cookie, Some(true));
+        assert_eq!(found.ticket_len, Some(780));
+        assert_eq!(found.ticket_out.as_deref(), Some("#bbbbbb"));
+        assert_eq!(found.service_tier.as_deref(), Some("priority"));
+        // 未命中 id 不应 panic。
+        update_response("nope", ResponsePatch { service_tier: Some("x".into()), ..Default::default() });
     }
 }
