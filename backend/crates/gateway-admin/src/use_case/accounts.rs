@@ -165,6 +165,29 @@ pub trait AccountsService: Send + Sync {
         Err(AdminError::invalid("当前服务不支持遍历代理找 state"))
     }
 
+    /// 账号成本、到期与票据状态（不含票据明文）。
+    async fn account_ticket(
+        &self,
+        _account_id: &ProviderAccountId,
+    ) -> Result<crate::model::account_tickets::AccountTicketFacts, AdminError> {
+        Err(AdminError::invalid("当前服务不支持账号成本与票据"))
+    }
+
+    async fn update_account_ticket(
+        &self,
+        _command: crate::model::account_tickets::UpdateAccountTicket,
+    ) -> Result<crate::model::account_tickets::AccountTicketFacts, AdminError> {
+        Err(AdminError::invalid("当前服务不支持账号成本与票据"))
+    }
+
+    /// 解密票据得到 Provider 轮换材料，交给凭据轮换流程登录并写回原账号。
+    async fn ticket_restore_material(
+        &self,
+        _account_id: &ProviderAccountId,
+    ) -> Result<crate::model::provider_credentials::ProviderDocument, AdminError> {
+        Err(AdminError::invalid("当前服务不支持票据恢复"))
+    }
+
     /// 自动撞：从一条轮换代理模板即时生成多国临时出口反复撞，命中即切静态并钉住。
     async fn auto_turn_state_hunt(
         &self,
@@ -185,7 +208,8 @@ pub trait AccountsService: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) struct DefaultAccountsService {
-    accounts: Arc<dyn AccountStore>,
+    pub(super) accounts: Arc<dyn AccountStore>,
+    pub(super) ticket_cipher: Arc<crate::ticket_cipher::TicketCipher>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     settings: Arc<dyn SettingsStore>,
     providers: ProviderAdminRegistry,
@@ -199,6 +223,8 @@ pub(crate) struct DefaultAccountsService {
 
 impl DefaultAccountsService {
     #[must_use]
+    // 组合根一次性注入各项独立能力，拆成参数结构体只会多一层搬运。
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         accounts: Arc<dyn AccountStore>,
         account_runtime: Arc<dyn AccountRuntimeStore>,
@@ -207,8 +233,10 @@ impl DefaultAccountsService {
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
         proxies: Arc<dyn ProxyStore>,
+        ticket_dir: std::path::PathBuf,
     ) -> Self {
         Self {
+            ticket_cipher: Arc::new(crate::ticket_cipher::TicketCipher::new(ticket_dir)),
             accounts,
             account_runtime,
             settings,
@@ -266,6 +294,20 @@ impl DefaultAccountsService {
                 (account.id.clone(), concurrency)
             })
             .collect()
+    }
+
+    /// 成本与票据状态只用于展示，读取失败降级为空，不影响列表。
+    async fn ticket_facts(
+        &self,
+        account_ids: &[String],
+    ) -> BTreeMap<String, crate::model::account_tickets::AccountTicketFacts> {
+        self.accounts
+            .load_account_tickets(account_ids)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "account tickets are unavailable");
+                BTreeMap::new()
+            })
     }
 
     /// 报错次数只用于展示，读取失败降级为零，不影响列表。
@@ -470,6 +512,11 @@ impl DefaultAccountsService {
             ),
             concurrency,
             recent_errors,
+            ticket: self
+                .ticket_facts(&ids)
+                .await
+                .remove(&stored.account.id)
+                .unwrap_or_default(),
             projection: stored.projection,
             usage,
             account: stored.account,
@@ -562,6 +609,7 @@ impl AccountsService for DefaultAccountsService {
             )
             .await;
         let mut recent_errors = self.recent_errors(rolling_range, &ids).await;
+        let mut tickets = self.ticket_facts(&ids).await;
         let items = page
             .items
             .into_iter()
@@ -580,6 +628,7 @@ impl AccountsService for DefaultAccountsService {
                     ),
                     concurrency: concurrency.remove(&item.account.id).unwrap_or_default(),
                     recent_errors: recent_errors.remove(&item.account.id).unwrap_or_default(),
+                    ticket: tickets.remove(&item.account.id).unwrap_or_default(),
                     usage,
                     account: item.account,
                     projection: item.projection,
@@ -1106,6 +1155,27 @@ impl AccountsService for DefaultAccountsService {
         command: TurnStateHuntCommand,
     ) -> Result<TurnStateHuntEventStream, AdminError> {
         self.start_turn_state_hunt(command).await
+    }
+
+    async fn account_ticket(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<crate::model::account_tickets::AccountTicketFacts, AdminError> {
+        self.load_ticket_facts(account_id).await
+    }
+
+    async fn update_account_ticket(
+        &self,
+        command: crate::model::account_tickets::UpdateAccountTicket,
+    ) -> Result<crate::model::account_tickets::AccountTicketFacts, AdminError> {
+        self.save_ticket(command).await
+    }
+
+    async fn ticket_restore_material(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<crate::model::provider_credentials::ProviderDocument, AdminError> {
+        self.ticket_material(account_id).await
     }
 
     async fn auto_turn_state_hunt(

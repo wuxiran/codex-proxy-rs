@@ -89,6 +89,7 @@ pub(crate) struct OpenAiAdminProvider {
     catalog: Arc<CodexCredentialCatalogService>,
     websocket_pool: Arc<CodexWebSocketPool>,
     desktop_release: CodexDesktopReleaseStatus,
+    ticket_login: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
 }
 
 pub(crate) struct OpenAiAdminServices {
@@ -122,7 +123,16 @@ impl OpenAiAdminProvider {
             catalog: services.catalog,
             websocket_pool,
             desktop_release,
+            ticket_login: None,
         }
+    }
+
+    pub(crate) fn with_ticket_login(
+        mut self,
+        client: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
+    ) -> Self {
+        self.ticket_login = client;
+        self
     }
 
     pub(crate) fn with_turn_state_pins(
@@ -139,6 +149,83 @@ impl OpenAiAdminProvider {
     ) -> Self {
         self.auto_hunt = store;
         self
+    }
+
+    /// 用票据（邮箱/密码/2FA）经 sidecar 重新登录，换回令牌后写回原账号。
+    ///
+    /// 登录走账号绑定的出口；新令牌必须属于同一个 ChatGPT 用户与工作区，否则拒绝写入，
+    /// 防止录错票据把别的账号写进来。
+    async fn prepare_ticket_restore(
+        &self,
+        current: LoadedCredential,
+        material: ProviderDocument,
+        provider_kind: ProviderKind,
+    ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+        let material = material.into_provider_data().into_inner();
+        let ticket = match (material.len(), material.get("ticket_restore")) {
+            (1, Some(Value::Object(ticket))) => ticket,
+            _ => return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)),
+        };
+        let field = |name: &str| {
+            ticket
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Invalid))
+        };
+        if current.account.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
+                .with_public_message("只有 OAuth 账号可以用票据恢复"));
+        }
+        let client = self.ticket_login.as_ref().ok_or_else(|| {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                .with_public_message("票据登录服务未配置")
+        })?;
+        let tokens = client
+            .login(crate::credential::ticket_login::TicketLoginRequest {
+                email: field("email")?,
+                password: field("password")?,
+                totp_secret: field("totp_secret")?,
+                proxy_url: current
+                    .account
+                    .outbound_proxy()
+                    .map(|proxy| proxy.expose_url()),
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    account_id = %current.account.id(),
+                    error = %error,
+                    "ticket login failed"
+                );
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message(error.public_message())
+            })?;
+        let claims =
+            crate::credential::parse_chatgpt_jwt_claims(tokens.access_token.expose_secret())
+                .map_err(|_| {
+                    provider_admin_error(ProviderAdminErrorKind::Invalid)
+                        .with_public_message("票据登录返回的令牌无法解析")
+                })?;
+        let same_user = claims.chatgpt_user_id.as_deref() == current.account.upstream_user_id();
+        let same_workspace =
+            claims.chatgpt_account_id.as_deref() == current.account.upstream_account_id();
+        if !same_user || !same_workspace {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("票据登录到的不是这个账号（用户或工作区不一致），未写入"));
+        }
+        let secret = CodexOAuthSecret {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            id_token: tokens.id_token,
+        };
+        let expires_at = parse_access_token_expiration(secret.access_token.expose_secret());
+        let prepared = CodexCredentialAdmin
+            .prepare_refreshed_oauth_rotation(current, secret, expires_at, None)
+            .map_err(map_credential_admin_error)?;
+        tracing::info!(target: "account_ticket", account_id = %prepared.profile.account_id, "ticket restore prepared");
+        prepared_rotation(prepared, provider_kind)
     }
 
     async fn account(
@@ -587,6 +674,20 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     _credential: credential_guard,
                 }),
             ));
+        }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("ticket_restore")
+        {
+            return self
+                .prepare_ticket_restore(
+                    current,
+                    command.provider_material,
+                    command.account.provider_kind,
+                )
+                .await;
         }
         let settings_material = command
             .provider_material

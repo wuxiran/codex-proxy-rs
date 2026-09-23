@@ -18,6 +18,14 @@ where
         .route("/api/admin/accounts/refresh", post(refresh_account::<S>))
         .route("/api/admin/accounts/recover", post(recover_account::<S>))
         .route("/api/admin/accounts/rotate", post(rotate_account::<S>))
+        .route(
+            "/api/admin/accounts/ticket",
+            get(account_ticket::<S>).post(update_account_ticket::<S>),
+        )
+        .route(
+            "/api/admin/accounts/ticket/restore",
+            post(restore_account_from_ticket::<S>),
+        )
         .route("/api/admin/accounts/update", post(update_account::<S>))
         .route("/api/admin/accounts/delete", post(delete_accounts::<S>))
         .route(
@@ -276,6 +284,84 @@ where
         .admin_services()
         .openai()
         .rotate(command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(AccountMutationData::from(result)),
+    ))
+}
+
+async fn account_ticket<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<AccountIdQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let account_id = query.into_id().map_err(map_wire_error)?;
+    let ticket = state
+        .admin_services()
+        .accounts()
+        .account_ticket(&account_id)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(account_ticket_view(ticket)),
+    ))
+}
+
+async fn update_account_ticket<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<UpdateAccountTicketRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let command = request
+        .into_command(auth.context().mutation_context())
+        .map_err(map_wire_error)?;
+    let ticket = state
+        .admin_services()
+        .accounts()
+        .update_account_ticket(command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(account_ticket_view(ticket)),
+    ))
+}
+
+/// 解密票据 → Provider 经 sidecar 登录并核对身份 → 走凭据轮换写回原账号。
+async fn restore_account_from_ticket<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<AccountActionRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let account_id = request.into_id().map_err(map_wire_error)?;
+    let services = state.admin_services();
+    let provider_material = services
+        .accounts()
+        .ticket_restore_material(&account_id)
+        .await
+        .map_err(map_service_error)?;
+    let result = services
+        .openai()
+        .rotate(RotateCredential {
+            mutation: CredentialMutation {
+                context: auth.context().mutation_context(),
+                account_id,
+            },
+            provider_material,
+            settings: None,
+        })
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(

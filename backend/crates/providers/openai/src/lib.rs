@@ -238,6 +238,18 @@ pub async fn initialize(
         )
         .with_oauth_client_id(config.oauth_client_id()),
     );
+    let ticket_settings = config.ticket_login_settings();
+    let ticket_login = if ticket_settings.enabled {
+        Some(Arc::new(
+            credential::ticket_login::TicketLoginClient::new(
+                &ticket_settings.base_url,
+                secrecy::SecretString::from(ticket_settings.token.clone()),
+            )
+            .map_err(|_| OpenAiInitializeError::Transport)?,
+        ))
+    } else {
+        None
+    };
     let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(
         OpenAiAdminProvider::new(
             provider_kind,
@@ -254,6 +266,7 @@ pub async fn initialize(
             desktop_release_status,
         )
         .with_turn_state_pins(turn_state_pins)
+        .with_ticket_login(ticket_login)
         .with_auto_hunt_store(
             turn_state_auto_hunt::AutoHuntStore::new(config.turn_state_data_dir().to_path_buf())
                 .map_err(|_| OpenAiInitializeError::Transport)?,

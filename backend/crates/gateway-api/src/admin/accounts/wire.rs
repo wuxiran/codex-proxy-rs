@@ -262,6 +262,93 @@ pub struct AccountSummaryView {
     pub error: u64,
 }
 
+/// 账号成本、到期与票据状态（fork 子表）；票据只回显打码邮箱。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTicketView {
+    pub purchase_amount: Option<String>,
+    pub purchase_currency: Option<String>,
+    /// 例如 `¥55.00` / `$20.00`。
+    pub purchase_display: Option<String>,
+    pub purchased_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub has_ticket: bool,
+    pub ticket_hint: Option<String>,
+    pub ticket_updated_at: Option<String>,
+    /// 自买入（或入库）起按模型价格计费的累计美元金额。
+    pub spent_usd: Option<String>,
+    pub spent_usd_display: Option<String>,
+}
+
+/// 保存账号成本、到期与票据。`ticket` 为空表示保持原票据不变。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateAccountTicketRequest {
+    pub account_id: String,
+    #[serde(default)]
+    pub purchase_amount: Option<String>,
+    #[serde(default)]
+    pub purchase_currency: Option<String>,
+    #[serde(default)]
+    pub purchased_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub ticket: Option<String>,
+    #[serde(default)]
+    pub clear_ticket: bool,
+}
+
+impl std::fmt::Debug for UpdateAccountTicketRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateAccountTicketRequest")
+            .field("account_id", &self.account_id)
+            .field("ticket", &self.ticket.as_ref().map(|_| "<redacted>"))
+            .field("clear_ticket", &self.clear_ticket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpdateAccountTicketRequest {
+    pub(super) fn into_command(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::account_tickets::UpdateAccountTicket, WireValidationError>
+    {
+        require_account_id(&self.account_id, "accountId")?;
+        let account_id = ProviderAccountId::new(self.account_id)
+            .map_err(|_| WireValidationError::new("accountId"))?;
+        let time = |value: Option<String>, field: &'static str| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(value.trim())
+                        .map(|at| at.with_timezone(&Utc))
+                        .map_err(|_| WireValidationError::new(field))
+                })
+                .transpose()
+        };
+        Ok(gateway_admin::model::account_tickets::UpdateAccountTicket {
+            context,
+            account_id,
+            purchase_amount: self
+                .purchase_amount
+                .filter(|amount| !amount.trim().is_empty()),
+            purchase_currency: self
+                .purchase_currency
+                .filter(|currency| !currency.trim().is_empty()),
+            purchased_at: time(self.purchased_at, "purchasedAt")?,
+            expires_at: time(self.expires_at, "expiresAt")?,
+            ticket_line: self
+                .ticket
+                .filter(|line| !line.trim().is_empty())
+                .map(secrecy::SecretString::from),
+            clear_ticket: self.clear_ticket,
+        })
+    }
+}
+
 /// 账号实时并发；`inFlight` 为空表示实时数据不可用，`limit` 为空表示不限。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,6 +396,8 @@ pub struct AccountView {
     pub concurrency: AccountConcurrencyView,
     /// 最近 24 小时的请求数与报错次数。
     pub recent_errors: AccountRecentErrorsView,
+    /// 成本、到期与票据状态；不含任何票据明文。
+    pub ticket: AccountTicketView,
     pub weight: u16,
     pub model_access: gateway_core::account::AccountModelAccess,
     pub access_token_expires_at: Option<String>,

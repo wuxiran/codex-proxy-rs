@@ -122,6 +122,10 @@ impl OpenAiConfig {
     }
 
     #[must_use]
+    pub const fn ticket_login_settings(&self) -> &CodexTicketLoginSettings {
+        &self.auth.ticket_login
+    }
+
     pub const fn cdk_settings(&self) -> &CodexCdkSettings {
         &self.auth.cdk
     }
@@ -261,6 +265,7 @@ pub struct CodexAuthSettings {
     pub oauth_token_endpoint: String,
     pub revive: CodexReviveSettings,
     pub cdk: CodexCdkSettings,
+    pub ticket_login: CodexTicketLoginSettings,
 }
 
 impl Default for CodexAuthSettings {
@@ -271,6 +276,7 @@ impl Default for CodexAuthSettings {
             oauth_token_endpoint: OFFICIAL_CODEX_TOKEN_ENDPOINT.to_owned(),
             revive: CodexReviveSettings::default(),
             cdk: CodexCdkSettings::default(),
+            ticket_login: CodexTicketLoginSettings::default(),
         }
     }
 }
@@ -286,7 +292,53 @@ impl CodexAuthSettings {
             return Err(OpenAiConfigError::InvalidField("openai.auth"));
         }
         self.revive.validate()?;
-        self.cdk.validate()
+        self.cdk.validate()?;
+        self.ticket_login.validate()
+    }
+}
+
+/// 票据登录 sidecar：用账号的 邮箱/密码/2FA 重新登录换回令牌。默认关闭。
+///
+/// sidecar 只应部署在 compose 内部网络；`token` 是两者之间的共享密钥。
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexTicketLoginSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for CodexTicketLoginSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodexTicketLoginSettings")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl CodexTicketLoginSettings {
+    fn validate(&self) -> Result<(), OpenAiConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if Url::parse(&self.base_url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+            .is_none()
+        {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.ticket_login.base_url",
+            ));
+        }
+        if self.token.trim().len() < 16 {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.auth.ticket_login.token",
+            ));
+        }
+        Ok(())
     }
 }
 

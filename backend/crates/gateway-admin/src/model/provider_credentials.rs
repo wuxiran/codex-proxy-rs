@@ -1123,6 +1123,8 @@ pub struct AccountDirectoryItem {
     pub account: AccountRecord,
     pub concurrency: AccountConcurrency,
     pub recent_errors: AccountRecentErrors,
+    /// 成本、到期与票据状态（fork 子表）；没有记录时为默认空值。
+    pub ticket: super::account_tickets::AccountTicketFacts,
     /// Provider 提供的套餐展示名称；未识别到套餐时为空。
     pub plan_type_display: Option<String>,
     pub projection: gateway_core::account::AccountStatusProjection,

@@ -15,6 +15,7 @@ mod repository;
 mod revive;
 mod security;
 mod selector;
+pub(crate) mod ticket_login;
 pub mod token_client;
 mod types;
 
@@ -24,7 +25,7 @@ pub(crate) use affinity::{
     derive_previous_response_id_hash,
 };
 pub(crate) use oauth::oauth_owner_ref;
-pub(crate) use types::parse_access_token_expiration;
+pub(crate) use types::{parse_access_token_expiration, parse_chatgpt_jwt_claims};
 
 pub use api_key::{
     ApiKeyAuthentication, ApiKeyConfiguration, ApiKeyCredentialData, ApiKeyTransport,

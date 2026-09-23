@@ -188,6 +188,8 @@ impl AdminTestFixture {
                 // 每个 harness 独占目录，避免用例之间共享入口配置。
                 public_import_dir: std::env::temp_dir()
                     .join(format!("cpr-public-import-{}", uuid::Uuid::now_v7())),
+                account_ticket_dir: std::env::temp_dir()
+                    .join(format!("cpr-tickets-{}", uuid::Uuid::now_v7())),
             },
         )
         .await

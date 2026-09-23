@@ -538,6 +538,175 @@ impl AccountStore for PgAdminAccountStore {
         self.usage_by_windows(windows).await
     }
 
+    async fn load_account_tickets(
+        &self,
+        account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::account_tickets::AccountTicketFacts>>
+    {
+        use gateway_admin::model::account_tickets::{AccountTicketFacts, TicketCurrency};
+        if account_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        // 累计按模型价格计费的金额从买入时间起算；没填买入时间则从账号入库起算。
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+                Option<String>,
+                Option<DateTime<Utc>>,
+                Option<String>,
+            ),
+        >(
+            "select t.provider_account_id, t.purchase_amount::text, t.purchase_currency,
+                    t.purchased_at, t.expires_at, t.ticket_hint, t.ticket_updated_at,
+                    (select sum(mrb.calculated_cost_amount)::text
+                       from model_requests mr
+                       join model_request_billing mrb on mrb.model_request_id = mr.id
+                      where mr.provider_account_id = t.provider_account_id
+                        and mrb.calculated_cost_currency = 'USD'
+                        and mr.started_at >= coalesce(t.purchased_at, pa.created_at))
+               from account_tickets t
+               join provider_accounts pa on pa.id = t.provider_account_id
+              where t.provider_account_id = any($1::text[])",
+        )
+        .bind(account_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account tickets")))?;
+        rows.into_iter()
+            .map(
+                |(
+                    account_id,
+                    amount,
+                    currency,
+                    purchased_at,
+                    expires_at,
+                    hint,
+                    ticket_at,
+                    spent,
+                )| {
+                    let purchase_currency = currency
+                        .as_deref()
+                        .map(TicketCurrency::parse)
+                        .transpose()
+                        .map_err(|_| {
+                            AdminStoreError::new(
+                                AdminStoreErrorKind::Invalid,
+                                ENTITY,
+                                "account ticket currency is invalid",
+                            )
+                        })?;
+                    Ok((
+                        account_id,
+                        AccountTicketFacts {
+                            purchase_amount: amount,
+                            purchase_currency,
+                            purchased_at,
+                            expires_at,
+                            ticket_hint: hint,
+                            ticket_updated_at: ticket_at,
+                            spent_usd: spent,
+                        },
+                    ))
+                },
+            )
+            .collect()
+    }
+
+    async fn save_account_ticket(
+        &self,
+        write: gateway_admin::model::account_tickets::AccountTicketWrite,
+    ) -> AdminStoreResult<()> {
+        use gateway_admin::model::account_tickets::TicketChange;
+        let unavailable =
+            |_| admin_store_error(ENTITY, postgres_unavailable("save account ticket"));
+        let mut transaction = self.pool.begin().await.map_err(unavailable)?;
+        let (amount, currency) = write
+            .purchase
+            .as_ref()
+            .map_or((None, None), |(amount, currency)| {
+                (Some(amount.as_str()), Some(currency.as_str()))
+            });
+        let saved = sqlx::query(
+            "insert into account_tickets (
+               provider_account_id, purchase_amount, purchase_currency, purchased_at, expires_at,
+               updated_at
+             ) values ($1, $2::numeric, $3, $4, $5, now())
+             on conflict (provider_account_id) do update set
+               purchase_amount = excluded.purchase_amount,
+               purchase_currency = excluded.purchase_currency,
+               purchased_at = excluded.purchased_at,
+               expires_at = excluded.expires_at,
+               updated_at = now()",
+        )
+        .bind(&write.account_id)
+        .bind(amount)
+        .bind(currency)
+        .bind(write.purchased_at)
+        .bind(write.expires_at)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = saved {
+            // 外键失败说明账号已被删除。
+            return Err(
+                match error.as_database_error().and_then(|error| error.code()) {
+                    Some(code) if code == "23503" => AdminStoreError::new(
+                        AdminStoreErrorKind::NotFound,
+                        ENTITY,
+                        "provider account does not exist",
+                    ),
+                    _ => unavailable(error),
+                },
+            );
+        }
+        match write.ticket {
+            TicketChange::Keep => {}
+            TicketChange::Set { ciphertext, hint } => {
+                sqlx::query(
+                    "update account_tickets
+                        set ticket_ciphertext = $2, ticket_hint = $3, ticket_updated_at = now()
+                      where provider_account_id = $1",
+                )
+                .bind(&write.account_id)
+                .bind(ciphertext)
+                .bind(hint)
+                .execute(&mut *transaction)
+                .await
+                .map_err(unavailable)?;
+            }
+            TicketChange::Clear => {
+                sqlx::query(
+                    "update account_tickets
+                        set ticket_ciphertext = null, ticket_hint = null, ticket_updated_at = now()
+                      where provider_account_id = $1",
+                )
+                .bind(&write.account_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(unavailable)?;
+            }
+        }
+        transaction.commit().await.map_err(unavailable)
+    }
+
+    async fn load_account_ticket_ciphertext(
+        &self,
+        account_id: &str,
+    ) -> AdminStoreResult<Option<Vec<u8>>> {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "select ticket_ciphertext from account_tickets where provider_account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(Option::flatten)
+        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account ticket")))
+    }
+
     async fn load_account_request_outcomes(
         &self,
         range: TimeRange,

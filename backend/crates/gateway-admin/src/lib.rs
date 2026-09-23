@@ -26,6 +26,7 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
+pub mod ticket_cipher;
 pub mod turn_state_renewal;
 mod use_case;
 
@@ -319,6 +320,8 @@ pub struct AdminRuntimePorts {
     pub client_key_verifier: Arc<dyn ClientKeyVerifier>,
     /// 免登录导入入口的配置目录，位于 runtime 数据目录下。
     pub public_import_dir: PathBuf,
+    /// 登录票据加密密钥所在目录，位于 runtime 数据目录下（蓝绿槽位共享）。
+    pub account_ticket_dir: PathBuf,
 }
 
 /// 校验配置、建立动态 Provider 注册表并完成默认管理员幂等初始化。
@@ -342,6 +345,7 @@ pub async fn initialize(
         system,
         client_key_verifier,
         public_import_dir,
+        account_ticket_dir,
     } = runtime;
     config
         .resolve_and_validate(Path::new("."))
@@ -375,6 +379,7 @@ pub async fn initialize(
         snapshot.clone(),
         probe.clone(),
         store.proxies(),
+        account_ticket_dir,
     ));
     let backup_ports = store.backup();
     let backups = Arc::new(DefaultBackupService::new(

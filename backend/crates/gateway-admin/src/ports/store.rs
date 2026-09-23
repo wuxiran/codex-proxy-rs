@@ -111,6 +111,34 @@ pub trait AccountStore: Send + Sync {
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
 
+    /// 账号成本、到期与票据状态（fork 子表 `account_tickets`）；没有记录的账号不出现在结果里。
+    async fn load_account_tickets(
+        &self,
+        _account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, crate::model::account_tickets::AccountTicketFacts>> {
+        Ok(BTreeMap::new())
+    }
+
+    /// 整体替换成本与到期，按意图处理票据密文。
+    async fn save_account_ticket(
+        &self,
+        _write: crate::model::account_tickets::AccountTicketWrite,
+    ) -> AdminStoreResult<()> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "account ticket",
+            "account tickets are not supported by this store",
+        ))
+    }
+
+    /// 读取票据密文；没有票据时为 `None`。
+    async fn load_account_ticket_ciphertext(
+        &self,
+        _account_id: &str,
+    ) -> AdminStoreResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// 时间窗内每个账号已结束的请求数与报错数（失败 + 未完成；客户端取消不算报错）。
     /// 用量统计只含有完整用量事实的请求，报错必须单独统计。
     async fn load_account_request_outcomes(

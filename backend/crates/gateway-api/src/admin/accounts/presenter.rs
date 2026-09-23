@@ -64,6 +64,7 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         account,
         concurrency,
         recent_errors,
+        ticket,
         plan_type_display,
         projection,
         usage,
@@ -116,6 +117,7 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
             in_flight: concurrency.in_flight,
             limit: concurrency.limit,
         },
+        ticket: account_ticket_view(ticket),
         recent_errors: AccountRecentErrorsView {
             request_count: recent_errors.request_count,
             error_count: recent_errors.error_count,
@@ -579,6 +581,41 @@ pub(super) fn relative_time(value: DateTime<Utc>, now: DateTime<Utc>) -> String 
 
 pub(super) fn china_offset() -> FixedOffset {
     FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid fixed offset")
+}
+
+pub(super) fn account_ticket_view(
+    ticket: gateway_admin::model::account_tickets::AccountTicketFacts,
+) -> AccountTicketView {
+    let currency = ticket
+        .purchase_currency
+        .map(|currency| currency.as_str().to_owned());
+    let purchase_display = ticket
+        .purchase_amount
+        .as_deref()
+        .zip(currency.as_deref())
+        .map(|(amount, currency)| match currency {
+            "CNY" => format!("¥{amount}"),
+            _ => format_decimal_currency(amount, currency),
+        });
+    let spent_usd_display = ticket.spent_usd.as_deref().map(|amount| {
+        // numeric 聚合带 10 位小数；展示保留两位。
+        let rounded = amount
+            .parse::<f64>()
+            .map_or_else(|_| amount.to_owned(), |value| format!("{value:.2}"));
+        format_decimal_currency(&rounded, "USD")
+    });
+    AccountTicketView {
+        purchase_amount: ticket.purchase_amount,
+        purchase_currency: currency,
+        purchase_display,
+        purchased_at: ticket.purchased_at.as_ref().map(china_rfc3339),
+        expires_at: ticket.expires_at.as_ref().map(china_rfc3339),
+        has_ticket: ticket.ticket_hint.is_some(),
+        ticket_hint: ticket.ticket_hint,
+        ticket_updated_at: ticket.ticket_updated_at.as_ref().map(china_rfc3339),
+        spent_usd: ticket.spent_usd,
+        spent_usd_display,
+    }
 }
 
 pub(super) fn china_rfc3339(value: &DateTime<Utc>) -> String {
