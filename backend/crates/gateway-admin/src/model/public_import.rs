@@ -74,3 +74,23 @@ pub struct PublicImportItem {
 pub struct PublicImportResult {
     pub items: Vec<PublicImportItem>,
 }
+
+/// 免登录入口的票据导入：每行 `邮箱----密码----2FA密钥`，买入价与预计到期时间必填。
+pub struct PublicTicketImport {
+    pub tickets: Vec<secrecy::SecretString>,
+    pub purchase_amount: String,
+    pub purchase_currency: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for PublicTicketImport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicTicketImport")
+            .field("tickets", &self.tickets.len())
+            .field("purchase_amount", &self.purchase_amount)
+            .field("purchase_currency", &self.purchase_currency)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}

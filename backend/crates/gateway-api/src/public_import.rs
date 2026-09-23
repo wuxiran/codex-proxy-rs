@@ -34,6 +34,7 @@ where
     Router::new()
         .route("/api/public-import/entry", get(entry::<S>))
         .route("/api/public-import/accounts", post(import_accounts::<S>))
+        .route("/api/public-import/tickets", post(import_tickets::<S>))
         .route("/api/public-import", any(not_found))
         .route("/api/public-import/{*path}", any(not_found))
         .method_not_allowed_fallback(method_not_allowed)
@@ -65,6 +66,26 @@ impl From<PublicImportEntry> for EntryData {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImportRequest {
     data: Value,
+}
+
+/// 票据导入：每行 `邮箱----密码----2FA密钥`；买入价、币种与预计到期时间必填。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TicketImportRequest {
+    tickets: Vec<String>,
+    purchase_amount: String,
+    purchase_currency: String,
+    expires_at: String,
+}
+
+impl std::fmt::Debug for TicketImportRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TicketImportRequest")
+            .field("tickets", &self.tickets.len())
+            .field("purchase_amount", &self.purchase_amount)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +179,43 @@ where
         .admin_services()
         .public_import()
         .import(&token, &request_id, document)
+        .await
+        .map_err(map_admin_service_error)?
+        .ok_or_else(invalid_link)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(ImportData::from(result)),
+    ))
+}
+
+async fn import_tickets<S>(
+    State(state): State<S>,
+    parts: Parts,
+    AdminJson(request): AdminJson<TicketImportRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let token = token(&parts.headers)?;
+    let request_id = admin_request_id(&parts).ok_or_else(AdminError::internal)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(request.expires_at.trim())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .map_err(|_| AdminError::bad_request("预计到期时间格式不正确"))?;
+    let command = gateway_admin::model::public_import::PublicTicketImport {
+        tickets: request
+            .tickets
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(secrecy::SecretString::from)
+            .collect(),
+        purchase_amount: request.purchase_amount,
+        purchase_currency: request.purchase_currency,
+        expires_at,
+    };
+    let result = state
+        .admin_services()
+        .public_import()
+        .import_tickets(&token, &request_id, command)
         .await
         .map_err(map_admin_service_error)?
         .ok_or_else(invalid_link)?;

@@ -233,6 +233,17 @@ pub trait ProviderAdmin: Send + Sync {
         input_text: &str,
     ) -> Result<Operation, ProviderAdminError>;
 
+    /// 用票据（邮箱/密码/2FA）经登录服务换回令牌，返回可直接交给导入流程的单账号文档。
+    ///
+    /// 登录走给定出口；票据与令牌都不得写日志。
+    async fn ticket_login(
+        &self,
+        _ticket: &crate::model::account_tickets::TicketSecret,
+        _proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 校验账号可以遍历代理找 state，并冻结本次遍历的长度规则与凭据绑定。
     ///
     /// 命中后再次调用并与首张票据比较，即可发现遍历期间凭据被刷新或重新捕获。

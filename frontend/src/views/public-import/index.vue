@@ -4,11 +4,15 @@ import type { PublicImportEntry } from '@/api'
 import { CircleCheck, CircleX, LoaderCircle, Upload } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useRoute } from 'vue-router'
-import { getPublicImportEntry, submitPublicImport } from '@/api'
+import { getPublicImportEntry, submitPublicImport, submitPublicTickets } from '@/api'
 import { ApiError } from '@/api/request'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
+import BaseInput from '@/components/base/BaseInput.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import { formatDateTime } from '@/utils/date'
 import AccountImportFields from '@/views/accounts/components/AccountCreateModal/AccountImportFields.vue'
 import { importAccountLabel, splitImportDocument } from './utils/document'
@@ -32,10 +36,112 @@ const text = ref('')
 const parseError = shallowRef('')
 const rows = ref<ImportRow[]>([])
 const running = shallowRef(false)
-
 const finished = computed(() => rows.value.filter(row => row.status === 'imported' || row.status === 'failed').length)
 const imported = computed(() => rows.value.filter(row => row.status === 'imported').length)
 const failed = computed(() => rows.value.filter(row => row.status === 'failed').length)
+
+// 票据导入：服务端逐个登录（含 2FA 与人机校验），单个可能要一两分钟；并发与登录服务一致。
+const TICKET_TIMEOUT_MS = 240_000
+const TICKET_CONCURRENCY = 2
+const modeOptions = [
+  { label: '账号文件', value: 'file' },
+  { label: '登录票据', value: 'ticket' },
+]
+const currencyOptions = [
+  { label: '人民币 ¥', value: 'CNY' },
+  { label: '美元 $', value: 'USD' },
+]
+const mode = shallowRef<'file' | 'ticket'>('file')
+const ticketText = ref('')
+const purchaseAmount = shallowRef('')
+const purchaseCurrency = shallowRef<'CNY' | 'USD'>('CNY')
+const expiresAtLocal = shallowRef('')
+const ticketError = shallowRef('')
+
+const ticketLines = computed(() => ticketText.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))
+
+function maskTicketEmail(line: string) {
+  const email = line.split('----')[0]?.trim() ?? ''
+  const [local = '', domain = ''] = email.split('@')
+  if (!domain)
+    return '格式不正确的票据'
+  return `${local.slice(0, 1)}***${local.length > 1 ? local.slice(-1) : ''}@${domain}`
+}
+
+/** 买入价与预计到期时间必填；到期时间必须晚于现在。 */
+function validateTicketForm(): string | null {
+  if (!ticketLines.value.length)
+    return '请至少填写一条票据'
+  if (!/^\d{1,10}(?:\.\d{1,2})?$/.test(purchaseAmount.value.trim()))
+    return '请填写买入价（非负数，最多两位小数）'
+  const expires = new Date(expiresAtLocal.value).getTime()
+  if (!expiresAtLocal.value || Number.isNaN(expires))
+    return '请填写预计到期时间'
+  if (expires <= Date.now())
+    return '预计到期时间必须晚于现在'
+  if (entry.value && ticketLines.value.length > entry.value.maxAccounts)
+    return `单次最多导入 ${entry.value.maxAccounts} 个账号`
+  return null
+}
+
+async function importTicket(line: string, row: ImportRow, expiresAt: string) {
+  row.status = 'running'
+  try {
+    const result = await submitPublicTickets(token, {
+      tickets: [line],
+      purchaseAmount: purchaseAmount.value.trim(),
+      purchaseCurrency: purchaseCurrency.value,
+      expiresAt,
+    }, { silent: true, timeout: TICKET_TIMEOUT_MS })
+    const item = result.items[0]
+    if (item?.status === 'imported') {
+      row.status = 'imported'
+      row.detail = [
+        item.proxyName ? `出口 ${item.proxyName}` : '',
+        entry.value?.pinTurnState ? (item.statePinned ? 'state 绑定已开启' : 'state 绑定未开启') : '',
+        '票据已保存，失效后自动复活',
+      ].filter(Boolean).join(' · ')
+    }
+    else {
+      row.status = 'failed'
+      row.detail = item?.message ?? '导入失败'
+    }
+  }
+  catch (error) {
+    row.status = 'failed'
+    row.detail = error instanceof Error ? error.message : '导入失败'
+    if (error instanceof ApiError && error.status === 404)
+      entryState.value = 'invalid'
+  }
+}
+
+async function startTicketImport() {
+  if (running.value || !entry.value)
+    return
+  ticketError.value = validateTicketForm() ?? ''
+  if (ticketError.value)
+    return
+  const lines = ticketLines.value
+  const expiresAt = new Date(expiresAtLocal.value).toISOString()
+  rows.value = lines.map(line => ({ label: maskTicketEmail(line), status: 'pending', detail: '' }))
+  running.value = true
+  let cursor = 0
+  await Promise.all(Array.from({ length: Math.min(TICKET_CONCURRENCY, lines.length) }, async () => {
+    while (cursor < lines.length && entryState.value === 'ready') {
+      const index = cursor++
+      await importTicket(lines[index]!, rows.value[index]!, expiresAt)
+    }
+  }))
+  for (const row of rows.value) {
+    if (row.status === 'pending') {
+      row.status = 'failed'
+      row.detail = '链接已失效，未导入'
+    }
+  }
+  running.value = false
+  if (failed.value === 0)
+    ticketText.value = ''
+}
 
 onMounted(async () => {
   try {
@@ -166,7 +272,44 @@ async function startImport() {
             </dl>
           </BaseCard>
 
-          <BaseCard title="账号文件">
+          <BaseSegmented v-model="mode" label="导入方式" :options="modeOptions" :disabled="running" />
+
+          <BaseCard v-if="mode === 'ticket'" title="登录票据" description="服务端用票据逐个登录建号，并加密保存票据；账号令牌失效时自动用票据复活（最多 3 次）">
+            <div class="grid gap-4">
+              <BaseFormItem label="票据" :description="`一行一个：邮箱----密码----2FA密钥，单次最多 ${entry.maxAccounts} 个`" required>
+                <BaseTextarea
+                  v-model="ticketText"
+                  :rows="5"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="name@example.com----password----BASE32SECRET"
+                  :disabled="running"
+                />
+              </BaseFormItem>
+              <BaseFormItem label="买入价（每个账号）" required>
+                <div class="flex flex-wrap items-center gap-2">
+                  <BaseInput v-model="purchaseAmount" class="max-w-40" inputmode="decimal" placeholder="例如 55" aria-label="买入价" :disabled="running" />
+                  <BaseSegmented v-model="purchaseCurrency" label="币种" :options="currencyOptions" :disabled="running" />
+                </div>
+              </BaseFormItem>
+              <BaseFormItem label="预计到期时间" description="例如车主说 23:20 踢人" required>
+                <BaseInput v-model="expiresAtLocal" type="datetime-local" class="max-w-64" aria-label="预计到期时间" :disabled="running" />
+              </BaseFormItem>
+              <p v-if="ticketError" role="alert" class="m-0 text-cp-sm text-cp-error">
+                {{ ticketError }}
+              </p>
+              <div class="flex items-center justify-end">
+                <BaseButton variant="primary" :loading="running" :disabled="!ticketLines.length || entryState !== 'ready'" @click="startTicketImport">
+                  <template #icon>
+                    <Upload class="size-4" />
+                  </template>
+                  {{ running ? `导入中 ${finished}/${rows.length}` : `导入 ${ticketLines.length} 个票据` }}
+                </BaseButton>
+              </div>
+            </div>
+          </BaseCard>
+
+          <BaseCard v-else title="账号文件">
             <div class="grid gap-4">
               <AccountImportFields
                 v-model="text"

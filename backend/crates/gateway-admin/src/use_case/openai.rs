@@ -12,7 +12,7 @@ use crate::{
             AuthorizationStarted, CompleteAuthorization, CredentialDeletion,
             CredentialDeletionResult, CredentialImportCommit, CredentialImportResult,
             CredentialMutationResult, ImportCredentials, PrepareCredentialImport,
-            PrepareCredentialRotation, RotateCredential, StartAuthorization,
+            PrepareCredentialRotation, ProviderDocument, RotateCredential, StartAuthorization,
         },
     },
     ports::{
@@ -35,6 +35,12 @@ pub trait OpenAiService: Send + Sync {
         &self,
         command: ImportCredentials,
     ) -> Result<CredentialImportResult, AdminError>;
+    /// 用票据登录换回单账号导入文档（经 Provider 的登录服务，走给定出口）。
+    async fn ticket_login(
+        &self,
+        ticket: &crate::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, AdminError>;
     /// 只新建 OAuth 账号：API Key 账号与上游身份已存在的账号整批拒绝，供免登录入口使用。
     async fn import_new_accounts(
         &self,
@@ -165,6 +171,17 @@ impl OpenAiService for DefaultOpenAiService {
         command: ImportCredentials,
     ) -> Result<CredentialImportResult, AdminError> {
         self.import(command, true).await
+    }
+
+    async fn ticket_login(
+        &self,
+        ticket: &crate::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, AdminError> {
+        self.provider
+            .ticket_login(ticket, proxy)
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI ticket login"))
     }
 
     async fn start_authorization(

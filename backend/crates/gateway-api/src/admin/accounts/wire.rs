@@ -278,6 +278,10 @@ pub struct AccountTicketView {
     /// 自买入（或入库）起按模型价格计费的累计美元金额。
     pub spent_usd: Option<String>,
     pub spent_usd_display: Option<String>,
+    /// 本轮失效后已自动复活的次数（上限 3）；成功或恢复正常后清零。
+    pub auto_revive_attempts: i32,
+    pub auto_revive_last_at: Option<String>,
+    pub auto_revive_last_error: Option<String>,
 }
 
 /// 保存账号成本、到期与票据。`ticket` 为空表示保持原票据不变。

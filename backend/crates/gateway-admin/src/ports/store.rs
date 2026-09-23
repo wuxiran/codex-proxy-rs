@@ -131,6 +131,26 @@ pub trait AccountStore: Send + Sync {
         ))
     }
 
+    /// 票据自动复活的候选账号：有票据、凭据已失效（expired/invalid）、尝试次数未达上限、
+    /// 且距上次尝试已过冷却。调用时顺带把已恢复正常账号的计数清零。
+    async fn ticket_revive_candidates(
+        &self,
+        _max_attempts: i32,
+        _retry_before: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> AdminStoreResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// 记录一次自动复活结果：成功清零计数，失败计数加一并记下原因。
+    async fn record_ticket_revive(
+        &self,
+        _account_id: &str,
+        _error: Option<&str>,
+    ) -> AdminStoreResult<()> {
+        Ok(())
+    }
+
     /// 读取票据密文；没有票据时为 `None`。
     async fn load_account_ticket_ciphertext(
         &self,
