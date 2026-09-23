@@ -34,7 +34,8 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
         EGRESS,
         now,
     );
-    first.observe(Some(&"b".repeat(312)));
+    // 长度门已废弃：太短(<MIN)的票据仍不予捕获。
+    first.observe(Some(&"b".repeat(100)));
     first.completed(now);
     assert!(pins.status("account", &binding, now).is_empty());
     first.observe(Some(&"a".repeat(292)));
@@ -463,7 +464,8 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
 fn account_wide_pin_rejects_wrong_length_non_ascii_and_stale_captures() {
     let pins = TurnStatePins::default();
     let now = SystemTime::now();
-    for value in ["s".repeat(331), format!("{} ", "s".repeat(331))] {
+    // 长度门已废弃：太短(<MIN)与含非 ASCII 可见字符仍拒。
+    for value in ["s".repeat(199), format!("{} ", "s".repeat(331))] {
         assert_eq!(
             pins.pin_account_wide(
                 "account",
@@ -495,66 +497,40 @@ fn account_wide_pin_rejects_wrong_length_non_ascii_and_stale_captures() {
 }
 
 #[test]
-fn team_capture_rule_is_model_specific_and_pro_stays_292() {
+fn capture_rule_is_uniform_and_length_gate_is_a_floor() {
+    // 长度门已废弃：expected_length 对所有套餐/模型统一，票据只按下限+ASCII 判合法。
     let now = SystemTime::now();
-    for plan in [
-        "team",
-        "business",
-        "self_serve_business_prolite",
-        "self_serve_business_usage_based",
-        "pro",
-    ] {
+    for plan in ["team", "business", "self_serve_business_prolite", "pro"] {
         let rule = CaptureRule::for_plan(Some(plan));
-        for (model, team_length) in [
-            ("gpt-5.5", 332),
-            ("gpt-5.6-sol", 332),
-            ("gpt-5.6-terra", 356),
-            ("gpt-6-astra", 332),
-            ("gpt-6-sol", 780),
+        for model in [
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "unknown-model",
         ] {
-            let expected = if plan == "pro" { 292 } else { team_length };
-            assert_eq!(rule.expected_length(model), Some(expected));
-            for length in [292, 312, 332, 356, 780] {
-                let pins = TurnStatePins::default();
-                let mut attempt = pins.attempt(
-                    "account",
-                    "binding".into(),
-                    model,
-                    "client",
-                    expected,
-                    EGRESS,
-                    now,
-                );
-                attempt.observe(Some(&"s".repeat(length)));
-                // metadata 符合长度也须等请求完整成功。
-                assert!(pins.status("account", "binding", now).is_empty());
-                attempt.completed(now);
-                let status = pins.status("account", "binding", now);
-                if length == expected {
-                    assert_eq!(status.len(), 1);
-                    assert_eq!(status[0].length, expected);
-                    // 套餐或规则变化后，不复用另一种长度规则的旧绑定。
-                    assert!(
-                        pins.attempt(
-                            "account",
-                            "binding".into(),
-                            model,
-                            "client",
-                            expected + 1,
-                            EGRESS,
-                            now
-                        )
-                        .value()
-                        .is_none()
-                    );
-                } else {
-                    assert!(status.is_empty());
-                }
-            }
+            assert_eq!(rule.expected_length(model), Some(0), "plan={plan} model={model}");
         }
-        assert_eq!(
-            rule.expected_length("unknown-model"),
-            if plan == "pro" { Some(292) } else { None }
+    }
+    // 任何 >= MIN 的合法票据都能被动捕获并钉住；太短的不捕获。
+    let rule = CaptureRule::for_plan(Some("team"));
+    let expected = rule.expected_length("gpt-6-astra").unwrap();
+    for (length, should_pin) in [(199usize, false), (200, true), (332, true), (780, true)] {
+        let pins = TurnStatePins::default();
+        let mut attempt = pins.attempt(
+            "account", "binding".into(), "gpt-6-astra", "client", expected, EGRESS, now,
         );
+        attempt.observe(Some(&"s".repeat(length)));
+        // 捕获须等请求成功完成。
+        assert!(pins.status("account", "binding", now).is_empty());
+        attempt.completed(now);
+        let status = pins.status("account", "binding", now);
+        if should_pin {
+            assert_eq!(status.len(), 1, "len={length}");
+            assert_eq!(status[0].length, length);
+        } else {
+            assert!(status.is_empty(), "len={length} should not pin");
+        }
     }
 }

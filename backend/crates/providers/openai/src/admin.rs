@@ -699,10 +699,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
         ticket: &TurnStateHuntTicket,
         response_headers: &[ProviderResponseHeader],
     ) -> TurnStateHuntObservation {
+        let _ = ticket; // 长度门已废弃：命中判据改为下限+ASCII，不再精确匹配长度。
         let length = hunted_turn_state(response_headers).map(str::len);
         TurnStateHuntObservation {
             length,
-            matched: length == Some(ticket.expected_length())
+            matched: length.is_some_and(|l| l >= crate::turn_state_pin::MIN_TURN_STATE_LEN)
                 && hunted_turn_state(response_headers)
                     .is_some_and(|value| value.bytes().all(|b| b.is_ascii_graphic())),
         }
@@ -861,8 +862,9 @@ impl ProviderAdmin for OpenAiAdminProvider {
                             .status(account_id.as_str(), &binding, now)
                     })
                     .unwrap_or_default();
+                // 长度门已废弃：展示判据改为下限，不再按写死长度过滤（rule 仍用于 turnStateCaptureRule 展示）。
                 let pins = pins.into_iter()
-                    .filter(|pin| rule.expected_length(&pin.model) == Some(pin.length))
+                    .filter(|pin| pin.length >= crate::turn_state_pin::MIN_TURN_STATE_LEN)
                     .map(|pin| serde_json::json!({
                     "model": pin.model,
                     "length": pin.length,

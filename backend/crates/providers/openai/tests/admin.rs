@@ -2458,7 +2458,7 @@ async fn turn_state_pin_admin_preserves_credentials_and_exposes_only_safe_status
     assert_eq!(view.get("turnStatePins"), Some(&json!([])));
     assert_eq!(
         view.get("turnStateCaptureRule"),
-        Some(&json!({"defaultLength":292,"modelLengths":{}}))
+        Some(&json!({"defaultLength":0,"modelLengths":{}}))
     );
     assert!(
         !serde_json::to_string(view)
@@ -2562,12 +2562,10 @@ async fn turn_state_pin_team_admin_exposes_model_rules_without_enabling_capture(
             .unwrap();
         let view = view.expose_to_provider().expose_to_provider();
         assert_eq!(view.get("pinTurnState"), Some(&json!(false)));
+        // 长度门已废弃：所有套餐/模型统一同一作用域长度常量，不再逐模型区分。
         assert_eq!(
             view.get("turnStateCaptureRule"),
-            Some(&json!({
-                "defaultLength":null,
-                "modelLengths":{"gpt-5.5":332,"gpt-5.6-sol":332,"gpt-5.6-terra":356,"gpt-6-astra":332,"gpt-6-sol":780}
-            }))
+            Some(&json!({"defaultLength":0,"modelLengths":{}}))
         );
     }
 }

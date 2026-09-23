@@ -7,6 +7,15 @@ use std::time::{Duration, SystemTime};
 const MAX_PINS: usize = 2048;
 pub(crate) const MAX_PIN_AGE: Duration = Duration::from_secs(3600);
 
+/// turn-state 票据的最小可信长度。上游（OA）多次调整过票据长度（探针已失效，
+/// 且各模型现已统一到 ~780），因此不再按写死的逐模型长度精确匹配，只要求票据
+/// 达到一个合理下限且为 ASCII 可见字符即视为有效，避免把合法票据误判成非法而钉不上。
+pub(crate) const MIN_TURN_STATE_LEN: usize = 200;
+
+/// 作用域键里保留的 length 分量已不再作长度门；统一取此常量，使同一账号/模型/出口下
+/// 不同长度的票据落在同一作用域，写入与读取一致即可命中。
+const TURN_STATE_SCOPE_LEN: usize = 0;
+
 /// 捕获规则由套餐事实选择，并原样提供给管理端，避免页面另行猜测长度。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,32 +25,12 @@ pub(crate) struct CaptureRule {
 }
 
 impl CaptureRule {
-    pub(crate) fn for_plan(plan: Option<&str>) -> Self {
-        if matches!(
-            plan,
-            Some(
-                "team"
-                    | "business"
-                    | "self_serve_business_prolite"
-                    | "self_serve_business_usage_based"
-            )
-        ) {
-            Self {
-                default_length: None,
-                model_lengths: BTreeMap::from([
-                    ("gpt-5.5", 332),
-                    ("gpt-5.6-sol", 332),
-                    ("gpt-5.6-terra", 356),
-                    ("gpt-6-astra", 332),
-                    ("gpt-6-sol", 780),
-                ]),
-            }
-        } else {
-            // Pro 及其它套餐保留既有 292 规则；Team 未列出的模型不自动套用。
-            Self {
-                default_length: Some(292),
-                model_lengths: BTreeMap::new(),
-            }
+    pub(crate) fn for_plan(_plan: Option<&str>) -> Self {
+        // 长度门已废弃（见 MIN_TURN_STATE_LEN）：不再按套餐/模型区分票据长度，
+        // 所有套餐所有模型统一用同一作用域长度常量，靠下限+ASCII 校验判合法。
+        Self {
+            default_length: Some(TURN_STATE_SCOPE_LEN),
+            model_lengths: BTreeMap::new(),
         }
     }
 
@@ -191,7 +180,8 @@ impl TurnStatePins {
         captured_at: SystemTime,
         now: SystemTime,
     ) -> Result<(), PinRejected> {
-        if value.len() != expected_length || !value.bytes().all(|b| b.is_ascii_graphic()) {
+        let _ = expected_length; // 长度门已废弃：只作下限+ASCII 校验，不再精确匹配长度。
+        if value.len() < MIN_TURN_STATE_LEN || !value.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(PinRejected::Length);
         }
         if !now
@@ -277,7 +267,7 @@ impl PinAttempt {
         // 只接收本次真实上游响应；客户端传入的 state 不具备捕获资格。
         if self.candidate.is_none()
             && let Some(value) = value.filter(|v| {
-                v.len() == self.scope.expected_length && v.bytes().all(|b| b.is_ascii_graphic())
+                v.len() >= MIN_TURN_STATE_LEN && v.bytes().all(|b| b.is_ascii_graphic())
             })
         {
             self.candidate = Some(value.to_owned());
@@ -336,4 +326,62 @@ pub(crate) fn credential_binding(generation: &str, access_token: &str) -> String
     digest.update([0]);
     digest.update(access_token.as_bytes());
     hex::encode(digest.finalize())
+}
+
+#[cfg(test)]
+mod length_gate_tests {
+    use super::*;
+
+    fn repeat(n: usize) -> String {
+        "a".repeat(n)
+    }
+
+    #[test]
+    fn accepts_780_ticket_and_reads_back_on_same_egress() {
+        let pins = TurnStatePins::default();
+        let now = SystemTime::now();
+        let value = repeat(780);
+        assert!(
+            pins.pin_account_wide(
+                "acct", "bind".into(), "gpt-6-astra", TURN_STATE_SCOPE_LEN,
+                "egr".into(), &value, now, now,
+            )
+            .is_ok()
+        );
+        let attempt = pins.attempt(
+            "acct", "bind".into(), "gpt-6-astra", "cli", TURN_STATE_SCOPE_LEN, "egr", now,
+        );
+        assert_eq!(attempt.value(), Some(value.as_str()));
+    }
+
+    #[test]
+    fn accepts_legacy_lengths() {
+        let pins = TurnStatePins::default();
+        let now = SystemTime::now();
+        for len in [292usize, 332, 356] {
+            assert!(
+                pins.pin_account_wide(
+                    "a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(),
+                    &repeat(len), now, now,
+                )
+                .is_ok(),
+                "len {len} should pin"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_too_short_and_non_ascii() {
+        let pins = TurnStatePins::default();
+        let now = SystemTime::now();
+        assert!(matches!(
+            pins.pin_account_wide("a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(), &repeat(100), now, now),
+            Err(PinRejected::Length)
+        ));
+        let non_ascii = "\u{00e9}".repeat(300);
+        assert!(matches!(
+            pins.pin_account_wide("a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(), &non_ascii, now, now),
+            Err(PinRejected::Length)
+        ));
+    }
 }
