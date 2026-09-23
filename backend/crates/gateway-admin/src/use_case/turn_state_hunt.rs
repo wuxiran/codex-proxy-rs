@@ -692,6 +692,10 @@ impl Hunt {
                 continue;
             }
             skipped = None;
+            if class == FailureClass::ModelUnavailable {
+                // 与出口好坏无关（动态出口每次换 IP），只占用本次尝试次数。
+                continue;
+            }
             if let Some((code, message)) = class.abort() {
                 self.log_egress(&view, &lengths, false);
                 // 这些失败换出口也不会好，继续只会白耗额度。
@@ -999,10 +1003,21 @@ enum FailureClass {
     System,
     /// 出口不通、被 Cloudflare 拦截、超时、返回了不合法的协议等：换一个出口再试。
     Egress,
+    /// 上游这次答复该模型不存在（404）：不中止、不算出口不通，消耗本次尝试后继续。
+    ModelUnavailable,
 }
 
 impl FailureClass {
     fn of(error: &AccountProbeError) -> Self {
+        // 上游 404（如 model_not_found）随出口/后端分片时有时无：同一账号换个出口或下一次
+        // 就可能成功。流式失败时没有 HTTP 响应，只剩 Provider 转述的错误码。
+        if error
+            .upstream_response()
+            .is_some_and(|response| response.status() == 404)
+            || error.client_error_code() == Some("model_not_found")
+        {
+            return Self::ModelUnavailable;
+        }
         match error.provider_kind() {
             Some(
                 ProviderErrorKind::Unauthorized
@@ -1042,6 +1057,7 @@ impl FailureClass {
             Self::Capacity => "上游该模型暂无容量",
             Self::System => "网关本地错误，请求未能完成",
             Self::Egress => "经该出口的请求失败",
+            Self::ModelUnavailable => "上游这次答复该模型不可用（404），继续下一次",
         }
     }
 
@@ -1052,8 +1068,44 @@ impl FailureClass {
             // 是否中止由连续次数决定，见 `try_egress`。
             Self::Capacity => None,
             Self::System => Some(("system_error", "网关本地错误，遍历已中止")),
-            Self::Egress => None,
+            Self::Egress | Self::ModelUnavailable => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use gateway_core::{
+        engine::probe::{AccountProbeError, AccountProbeErrorSource},
+        error::{GatewayError, GatewayErrorKind, ProviderErrorKind},
+    };
+
+    use super::FailureClass;
+
+    fn provider_error(kind: ProviderErrorKind, code: Option<&'static str>) -> AccountProbeError {
+        let mut gateway = GatewayError::new(GatewayErrorKind::InvalidRequest, "upstream rejected");
+        if let Some(code) = code {
+            gateway = gateway.with_client_code(code);
+        }
+        AccountProbeError::new(gateway, AccountProbeErrorSource::Upstream, None, None)
+            .with_provider_kind(Some(kind))
+    }
+
+    #[test]
+    fn model_not_found_moves_on_instead_of_aborting_the_hunt() {
+        let class = FailureClass::of(&provider_error(
+            ProviderErrorKind::InvalidRequest,
+            Some("model_not_found"),
+        ));
+        assert_eq!(class, FailureClass::ModelUnavailable);
+        assert!(class.abort().is_none());
+    }
+
+    #[test]
+    fn other_invalid_requests_still_abort_the_hunt() {
+        let class = FailureClass::of(&provider_error(ProviderErrorKind::InvalidRequest, None));
+        assert_eq!(class, FailureClass::Account);
+        assert!(class.abort().is_some());
     }
 }
 
