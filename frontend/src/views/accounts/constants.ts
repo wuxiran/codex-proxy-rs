@@ -36,7 +36,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     align: 'center',
     format: value => accountProviderLabel(typeof value === 'string' ? value : null),
   },
-  { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true },
+  { key: 'status', label: '状态', kind: 'status', size: 'lg', align: 'left', sortable: true },
   { key: 'enabled', label: '调度', kind: 'custom', size: 'sm' },
   { key: 'turnState', label: 'State', kind: 'custom', size: 'sm' },
   { key: 'stateBinding', label: 'State 绑定 / 到期', kind: 'custom', size: '2xl' },

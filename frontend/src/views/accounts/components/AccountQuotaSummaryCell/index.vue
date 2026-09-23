@@ -18,6 +18,13 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
     <div class="grid gap-1" :title="account.usage.windowLabelDisplay">
       <span class="text-[10px] font-emphasis text-cp-text-secondary">按模型价格计费</span>
       <strong class="font-mono text-cp-xs font-heavy tabular-nums text-cp-text">{{ account.usage.billing?.modelPriceAmountUsdDisplay ?? '未提供' }}</strong>
+      <span
+        v-if="account.usage.estimatedQuotaUsdDisplay"
+        class="text-[10px] text-cp-text-secondary"
+        title="预估额度 ≈ 本窗口按模型价格计费 ÷ 额度已用比例；仅供参考，站外消耗与未计价请求会让它偏低"
+      >
+        预估额度：<span class="font-mono font-heavy tabular-nums text-cp-text">{{ account.usage.estimatedQuotaUsdDisplay }}</span>
+      </span>
       <span class="text-[10px] text-cp-text-tertiary">
         真实上游费用：<span class="font-mono tabular-nums">{{ account.usage.billing?.upstreamCostAmountUsdDisplay ?? '未提供' }}</span>
       </span>

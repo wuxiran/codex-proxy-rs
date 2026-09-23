@@ -435,6 +435,8 @@ pub struct AccountQuotaWindowView {
 pub struct AccountUsageView {
     pub billing: AccountBillingView,
     pub window_label_display: String,
+    /// 按额度窗口已用比例外推的整窗口额度（按模型价格计）；无窗口数据时为空。
+    pub estimated_quota_usd_display: Option<String>,
     pub request_count: Option<u64>,
     pub request_count_display: String,
     pub input_tokens: Option<u64>,

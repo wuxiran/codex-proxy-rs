@@ -76,6 +76,7 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
     let updated_at = china_rfc3339(&account.updated_at);
     let usage_period = quota.usage_window().map(|(_, period)| period);
     let mut usage = account_usage_view(usage, usage_period, now);
+    usage.estimated_quota_usd_display = estimated_quota_usd_display(&quota);
     if account.authentication_kind == "api_key" {
         usage.window_label_display = "本地累计".to_owned();
     }
@@ -349,6 +350,7 @@ pub(super) fn account_usage_view(
     };
     AccountUsageView {
         billing: AccountBillingView::from((&usage.billing, usage.request_count)),
+        estimated_quota_usd_display: None,
         window_label_display: match period {
             Some(AccountUsagePeriod::Weekly) => "周额度窗口",
             Some(AccountUsagePeriod::Monthly) => "月额度窗口",
@@ -489,8 +491,38 @@ pub(super) fn display_optional_tokens(value: Option<u64>) -> String {
     value.map_or_else(|| "—".to_owned(), format_compact_number)
 }
 
+/// 已用比例低于此值时外推误差过大，与额度预测的最小样本门槛一致。
+const MIN_ESTIMATE_USED_PERCENT: f64 = 5.0;
+
+/// 整窗口额度 ≈ 窗口内按模型价格计费金额 ÷ 已用比例；金额与比例取自同一个用量窗口。
+fn estimated_quota_usd_display(quota: &ProviderQuota) -> Option<String> {
+    let (window, _) = quota.usage_window()?;
+    let used = window.used_percent.filter(|used| used.is_finite())?;
+    if used < MIN_ESTIMATE_USED_PERCENT {
+        return Some("已用不足 5%，暂不估算".to_owned());
+    }
+    let usage = window.local_usage.as_ref()?;
+    let spent = usage
+        .billing
+        .model_price_usd
+        .as_ref()?
+        .as_str()
+        .parse::<f64>()
+        .ok()
+        .filter(|spent| spent.is_finite() && *spent > 0.0)?;
+    let estimate = spent / (used / 100.0);
+    let display = format_decimal_currency(&format!("{estimate:.2}"), "USD");
+    // 有请求缺少模型价格时金额偏低，外推结果同样偏低。
+    Some(if usage.billing.model_price_count < usage.request_count {
+        format!("{display}（部分计价，偏低）")
+    } else {
+        display
+    })
+}
+
 pub(super) fn empty_account_usage() -> AccountUsageView {
     AccountUsageView {
+        estimated_quota_usd_display: None,
         billing: AccountBillingView::from((&Default::default(), 0)),
         window_label_display: "周/月额度窗口".to_owned(),
         request_count: None,

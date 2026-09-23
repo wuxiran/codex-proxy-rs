@@ -434,6 +434,7 @@ mod response {
     #[test]
     fn account_usage_view_should_keep_unobserved_numbers_null() {
         let view = AccountUsageView {
+            estimated_quota_usd_display: None,
             billing: gateway_api::admin::accounts::AccountBillingView::from((
                 &Default::default(),
                 0,

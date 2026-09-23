@@ -98,6 +98,8 @@ export interface AccountModelUsage {
 
 export interface AccountUsage {
   billing: AccountBilling
+  /** 按额度窗口已用比例外推的整窗口额度（按模型价格计）；无窗口数据时为空。 */
+  estimatedQuotaUsdDisplay: string | null
   windowLabelDisplay: string
   requestCount: number | null
   requestCountDisplay: string

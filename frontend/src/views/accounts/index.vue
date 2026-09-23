@@ -28,6 +28,7 @@ import AccountOverviewCards from './components/AccountOverviewCards.vue'
 import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
+import AccountRecentErrors from './components/AccountRecentErrors.vue'
 import AccountStateBindingCell from './components/AccountStateBindingCell.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
@@ -40,7 +41,7 @@ import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
-import { accountColumns, derivedAccountStatus, errorRateDisplay } from './constants'
+import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
 const narrowTable = useMediaQuery('(max-width: 639px)')
@@ -335,18 +336,16 @@ const {
                   :next-refresh-at="row.nextRefreshAt"
                 />
                 <span
-                  class="text-cp-xs font-emphasis tabular-nums text-cp-text-tertiary"
+                  class="whitespace-nowrap text-cp-xs font-emphasis tabular-nums text-cp-text-tertiary"
                   :title="row.concurrencyLimit === null ? '当前并发 / 并发上限（继承全局默认）' : '当前并发 / 并发上限'"
                 >
                   并发 {{ row.concurrency.inFlight ?? '—' }}/{{ row.concurrency.limit ?? '不限' }}
                 </span>
-                <span
-                  class="text-cp-xs font-emphasis tabular-nums"
-                  :class="row.recentErrors.errorCount > 0 ? 'text-cp-error-text' : 'text-cp-text-tertiary'"
-                  :title="`最近 24 小时已结束的 ${row.recentErrors.requestCount} 次请求中，失败或未完成 ${row.recentErrors.errorCount} 次（客户端取消不计）`"
-                >
-                  24h 报错 {{ row.recentErrors.errorCount }}{{ errorRateDisplay(row.recentErrors) }}
-                </span>
+                <AccountRecentErrors
+                  :account-id="row.id"
+                  :request-count="row.recentErrors.requestCount"
+                  :error-count="row.recentErrors.errorCount"
+                />
               </div>
             </template>
 
