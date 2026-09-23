@@ -283,7 +283,9 @@ fn summarize_set_cookies(headers: &[String]) -> Vec<String> {
                 .filter_map(|attr| {
                     let attr = attr.trim();
                     attr.split_once('=').and_then(|(k, v)| {
-                        k.trim().eq_ignore_ascii_case("domain").then(|| v.trim().to_owned())
+                        k.trim()
+                            .eq_ignore_ascii_case("domain")
+                            .then(|| v.trim().to_owned())
                     })
                 })
                 .next()
