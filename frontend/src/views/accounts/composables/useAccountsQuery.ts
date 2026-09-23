@@ -1,11 +1,14 @@
 import type { BaseTableSort } from '@/components/base/BaseTable/columns'
-import { watchDebounced } from '@vueuse/core'
+import { useDocumentVisibility, useIntervalFn, watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getAccounts } from '@/api'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
+
+/** 状态、并发、报错与用量随线上流量变化，列表按此间隔静默刷新。 */
+const AUTO_REFRESH_INTERVAL_MS = 15_000
 
 export function useAccountsQuery() {
   const searchQuery = shallowRef('')
@@ -90,6 +93,18 @@ export function useAccountsQuery() {
 
   onMounted(() => {
     void query.execute()
+  })
+
+  // 后台标签页不刷新；上一次请求未返回时跳过本轮，避免请求堆积。
+  const visibility = useDocumentVisibility()
+  function refreshInBackground() {
+    if (visibility.value === 'visible' && !query.loading.value)
+      void query.execute({ silent: true })
+  }
+  useIntervalFn(refreshInBackground, AUTO_REFRESH_INTERVAL_MS)
+  watch(visibility, (current, previous) => {
+    if (current === 'visible' && previous === 'hidden')
+      refreshInBackground()
   })
 
   return {

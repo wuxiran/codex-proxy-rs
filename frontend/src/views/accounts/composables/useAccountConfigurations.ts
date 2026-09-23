@@ -50,7 +50,9 @@ export function useAccountConfigurations(accounts: Ref<Account[]>) {
     request.finish(requestId)
   }
 
-  watch(accounts, () => {
+  // 列表会定时静默刷新；只有账号集合变化（翻页、筛选、增删）才需要重读配置，
+  // 其余由下面的定时器负责，避免每次列表刷新都对每个账号发一轮请求。
+  watch(() => accounts.value.map(account => account.id).join(','), () => {
     void reload()
   }, { immediate: true })
   useIntervalFn(() => {
