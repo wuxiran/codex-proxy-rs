@@ -90,7 +90,14 @@ impl HostBundle {
         + Sync
         + 'static,
     ) -> Arc<dyn gateway_admin::ports::proxy::ProxyProbe> {
-        Arc::new(proxy_probe::HttpProxyProbe::default().with_client_builder(build_client))
+        // 出口自动定位端点（经代理请求）。设置 CPR_PROXY_GEO_ENDPOINT 即开启「按出口自动设时区」，
+        // 未设置则保持原行为。默认建议 ip-api：http://ip-api.com/json/?fields=status,countryCode,regionName,city,timezone
+        let geo_endpoint = std::env::var("CPR_PROXY_GEO_ENDPOINT").ok();
+        Arc::new(
+            proxy_probe::HttpProxyProbe::default()
+                .with_client_builder(build_client)
+                .with_geo_endpoint(geo_endpoint),
+        )
     }
 
     #[must_use]

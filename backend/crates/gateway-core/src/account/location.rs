@@ -58,4 +58,20 @@ impl RequestLocation {
         self.city = self.city.trim().to_owned();
         Ok(self)
     }
+
+    /// 从 IP 地理定位结果构造：`country` 需为两位大写国家码，`timezone_name` 为 IANA 名。
+    /// 用于按出口自动设置每个代理的请求位置（时区）。任一字段不合法返回 `None`。
+    #[must_use]
+    pub fn from_geo(country: &str, region: &str, city: &str, timezone_name: &str) -> Option<Self> {
+        let timezone = timezone_name.trim().parse::<chrono_tz::Tz>().ok()?;
+        let region = if region.trim().is_empty() { "-" } else { region.trim() };
+        let city = if city.trim().is_empty() { "-" } else { city.trim() };
+        let location = Self {
+            country: country.trim().to_ascii_uppercase(),
+            region: region.to_owned(),
+            city: city.to_owned(),
+            timezone,
+        };
+        location.normalized().ok()
+    }
 }

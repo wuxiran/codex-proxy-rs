@@ -2007,6 +2007,7 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
         latency_ms: 1,
         exit_ip: Some("203.0.113.5".parse().unwrap()),
         message: "Connected".to_owned(),
+        location: None,
     };
     proxies
         .record_test(&saved.id, saved.revision, success.clone(), &context)

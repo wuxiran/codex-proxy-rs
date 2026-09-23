@@ -128,6 +128,7 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
                         .try_get::<Option<String>, _>("last_test_message")
                         .map_err(|_| invalid())?
                         .unwrap_or_default(),
+                    location: None,
                 })
             })
             .transpose()?,
@@ -712,6 +713,15 @@ impl ProxyStore for PgProxyRepository {
             .execute(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
         if updated.rows_affected() != 1 {
             return Err(store_error(conflict(id)));
+        }
+        // 出口自动定位：仅当本次拿到合法位置时回填代理的国家/地区/城市/时区，
+        // 让绑定该代理的每个账号自动继承正确时区。未定位则保持原值不动。
+        if let Some(location) = result.location.as_ref() {
+            if location.validate().is_ok() {
+                save_location(&mut transaction, id, Some(location))
+                    .await
+                    .map_err(store_error)?;
+            }
         }
         let current: i64 =
             sqlx::query_scalar("select config_revision from runtime_settings where id = 1")

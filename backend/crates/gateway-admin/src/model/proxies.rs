@@ -61,6 +61,8 @@ pub struct ProxyTestResult {
     pub latency_ms: u64,
     pub exit_ip: Option<std::net::IpAddr>,
     pub message: String,
+    /// 出口自动地理定位得到的请求位置（时区）。None=未定位或定位失败，不覆盖已有配置。
+    pub location: Option<gateway_core::account::RequestLocation>,
 }
 
 #[derive(Debug, Clone)]

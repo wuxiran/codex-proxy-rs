@@ -162,6 +162,7 @@ fn success() -> ProxyTestResult {
         latency_ms: 10,
         exit_ip: Some("203.0.113.5".parse().unwrap()),
         message: "Connected".to_owned(),
+        location: None,
     }
 }
 

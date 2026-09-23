@@ -13,6 +13,9 @@ use serde::Deserialize;
 
 pub struct HttpProxyProbe {
     endpoint: String,
+    /// 出口地理定位端点（经代理请求，看到的即出口 IP 的地理）。None=不做自动定位。
+    /// 期望返回 ip-api 风格 JSON：{status, countryCode, regionName, city, timezone}。
+    geo_endpoint: Option<String>,
     build_client: Arc<ProxyClientBuilder>,
 }
 
@@ -31,8 +34,65 @@ impl HttpProxyProbe {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            geo_endpoint: None,
             build_client: Arc::new(|builder| builder.build().map_err(|_| "无法创建代理连接")),
         }
+    }
+
+    /// 注入出口地理定位端点（经代理），开启「按出口自动设时区」。
+    #[must_use]
+    pub fn with_geo_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.geo_endpoint = endpoint.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// 经代理请求地理定位端点，解析出口所在地的请求位置（含 IANA 时区）。
+    /// 任何失败都返回 None，绝不影响代理测试本身。
+    async fn locate(&self, proxy: &OutboundProxy) -> Option<gateway_core::account::RequestLocation> {
+        let endpoint = self.geo_endpoint.as_ref()?;
+        let proxy = reqwest::Proxy::all(proxy.expose_url()).ok()?;
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(12))
+            .redirect(reqwest::redirect::Policy::none());
+        let client = (self.build_client)(builder).ok()?;
+        let mut response = client.get(endpoint).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len() + chunk.len() > 4096 {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GeoResponse {
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            country_code: Option<String>,
+            #[serde(default)]
+            region_name: Option<String>,
+            #[serde(default)]
+            city: Option<String>,
+            #[serde(default)]
+            timezone: Option<String>,
+        }
+        let geo = serde_json::from_slice::<GeoResponse>(&body).ok()?;
+        if geo.status.as_deref().is_some_and(|value| value != "success") {
+            return None;
+        }
+        gateway_core::account::RequestLocation::from_geo(
+            geo.country_code.as_deref()?,
+            geo.region_name.as_deref().unwrap_or("-"),
+            geo.city.as_deref().unwrap_or("-"),
+            geo.timezone.as_deref()?,
+        )
     }
 
     /// 由组合根注入与 Provider 请求一致的证书信任策略。
@@ -96,11 +156,21 @@ impl ProxyProbe for HttpProxyProbe {
         let started = Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(15), self.exit_ip(proxy)).await;
         let result = result.unwrap_or(Err("代理连接超时"));
+        let success = result.is_ok();
+        // 仅在连通成功时做出口地理定位（经代理，看到的即出口 IP 的地理）。
+        let location = if success && self.geo_endpoint.is_some() {
+            tokio::time::timeout(Duration::from_secs(15), self.locate(proxy))
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
         ProxyTestResult {
-            success: result.is_ok(),
+            success,
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             exit_ip: result.as_ref().ok().copied(),
             message: result.map_or_else(str::to_owned, |_| "连接成功".to_owned()),
+            location,
         }
     }
 }

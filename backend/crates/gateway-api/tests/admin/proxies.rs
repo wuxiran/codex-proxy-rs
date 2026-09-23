@@ -238,6 +238,7 @@ impl ProxyProbe for SuccessfulProbe {
             latency_ms: 15,
             exit_ip: Some("203.0.113.2".parse().unwrap()),
             message: "Connected".to_owned(),
+            location: None,
         }
     }
 }
