@@ -97,12 +97,11 @@ pub(in crate::transport) fn normalize_codex_request_body(body: &mut Map<String, 
                 return non_empty && !RESERVED_NAMESPACES.contains(&name);
             }
             // 函数工具名形如 `browser.xxx` 撞保留命名空间，触发 reserved 400，丢弃。
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                if let Some((prefix, _)) = name.split_once('.') {
-                    if RESERVED_NAMESPACES.contains(&prefix) {
-                        return false;
-                    }
-                }
+            if let Some(name) = tool.get("name").and_then(Value::as_str)
+                && let Some((prefix, _)) = name.split_once('.')
+                && RESERVED_NAMESPACES.contains(&prefix)
+            {
+                return false;
             }
             true
         });

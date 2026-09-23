@@ -768,7 +768,12 @@ impl CodexCredentialSelector {
                             let unified = cookies
                                 .iter()
                                 .find(|c| c.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME)
-                                .map(|c| gateway_core::request_log::short_label(c.value.expose_secret(), "unified"));
+                                .map(|c| {
+                                    gateway_core::request_log::short_label(
+                                        c.value.expose_secret(),
+                                        "unified",
+                                    )
+                                });
                             let ticket_in = runtime
                                 .turn_state_pin
                                 .as_deref()
@@ -780,14 +785,18 @@ impl CodexCredentialSelector {
                             } else {
                                 "none"
                             };
-                            gateway_core::request_log::record(gateway_core::request_log::RequestLogRecord {
-                                at_ms: gateway_core::request_log::now_ms(),
-                                model: upstream_model.unwrap_or("-").to_owned(),
-                                cookie_action: cookie_action.to_owned(),
-                                egress: gateway_core::request_log::short_label(&egress_fp, "egr"),
-                                unified,
-                                ticket_in,
-                            });
+                            gateway_core::request_log::record(
+                                gateway_core::request_log::RequestLogRecord {
+                                    at_ms: gateway_core::request_log::now_ms(),
+                                    model: upstream_model.unwrap_or("-").to_owned(),
+                                    cookie_action: cookie_action.to_owned(),
+                                    egress: gateway_core::request_log::short_label(
+                                        &egress_fp, "egr",
+                                    ),
+                                    unified,
+                                    ticket_in,
+                                },
+                            );
                         }
                         if !diagnostic
                             && observed_affinity_account.as_ref() == Some(account.id())

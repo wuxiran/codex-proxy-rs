@@ -120,7 +120,13 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret as _;
 
-    fn harvest(pool: &CfCookiePool, egress: &str, name: &str, value: &str, expires: Option<DateTime<Utc>>) {
+    fn harvest(
+        pool: &CfCookiePool,
+        egress: &str,
+        name: &str,
+        value: &str,
+        expires: Option<DateTime<Utc>>,
+    ) {
         pool.harvest(
             egress,
             name,
@@ -137,7 +143,13 @@ mod tests {
     fn pools_cf_bm_per_egress_and_ignores_other_names() {
         let pool = CfCookiePool::default();
         harvest(&pool, "egr-a", "__cf_bm", "cf-a", None);
-        harvest(&pool, "egr-a", "__Secure-next-auth.session-token", "auth", None);
+        harvest(
+            &pool,
+            "egr-a",
+            "__Secure-next-auth.session-token",
+            "auth",
+            None,
+        );
         let got = pool.borrow("egr-a").unwrap();
         assert_eq!(got.name, "__cf_bm");
         assert_eq!(got.value.expose_secret(), "cf-a");
@@ -148,7 +160,13 @@ mod tests {
     #[test]
     fn expired_cookie_is_not_borrowable() {
         let pool = CfCookiePool::default();
-        harvest(&pool, "egr", "__cf_bm", "old", Some(Utc::now() - chrono::Duration::seconds(5)));
+        harvest(
+            &pool,
+            "egr",
+            "__cf_bm",
+            "old",
+            Some(Utc::now() - chrono::Duration::seconds(5)),
+        );
         assert!(pool.borrow("egr").is_none());
     }
 

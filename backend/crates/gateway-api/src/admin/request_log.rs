@@ -5,12 +5,7 @@
 
 use crate::auth::SessionState;
 
-use axum::{
-    Router,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 
 use super::{AdminAuth, AdminEnvelope, AdminError, AdminResponse};
 
@@ -18,13 +13,10 @@ pub fn router<S>() -> Router<S>
 where
     S: SessionState + Clone + Send + Sync + 'static,
 {
-    Router::new().route("/api/admin/logs/recent", get(recent_logs::<S>))
+    Router::new().route("/api/admin/logs/recent", get(recent_logs))
 }
 
-pub(crate) async fn recent_logs<S>(_auth: AdminAuth) -> Result<impl IntoResponse, AdminError>
-where
-    S: SessionState + Send + Sync,
-{
+pub(crate) async fn recent_logs(_auth: AdminAuth) -> Result<impl IntoResponse, AdminError> {
     let data = gateway_core::request_log::recent(300);
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }

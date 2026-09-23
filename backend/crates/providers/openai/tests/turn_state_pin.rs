@@ -510,7 +510,11 @@ fn capture_rule_is_uniform_and_length_gate_is_a_floor() {
             "gpt-6-sol",
             "unknown-model",
         ] {
-            assert_eq!(rule.expected_length(model), Some(0), "plan={plan} model={model}");
+            assert_eq!(
+                rule.expected_length(model),
+                Some(0),
+                "plan={plan} model={model}"
+            );
         }
     }
     // 任何 >= MIN 的合法票据都能被动捕获并钉住；太短的不捕获。
@@ -519,7 +523,13 @@ fn capture_rule_is_uniform_and_length_gate_is_a_floor() {
     for (length, should_pin) in [(199usize, false), (200, true), (332, true), (780, true)] {
         let pins = TurnStatePins::default();
         let mut attempt = pins.attempt(
-            "account", "binding".into(), "gpt-6-astra", "client", expected, EGRESS, now,
+            "account",
+            "binding".into(),
+            "gpt-6-astra",
+            "client",
+            expected,
+            EGRESS,
+            now,
         );
         attempt.observe(Some(&"s".repeat(length)));
         // 捕获须等请求成功完成。

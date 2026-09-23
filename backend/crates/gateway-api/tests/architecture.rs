@@ -53,6 +53,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/admin/presenter.rs",
         "src/admin/proxies.rs",
         "src/admin/public_import.rs",
+        "src/admin/request_log.rs",
         "src/admin/settings.rs",
         "src/admin/system.rs",
         "src/admin/wire.rs",

@@ -69,8 +69,14 @@ impl RequestLocation {
         timezone_name: &str,
     ) -> Option<Self> {
         let timezone = timezone_name.trim().parse::<chrono_tz::Tz>().ok()?;
-        let region = region.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("-");
-        let city = city.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("-");
+        let region = region
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        let city = city
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
         Self {
             country: country_code.trim().to_ascii_uppercase(),
             region: region.to_owned(),

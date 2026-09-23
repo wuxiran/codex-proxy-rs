@@ -343,13 +343,25 @@ mod length_gate_tests {
         let value = repeat(780);
         assert!(
             pins.pin_account_wide(
-                "acct", "bind".into(), "gpt-6-astra", TURN_STATE_SCOPE_LEN,
-                "egr".into(), &value, now, now,
+                "acct",
+                "bind".into(),
+                "gpt-6-astra",
+                TURN_STATE_SCOPE_LEN,
+                "egr".into(),
+                &value,
+                now,
+                now,
             )
             .is_ok()
         );
         let attempt = pins.attempt(
-            "acct", "bind".into(), "gpt-6-astra", "cli", TURN_STATE_SCOPE_LEN, "egr", now,
+            "acct",
+            "bind".into(),
+            "gpt-6-astra",
+            "cli",
+            TURN_STATE_SCOPE_LEN,
+            "egr",
+            now,
         );
         assert_eq!(attempt.value(), Some(value.as_str()));
     }
@@ -361,8 +373,14 @@ mod length_gate_tests {
         for len in [292usize, 332, 356] {
             assert!(
                 pins.pin_account_wide(
-                    "a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(),
-                    &repeat(len), now, now,
+                    "a",
+                    "b".into(),
+                    "m",
+                    TURN_STATE_SCOPE_LEN,
+                    "e".into(),
+                    &repeat(len),
+                    now,
+                    now,
                 )
                 .is_ok(),
                 "len {len} should pin"
@@ -375,12 +393,30 @@ mod length_gate_tests {
         let pins = TurnStatePins::default();
         let now = SystemTime::now();
         assert!(matches!(
-            pins.pin_account_wide("a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(), &repeat(100), now, now),
+            pins.pin_account_wide(
+                "a",
+                "b".into(),
+                "m",
+                TURN_STATE_SCOPE_LEN,
+                "e".into(),
+                &repeat(100),
+                now,
+                now
+            ),
             Err(PinRejected::Length)
         ));
         let non_ascii = "\u{00e9}".repeat(300);
         assert!(matches!(
-            pins.pin_account_wide("a", "b".into(), "m", TURN_STATE_SCOPE_LEN, "e".into(), &non_ascii, now, now),
+            pins.pin_account_wide(
+                "a",
+                "b".into(),
+                "m",
+                TURN_STATE_SCOPE_LEN,
+                "e".into(),
+                &non_ascii,
+                now,
+                now
+            ),
             Err(PinRejected::Length)
         ));
     }
