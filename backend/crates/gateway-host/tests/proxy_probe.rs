@@ -149,6 +149,23 @@ fn exit_geo_parser_rejects_untrusted_shapes() {
     let geo = parse_exit_geo(long.as_bytes()).unwrap();
     assert!(geo.city.is_none());
     assert!(geo.region.is_none());
+    assert!(geo.timezone.is_none());
+
+    // 带 IANA 时区时应解析出来，供按出口自动设时区使用。
+    let with_tz = parse_exit_geo(
+        br#"{"status":"success","country":"US","countryCode":"US","regionName":"Ohio","city":"Piketon","timezone":"America/New_York"}"#,
+    )
+    .unwrap();
+    assert_eq!(with_tz.timezone.as_deref(), Some("America/New_York"));
+    let location = gateway_core::account::RequestLocation::from_geo(
+        &with_tz.country_code,
+        with_tz.region.as_deref(),
+        with_tz.city.as_deref(),
+        with_tz.timezone.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(location.timezone, chrono_tz::America::New_York);
+    assert_eq!(location.country, "US");
 }
 
 #[tokio::test]

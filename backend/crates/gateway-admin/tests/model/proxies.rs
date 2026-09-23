@@ -10,6 +10,7 @@ fn base(success: bool) -> ProxyTestResult {
             country_code: "US".to_owned(),
             region: None,
             city: Some("洛杉矶".to_owned()),
+            timezone: None,
         }),
         exit_ipv4: None,
         exit_ipv6: None,

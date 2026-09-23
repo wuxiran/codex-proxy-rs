@@ -174,6 +174,7 @@ fn geo() -> ProxyExitGeo {
         country_code: "US".to_owned(),
         region: Some("加州".to_owned()),
         city: None,
+        timezone: Some("America/Los_Angeles".to_owned()),
     }
 }
 

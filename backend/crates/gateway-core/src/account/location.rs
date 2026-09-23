@@ -58,4 +58,26 @@ impl RequestLocation {
         self.city = self.city.trim().to_owned();
         Ok(self)
     }
+
+    /// 从出口地理定位结果构造：`country_code` 两位大写国家码，`timezone_name` 为 IANA 名。
+    /// 用于按出口自动设置代理（进而每个账号）的请求时区。任一不合法返回 None。
+    #[must_use]
+    pub fn from_geo(
+        country_code: &str,
+        region: Option<&str>,
+        city: Option<&str>,
+        timezone_name: &str,
+    ) -> Option<Self> {
+        let timezone = timezone_name.trim().parse::<chrono_tz::Tz>().ok()?;
+        let region = region.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("-");
+        let city = city.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("-");
+        Self {
+            country: country_code.trim().to_ascii_uppercase(),
+            region: region.to_owned(),
+            city: city.to_owned(),
+            timezone,
+        }
+        .normalized()
+        .ok()
+    }
 }

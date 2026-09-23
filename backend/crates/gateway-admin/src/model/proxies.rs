@@ -62,6 +62,9 @@ pub struct ProxyExitGeo {
     pub country_code: String,
     pub region: Option<String>,
     pub city: Option<String>,
+    /// 出口所在地的 IANA 时区（如 America/New_York）。测试时从地理服务解析，
+    /// 用于按出口自动回填代理请求位置的时区；DB 子表未持久化此值，读回为 None。
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

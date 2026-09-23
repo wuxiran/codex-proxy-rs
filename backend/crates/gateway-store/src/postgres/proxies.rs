@@ -164,6 +164,7 @@ fn exit_geo_from_row(row: &PgRow) -> StoreResult<Option<ProxyExitGeo>> {
                     .ok_or_else(invalid)?,
                 region: row.try_get("last_test_region").map_err(|_| invalid())?,
                 city: row.try_get("last_test_city").map_err(|_| invalid())?,
+                timezone: None,
             })
         })
         .transpose()
@@ -203,6 +204,7 @@ fn quality_report_document(report: &ProxyQualityReport) -> serde_json::Value {
             "countryCode": geo.country_code,
             "region": geo.region,
             "city": geo.city,
+            "timezone": geo.timezone,
         })),
         "baseLatencyMs": report.base_latency_ms,
         "passedCount": report.passed_count,
@@ -244,6 +246,7 @@ fn quality_report_from_document(
                     country_code: text(&geo["countryCode"]).ok_or_else(invalid)?,
                     region: text(&geo["region"]),
                     city: text(&geo["city"]),
+                    timezone: text(&geo["timezone"]),
                 })
             })
             .transpose()?,
@@ -940,6 +943,22 @@ impl ProxyStore for PgProxyRepository {
         upsert_test_geo(&mut transaction, id, &result)
             .await
             .map_err(store_error)?;
+        // 按出口自动设时区：测试成功且地理服务给出 IANA 时区时，用出口地理回填代理的
+        // 请求位置（国家/地区/城市/时区），让绑定该代理的每个账号自动继承正确上游时区。
+        if let Some(geo) = result.exit_geo.as_ref().filter(|_| result.success) {
+            if let Some(timezone) = geo.timezone.as_deref() {
+                if let Some(location) = gateway_core::account::RequestLocation::from_geo(
+                    &geo.country_code,
+                    geo.region.as_deref(),
+                    geo.city.as_deref(),
+                    timezone,
+                ) {
+                    save_location(&mut transaction, id, Some(&location))
+                        .await
+                        .map_err(store_error)?;
+                }
+            }
+        }
         let current: i64 =
             sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
                 .fetch_one(&mut *transaction)

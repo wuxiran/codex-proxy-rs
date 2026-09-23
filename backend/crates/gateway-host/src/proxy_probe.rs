@@ -75,7 +75,7 @@ impl Default for HttpProxyProbe {
         )
         // 免费地区服务只提供明文 HTTP；请求经代理发出，既得到出口视角，也不消耗本机限额。
         .with_geo_endpoint(
-            "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city&lang=zh-CN",
+            "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone&lang=zh-CN",
         )
         // 只检测网关真实会访问的上游：Codex 后端、令牌刷新、官方 API 与 xAI。
         .with_quality_targets(vec![
@@ -462,6 +462,7 @@ pub fn parse_exit_geo(body: &[u8]) -> Option<ProxyExitGeo> {
         country_code: Option<String>,
         region_name: Option<String>,
         city: Option<String>,
+        timezone: Option<String>,
     }
     let response = serde_json::from_slice::<Response>(body).ok()?;
     if response.status != "success" {
@@ -483,6 +484,7 @@ pub fn parse_exit_geo(body: &[u8]) -> Option<ProxyExitGeo> {
         country_code,
         region: clean(response.region_name),
         city: clean(response.city),
+        timezone: clean(response.timezone),
     })
 }
 

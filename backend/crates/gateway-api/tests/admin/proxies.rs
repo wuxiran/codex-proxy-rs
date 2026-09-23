@@ -276,6 +276,7 @@ impl ProxyProbe for SuccessfulProbe {
                 country_code: "US".to_owned(),
                 region: Some("加州".to_owned()),
                 city: None,
+                timezone: Some("America/Los_Angeles".to_owned()),
             }),
             exit_ipv4: Some("203.0.113.2".parse().unwrap()),
             exit_ipv6: None,
