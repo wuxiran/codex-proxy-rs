@@ -1,7 +1,17 @@
 <script setup lang="ts">
 // 请求日志台：统一 cookie 库 / turn-state 票 / 满血(astra)·降智(luna) 逐请求观测。
 // v1 先渲染结构与示例数据；实时数据待后端 GET /api/admin/logs/recent 接入。
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import request from '@/api/request'
+
+interface BackendRecord {
+  atMs: number
+  model: string
+  cookieAction: 'reuse' | 'inject' | 'none'
+  egress: string
+  unified?: string
+  ticketIn?: string
+}
 
 interface LogRow {
   at: string
@@ -34,6 +44,44 @@ const sample: LogRow[] = [
 
 const rows = ref<LogRow[]>(sample)
 const usingSample = ref(true)
+const loading = ref(false)
+
+function fmtTime(ms: number): string {
+  try {
+    return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false })
+  } catch {
+    return '--:--:--'
+  }
+}
+
+function toRow(r: BackendRecord): LogRow {
+  return {
+    at: fmtTime(r.atMs),
+    action: r.cookieAction === 'reuse' ? 'reuse' : r.cookieAction === 'inject' ? 'inject' : 'off',
+    unifiedTo: r.unified,
+    ticketFrom: r.ticketIn,
+    model: r.model,
+    degraded: r.model.includes('luna'),
+    note: r.cookieAction === 'none' ? '无 __cf_bm' : undefined,
+  }
+}
+
+async function load() {
+  loading.value = true
+  try {
+    const data = await request<BackendRecord[]>({ url: '/api/admin/logs/recent', method: 'GET' })
+    if (Array.isArray(data) && data.length) {
+      rows.value = data.map(toRow)
+      usingSample.value = false
+    }
+  } catch {
+    // 后端未接入或无数据：保留示例，明确标注。
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(load)
 
 const actionLabel = (a: LogRow['action']) => (a === 'reuse' ? '沿用' : a === 'inject' ? '注入' : '注入已关')
 const actionClass = (a: LogRow['action']) =>
@@ -56,10 +104,18 @@ const stats = computed(() => {
           逐请求观测统一 cookie 库（注入/沿用 <code class="font-mono">__cf_bm</code>）、turn-state 票指纹流转、满血(astra)/降智(luna) 与缓冲后备。
         </p>
       </div>
-      <span v-if="usingSample"
-        class="rounded-full border border-amber-500/40 px-2.5 py-1 font-mono text-[11px] text-amber-500">
-        示例数据 · 后端接入中
-      </span>
+      <div class="flex items-center gap-2">
+        <span
+          class="rounded-full border px-2.5 py-1 font-mono text-[11px]"
+          :class="usingSample ? 'border-amber-500/40 text-amber-500' : 'border-emerald-500/40 text-emerald-500'">
+          {{ usingSample ? '示例数据 · 暂无实时' : '实时' }}
+        </span>
+        <button
+          class="rounded-full border border-neutral-300 px-2.5 py-1 text-[11px] text-neutral-600 hover:border-neutral-400 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
+          :disabled="loading" @click="load">
+          {{ loading ? '刷新中…' : '↻ 刷新' }}
+        </button>
+      </div>
     </div>
 
     <!-- KPI -->
@@ -99,7 +155,7 @@ const stats = computed(() => {
             <template v-if="r.ticketFrom">
               <span class="text-neutral-400">票</span>
               <span class="whitespace-nowrap rounded-md border border-amber-500/35 bg-amber-500/10 px-1.5 py-0.5 font-mono text-xs text-amber-600 dark:text-amber-400">
-                {{ r.ticketFrom }} → {{ r.ticketTo }}
+                {{ r.ticketTo ? `${r.ticketFrom} → ${r.ticketTo}` : r.ticketFrom }}
               </span>
             </template>
             <span class="text-neutral-400">模型</span>

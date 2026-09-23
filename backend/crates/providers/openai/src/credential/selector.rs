@@ -734,32 +734,60 @@ impl CodexCredentialSelector {
                             .collect();
                         // 账号自己没有未过期 __cf_bm 时，从按出口共享的池借一张注入
                         // （跨账号复用 Cloudflare 边缘 cookie，对应日志的「注入」；有则「沿用」自己的）。
-                        if !cookies
+                        let egress_fp = crate::turn_state_pin::egress_fingerprint(
+                            account.outbound_proxy().map(|proxy| proxy.expose_url()),
+                        );
+                        let has_own_cf = cookies
                             .iter()
-                            .any(|cookie| cookie.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME)
+                            .any(|cookie| cookie.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME);
+                        let mut cf_injected = false;
+                        if !has_own_cf
+                            && let Some(cf) = self.cf_pool.borrow(&egress_fp)
+                            && self.cookie_policy.may_replay(
+                                request.request_url,
+                                &cf.domain,
+                                &cf.path,
+                                cf.host_only,
+                                cf.secure,
+                            )
                         {
-                            let egress_fp = crate::turn_state_pin::egress_fingerprint(
-                                account.outbound_proxy().map(|proxy| proxy.expose_url()),
-                            );
-                            if let Some(cf) = self.cf_pool.borrow(&egress_fp)
-                                && self.cookie_policy.may_replay(
-                                    request.request_url,
-                                    &cf.domain,
-                                    &cf.path,
-                                    cf.host_only,
-                                    cf.secure,
-                                )
-                            {
-                                cookies.push(RuntimeCodexCookie {
-                                    name: cf.name,
-                                    value: cf.value,
-                                    domain: cf.domain,
-                                    path: cf.path,
-                                    host_only: cf.host_only,
-                                    secure: cf.secure,
-                                    expires_at: cf.expires_at,
-                                });
-                            }
+                            cookies.push(RuntimeCodexCookie {
+                                name: cf.name,
+                                value: cf.value,
+                                domain: cf.domain,
+                                path: cf.path,
+                                host_only: cf.host_only,
+                                secure: cf.secure,
+                                expires_at: cf.expires_at,
+                            });
+                            cf_injected = true;
+                        }
+                        // 请求日志观测（诊断，只存短标识/短指纹，绝不存原文）。
+                        {
+                            use secrecy::ExposeSecret as _;
+                            let unified = cookies
+                                .iter()
+                                .find(|c| c.name == crate::cf_cookie_pool::POOLED_COOKIE_NAME)
+                                .map(|c| gateway_core::request_log::short_label(c.value.expose_secret(), "unified"));
+                            let ticket_in = runtime
+                                .turn_state_pin
+                                .as_deref()
+                                .map(gateway_core::request_log::fingerprint);
+                            let cookie_action = if has_own_cf {
+                                "reuse"
+                            } else if cf_injected {
+                                "inject"
+                            } else {
+                                "none"
+                            };
+                            gateway_core::request_log::record(gateway_core::request_log::RequestLogRecord {
+                                at_ms: gateway_core::request_log::now_ms(),
+                                model: upstream_model.unwrap_or("-").to_owned(),
+                                cookie_action: cookie_action.to_owned(),
+                                egress: gateway_core::request_log::short_label(&egress_fp, "egr"),
+                                unified,
+                                ticket_in,
+                            });
                         }
                         if !diagnostic
                             && observed_affinity_account.as_ref() == Some(account.id())

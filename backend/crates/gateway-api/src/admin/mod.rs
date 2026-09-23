@@ -17,6 +17,7 @@ pub mod backups;
 pub mod client_keys;
 mod extract;
 pub mod observability;
+pub mod request_log;
 pub mod presenter;
 pub mod proxies;
 pub mod public_import;
@@ -44,6 +45,7 @@ where
         .merge(backups::router::<S>())
         .merge(client_keys::router::<S>())
         .merge(observability::router::<S>())
+        .merge(request_log::router::<S>())
         .merge(settings::router::<S>())
         .merge(system::router::<S>())
         .method_not_allowed_fallback(method_not_allowed)
