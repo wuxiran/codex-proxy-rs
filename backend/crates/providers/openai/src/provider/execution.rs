@@ -264,6 +264,7 @@ fn codex_response_log_patch(
         served_model: served_model.map(str::to_owned),
         resp_cookies: (!resp_cookies.is_empty()).then(|| resp_cookies.to_vec()),
         cfbm_ttl,
+        ..Default::default()
     }
 }
 
@@ -816,6 +817,15 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             request.passthrough_headers.remove("x-codex-turn-state");
         }
         let request_id = context.request_id().as_str().to_owned();
+        // 回填 ticket_in = **实际发送**给上游的 turn-state 指纹（pin 值或客户透传值，未发=None）；
+        // 不是请求侧 runtime.turn_state_pin(那是 pin 的 uuid 代次标识、非真票)。
+        gateway_core::request_log::update_response(
+            &request_id,
+            gateway_core::request_log::ResponsePatch {
+                ticket_in: request.turn_state.as_deref().map(gateway_core::request_log::fingerprint),
+                ..Default::default()
+            },
+        );
         let cancellation = context.cancellation().clone();
         let account_selection = CodexAccountSelectionTelemetry::new(
             lease.affinity_hit(),

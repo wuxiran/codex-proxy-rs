@@ -776,10 +776,8 @@ impl CodexCredentialSelector {
                                         "cfbm",
                                     )
                                 });
-                            let ticket_in = runtime
-                                .turn_state_pin
-                                .as_deref()
-                                .map(gateway_core::request_log::fingerprint);
+                            // ticket_in（实际发送的票指纹）在 execution 最终组装后回填；
+                            // 这里不能用 runtime.turn_state_pin——那是 pin 的 uuid 代次标识、非真票。
                             let cookie_action = if has_own_cf {
                                 "reuse"
                             } else if cf_injected {
@@ -797,7 +795,7 @@ impl CodexCredentialSelector {
                                         &egress_fp, "egr",
                                     ),
                                     unified,
-                                    ticket_in,
+                                    ticket_in: None,
                                     set_cookie: None,
                                     ticket_out: None,
                                     ticket_len: None,

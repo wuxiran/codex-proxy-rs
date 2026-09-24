@@ -66,9 +66,11 @@ pub struct RequestLogRecord {
     pub cfbm_ttl: Option<u32>,
 }
 
-/// 响应侧回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
+/// 响应侧/组装后回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
 #[derive(Default)]
 pub struct ResponsePatch {
+    /// 实际发送给上游的 turn-state 票短指纹（在最终请求组装后回填，非请求侧的 pin uuid）。
+    pub ticket_in: Option<String>,
     pub set_cookie: Option<bool>,
     pub ticket_out: Option<String>,
     pub ticket_len: Option<usize>,
@@ -102,6 +104,9 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
     if let Ok(mut buf) = buffer().lock()
         && let Some(rec) = buf.iter_mut().rev().find(|r| r.id == id)
     {
+        if patch.ticket_in.is_some() {
+            rec.ticket_in = patch.ticket_in;
+        }
         if patch.set_cookie.is_some() {
             rec.set_cookie = patch.set_cookie;
         }
