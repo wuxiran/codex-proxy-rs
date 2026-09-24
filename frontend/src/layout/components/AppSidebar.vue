@@ -12,6 +12,7 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
+  FlaskConical,
   ScrollText,
   Settings,
   Sun,
@@ -68,6 +69,7 @@ const navItems = [
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
   { label: '请求日志', icon: ScrollText, path: '/logs' },
+  { label: '测智台', icon: FlaskConical, path: '/testbench' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
 ]
