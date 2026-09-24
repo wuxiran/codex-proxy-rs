@@ -52,7 +52,7 @@ pub struct RequestLogRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     /// 响应侧：上游实际服务的模型（`openai-model` 头 / body `response.model`）。
-    /// 与请求模型**分叉**（present 且 != 请求模型）= 猫腻信号（掺假/relay/降级上报）。
+    /// 与请求模型不同只是**事实陈述**，不由此判定猫腻/降智。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
     /// 响应侧：**未过滤**的全部 Set-Cookie 摘要（每项 `name@domain#值指纹`，非原文）。
@@ -61,7 +61,7 @@ pub struct RequestLogRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resp_cookies: Option<Vec<String>>,
     /// 响应侧：本次上游下发的 `__cf_bm` 签发 TTL（秒，取 Set-Cookie 的 Max-Age，
-    /// 无 Max-Age 时用 Expires-now）。短（如 ~120s）= 降智节点特征，长（~1800s）= 好。
+    /// 无 Max-Age 时用 Expires-now）。**中性诊断数值**——实测证明不能据此判降智。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cfbm_ttl: Option<u32>,
 }

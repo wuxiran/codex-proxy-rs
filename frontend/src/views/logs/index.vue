@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // 请求日志台（表格 + 筛选 + 翻页）：逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、
-// turn-state 票、上游实际模型(分叉=猫腻)、service_tier(诊断)、__cf_bm 签发 TTL(短=降智特征)。
+// turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——全部只作中性诊断事实。
 // 数据源 /api/admin/logs/recent 为最近 300 条内存记录，筛选与翻页均在客户端进行。
-// 只如实铺数据；TTL 仅按阈值上色，不替用户下「降智」结论。
+// 满血/降智不由本页任何被动信号判定（TTL 判降智已被实测否定）；只如实铺数据。
 import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
 import type { BaseTablePagination as Pagination } from '@/components/base/BaseTable/pagination'
 import { computed, onMounted, ref, watch } from 'vue'
@@ -71,6 +71,8 @@ const sample: LogRow[] = [
 
 const allRows = ref<LogRow[]>(sample)
 const usingSample = ref(true)
+const loaded = ref(false)
+const loadError = ref(false)
 const loading = ref(false)
 
 // —— 筛选状态 ——
@@ -115,18 +117,31 @@ async function load() {
   loading.value = true
   try {
     const data = await request<BackendRecord[]>({ url: '/api/admin/logs/recent', method: 'GET' })
-    if (Array.isArray(data) && data.length) {
-      allRows.value = data.map(toRow)
-      usingSample.value = false
-    }
+    // 成功即以真数据为准（空数组也如实展示为「无记录」，不再拿示例/旧数据冒充当前）。
+    allRows.value = Array.isArray(data) ? data.map(toRow) : []
+    usingSample.value = false
+    loaded.value = true
+    loadError.value = false
   }
   catch {
-    // 后端未接入或无数据：保留示例并明确标注。
+    loadError.value = true
+    // 从没成功过就清掉示例，避免把示例当成当前结果。
+    if (usingSample.value)
+      allRows.value = []
   }
   finally {
     loading.value = false
   }
 }
+
+// 空状态区分：加载中 / 加载失败 / 已加载但无记录（日志开关关闭或还没测试）。
+const emptyText = computed(() => {
+  if (loadError.value)
+    return '加载失败，点「刷新」重试'
+  if (!loaded.value)
+    return '加载中…'
+  return '暂无测试记录（可能日志开关关闭，或还没有测试）'
+})
 
 onMounted(load)
 
@@ -134,14 +149,9 @@ const actionLabel = (a: LogRow['action']) => (a === 'reuse' ? '沿用' : a === '
 const actionClass = (a: LogRow['action']) =>
   a === 'reuse' ? 'text-emerald-500' : a === 'inject' ? 'text-amber-500' : 'text-neutral-400'
 
+// TTL 只作中性诊断数值展示（老板实测：TTL 判降智不科学），不再红黄绿上「降智」色。
 function ttlClass(ttl?: number) {
-  if (ttl == null)
-    return 'text-neutral-300 dark:text-neutral-600'
-  if (ttl < 300)
-    return 'text-rose-500 font-semibold'
-  if (ttl < 900)
-    return 'text-amber-500'
-  return 'text-emerald-500'
+  return ttl == null ? 'text-neutral-300 dark:text-neutral-600' : 'text-neutral-600 dark:text-neutral-300'
 }
 
 const isMole = (r: LogRow) => Boolean(r.servedModel && r.servedModel !== r.model)
@@ -241,7 +251,7 @@ const stats = computed(() => {
   <div class="mx-auto flex max-w-[1600px] flex-col gap-5 px-4 py-6">
     <BasePageHeader
       title="请求日志台"
-      description="逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、上游实际模型（分叉=猫腻）、service_tier（诊断）与 __cf_bm 签发 TTL（短=降智节点特征）。">
+      description="逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——均为中性诊断事实，不作满血/降智判定。">
       <template #actions>
         <span
           class="rounded-full border px-2.5 py-1 font-mono text-[11px]"
@@ -270,8 +280,8 @@ const stats = computed(() => {
         <div class="mt-2 text-2xl font-semibold tabular-nums text-amber-500">{{ stats.inject }}</div>
       </BaseCard>
       <BaseCard>
-        <div class="text-xs text-neutral-500">短 TTL（降智嫌疑）</div>
-        <div class="mt-2 text-2xl font-semibold tabular-nums" :class="stats.shortTtl ? 'text-rose-500' : 'text-neutral-400'">
+        <div class="text-xs text-neutral-500">短 TTL(&lt;300s) 计数</div>
+        <div class="mt-2 text-2xl font-semibold tabular-nums text-neutral-600 dark:text-neutral-300">
           {{ stats.shortTtl }}<span class="ml-1 text-sm font-normal text-neutral-400">/ {{ stats.ttlSamples }} 有 TTL</span>
         </div>
       </BaseCard>
@@ -283,9 +293,9 @@ const stats = computed(() => {
         <BaseSelect v-model="modelFilter" :options="modelOptions" class="w-40" />
         <BaseSelect v-model="actionFilter" :options="actionOptions" class="w-32" />
         <BaseSegmented v-model="ttlFilter" label="TTL 档" :options="ttlOptions" />
-        <BaseCheckbox v-model="moleOnly" label="只看猫腻" class="ml-1 text-xs" />
+        <BaseCheckbox v-model="moleOnly" label="只看实际模型≠请求" class="ml-1 text-xs" />
       </div>
-      <BaseTable :columns="columns" :rows="pagedRows" row-key="id" :loading="loading" density="compact" empty-text="无匹配请求">
+      <BaseTable :columns="columns" :rows="pagedRows" row-key="id" :loading="loading" density="compact" :empty-text="allRows.length ? '无匹配请求（可调整筛选）' : emptyText">
         <template #action="{ row }">
           <span class="font-semibold" :class="actionClass((row as LogRow).action)">{{ actionLabel((row as LogRow).action) }}</span>
         </template>
@@ -302,8 +312,8 @@ const stats = computed(() => {
         <template #servedModel="{ row }">
           <span v-if="(row as LogRow).servedModel"
             class="font-mono text-xs"
-            :class="isMole(row as LogRow) ? 'font-semibold text-rose-500' : 'text-neutral-500'">
-            {{ (row as LogRow).servedModel }}<span v-if="isMole(row as LogRow)"> ⚠猫腻</span>
+            :class="isMole(row as LogRow) ? 'font-semibold text-amber-600 dark:text-amber-400' : 'text-neutral-500'">
+            {{ (row as LogRow).servedModel }}<span v-if="isMole(row as LogRow)" class="text-neutral-400"> ≠请求</span>
           </span>
           <span v-else class="text-neutral-300 dark:text-neutral-600">—</span>
         </template>
