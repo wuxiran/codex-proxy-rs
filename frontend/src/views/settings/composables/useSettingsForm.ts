@@ -49,6 +49,8 @@ export function useSettingsForm() {
     accountAutoFreezeProbeEnabled: true,
     accountAutoFreezeProbeModel: '',
     accountAutoFreezeAdaptiveConcurrency: true,
+    requestLogEnabled: true,
+    requestLogTestKeyId: null as string | null,
   })
 
   function snapshot() {
@@ -131,6 +133,8 @@ export function useSettingsForm() {
     form.accountAutoFreezeProbeEnabled = data.accountAutoFreezeProbeEnabled
     form.accountAutoFreezeProbeModel = data.accountAutoFreezeProbeModel ?? ''
     form.accountAutoFreezeAdaptiveConcurrency = data.accountAutoFreezeAdaptiveConcurrency
+    form.requestLogEnabled = data.requestLogEnabled
+    form.requestLogTestKeyId = data.requestLogTestKeyId
     mappings.value = Object.entries(data.modelMappings || {}).map(([requestedModel, upstreamModel]) => ({
       requestedModel,
       upstreamModel: String(upstreamModel),
@@ -264,6 +268,8 @@ export function useSettingsForm() {
         accountAutoFreezeProbeEnabled: form.accountAutoFreezeProbeEnabled,
         accountAutoFreezeProbeModel: probeModel || null,
         accountAutoFreezeAdaptiveConcurrency: form.accountAutoFreezeAdaptiveConcurrency,
+        requestLogEnabled: form.requestLogEnabled,
+        requestLogTestKeyId: form.requestLogTestKeyId?.trim() ? form.requestLogTestKeyId.trim() : null,
       })
       applySettings(result)
       toast.success('设置已保存')
