@@ -359,6 +359,8 @@ pub struct RequestAttemptContext {
     request_profile: Option<crate::account::OpaqueProviderData>,
     disable_fast: bool,
     request_location: Option<crate::account::RequestLocation>,
+    request_log_enabled: bool,
+    request_log_test_key_id: Option<String>,
     request_id: ModelRequestId,
     client_api_key_ref: ClientApiKeyId,
     timing_started_at: Instant,
@@ -398,6 +400,13 @@ impl RequestAttemptContext {
     }
 
     #[must_use]
+    pub fn with_request_log_capture(mut self, enabled: bool, test_key_id: Option<String>) -> Self {
+        self.request_log_enabled = enabled;
+        self.request_log_test_key_id = test_key_id;
+        self
+    }
+
+    #[must_use]
     pub fn new(request_id: ModelRequestId, client_api_key_ref: ClientApiKeyId) -> Self {
         Self {
             request_id,
@@ -406,6 +415,8 @@ impl RequestAttemptContext {
             pricing: Arc::default(),
             disable_fast: false,
             request_location: None,
+            request_log_enabled: true,
+            request_log_test_key_id: None,
             timing_started_at: Instant::now(),
             trace: crate::diagnostics::TraceContext::default(),
             concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget::default(),
@@ -488,7 +499,18 @@ impl AttemptContext {
         self.request.request_location.as_ref()
     }
 
-    /// 当前 attempt 的诊断关联；克隆后可传给后台 transport 任务。
+    /// 本次请求是否应采集请求日志（冻结决定，record 与所有 update_response 用同一份）。
+    /// 规则：总开关开 且 本请求的 client key 命中配置的「测试 key」。未配测试 key 绝不匹配
+    /// （客户流量因此不采）。后续内部测智入口会另加「内部测试来源」并入此判定。
+    #[must_use]
+    pub fn should_capture_request_log(&self) -> bool {
+        self.request.request_log_enabled
+            && self
+                .request
+                .request_log_test_key_id
+                .as_deref()
+                .is_some_and(|test| test == self.request.client_api_key_ref.as_str())
+    }
     #[must_use]
     pub fn trace(&self) -> crate::diagnostics::TraceContext {
         self.request.trace.attempt(self.attempt_index.get())

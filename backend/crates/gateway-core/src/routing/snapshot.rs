@@ -34,6 +34,8 @@ pub struct SnapshotSettingsFacts {
     request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     request_location_enabled: bool,
     request_location: crate::account::RequestLocation,
+    request_log_enabled: bool,
+    request_log_test_key_id: Option<String>,
     max_concurrent_per_account: u32,
     max_waiting_per_key: u32,
     max_waiting_per_account: u32,
@@ -80,6 +82,13 @@ impl SnapshotSettingsFacts {
     }
 
     #[must_use]
+    pub fn with_request_log(mut self, enabled: bool, test_key_id: Option<String>) -> Self {
+        self.request_log_enabled = enabled;
+        self.request_log_test_key_id = test_key_id;
+        self
+    }
+
+    #[must_use]
     pub const fn with_concurrency_queues(
         mut self,
         max_waiting_per_key: u32,
@@ -106,6 +115,8 @@ impl SnapshotSettingsFacts {
             pricing: Arc::default(),
             request_location_enabled: false,
             request_location: crate::account::RequestLocation::default(),
+            request_log_enabled: true,
+            request_log_test_key_id: None,
             max_concurrent_per_account,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
@@ -559,6 +570,10 @@ async fn compile_runtime_snapshot(
         snapshot
             .with_pricing(facts.settings.pricing)
             .with_request_location(request_location)
+            .with_request_log(
+                facts.settings.request_log_enabled,
+                facts.settings.request_log_test_key_id,
+            )
             .with_responses_max_decompressed_body_bytes(decompressed_body_limit)
             .with_client_queue_policy(client_queue_policy)
             .with_model_mappings(model_mappings)
@@ -574,6 +589,8 @@ pub struct RuntimeSnapshot {
     pricing: Arc<crate::metering::PricingOverrides>,
     responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
     request_location: Option<crate::account::RequestLocation>,
+    request_log_enabled: bool,
+    request_log_test_key_id: Option<String>,
     revision: ConfigRevision,
     client_queue_policy: ConcurrencyQueuePolicy,
     account_selection_policy: AccountSelectionPolicy,
@@ -617,6 +634,23 @@ impl RuntimeSnapshot {
     ) -> Self {
         self.request_location = location;
         self
+    }
+
+    #[must_use]
+    pub fn with_request_log(mut self, enabled: bool, test_key_id: Option<String>) -> Self {
+        self.request_log_enabled = enabled;
+        self.request_log_test_key_id = test_key_id;
+        self
+    }
+
+    #[must_use]
+    pub const fn request_log_enabled(&self) -> bool {
+        self.request_log_enabled
+    }
+
+    #[must_use]
+    pub fn request_log_test_key_id(&self) -> Option<&str> {
+        self.request_log_test_key_id.as_deref()
     }
 
     #[must_use]
@@ -702,6 +736,8 @@ impl RuntimeSnapshot {
                 .expect("positive default limit"),
             pricing: Arc::default(),
             request_location: None,
+            request_log_enabled: true,
+            request_log_test_key_id: None,
             revision,
             account_selection_policy,
             client_queue_policy: ConcurrencyQueuePolicy::default(),
@@ -1014,6 +1050,8 @@ impl RuntimeSnapshot {
             config_revision: self.revision,
             pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
+            request_log_enabled: self.request_log_enabled,
+            request_log_test_key_id: self.request_log_test_key_id.clone(),
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),
             max_attempts: NonZeroU32::new(super::MAX_REQUEST_ATTEMPTS)
@@ -1057,6 +1095,8 @@ impl RuntimeSnapshot {
             config_revision: self.revision,
             pricing: Arc::clone(&self.pricing),
             request_location: self.request_location.clone(),
+            request_log_enabled: self.request_log_enabled,
+            request_log_test_key_id: self.request_log_test_key_id.clone(),
             account_selection_policy: self.account_selection_policy,
             operation: operation.kind(),
             max_attempts: NonZeroU32::new(super::MAX_REQUEST_ATTEMPTS)

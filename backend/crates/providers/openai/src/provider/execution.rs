@@ -817,15 +817,19 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             request.passthrough_headers.remove("x-codex-turn-state");
         }
         let request_id = context.request_id().as_str().to_owned();
+        let capture_request_log = context.should_capture_request_log();
         // 回填 ticket_in = **实际发送**给上游的 turn-state 指纹（pin 值或客户透传值，未发=None）；
         // 不是请求侧 runtime.turn_state_pin(那是 pin 的 uuid 代次标识、非真票)。
-        gateway_core::request_log::update_response(
-            &request_id,
-            gateway_core::request_log::ResponsePatch {
-                ticket_in: request.turn_state.as_deref().map(gateway_core::request_log::fingerprint),
-                ..Default::default()
-            },
-        );
+        // 门控用请求开始冻结的同一决定；关闭/非测试来源不做任何指纹构造。
+        if capture_request_log {
+            gateway_core::request_log::update_response(
+                &request_id,
+                gateway_core::request_log::ResponsePatch {
+                    ticket_in: request.turn_state.as_deref().map(gateway_core::request_log::fingerprint),
+                    ..Default::default()
+                },
+            );
+        }
         let cancellation = context.cancellation().clone();
         let account_selection = CodexAccountSelectionTelemetry::new(
             lease.affinity_hit(),
@@ -1245,19 +1249,21 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 yield event;
             }
             if completed {
-                // 成功出口（流内完成）：回填响应侧观测（Set-Cookie/票/真档位）。
-                gateway_core::request_log::update_response(
-                    &request_id,
-                    codex_response_log_patch(
-                        resp_has_cfbm,
-                        session_capture.as_ref(),
-                        resp_handshake_turn_state.as_deref(),
-                        decoder.response_service_tier(),
-                        decoder.response_model(),
-                        &resp_cookie_summary,
-                        resp_cfbm_ttl,
-                    ),
-                );
+                // 成功出口（流内完成）：回填响应侧观测（Set-Cookie/票/档位/实际模型/TTL）。
+                if capture_request_log {
+                    gateway_core::request_log::update_response(
+                        &request_id,
+                        codex_response_log_patch(
+                            resp_has_cfbm,
+                            session_capture.as_ref(),
+                            resp_handshake_turn_state.as_deref(),
+                            decoder.response_service_tier(),
+                            decoder.response_model(),
+                            &resp_cookie_summary,
+                            resp_cfbm_ttl,
+                        ),
+                    );
+                }
                 return;
             }
         }
@@ -1388,19 +1394,21 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             ))?;
             return;
         }
-        // 成功出口（流尾 finish）：回填响应侧观测（Set-Cookie/票/真档位）。
-        gateway_core::request_log::update_response(
-            &request_id,
-            codex_response_log_patch(
-                resp_has_cfbm,
-                session_capture.as_ref(),
-                resp_handshake_turn_state.as_deref(),
-                decoder.response_service_tier(),
-                decoder.response_model(),
-                        &resp_cookie_summary,
-                        resp_cfbm_ttl,
-            ),
-        );
+        // 成功出口（流尾 finish）：回填响应侧观测（Set-Cookie/票/档位/实际模型/TTL）。
+        if capture_request_log {
+            gateway_core::request_log::update_response(
+                &request_id,
+                codex_response_log_patch(
+                    resp_has_cfbm,
+                    session_capture.as_ref(),
+                    resp_handshake_turn_state.as_deref(),
+                    decoder.response_service_tier(),
+                    decoder.response_model(),
+                    &resp_cookie_summary,
+                    resp_cfbm_ttl,
+                ),
+            );
+        }
         let events = pre_commit_events.finish(events, timing_signals, completed);
         for event in events {
             yield event;

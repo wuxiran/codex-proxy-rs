@@ -52,6 +52,8 @@ fn runtime_settings(enabled: bool, probe_enabled: bool, adaptive: bool) -> Runti
         account_auto_freeze_probe_enabled: probe_enabled,
         account_auto_freeze_probe_model: Some("gpt-5.5".to_owned()),
         account_auto_freeze_adaptive_concurrency: adaptive,
+        request_log_enabled: true,
+        request_log_test_key_id: None,
         updated_at: Utc::now(),
     }
 }

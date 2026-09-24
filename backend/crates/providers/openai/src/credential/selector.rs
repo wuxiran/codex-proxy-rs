@@ -763,7 +763,9 @@ impl CodexCredentialSelector {
                             cf_injected = true;
                         }
                         // 请求日志观测（诊断，只存短标识/短指纹，绝不存原文）。
-                        {
+                        // 门控：仅采集测试来源流量（配置的测试 key）；客户流量与关闭时都不记，
+                        // 也不做任何哈希/摘要构造。决定在请求开始已冻结（AttemptContext）。
+                        if request.attempt.should_capture_request_log() {
                             use secrecy::ExposeSecret as _;
                             // __cf_bm cookie 值的短哈希桶（cfbm-XX）。不是网关节点号，命名刻意
                             // 避开 unified-N，防止和 chat.gateway.unified-N 真节点混淆。

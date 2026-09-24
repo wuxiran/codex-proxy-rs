@@ -553,6 +553,8 @@ impl SettingsStore for MemorySettingsStore {
             account_auto_freeze_probe_enabled: true,
             account_auto_freeze_probe_model: None,
             account_auto_freeze_adaptive_concurrency: true,
+            request_log_enabled: true,
+            request_log_test_key_id: None,
             updated_at: Utc::now(),
         };
         *settings = updated.clone();
@@ -1473,6 +1475,8 @@ fn test_runtime_settings() -> RuntimeSettings {
         account_auto_freeze_probe_enabled: true,
         account_auto_freeze_probe_model: None,
         account_auto_freeze_adaptive_concurrency: true,
+        request_log_enabled: true,
+        request_log_test_key_id: None,
         updated_at: Utc::now(),
     }
 }
