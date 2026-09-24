@@ -233,6 +233,17 @@ pub trait ProviderAdmin: Send + Sync {
         input_text: &str,
     ) -> Result<Operation, ProviderAdminError>;
 
+    /// 生成一次「测智台」测试请求的 operation：自定义 prompt + 可选思考强度(reasoning.effort)。
+    /// 默认忽略 effort、退化为普通连接测试；支持思考强度的 Provider 可覆写以注入 reasoning。
+    fn test_bench_operation(
+        &self,
+        upstream_model: &UpstreamModelId,
+        input_text: &str,
+        _reasoning_effort: Option<&str>,
+    ) -> Result<Operation, ProviderAdminError> {
+        self.connection_test_operation(upstream_model, input_text)
+    }
+
     /// 用票据（邮箱/密码/2FA）经登录服务换回令牌，返回可直接交给导入流程的单账号文档。
     ///
     /// 登录走给定出口；票据与令牌都不得写日志。
