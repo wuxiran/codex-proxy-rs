@@ -39,6 +39,7 @@ use crate::{
     },
 };
 
+use super::usage_projection_cache::{self, UsageProjection};
 use super::{
     commit_credential_refresh, map_provider_error, map_store_error, publish_committed,
     validate_prepared_rotation,
@@ -216,6 +217,9 @@ pub trait AccountsService: Send + Sync {
     }
 }
 
+/// 无额度窗口账号的本地累计窗口 key（起点 = 账号创建时间）。
+const LIFETIME_WINDOW_KEY: &str = "account-lifetime";
+
 #[derive(Clone)]
 pub(crate) struct DefaultAccountsService {
     pub(super) accounts: Arc<dyn AccountStore>,
@@ -229,6 +233,8 @@ pub(crate) struct DefaultAccountsService {
     pub(super) hunts: super::turn_state_hunt::ActiveHunts,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
+    /// 列表用量投影的 SWR 缓存（只装请求历史聚合，见模块注释）。
+    usage_cache: Arc<usage_projection_cache::UsageProjectionCache>,
 }
 
 impl DefaultAccountsService {
@@ -256,6 +262,7 @@ impl DefaultAccountsService {
             proxies,
             hunts: super::turn_state_hunt::ActiveHunts::default(),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
+            usage_cache: Arc::default(),
         }
     }
 
@@ -381,12 +388,13 @@ impl DefaultAccountsService {
         Ok((item, provider))
     }
 
-    async fn attach_quota_local_usage(
-        &self,
+    /// 列表需要的本地用量窗口：额度窗口（上游没给本地用量的）+ 终身窗口（API Key 或无额度窗口的账号）。
+    fn needed_usage_windows(
         accounts: &[AccountPageItem],
-        quotas: &mut [ProviderQuota],
-    ) -> Result<(), AdminError> {
-        let windows = accounts
+        quotas: &[ProviderQuota],
+    ) -> Vec<AccountUsageWindowQuery> {
+        let now = Utc::now();
+        let mut windows = accounts
             .iter()
             .zip(quotas.iter())
             .flat_map(|(item, quota)| {
@@ -397,65 +405,71 @@ impl DefaultAccountsService {
                     .filter_map(|window| quota_usage_window(&item.account.id, window))
             })
             .collect::<Vec<_>>();
-        if windows.is_empty() {
-            return Ok(());
-        }
-        let usage_by_window = self
-            .accounts
-            .load_account_usage_by_windows(&windows)
-            .await
-            .map_err(|error| map_store_error(error, "quota window usage"))?
-            .into_iter()
-            .map(|result| ((result.account_id, result.key), result.usage))
-            .collect::<BTreeMap<_, _>>();
+        // API Key 或尚无额度窗口的账号展示本地累计，仅统计账号创建后仍保留的请求记录。
+        windows.extend(
+            accounts
+                .iter()
+                .zip(quotas)
+                .filter(|(item, quota)| {
+                    item.account.authentication_kind == "api_key" || quota.windows.is_empty()
+                })
+                .map(|(item, _)| AccountUsageWindowQuery {
+                    account_id: item.account.id.clone(),
+                    key: LIFETIME_WINDOW_KEY.to_owned(),
+                    range: TimeRange {
+                        start: item.account.created_at,
+                        end: now,
+                    },
+                }),
+        );
+        windows
+    }
+
+    fn attach_quota_local_usage(
+        accounts: &[AccountPageItem],
+        quotas: &mut [ProviderQuota],
+        usage_by_window: &BTreeMap<usage_projection_cache::WindowKey, AccountUsage>,
+    ) {
         for (item, quota) in accounts.iter().zip(quotas) {
             for window in &mut quota.windows {
                 if window.local_usage.is_none()
                     && window.local_usage_attribution == QuotaLocalUsageAttribution::AccountWide
                 {
-                    let key = (item.account.id.clone(), window.key.clone());
-                    if let Some(usage) = usage_by_window.get(&key) {
+                    let Some(query) = quota_usage_window(&item.account.id, window) else {
+                        continue;
+                    };
+                    if let Some(usage) =
+                        usage_by_window.get(&usage_projection_cache::window_key(&query))
+                    {
                         window.local_usage = Some(usage.clone());
                     }
                 }
             }
         }
-        Ok(())
     }
 
-    async fn load_lifetime_usage(
-        &self,
+    fn lifetime_usage(
         accounts: &[AccountPageItem],
         quotas: &[ProviderQuota],
-    ) -> Result<BTreeMap<String, AccountUsage>, AdminError> {
-        let now = Utc::now();
-        // API Key 或尚无额度窗口的账号展示本地累计，仅统计账号创建后仍保留的请求记录。
-        let windows = accounts
+        usage_by_window: &BTreeMap<usage_projection_cache::WindowKey, AccountUsage>,
+    ) -> BTreeMap<String, AccountUsage> {
+        accounts
             .iter()
             .zip(quotas)
             .filter(|(item, quota)| {
                 item.account.authentication_kind == "api_key" || quota.windows.is_empty()
             })
-            .map(|(item, _)| AccountUsageWindowQuery {
-                account_id: item.account.id.clone(),
-                key: "account-lifetime".to_owned(),
-                range: TimeRange {
-                    start: item.account.created_at,
-                    end: now,
-                },
+            .filter_map(|(item, _)| {
+                let key = (
+                    item.account.id.clone(),
+                    LIFETIME_WINDOW_KEY.to_owned(),
+                    item.account.created_at,
+                );
+                usage_by_window
+                    .get(&key)
+                    .map(|usage| (item.account.id.clone(), usage.clone()))
             })
-            .collect::<Vec<_>>();
-        if windows.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        Ok(self
-            .accounts
-            .load_account_usage_by_windows(&windows)
-            .await
-            .map_err(|error| map_store_error(error, "lifetime account usage"))?
-            .into_iter()
-            .map(|result| (result.account_id, result.usage))
-            .collect())
+            .collect()
     }
 
     async fn load_directory_item(
@@ -490,15 +504,31 @@ impl DefaultAccountsService {
         } else {
             stored
         };
-        self.attach_quota_local_usage(
+        // 单账号详情不走列表缓存：只查这一个账号需要的窗口。
+        let windows =
+            Self::needed_usage_windows(std::slice::from_ref(&stored), std::slice::from_ref(&quota));
+        let usage_by_window = if windows.is_empty() {
+            BTreeMap::new()
+        } else {
+            usage_projection_cache::index_window_results(
+                &windows,
+                self.accounts
+                    .load_account_usage_by_windows(&windows)
+                    .await
+                    .map_err(|error| map_store_error(error, "quota window usage"))?,
+            )
+        };
+        Self::attach_quota_local_usage(
             std::slice::from_ref(&stored),
             std::slice::from_mut(&mut quota),
+            &usage_by_window,
+        );
+        let usage = Self::lifetime_usage(
+            std::slice::from_ref(&stored),
+            std::slice::from_ref(&quota),
+            &usage_by_window,
         )
-        .await?;
-        let usage = self
-            .load_lifetime_usage(std::slice::from_ref(&stored), std::slice::from_ref(&quota))
-            .await?
-            .remove(&stored.account.id)
+        .remove(&stored.account.id)
             .or_else(|| {
                 quota
                     .usage_window()
@@ -548,25 +578,26 @@ impl AccountsService for DefaultAccountsService {
             .list_accounts(query, runtime)
             .await
             .map_err(|error| map_store_error(error, "account directory"))?;
-        let now = Utc::now();
-        let rolling_range = TimeRange {
-            start: now - Duration::hours(24),
-            end: now,
-        };
+        let rolling_range = usage_projection_cache::rolling_range(Utc::now());
         let ids = page
             .items
             .iter()
             .map(|item| item.account.id.clone())
             .collect::<Vec<_>>();
-        let rolling_usage = self
-            .accounts
-            .load_account_usage(rolling_range, &ids)
-            .await
-            .map_err(|error| map_store_error(error, "rolling account usage"))?;
-        let rolling_usage = rolling_usage
-            .into_iter()
-            .map(|usage| (usage.account_id.clone(), usage))
-            .collect::<BTreeMap<_, _>>();
+        // 用量投影走 SWR 缓存：命中即用（过期则后台重算），缺失才内联计算。
+        let cache_key = ids.join("\n");
+        let cached = self.usage_cache.get(&cache_key);
+        let rolling_usage = match &cached {
+            Some((projection, _)) => projection.rolling_usage.clone(),
+            None => self
+                .accounts
+                .load_account_usage(rolling_range, &ids)
+                .await
+                .map_err(|error| map_store_error(error, "rolling account usage"))?
+                .into_iter()
+                .map(|usage| (usage.account_id.clone(), usage))
+                .collect::<BTreeMap<_, _>>(),
+        };
         let mut quotas = futures::future::join_all(page.items.iter().map(|item| async {
             let account = &item.account;
             let account_id = ProviderAccountId::new(account.id.clone())
@@ -606,9 +637,54 @@ impl AccountsService for DefaultAccountsService {
         .await
         .into_iter()
         .collect::<Result<Vec<_>, AdminError>>()?;
-        self.attach_quota_local_usage(&page.items, &mut quotas)
-            .await?;
-        let mut lifetime_usage = self.load_lifetime_usage(&page.items, &quotas).await?;
+        // 额度窗口 / 终身窗口：先从投影里取，缺的（首轮、额度窗口翻期）内联补查并并入缓存。
+        let needed_windows = Self::needed_usage_windows(&page.items, &quotas);
+        let mut usage_by_window = cached
+            .as_ref()
+            .map(|(projection, _)| projection.usage_by_window.clone())
+            .unwrap_or_default();
+        let missing = needed_windows
+            .iter()
+            .filter(|query| !usage_by_window.contains_key(&usage_projection_cache::window_key(query)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let fetched = usage_projection_cache::index_window_results(
+                &missing,
+                self.accounts
+                    .load_account_usage_by_windows(&missing)
+                    .await
+                    .map_err(|error| map_store_error(error, "quota window usage"))?,
+            );
+            usage_by_window.extend(fetched.clone());
+            if cached.is_some() {
+                self.usage_cache
+                    .merge_windows(&cache_key, &missing, fetched);
+            }
+        }
+        match &cached {
+            None => self.usage_cache.store(
+                cache_key.clone(),
+                UsageProjection {
+                    rolling_usage: rolling_usage.clone(),
+                    windows: needed_windows.clone(),
+                    usage_by_window: usage_by_window.clone(),
+                },
+            ),
+            Some((_, true)) => {
+                if let Some(snapshot) = self.usage_cache.try_begin_refresh(&cache_key) {
+                    self.usage_cache.spawn_refresh(
+                        Arc::clone(&self.accounts),
+                        cache_key.clone(),
+                        ids.clone(),
+                        snapshot,
+                    );
+                }
+            }
+            Some((_, false)) => {}
+        }
+        Self::attach_quota_local_usage(&page.items, &mut quotas, &usage_by_window);
+        let mut lifetime_usage = Self::lifetime_usage(&page.items, &quotas, &usage_by_window);
         let mut concurrency = self
             .concurrency(
                 &page

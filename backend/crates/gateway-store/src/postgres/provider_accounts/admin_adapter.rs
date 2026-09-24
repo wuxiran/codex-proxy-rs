@@ -564,17 +564,26 @@ impl AccountStore for PgAdminAccountStore {
                 Option<String>,
             ),
         >(
-            "select t.provider_account_id, t.purchase_amount::text, t.purchase_currency,
+            // 已花费一次分组算完：原相关子查询会对每个账号各扫一遍 model_request_billing 全表。
+            "with spent as (
+               select mr.provider_account_id, sum(mrb.calculated_cost_amount) as usd
+                 from account_tickets t
+                 join provider_accounts pa on pa.id = t.provider_account_id
+                 join model_requests mr
+                   on mr.provider_account_id = t.provider_account_id
+                  and mr.started_at >= coalesce(t.purchased_at, pa.created_at)
+                 join model_request_billing mrb
+                   on mrb.model_request_id = mr.id
+                  and mrb.calculated_cost_currency = 'USD'
+                where t.provider_account_id = any($1::text[])
+                group by mr.provider_account_id
+             )
+             select t.provider_account_id, t.purchase_amount::text, t.purchase_currency,
                     t.purchased_at, t.expires_at, t.ticket_hint, t.ticket_updated_at,
-                    (select sum(mrb.calculated_cost_amount)::text
-                       from model_requests mr
-                       join model_request_billing mrb on mrb.model_request_id = mr.id
-                      where mr.provider_account_id = t.provider_account_id
-                        and mrb.calculated_cost_currency = 'USD'
-                        and mr.started_at >= coalesce(t.purchased_at, pa.created_at)),
+                    s.usd::text,
                     t.auto_revive_attempts, t.auto_revive_last_at, t.auto_revive_last_error
                from account_tickets t
-               join provider_accounts pa on pa.id = t.provider_account_id
+               left join spent s on s.provider_account_id = t.provider_account_id
               where t.provider_account_id = any($1::text[])",
         )
         .bind(account_ids)
