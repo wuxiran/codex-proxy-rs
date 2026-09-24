@@ -19,6 +19,7 @@ pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/gateway-store",
     "crates/providers/openai",
     "crates/providers/xai",
+    "crates/turn-state",
 ];
 
 #[test]
@@ -174,6 +175,7 @@ const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("gateway-store", "crates/gateway-store"),
     ("provider-openai", "crates/providers/openai"),
     ("provider-xai", "crates/providers/xai"),
+    ("turn-state", "crates/turn-state"),
 ];
 
 /// Adapter/provider 根门面的稳定合同模块；任何增减都必须同步完成边界审计。
@@ -218,6 +220,7 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("gateway-api", "gateway-admin"),
     ("gateway-api", "gateway-core"),
     ("gateway-api", "gateway-protocol"),
+    ("gateway-api", "turn-state"),
     ("gateway-host", "gateway-admin"),
     ("gateway-host", "gateway-core"),
     ("gateway-store", "gateway-admin"),
@@ -225,6 +228,7 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("provider-openai", "gateway-admin"),
     ("provider-openai", "gateway-core"),
     ("provider-openai", "gateway-protocol"),
+    ("provider-openai", "turn-state"),
     ("provider-xai", "gateway-admin"),
     ("provider-xai", "gateway-core"),
     ("provider-xai", "gateway-protocol"),

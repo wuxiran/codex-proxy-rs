@@ -4,11 +4,13 @@ import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 import type { AccountGroup, AccountModelAccess, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { ref, useId, watch } from 'vue'
+import { mintAccountTurnState } from '@/api'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
+import { toast } from '@/components/base/BaseToast'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import AccountApiKeyFields from './AccountApiKeyFields.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
@@ -17,7 +19,7 @@ import AccountSettingsFields from './AccountSettingsFields.vue'
 import AccountTurnStateHistory from './AccountTurnStateHistory.vue'
 import AccountTurnStateHunt from './AccountTurnStateHunt.vue'
 
-defineProps<{
+const props = defineProps<{
   account: AccountRow | null
   groups: AccountGroup[]
   groupsLoading: boolean
@@ -36,7 +38,32 @@ const emit = defineEmits<{
   turnStateHunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
   turnStateHuntCancelled: []
   stopTurnStateAutoHunt: []
+  /** 云端打票完成（成功或失败），让上层按实际状态刷新 pin 列表。 */
+  turnStateMinted: []
 }>()
+
+const minting = ref(false)
+const mintMessage = ref('')
+async function mintNow() {
+  if (!props.account)
+    return
+  minting.value = true
+  mintMessage.value = ''
+  try {
+    const report = await mintAccountTurnState({ accountId: props.account.id })
+    const tickets = report.tickets.map(t => `${t.model} ${t.length} 字节`).join('，')
+    mintMessage.value = `${report.gateway ?? '网关未知'} · ${report.attempts} 发 · ${tickets || '无票'}${report.pairWritten ? ' · 路由对已写入' : ''}${report.observeOnly ? ' · 仅观测' : ''}`
+    toast.success('云端打票完成')
+  }
+  catch (error) {
+    mintMessage.value = error instanceof Error ? error.message : '打票失败'
+    toast.error(mintMessage.value)
+  }
+  finally {
+    minting.value = false
+    emit('turnStateMinted')
+  }
+}
 
 const open = defineModel<boolean>({ required: true })
 const showStateHistory = ref(false)
@@ -117,6 +144,16 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             >
               遍历代理找 state
             </BaseButton>
+            <BaseButton
+              variant="soft"
+              size="sm"
+              :loading="minting"
+              :disabled="saving || minting || !savedPinTurnState || !pinTurnState"
+              :title="savedPinTurnState ? '向 relay 铸票并钉住路由 cookie 对（需先在 state 观测页启用云端打票）' : '请先开启并保存「固定自身 state」'"
+              @click="mintNow"
+            >
+              云端打票
+            </BaseButton>
             <BaseButton variant="soft" size="sm" :disabled="saving" :aria-expanded="showStateHistory" :aria-controls="historyId" @click="showStateHistory = !showStateHistory">
               最近捕获
             </BaseButton>
@@ -137,7 +174,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             <span v-for="(length, model) in turnStateCaptureRule.modelLengths" :key="model">
               {{ model }}：{{ length }} 字节
             </span>
-            <span v-if="turnStateCaptureRule.defaultLength !== null">默认规则：{{ turnStateCaptureRule.defaultLength }} 字节</span>
+            <span v-if="turnStateCaptureRule.defaultLength !== null">规则：≥200 字节可见 ASCII；正常/受限长度档在「state 观测」页配置。</span>
             <span v-else>仅捕获上述模型，未列出的模型等待补充规则。</span>
           </div>
           <p v-else class="m-0 text-cp-xs text-cp-text-secondary">
@@ -157,8 +194,12 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
               <li v-for="(pin, index) in turnStatePins" :key="`${pin.model}-${pin.capturedAt}-${index}`">
                 {{ pin.model }} · {{ pin.length }} 字节 · 命中 {{ pin.hits }} 次 · {{ new Date(pin.expiresAt).toLocaleString() }} 到期
                 <span v-if="pin.scope === 'account'" class="text-cp-xs text-cp-text-secondary">· 全部客户端</span>
+                <span v-if="pin.source === 'mint'" class="text-cp-xs text-cp-text-secondary">· 云端打票{{ pin.gateway ? ` · ${pin.gateway}` : '' }}</span>
               </li>
             </ul>
+            <p v-if="mintMessage" role="status" class="m-0 text-cp-sm text-cp-text-secondary">
+              云端打票：{{ mintMessage }}
+            </p>
             <p v-if="turnStateAutoHunt" role="status" class="m-0 flex flex-wrap items-center gap-2 text-cp-sm text-cp-text">
               自动续期：{{ turnStateAutoHunt.modelId }} · 每个代理 {{ turnStateAutoHunt.attempts }} 次<template v-if="turnStateAutoHunt.includeDirect">
                 · 含直连

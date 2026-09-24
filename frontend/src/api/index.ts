@@ -31,6 +31,9 @@ export * from './modules/settings'
 // 系统更新
 export * from './modules/system'
 
+// turn-state 模板/设置/观测
+export * from './modules/turn-state'
+
 // 使用记录
 export * from './modules/usage'
 

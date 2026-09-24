@@ -106,6 +106,7 @@ pub async fn run() -> Result<(), BootstrapError> {
         api,
         core.execution_service(),
         admin.services(),
+        Some(openai.turn_state_service()),
         probes,
         host.worker_health(),
         host.connection_lifecycle(),

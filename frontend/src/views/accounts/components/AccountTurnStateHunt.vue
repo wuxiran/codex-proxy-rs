@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import type { TurnStateHuntRow } from '../composables/useAccountTurnStateHunt'
 import type { TurnStateAutoHunt, TurnStateCaptureRule } from '@/api'
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { getAccountModels } from '@/api'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
+import BaseInput from '@/components/base/BaseInput.vue'
 import BaseNumberInput from '@/components/base/BaseNumberInput.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import { useProxyCatalog } from '@/composables/useProxyCatalog'
@@ -20,16 +22,44 @@ const emit = defineEmits<{
 }>()
 
 const PREFERRED_MODEL = 'gpt-6-astra'
-const models = computed(() => Object.keys(props.captureRule?.modelLengths ?? {}))
-const modelOptions = computed(() => models.value.map(model => ({
-  label: `${model}（${props.captureRule!.modelLengths[model]} 字节）`,
-  value: model,
-})))
-const modelId = ref('')
+// 长度门已废弃（票据长度由 state 观测页的运行设置判别），模型下拉改从账号模型目录取；
+// 目录还没回来或为空时给一个可输入的兜底，启动按钮只依赖模型 id 非空。
+const catalogModels = ref<string[]>([])
+const modelsLoading = ref(false)
+const models = computed(() => {
+  const merged = new Set<string>([
+    ...catalogModels.value,
+    ...Object.keys(props.captureRule?.modelLengths ?? {}),
+  ])
+  if (!merged.size)
+    merged.add(PREFERRED_MODEL)
+  return [...merged]
+})
+const modelOptions = computed(() => models.value.map(model => ({ label: model, value: model })))
+const modelId = ref(PREFERRED_MODEL)
+const customModel = computed({
+  get: () => modelId.value,
+  set: (value: string) => {
+    modelId.value = value.trim()
+  },
+})
 watch(models, (value) => {
   if (!value.includes(modelId.value))
     modelId.value = value.includes(PREFERRED_MODEL) ? PREFERRED_MODEL : value[0] ?? ''
 }, { immediate: true })
+onMounted(async () => {
+  modelsLoading.value = true
+  try {
+    const res = await getAccountModels({ accountId: props.accountId }, { silent: true })
+    catalogModels.value = res.models.map(model => model.id)
+  }
+  catch {
+    // 目录取不到就用兜底列表，不阻断遍历
+  }
+  finally {
+    modelsLoading.value = false
+  }
+})
 const attempts = ref(5)
 const includeDirect = ref(false)
 const autoRenew = ref(true)
@@ -199,12 +229,15 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
     <p class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
       依次经每个已测试通过的代理向上游发真实请求，直到返回符合长度规则的 state；命中后把账号绑定到该代理，并把这个 state 钉给该账号此模型的全部客户端（替换已有的固定）。每次尝试都会消耗少量额度，未命中不改动账号。勾选自动续期后，服务端会在到期前 5 分钟用同样的参数重新遍历：先试当前绑定的代理，续不上就继续打其它代理；整轮都没续上则 5 分钟后再来。
     </p>
-    <p v-if="!models.length" role="alert" class="mb-0 mt-2 text-cp-sm text-cp-error">
-      该账号的套餐没有按模型的长度规则，无法判断哪个 state 正确。
-    </p>
-    <div v-else class="mt-3 grid gap-1 text-cp-xs text-cp-text-secondary">
-      <span>方式</span>
-      <BaseSelect v-model="mode" class="min-w-56" size="sm" aria-label="方式" :options="modeOptions" :disabled="busy" />
+    <div class="mt-3 flex flex-wrap items-end gap-3">
+      <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
+        <span>方式</span>
+        <BaseSelect v-model="mode" class="min-w-56" size="sm" aria-label="方式" :options="modeOptions" :disabled="busy" />
+      </div>
+      <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
+        <span>模型 id（可手填）{{ modelsLoading ? '，目录加载中…' : '' }}</span>
+        <BaseInput v-model="customModel" class="min-w-56" size="sm" aria-label="模型 id" placeholder="gpt-6-astra" :disabled="busy" />
+      </div>
     </div>
     <p v-if="models.length && mode === 'auto'" class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
       从轮换代理模板即时生成美/日/德/菲随机出口，逐个 IP 打 1 次（同一 IP 复打会被上游抹掉 state），命中即把账号改绑到你选的静态出口并按静态出口钉住 state（state 已确认可跨 IP 移植）。每个 IP 都是一次真实请求、消耗额度，到「最多 IP 数」即止。

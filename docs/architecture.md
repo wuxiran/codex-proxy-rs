@@ -32,6 +32,9 @@ flowchart LR
   Admin --> Registry
   Registry --> OpenAI[provider-openai]
   Registry --> XAI[provider-xai]
+  OpenAI --> TurnState[turn-state]
+  API --> TurnState
+  TurnState --> StateFiles[(runtime_data_dir/turn_state)]
   OpenAI --> OpenAIUpstream[OpenAI upstream]
   XAI --> XAIUpstream[xAI upstream]
 
@@ -64,6 +67,7 @@ flowchart LR
 | `gateway-host` | 配置加载、日志、HTTP 生命周期、Worker 监督、系统更新及外部价格源适配 |
 | `providers/openai` | OpenAI OAuth、账号选择、目录、额度、Responses/Images/Search transport |
 | `providers/xai` | xAI OAuth session、账号选择、目录、额度和 Grok/Responses 转换 |
+| `turn-state` | Codex `X-Codex-Turn-State` 模板的桶存储（账号 × 模型，落运行数据目录）、Fernet 到期、注入决策、观测统计；纯逻辑 + 文件，不依赖其它 workspace crate，由 `providers/openai` 在请求前/响应后两处钩子调用，管理接口由 `gateway-api` 直接持有服务句柄 |
 | `frontend` | Vue 管理端与 Key 用量页，仅通过各自身份允许的控制面 API 访问状态 |
 
 依赖方向遵守四条规则：

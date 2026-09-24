@@ -1131,6 +1131,7 @@ async fn websocket_disconnect_during_core_settlement_finishes_charge_before_rele
         },
         execution,
         admin.services,
+        None,
         Vec::new(),
         Arc::new(EmptyWorkerHealth),
         lifecycle.clone(),

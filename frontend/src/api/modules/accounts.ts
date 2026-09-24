@@ -721,10 +721,53 @@ export interface TurnStatePinStatus {
   model: string
   length: number
   capturedAt: string
+  issuedAt?: string
+  issuedAtSource?: 'fernet' | 'captured'
   expiresAt: string
   hits: number
   /** account：遍历代理后钉住，对全部客户端生效；client：按客户端密钥被动捕获。 */
   scope?: 'account' | 'client'
+  source?: 'hunt' | 'passive' | 'renewal' | 'mint'
+  /** 云端打票的票所属网关节点。 */
+  gateway?: string | null
+}
+
+export interface TurnStateMintTicket {
+  model: string
+  length: number
+  servedModel?: string | null
+  expiresAt: string
+}
+
+export interface TurnStateMintReport {
+  gateway: string | null
+  attempts: number
+  observeOnly: boolean
+  pairWritten: boolean
+  tickets: TurnStateMintTicket[]
+}
+
+export interface TurnStateCloudMintStatus {
+  enabled: boolean
+  last: {
+    at: string
+    ok: boolean
+    gateway: string | null
+    attempts: number
+    tickets: TurnStateMintTicket[]
+    pairWritten: boolean
+    error: string | null
+  } | null
+}
+
+/** 云端打票：向 relay 铸票并钉住；models 省略时按 turn-state 设置里的模型列表。 */
+export function mintAccountTurnState(data: { accountId: string, models?: string[] }) {
+  return request<TurnStateMintReport>({
+    url: '/api/admin/accounts/mint-turn-state',
+    method: 'POST',
+    data,
+    timeout: 200_000,
+  })
 }
 
 export interface TurnStateHuntProxy {
@@ -814,6 +857,7 @@ export interface TurnStateAutoHunt {
 
 export interface OAuthStateConfiguration {
   guanlanReviveAvailable?: boolean
+  cloudMint?: TurnStateCloudMintStatus | null
   pinTurnState: boolean
   turnStateAutoHunt?: TurnStateAutoHunt | null
   turnStatePins: TurnStatePinStatus[]

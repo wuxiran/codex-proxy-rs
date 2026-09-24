@@ -141,6 +141,7 @@ pub enum CodexProviderConfigError {
 
 pub struct CodexProvider {
     turn_state_pins: crate::turn_state_pin::TurnStatePins,
+    cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -207,6 +208,7 @@ impl CodexProvider {
             search_url,
             session_identity: None,
             turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
+            cloud_mint: None,
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             invalid_encrypted_content: InvalidEncryptedContentCache::default(),
             stream_max_retries,
@@ -218,6 +220,14 @@ impl CodexProvider {
         pins: crate::turn_state_pin::TurnStatePins,
     ) -> Self {
         self.turn_state_pins = pins;
+        self
+    }
+
+    pub(crate) fn with_cloud_mint(
+        mut self,
+        service: Arc<crate::turn_state_mint::CloudMintService>,
+    ) -> Self {
+        self.cloud_mint = Some(service);
         self
     }
 
@@ -664,6 +674,7 @@ impl Provider for CodexProvider {
             .with_authentication(lease.authentication());
         let events = cold_response_stream(ColdResponse {
             turn_state_pins: self.turn_state_pins.clone(),
+            cloud_mint: self.cloud_mint.clone(),
             client,
             response_origin: self.responses_url.clone(),
             request: upstream_request,

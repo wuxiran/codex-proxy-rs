@@ -1,12 +1,16 @@
 // 直接测试生产缓存的时钟边界，不为测试扩大 Provider 的公开 API。
+// 生产壳里给 lib.rs/admin.rs 用的构造与访问器在这里用不到。
 #[path = "../src/turn_state_pin.rs"]
+#[allow(dead_code, unused_imports)]
 mod implementation;
 
-use implementation::{CaptureRule, MAX_PIN_AGE, PinRejected, TurnStatePins, credential_binding};
+use implementation::{CaptureRule, PinRejected, TurnStatePins, credential_binding};
 use std::time::{Duration, SystemTime};
 
 /// 多数用例不关心出口；账号级 state 与请求走同一个出口。
 const EGRESS: &str = "egress-a";
+/// 默认模板寿命（运行设置未改时）。
+const MAX_PIN_AGE: Duration = turn_state::DEFAULT_TTL;
 
 #[test]
 fn pins_require_success_are_immutable_and_expire_without_sliding() {
@@ -20,6 +24,7 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     failed.observe(Some(&"f".repeat(292)));
@@ -32,6 +37,7 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     // 长度门已废弃：太短(<MIN)的票据仍不予捕获。
@@ -48,6 +54,7 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
         "client",
         292,
         EGRESS,
+        None,
         later,
     );
     assert_eq!(second.value(), Some("a".repeat(292).as_str()));
@@ -66,6 +73,7 @@ fn pins_require_success_are_immutable_and_expire_without_sliding() {
             "client",
             292,
             EGRESS,
+            None,
             now + MAX_PIN_AGE
         )
         .value()
@@ -85,6 +93,7 @@ fn pins_separate_account_model_client_and_credential_and_can_be_cleared() {
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     first.observe(Some(&"a".repeat(292)));
@@ -107,7 +116,7 @@ fn pins_separate_account_model_client_and_credential_and_can_be_cleared() {
         ),
     ] {
         assert!(
-            pins.attempt(account, epoch, model, client, 292, EGRESS, now)
+            pins.attempt(account, epoch, model, client, 292, EGRESS, None, now)
                 .value()
                 .is_none()
         );
@@ -129,6 +138,7 @@ fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expi
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     let mut second = pins.attempt(
@@ -138,6 +148,7 @@ fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expi
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     first.observe(Some(&"a".repeat(292)));
@@ -152,6 +163,7 @@ fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expi
             "client",
             292,
             EGRESS,
+            None,
             now
         )
         .value(),
@@ -164,6 +176,7 @@ fn concurrent_successes_choose_one_candidate_and_long_requests_cannot_renew_expi
         "client",
         292,
         EGRESS,
+        None,
         now,
     );
     late.observe(Some(&"c".repeat(292)));
@@ -187,6 +200,7 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             "client-a",
             332,
             EGRESS,
+            None,
             now,
         );
         own.observe(Some(&"o".repeat(332)));
@@ -214,6 +228,7 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
                 client,
                 332,
                 EGRESS,
+                None,
                 now
             )
             .value(),
@@ -228,6 +243,7 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             "client-a",
             332,
             EGRESS,
+            None,
             now
         )
         .value(),
@@ -241,6 +257,7 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             "client-b",
             332,
             EGRESS,
+            None,
             now
         )
         .value()
@@ -256,7 +273,7 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             .iter()
             .any(|pin| pin.model == "terra" && !pin.account_wide)
     );
-    // 换凭据或换长度规则后账号级 state 同样不可见。
+    // 换凭据后账号级 state 不可见；长度规则已废弃，不同长度参数落在同一作用域。
     assert!(
         pins.attempt(
             "account",
@@ -265,15 +282,16 @@ fn account_wide_pin_serves_every_client_and_replaces_only_that_model() {
             "c",
             332,
             EGRESS,
+            None,
             now
         )
         .value()
         .is_none()
     );
     assert!(
-        pins.attempt("account", binding, "astra", "c", 356, EGRESS, now)
+        pins.attempt("account", binding, "astra", "c", 356, EGRESS, None, now)
             .value()
-            .is_none()
+            .is_some()
     );
 }
 
@@ -294,17 +312,17 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
     )
     .unwrap();
     assert_eq!(
-        pins.account_wide_captured_at("account", "binding", "astra", 332, EGRESS, now),
-        Some(now)
+        pins.account_wide_expires_at("account", "binding", "astra", EGRESS, now),
+        Some(now + MAX_PIN_AGE)
     );
     assert!(
-        pins.account_wide_captured_at("account", "binding", "terra", 332, EGRESS, now)
+        pins.account_wide_expires_at("account", "binding", "terra", EGRESS, now)
             .is_none()
     );
-    // 长度规则变了的旧 state 对续期来说等于没有。
-    assert!(
-        pins.account_wide_captured_at("account", "binding", "astra", 356, EGRESS, now)
-            .is_none()
+    // 到期以模板自身为准：捕获时刻 + 默认 TTL。
+    assert_eq!(
+        pins.account_wide_expires_at("account", "binding", "astra", EGRESS, now),
+        Some(now + MAX_PIN_AGE)
     );
     let later = now + Duration::from_secs(3599);
     let mut reuse = pins.attempt(
@@ -314,6 +332,7 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
         "client",
         332,
         EGRESS,
+        None,
         later,
     );
     assert_eq!(reuse.value(), Some(hunted.as_str()));
@@ -329,6 +348,7 @@ fn account_wide_fallback_never_creates_client_pins_and_keeps_fixed_lifetime() {
             "client",
             332,
             EGRESS,
+            None,
             now + MAX_PIN_AGE
         )
         .value()
@@ -349,6 +369,7 @@ fn request_in_flight_during_a_hunt_cannot_shadow_the_account_wide_pin() {
         "client",
         332,
         EGRESS,
+        None,
         now,
     );
     assert!(in_flight.value().is_none());
@@ -375,6 +396,7 @@ fn request_in_flight_during_a_hunt_cannot_shadow_the_account_wide_pin() {
             "client",
             332,
             EGRESS,
+            None,
             now
         )
         .value(),
@@ -407,6 +429,7 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
             "client",
             332,
             EGRESS,
+            None,
             now
         )
         .value(),
@@ -420,13 +443,14 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
             "client",
             332,
             "egress-b",
+            None,
             now
         )
         .value()
         .is_none()
     );
     assert!(
-        pins.account_wide_captured_at("account", "binding", "astra", 332, "egress-b", now)
+        pins.account_wide_expires_at("account", "binding", "astra", "egress-b", now)
             .is_none()
     );
     assert_ne!(
@@ -441,6 +465,7 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
         "client",
         332,
         "egress-b",
+        None,
         now,
     );
     on_new_egress.observe(Some(&"n".repeat(332)));
@@ -453,6 +478,7 @@ fn account_wide_pin_is_only_used_on_the_egress_it_was_observed_on() {
             "client",
             332,
             "egress-b",
+            None,
             now
         )
         .value(),
@@ -529,6 +555,7 @@ fn capture_rule_is_uniform_and_length_gate_is_a_floor() {
             "client",
             expected,
             EGRESS,
+            None,
             now,
         );
         attempt.observe(Some(&"s".repeat(length)));
@@ -543,4 +570,109 @@ fn capture_rule_is_uniform_and_length_gate_is_a_floor() {
             assert!(status.is_empty(), "len={length} should not pin");
         }
     }
+}
+
+fn repeat(n: usize) -> String {
+    "a".repeat(n)
+}
+
+#[test]
+fn accepts_780_ticket_and_reads_back_on_same_egress() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let value = repeat(780);
+    assert!(
+        pins.pin_account_wide(
+            "acct",
+            "bind".into(),
+            "gpt-6-astra",
+            0,
+            "egr".into(),
+            &value,
+            now,
+            now,
+        )
+        .is_ok()
+    );
+    let attempt = pins.attempt(
+        "acct",
+        "bind".into(),
+        "gpt-6-astra",
+        "cli",
+        0,
+        "egr",
+        None,
+        now,
+    );
+    assert_eq!(attempt.value(), Some(value.as_str()));
+}
+
+#[test]
+fn accepts_legacy_lengths() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    for len in [292usize, 332, 356] {
+        assert!(
+            pins.pin_account_wide("a", "b".into(), "m", 0, "e".into(), &repeat(len), now, now)
+                .is_ok(),
+            "len {len} should pin"
+        );
+    }
+}
+
+#[test]
+fn rejects_too_short_and_non_ascii() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    assert!(matches!(
+        pins.pin_account_wide("a", "b".into(), "m", 0, "e".into(), &repeat(100), now, now),
+        Err(PinRejected::Length)
+    ));
+    let non_ascii = "\u{00e9}".repeat(300);
+    assert!(matches!(
+        pins.pin_account_wide("a", "b".into(), "m", 0, "e".into(), &non_ascii, now, now),
+        Err(PinRejected::Length)
+    ));
+}
+
+/// 客户端带着受限档 state 而桶里有模板：默认 `always` 模式直接换掉；被动捕获不因此改变。
+#[test]
+fn carried_state_is_replaced_by_the_account_wide_pin() {
+    let pins = TurnStatePins::default();
+    let now = SystemTime::now();
+    let hunted = "h".repeat(332);
+    pins.pin_account_wide(
+        "account",
+        "binding".into(),
+        "astra",
+        0,
+        EGRESS.into(),
+        &hunted,
+        now,
+        now,
+    )
+    .unwrap();
+    let carried = "c".repeat(312);
+    let attempt = pins.attempt(
+        "account",
+        "binding".into(),
+        "astra",
+        "client",
+        0,
+        EGRESS,
+        Some(&carried),
+        now,
+    );
+    assert_eq!(attempt.value(), Some(hunted.as_str()));
+    let same = pins.attempt(
+        "account",
+        "binding".into(),
+        "astra",
+        "client",
+        0,
+        EGRESS,
+        Some(&hunted),
+        now,
+    );
+    assert!(same.value().is_none());
 }

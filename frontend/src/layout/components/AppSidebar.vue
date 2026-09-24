@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {
+  Activity,
   ArrowUpCircle,
   ChartNoAxesColumn,
   FlaskConical,
@@ -72,6 +73,7 @@ const navItems = [
   { label: '经营日报', icon: TrendingUp, path: '/ops-report' },
   { label: '请求日志', icon: ScrollText, path: '/logs' },
   { label: '测智台', icon: FlaskConical, path: '/testbench' },
+  { label: 'state 观测', icon: Activity, path: '/turn-state' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
 ]

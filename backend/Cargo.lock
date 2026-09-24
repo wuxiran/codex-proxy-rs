@@ -1500,6 +1500,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "turn-state",
  "url",
  "uuid",
  "zstd",
@@ -2773,6 +2774,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite 0.27.0",
+ "turn-state",
  "url",
  "uuid",
  "wiremock",
@@ -4297,6 +4299,21 @@ dependencies = [
  "rand 0.9.4",
  "sha1 0.10.7",
  "thiserror",
+]
+
+[[package]]
+name = "turn-state"
+version = "0.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

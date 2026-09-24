@@ -21,7 +21,12 @@ pub(super) const MODEL_ETAG_WORKER_OWNER: &str = "openai-model-etag";
 pub(super) const MODEL_CATALOG_WORKER_OWNER: &str = "openai-model-catalog";
 pub(super) const OAUTH_REVIVE_WORKER_OWNER: &str = "openai-oauth-revive";
 pub(super) const OAUTH_REVIVE_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const CLOUD_MINT_WORKER_OWNER: &str = "openai-cloud-mint";
+/// 票只有 ~240s，续打要比到期余量（60s）扫得更勤。
+pub(super) const CLOUD_MINT_INTERVAL: Duration = Duration::from_secs(20);
 
+// 每个参数都是独立注入的服务，打包成结构体只会多一层无意义的搬运。
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn worker_contributions(
     refresh: Arc<CodexCredentialRefreshService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -30,6 +35,7 @@ pub(crate) fn worker_contributions(
     oauth_refresh_enabled: bool,
     releases: ClientReleaseServices,
     revive: Arc<crate::credential::CodexReviveService>,
+    cloud_mint: Arc<crate::turn_state_mint::CloudMintService>,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -54,6 +60,13 @@ pub(crate) fn worker_contributions(
             Box::new(OpenAiOAuthReviveTask { service: revive }),
         )?));
     }
+    contributions.push(WorkerContribution::Registration(scheduled_registration(
+        WorkerId::try_new(WorkerKind::QuotaCatalogHealth, CLOUD_MINT_WORKER_OWNER)?,
+        CLOUD_MINT_INTERVAL,
+        Box::new(OpenAiCloudMintTask {
+            service: cloud_mint,
+        }),
+    )?));
     contributions.extend([
         WorkerContribution::Registration(scheduled_registration(
             WorkerId::try_new(
@@ -232,6 +245,26 @@ impl ScheduledTask for OpenAiOAuthReviveTask {
                     Err(WorkerTaskError::safe("OpenAI 401 revive failed"))
                 }
             }
+        })
+    }
+}
+
+/// 云端打票续打：设置未开启时每轮直接空转。
+pub(super) struct OpenAiCloudMintTask {
+    service: Arc<crate::turn_state_mint::CloudMintService>,
+}
+
+impl ScheduledTask for OpenAiCloudMintTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            if context.cancellation().is_cancelled() {
+                return Ok(());
+            }
+            let minted = self.service.renew_cycle().await;
+            if minted > 0 {
+                tracing::info!(target: "turn_state", minted, "[turn-state] mint renew cycle");
+            }
+            Ok(())
         })
     }
 }

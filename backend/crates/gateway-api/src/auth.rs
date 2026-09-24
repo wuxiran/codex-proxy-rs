@@ -24,6 +24,11 @@ use crate::{
 /// 控制面 HTTP adapter 消费同一组用例；权限由各入口服务端校验。
 pub trait SessionState {
     fn admin_services(&self) -> &AdminServices;
+
+    /// turn-state 模板/设置/观测服务；未注入时相关管理路由回 503。
+    fn turn_state(&self) -> Option<&turn_state::TurnStateService> {
+        None
+    }
 }
 
 #[derive(Deserialize)]

@@ -6,6 +6,7 @@ pub mod config;
 mod provider;
 mod session_transport;
 mod turn_state_auto_hunt;
+mod turn_state_mint;
 mod turn_state_pin;
 
 use std::sync::Arc;
@@ -50,6 +51,7 @@ pub struct ProviderBundle {
     core_provider: Arc<dyn Provider>,
     admin_provider: Arc<dyn ProviderAdmin>,
     worker_contributions: Vec<WorkerContribution>,
+    turn_state_service: turn_state::TurnStateService,
 }
 
 /// 构造 OpenAI 数据面、Provider-owned 后台任务与 Redis OAuth pending owner。
@@ -166,9 +168,21 @@ pub async fn initialize(
         session_exclusions,
         Arc::clone(&quota),
         Arc::clone(&account_feedback),
-        CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
+        CodexCookiePolicy::official()
+            .map_err(|_| OpenAiInitializeError::CookiePolicy)?
+            .with_loopback_upstream(config.base_url()),
     ));
-    let turn_state_pins = crate::turn_state_pin::TurnStatePins::default();
+    // 模板落在运行数据目录（与 auto_hunt.json 同目录），蓝绿实例共享、重启不丢。
+    let turn_state_service = turn_state::TurnStateService::open(config.turn_state_data_dir())
+        .map_err(|_| OpenAiInitializeError::Transport)?;
+    let turn_state_pins =
+        crate::turn_state_pin::TurnStatePins::from_service(turn_state_service.clone());
+    let cloud_mint = Arc::new(turn_state_mint::CloudMintService::new(
+        repository.clone(),
+        turn_state_pins.clone(),
+        profile.clone(),
+        config.base_url(),
+    ));
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,
@@ -183,7 +197,8 @@ pub async fn initialize(
         )
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
-        .with_turn_state_pins(turn_state_pins.clone()),
+        .with_turn_state_pins(turn_state_pins.clone())
+        .with_cloud_mint(Arc::clone(&cloud_mint)),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -266,6 +281,7 @@ pub async fn initialize(
             desktop_release_status,
         )
         .with_turn_state_pins(turn_state_pins)
+        .with_cloud_mint(Arc::clone(&cloud_mint))
         .with_ticket_login(ticket_login)
         .with_auto_hunt_store(
             turn_state_auto_hunt::AutoHuntStore::new(config.turn_state_data_dir().to_path_buf())
@@ -284,6 +300,7 @@ pub async fn initialize(
             platforms: platform_releases,
         },
         revive,
+        cloud_mint,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
 
@@ -291,6 +308,7 @@ pub async fn initialize(
         core_provider,
         admin_provider,
         worker_contributions,
+        turn_state_service,
     })
 }
 
@@ -303,6 +321,12 @@ impl ProviderBundle {
     #[must_use]
     pub fn admin_provider(&self) -> Arc<dyn ProviderAdmin> {
         Arc::clone(&self.admin_provider)
+    }
+
+    /// turn-state 模板/设置/观测服务；组装根把它交给管理端 HTTP adapter，不经过 ProviderAdmin。
+    #[must_use]
+    pub fn turn_state_service(&self) -> turn_state::TurnStateService {
+        self.turn_state_service.clone()
     }
 
     /// 一次性移交 Host 任务计划，防止同一 owner 被重复注册。

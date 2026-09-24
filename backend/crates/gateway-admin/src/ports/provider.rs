@@ -174,6 +174,24 @@ pub struct TurnStateRenewal {
     pub include_direct: bool,
 }
 
+/// 云端打票结果；不含票值与 cookie 值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateMintReport {
+    pub gateway: Option<String>,
+    pub attempts: u64,
+    pub observe_only: bool,
+    pub pair_written: bool,
+    pub tickets: Vec<TurnStateMintTicket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStateMintTicket {
+    pub model: String,
+    pub length: usize,
+    pub served_model: Option<String>,
+    pub expires_at: SystemTime,
+}
+
 /// 单次探测观测到的 state 形状；不含 state 值。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnStateHuntObservation {
@@ -409,6 +427,15 @@ pub trait ProviderAdmin: Send + Sync {
         account_id: &ProviderAccountId,
         refresh: bool,
     ) -> Result<ProviderModels, ProviderAdminError>;
+
+    /// 云端打票：向 relay 铸票并钉住；不支持的 Provider 使用默认拒绝。
+    async fn mint_turn_state(
+        &self,
+        _account_id: &ProviderAccountId,
+        _models: Vec<String>,
+    ) -> Result<TurnStateMintReport, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
 
     async fn export_credentials(
         &self,

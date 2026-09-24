@@ -538,6 +538,7 @@ const {
       :saving="savingAccountEdit"
       @turn-state-hunted="afterTurnStateHunt"
       @turn-state-hunt-cancelled="afterTurnStateHuntCancelled"
+      @turn-state-minted="afterTurnStateHuntCancelled"
       @stop-turn-state-auto-hunt="stopTurnStateAutoHunt"
       @save="saveAccountEdit"
     />

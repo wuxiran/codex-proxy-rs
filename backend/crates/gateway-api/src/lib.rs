@@ -125,6 +125,7 @@ pub fn initialize(
     mut config: ApiConfig,
     execution: Arc<dyn ExecutionService>,
     admin: AdminServices,
+    turn_state: Option<turn_state::TurnStateService>,
     probes: Vec<Arc<dyn HealthProbe>>,
     worker_health: Arc<dyn WorkerHealthSource>,
     lifecycle: Arc<dyn ConnectionLifecycle>,
@@ -135,6 +136,7 @@ pub fn initialize(
         .map_err(|_| ApiError::Config(ApiConfigError::InvalidRequestIdHeader))?;
     let state = ApiState {
         admin,
+        turn_state,
         openai: OpenAiService::new(execution, lifecycle),
         health: HealthStatus::new(probes, worker_health),
     };
@@ -219,6 +221,7 @@ pub enum ApiError {
 #[derive(Clone)]
 pub(crate) struct ApiState {
     admin: AdminServices,
+    turn_state: Option<turn_state::TurnStateService>,
     openai: OpenAiService,
     health: HealthStatus,
 }
@@ -238,6 +241,10 @@ impl ApiState {
 impl auth::SessionState for ApiState {
     fn admin_services(&self) -> &AdminServices {
         &self.admin
+    }
+
+    fn turn_state(&self) -> Option<&turn_state::TurnStateService> {
+        self.turn_state.as_ref()
     }
 }
 

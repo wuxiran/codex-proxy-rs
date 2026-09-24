@@ -59,6 +59,10 @@ where
             post(refresh_account_models::<S>),
         )
         .route(
+            "/api/admin/accounts/mint-turn-state",
+            post(mint_account_turn_state::<S>),
+        )
+        .route(
             "/api/admin/accounts/connection-test",
             get(test_account_connection::<S>),
         )
@@ -661,6 +665,38 @@ where
         .map_err(map_service_error)?;
     let data = account_models_data(result);
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+async fn mint_account_turn_state<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<MintTurnStateRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let (account_id, models) = request.into_parts().map_err(map_wire_error)?;
+    let report = state
+        .admin_services()
+        .accounts()
+        .mint_turn_state(&account_id, models)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "gateway": report.gateway,
+            "attempts": report.attempts,
+            "observeOnly": report.observe_only,
+            "pairWritten": report.pair_written,
+            "tickets": report.tickets.iter().map(|ticket| serde_json::json!({
+                "model": ticket.model,
+                "length": ticket.length,
+                "servedModel": ticket.served_model,
+                "expiresAt": chrono::DateTime::<chrono::Utc>::from(ticket.expires_at),
+            })).collect::<Vec<_>>(),
+        })),
+    ))
 }
 
 async fn refresh_account_models<S>(

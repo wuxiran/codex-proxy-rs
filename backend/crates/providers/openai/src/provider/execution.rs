@@ -168,6 +168,7 @@ struct RawJsonEndpointRequest {
 #[derive(Clone)]
 pub(super) struct ColdResponse {
     pub(super) turn_state_pins: crate::turn_state_pin::TurnStatePins,
+    pub(super) cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -729,6 +730,7 @@ fn encrypted_recovery_prelude(event: &ProviderEvent) -> bool {
 fn cold_response_stream_once(response: ColdResponse) -> EventStream {
     let ColdResponse {
         turn_state_pins,
+        cloud_mint,
         client,
         response_origin,
         mut request,
@@ -784,14 +786,25 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             let egress = crate::turn_state_pin::egress_fingerprint(
                 active_account.outbound_proxy().map(|proxy| proxy.expose_url()),
             );
+            // 客户端自带的 state 一并交给决策：`always` 模式补上/换掉，`replace-only` 只换受限档。
             Some(turn_state_pins.attempt(
                 active_account.id().as_str(), binding, upstream_model.as_str(),
-                context.client_api_key_ref().as_str(), expected_length, &egress, SystemTime::now(),
+                context.client_api_key_ref().as_str(), expected_length, &egress,
+                request.turn_state.as_deref(), SystemTime::now(),
             ))
         } else { None };
         if let Some(value) = pin_attempt.as_ref().and_then(crate::turn_state_pin::PinAttempt::value) {
             request.turn_state = Some(value.to_owned());
             request.passthrough_headers.remove("x-codex-turn-state");
+        }
+        // 云端打票：记下活跃模型；桶里没票就后台预热一次（本次请求照常裸发，下一次带票）。
+        if let (Some(pin), Some(mint)) = (pin_attempt.as_ref(), cloud_mint.as_ref())
+            && mint.enabled()
+        {
+            mint.note_request(active_account.id().as_str(), upstream_model.as_str());
+            if pin.needs_template() {
+                mint.prefetch(active_account.id().as_str(), upstream_model.as_str());
+            }
         }
         let request_id = context.request_id().as_str().to_owned();
         let capture_request_log = context.should_capture_request_log();

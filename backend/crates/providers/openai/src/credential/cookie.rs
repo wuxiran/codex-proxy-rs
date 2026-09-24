@@ -49,9 +49,29 @@ impl CodexCookiePolicy {
                 "cf_clearance",
                 "__cf_bm",
                 "_cfuvid",
+                // 路由 cookie 对：钉住 Codex 网关节点（__oailb JWT 内嵌 unified-N），云端打票写入。
+                "__cflb",
+                "__oailb",
             ],
             ["chatgpt.com", "openai.com"],
         )
+    }
+
+    /// 本机联调：上游是回环 http 假地址时，把它加进允许域，否则 pair/`__cf_bm` 永远不会回放。
+    /// 生产上游 `https://chatgpt.com` 不是回环，策略原样不变。
+    #[must_use]
+    pub fn with_loopback_upstream(mut self, base_url: &str) -> Self {
+        if let Ok(url) = Url::parse(base_url)
+            && let Some(host) = url.host_str()
+            && (host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
+            && let Ok(domain) = normalize_domain(host)
+        {
+            self.allowed_domains.insert(domain);
+        }
+        self
     }
 
     pub fn validate_capture(

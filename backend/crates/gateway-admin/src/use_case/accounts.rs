@@ -142,6 +142,15 @@ pub trait AccountsService: Send + Sync {
         refresh: bool,
     ) -> Result<ProviderModels, AdminError>;
 
+    /// 云端打票（默认不支持）。
+    async fn mint_turn_state(
+        &self,
+        _account_id: &ProviderAccountId,
+        _models: Vec<String>,
+    ) -> Result<crate::ports::provider::TurnStateMintReport, AdminError> {
+        Err(AdminError::invalid("当前 Provider 不支持云端打票"))
+    }
+
     async fn test_connection(
         &self,
         account_id: ProviderAccountId,
@@ -1079,6 +1088,18 @@ impl AccountsService for DefaultAccountsService {
             .models(account_id, refresh)
             .await
             .map_err(|error| map_provider_error(error, "provider model catalog"))
+    }
+
+    async fn mint_turn_state(
+        &self,
+        account_id: &ProviderAccountId,
+        models: Vec<String>,
+    ) -> Result<crate::ports::provider::TurnStateMintReport, AdminError> {
+        let (_, provider) = self.provider_for_account(account_id).await?;
+        provider
+            .mint_turn_state(account_id, models)
+            .await
+            .map_err(|error| map_provider_error(error, "provider cloud mint"))
     }
 
     async fn test_connection(

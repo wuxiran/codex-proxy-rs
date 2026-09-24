@@ -24,6 +24,7 @@ pub mod public_import;
 pub mod request_log;
 pub mod settings;
 pub mod system;
+pub mod turn_state;
 pub mod wire;
 
 pub use auth::AdminAuth;
@@ -50,6 +51,7 @@ where
         .merge(request_log::router::<S>())
         .merge(settings::router::<S>())
         .merge(system::router::<S>())
+        .merge(turn_state::router::<S>())
         .method_not_allowed_fallback(method_not_allowed)
         .route("/api/admin", any(admin_not_found))
         .route("/api/admin/{*path}", any(admin_not_found))

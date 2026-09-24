@@ -733,6 +733,35 @@ impl AccountActionRequest {
     }
 }
 
+/// 云端打票请求；`models` 省略时按 turn-state 设置里的模型列表。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MintTurnStateRequest {
+    pub account_id: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+impl MintTurnStateRequest {
+    pub(super) fn into_parts(
+        self,
+    ) -> Result<(ProviderAccountId, Vec<String>), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.models.len() > 16
+            || self.models.iter().any(|model| {
+                model.trim().is_empty()
+                    || model.len() > 96
+                    || !model.bytes().all(|b| b.is_ascii_graphic())
+            })
+        {
+            return Err(WireValidationError::new("models"));
+        }
+        let account_id = ProviderAccountId::new(self.account_id)
+            .map_err(|_| WireValidationError::new("accountId"))?;
+        Ok((account_id, self.models))
+    }
+}
+
 /// 主动额度重置卡消费请求。幂等键由 UI 生成并在不确定重试时复用，与官方一致。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

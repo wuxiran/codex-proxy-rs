@@ -30,7 +30,7 @@ use gateway_admin::model::provider_credentials::{
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
 use gateway_admin::ports::provider::{
     ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind, TurnStateHuntObservation,
-    TurnStateHuntTicket, TurnStateRenewal,
+    TurnStateHuntTicket, TurnStateMintReport, TurnStateMintTicket, TurnStateRenewal,
 };
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
@@ -90,6 +90,7 @@ pub(crate) struct OpenAiAdminProvider {
     websocket_pool: Arc<CodexWebSocketPool>,
     desktop_release: CodexDesktopReleaseStatus,
     ticket_login: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
+    cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
 }
 
 pub(crate) struct OpenAiAdminServices {
@@ -124,7 +125,16 @@ impl OpenAiAdminProvider {
             websocket_pool,
             desktop_release,
             ticket_login: None,
+            cloud_mint: None,
         }
+    }
+
+    pub(crate) fn with_cloud_mint(
+        mut self,
+        service: Arc<crate::turn_state_mint::CloudMintService>,
+    ) -> Self {
+        self.cloud_mint = Some(service);
+        self
     }
 
     pub(crate) fn with_ticket_login(
@@ -918,29 +928,27 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 continue;
             };
             // 套餐规则里没有这个模型时，遍历本身就会被拒绝，不必进续期队列。
-            let Some(expected_length) =
-                crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
-                    .expected_length(&auto.model)
-            else {
+            if crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                .expected_length(&auto.model)
+                .is_none()
+            {
                 continue;
-            };
+            }
             let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
+            // 到期按模板自身（签发时间 + TTL）算，不再按捕获时刻推。
             let fresh = self
                 .turn_state_pins
-                .account_wide_captured_at(
+                .account_wide_expires_at(
                     account.id().as_str(),
                     &binding,
                     &auto.model,
-                    expected_length,
                     // 账号改绑到别的出口后，旧出口上的 state 不再生效，要在新出口上重新找。
                     &crate::turn_state_pin::egress_fingerprint(
                         account.outbound_proxy().map(|proxy| proxy.expose_url()),
                     ),
                     now,
                 )
-                .is_some_and(|captured_at| {
-                    captured_at + crate::turn_state_pin::MAX_PIN_AGE > now + margin
-                });
+                .is_some_and(|expires_at| expires_at > now + margin);
             if !fresh {
                 due.push(TurnStateRenewal {
                     account_id: account.id().clone(),
@@ -983,14 +991,52 @@ impl ProviderAdmin for OpenAiAdminProvider {
             )
             .map_err(|rejected| {
                 provider_admin_error(match rejected {
-                    crate::turn_state_pin::PinRejected::Full => ProviderAdminErrorKind::Unavailable,
+                    crate::turn_state_pin::PinRejected::Full
+                    | crate::turn_state_pin::PinRejected::Io => ProviderAdminErrorKind::Unavailable,
                     crate::turn_state_pin::PinRejected::Length
-                    | crate::turn_state_pin::PinRejected::Expired => {
+                    | crate::turn_state_pin::PinRejected::Expired
+                    | crate::turn_state_pin::PinRejected::FutureStamped => {
                         ProviderAdminErrorKind::Invalid
                     }
                 })
+            })
+    }
+
+    async fn mint_turn_state(
+        &self,
+        account_id: &ProviderAccountId,
+        models: Vec<String>,
+    ) -> Result<TurnStateMintReport, ProviderAdminError> {
+        let Some(mint) = self.cloud_mint.as_ref() else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        };
+        self.account(account_id).await?;
+        let report = mint
+            .mint_account(account_id.as_str(), models)
+            .await
+            .map_err(|error| {
+                use crate::turn_state_mint::MintError;
+                let kind = match error {
+                    MintError::Disabled => ProviderAdminErrorKind::Unsupported,
+                    MintError::NotEligible => ProviderAdminErrorKind::Invalid,
+                    MintError::Busy | MintError::CoolingDown => ProviderAdminErrorKind::Conflict,
+                    MintError::Unreachable
+                    | MintError::Rejected
+                    | MintError::InvalidResponse
+                    | MintError::Store => ProviderAdminErrorKind::Unavailable,
+                };
+                provider_admin_error(kind).with_public_message(match error {
+                    MintError::Disabled => "云端打票未启用，请先在「state 观测」页配置",
+                    MintError::NotEligible => "只有已启用「固定自身 state」的 OAuth 账号能打票",
+                    MintError::Busy => "该账号正在打票中",
+                    MintError::CoolingDown => "上次打票失败，冷却中",
+                    MintError::Unreachable => "relay 不可达",
+                    MintError::Rejected => "relay 没有铸出符合条件的票",
+                    MintError::InvalidResponse => "relay 响应不合法",
+                    MintError::Store => "凭据写入失败",
+                })
             })?;
-        Ok(captured_at + crate::turn_state_pin::MAX_PIN_AGE)
+        Ok(mint_report_view(&report))
     }
 
     async fn account_configuration(
@@ -1023,16 +1069,24 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     })
                     .unwrap_or_default();
                 // 长度门已废弃：展示判据改为下限，不再按写死长度过滤（rule 仍用于 turnStateCaptureRule 展示）。
-                let pins = pins.into_iter()
+                let pins = pins
+                    .into_iter()
                     .filter(|pin| pin.length >= crate::turn_state_pin::MIN_TURN_STATE_LEN)
-                    .map(|pin| serde_json::json!({
-                    "model": pin.model,
-                    "length": pin.length,
-                    "capturedAt": DateTime::<Utc>::from(pin.captured_at),
-                    "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
-                    "hits": pin.hits,
-                    "scope": if pin.account_wide { "account" } else { "client" },
-                })).collect::<Vec<_>>();
+                    .map(|pin| {
+                        serde_json::json!({
+                            "model": pin.model,
+                            "length": pin.length,
+                            "capturedAt": DateTime::<Utc>::from(pin.captured_at),
+                            "gateway": pin.gateway,
+                            "issuedAt": DateTime::<Utc>::from(pin.issued_at),
+                            "issuedAtSource": pin.issued_at_source,
+                            "expiresAt": DateTime::<Utc>::from(pin.expires_at),
+                            "hits": pin.hits,
+                            "scope": if pin.account_wide { "account" } else { "client" },
+                            "source": pin.source,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 let guanlan_revive_available = self.credentials.revive_service()
                     .map(|service| service.supports_account(&current.account))
                     .transpose()
@@ -1040,8 +1094,29 @@ impl ProviderAdmin for OpenAiAdminProvider {
                         tracing::warn!(error = %error, "Guanlan revival availability could not be read");
                         None
                     }).unwrap_or(false);
+                let cloud_mint = self.cloud_mint.as_ref().map(|mint| {
+                    serde_json::json!({
+                        "enabled": mint.enabled(),
+                        "last": mint.last_report(account_id.as_str()).map(|report| {
+                            let view = mint_report_view(&report);
+                            serde_json::json!({
+                                "at": DateTime::<Utc>::from(report.at),
+                                "ok": report.ok,
+                                "gateway": view.gateway,
+                                "attempts": view.attempts,
+                                "tickets": view.tickets.iter().map(|t| serde_json::json!({
+                                    "model": t.model, "length": t.length,
+                                    "expiresAt": DateTime::<Utc>::from(t.expires_at),
+                                })).collect::<Vec<_>>(),
+                                "pairWritten": view.pair_written,
+                                "error": report.error,
+                            })
+                        }),
+                    })
+                });
                 let value = serde_json::json!({
                     "guanlanReviveAvailable": guanlan_revive_available,
+                    "cloudMint": cloud_mint,
                     "pinTurnState": data.turn_state_pin.is_some(),
                     // 续期只对开启中的固定有意义；固定关着时即便文件里有残留也不展示、不续期。
                     "turnStateAutoHunt": data.turn_state_pin.as_ref().and_then(|_| self.auto_hunt.get(account_id.as_str())).map(|auto| serde_json::json!({
@@ -1051,7 +1126,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     })),
                     "turnStatePins": pins,
                     "turnStateCaptureRule": rule,
-                    "maxAgeSeconds": crate::turn_state_pin::MAX_PIN_AGE.as_secs(),
+                    "maxAgeSeconds": self.turn_state_pins.service().ttl().as_secs(),
                 });
                 return Ok(Some(ProviderDocument::new(OpaqueProviderData::new(
                     value
@@ -2104,6 +2179,25 @@ fn decode_mutation(
 
 fn binding(value: &str) -> Result<OAuthPendingBinding, CodexOAuthPendingStoreError> {
     OAuthPendingBinding::try_new(value.to_owned()).map_err(map_pending_store_error)
+}
+
+fn mint_report_view(report: &crate::turn_state_mint::MintReport) -> TurnStateMintReport {
+    TurnStateMintReport {
+        gateway: report.gateway.clone(),
+        attempts: report.attempts,
+        observe_only: report.observe_only,
+        pair_written: report.pair_written,
+        tickets: report
+            .tickets
+            .iter()
+            .map(|ticket| TurnStateMintTicket {
+                model: ticket.model.clone(),
+                length: ticket.length,
+                served_model: ticket.served_model.clone(),
+                expires_at: ticket.expires_at,
+            })
+            .collect(),
+    }
 }
 
 /// 上游最新返回的 turn state。仅在进程内用于判长和钉住，绝不序列化或落日志。

@@ -439,6 +439,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `POST` | `/api/admin/accounts/reset-credits` | `{ accountId, creditId?, redeemRequestId }` | 使用 UUIDv4 幂等键消费一张 OpenAI 上游重置卡 |
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
+| `POST` | `/api/admin/accounts/mint-turn-state` | `{ accountId, models? }` | 云端打票：向 relay 铸票并钉成账号级 state、把路由 cookie 对写进凭据；`models` 省略时用 turn-state 设置里的列表。返回 `{ gateway, attempts, observeOnly, pairWritten, tickets:[{model,length,servedModel,expiresAt}] }`，不含票值 |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
 | `GET` | `/api/admin/accounts/turn-state-hunt` | `accountId`、`modelId`、`attempts`（1–200，默认 5）、`includeDirect`、`proxyId`（可选，只遍历这一个代理） | 通过 SSE 遍历已测试通过的代理找符合长度规则的 state；命中后绑定该代理并钉住 state |
 | `GET` | `/api/admin/accounts/turn-state-auto-hunt` | `accountId`、`modelId`、`templateProxyId`（轮换代理模板）、`countries`（逗号，US/JP/DE/PH）、`staticProxyIds`（逗号）、`maxIps`（1–2000） | 从轮换代理模板即时生成多国临时出口反复撞（每个 IP 打 1 次），命中后改绑到静态池里账号数最少的出口、并按该静态出口的指纹钉住 state；事件形状与 `turn-state-hunt` 一致 |
@@ -1620,3 +1621,18 @@ Key 已删除或未关联时为 `null`，不影响记录返回，不包含密钥
 Host 关闭或任务取消会记录失败终态；状态查询会收敛无执行锁的遗留 `running`。
 异常退出留下的锁仍遵循 30 分钟过期规则，未过期前不会抢占其他进程的操作。
 实例升级和仓库发版见 [部署文档](../deploy/README.md#镜像升级与源码构建)。
+
+## turn-state 模板与观测
+
+`turn_state` crate 承载 Codex `X-Codex-Turn-State` 模板（按账号 × 模型分桶，落 `<runtime_data_dir>/turn_state/`，蓝绿实例共享）。管理接口只用 GET/POST 静态路径，票值永不返回。
+
+| 方法 | 路径 | 请求 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/admin/turn-state/settings` | 无 | 运行设置；`cloudMint.relayKey` 只回 `<set>`/空 |
+| `POST` | `/api/admin/turn-state/settings/update` | 全部字段 + 可选 `cloudMint` | 整体替换并热生效；`cloudMint` 省略时保留现值，`relayKey` 为 `<set>` 时沿用已保存密钥；模板/受限长度表不能重叠 |
+| `GET` | `/api/admin/turn-state/observations` | 无 | 按桶的正常/受限/未知/沉默与注入盲区计数、48 小时分时、长度直方图、最近 100 条事件 |
+| `GET` | `/api/admin/turn-state/buckets` | `account?`、`model?` | 有效模板摘要（范围、长度、签发/到期、来源、网关、命中），不含值 |
+| `POST` | `/api/admin/turn-state/buckets/clear` | `{ account, model? }` | 清除模板（内存与磁盘） |
+
+设置字段：`ttlSeconds`（600–86400）、`injectMode`（`always` 有模板就注入；`replace-only` 只替换受限档长度的 state）、`dryRun`、`logDecisions`、`templateLengths`、`degradedLengths`（空表 = ≥200 字节可见 ASCII 下限规则）、`cloudMint { enabled, mode, observeOnly, relayUrl, relayKey, proxyUrl, gateway, ticketLen, ticketTtlSeconds, models, transport, cooldownSeconds, maxAttempts }`。
+`mode=native`（默认）由 cpr 经账号绑定的代理直接向上游铸票（出口 = 该代理 IP），验收票长、`__oailb` 内嵌网关名与 `response.created` 的模型声明；`mode=relay` 交给 `deploy/cloud-mint/` 的 relay（出口 = relay 所在机器）；账号缺票时请求侧异步预热一次，后台每 20 秒对最近 10 分钟有流量的账号在票剩余不足 60 秒时续打。

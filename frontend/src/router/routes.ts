@@ -73,6 +73,11 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/testbench/index.vue'),
       },
       {
+        path: 'turn-state',
+        name: 'turn-state',
+        component: () => import('@/views/turn-state/index.vue'),
+      },
+      {
         path: 'theme',
         name: 'theme',
         component: () => import('@/views/theme/index.vue'),

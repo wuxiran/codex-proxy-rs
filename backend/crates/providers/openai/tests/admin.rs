@@ -76,7 +76,8 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     let contributions = bundle.take_worker_contributions();
     // 8 = 6 个无条件 worker + oauth 刷新 + 观澜自动复活（revive 默认开启后随之注册）。
     // 上游把客户端发布类 worker 拆成多个（7），我方在其上再加 revive（+1）。
-    assert_eq!(contributions.len(), 8);
+    // +1 云端打票续打 worker（设置未开启时空转）。
+    assert_eq!(contributions.len(), 9);
 
     assert!(
         contributions
