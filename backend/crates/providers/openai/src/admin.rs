@@ -361,6 +361,15 @@ impl ProviderAdmin for OpenAiAdminProvider {
         build_connection_test_operation(upstream_model, input_text)
     }
 
+    fn test_bench_operation(
+        &self,
+        upstream_model: &UpstreamModelId,
+        input_text: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Operation, ProviderAdminError> {
+        build_test_bench_operation(upstream_model, input_text, reasoning_effort)
+    }
+
     fn dashboard_wire_profile(&self) -> Option<DashboardWireProfile> {
         let profile = self.profile.snapshot();
         let release = self.desktop_release.snapshot();
@@ -2127,6 +2136,45 @@ fn build_connection_test_operation(
             "content": [{"type": "input_text", "text": input_text}]
         }]),
     );
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    let payload = ProtocolPayload::json_object("openai", body)
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(Operation::Generate(GenerateRequest::from_protocol_payload(
+        payload,
+    )))
+}
+
+/// 测智台 operation：自定义 prompt + 可选 reasoning.effort。effort 只接受已知白名单值，
+/// 交由上游最终裁定是否生效（前端展示以实际观测为准，不把用户选择当已被接受）。
+fn build_test_bench_operation(
+    upstream_model: &UpstreamModelId,
+    input_text: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Operation, ProviderAdminError> {
+    let mut body = Map::new();
+    body.insert(
+        "model".to_owned(),
+        Value::String(upstream_model.as_str().to_owned()),
+    );
+    body.insert(
+        "input".to_owned(),
+        serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": input_text}]
+        }]),
+    );
+    if let Some(effort) = reasoning_effort {
+        let effort = effort.trim();
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        body.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({ "effort": effort }),
+        );
+    }
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
     let payload = ProtocolPayload::json_object("openai", body)

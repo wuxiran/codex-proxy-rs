@@ -822,6 +822,53 @@ impl AccountTestQuery {
     }
 }
 
+/// 测智台单账号测试请求（POST body：prompt 可能较长）。SSE 用 fetch 流式读取。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTestBenchRequest {
+    pub account_id: String,
+    pub model_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl AccountTestBenchRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.prompt.trim().is_empty() || self.prompt.len() > 32_768 {
+            return Err(WireValidationError::new("prompt"));
+        }
+        if let Some(effort) = self.reasoning_effort.as_deref()
+            && !matches!(effort.trim(), "low" | "medium" | "high" | "xhigh" | "max")
+        {
+            return Err(WireValidationError::new("reasoningEffort"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(ProviderAccountId, UpstreamModelId, String, Option<String>), WireValidationError>
+    {
+        self.validate()?;
+        let effort = self
+            .reasoning_effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        Ok((
+            ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
+            self.prompt,
+            effort,
+        ))
+    }
+}
+
 /// 遍历代理找 state 的 query。EventSource 只能发 GET，所以参数走 query。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

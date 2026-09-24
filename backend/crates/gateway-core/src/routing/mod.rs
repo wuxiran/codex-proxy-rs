@@ -538,6 +538,8 @@ impl ProviderCandidate {
 pub struct RoutingPlan {
     pricing: Arc<crate::metering::PricingOverrides>,
     request_location: Option<crate::account::RequestLocation>,
+    request_log_enabled: bool,
+    request_log_test_key_id: Option<String>,
     config_revision: ConfigRevision,
     account_selection_policy: AccountSelectionPolicy,
     operation: OperationKind,
@@ -561,6 +563,18 @@ impl RoutingPlan {
     #[must_use]
     pub const fn request_location(&self) -> Option<&crate::account::RequestLocation> {
         self.request_location.as_ref()
+    }
+
+    /// 本次请求冻结的请求日志采集开关。
+    #[must_use]
+    pub const fn request_log_enabled(&self) -> bool {
+        self.request_log_enabled
+    }
+
+    /// 本次请求冻结的「测试 client key id」（用于日志来源门控）。
+    #[must_use]
+    pub fn request_log_test_key_id(&self) -> Option<&str> {
+        self.request_log_test_key_id.as_deref()
     }
 
     #[must_use]

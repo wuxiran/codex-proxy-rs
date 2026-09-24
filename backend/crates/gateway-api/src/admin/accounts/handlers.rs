@@ -63,6 +63,10 @@ where
             get(test_account_connection::<S>),
         )
         .route(
+            "/api/admin/accounts/test-bench",
+            post(run_account_test_bench::<S>),
+        )
+        .route(
             "/api/admin/accounts/turn-state-hunt",
             get(hunt_account_turn_state::<S>),
         )
@@ -770,6 +774,30 @@ where
         .admin_services()
         .accounts()
         .test_connection(account_id, upstream_model)
+        .await
+        .map_err(map_service_error)?
+        .map(|event| {
+            let event = AccountConnectionTestEvent::from(event);
+            let data = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_owned());
+            Ok(Event::default().data(data))
+        });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn run_account_test_bench<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<AccountTestBenchRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let (account_id, upstream_model, prompt, effort) =
+        request.into_command().map_err(map_wire_error)?;
+    let stream = state
+        .admin_services()
+        .accounts()
+        .run_test_bench(account_id, upstream_model, prompt, effort)
         .await
         .map_err(map_service_error)?
         .map(|event| {

@@ -52,7 +52,7 @@ pub struct RequestLogRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     /// 响应侧：上游实际服务的模型（`openai-model` 头 / body `response.model`）。
-    /// 与请求模型**分叉**（present 且 != 请求模型）= 猫腻信号（掺假/relay/降级上报）。
+    /// 与请求模型不同只是**事实陈述**，不由此判定猫腻/降智。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
     /// 响应侧：**未过滤**的全部 Set-Cookie 摘要（每项 `name@domain#值指纹`，非原文）。
@@ -60,17 +60,24 @@ pub struct RequestLogRecord {
     /// 好确认「网关节点信息是否藏在某张 cookie 里」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resp_cookies: Option<Vec<String>>,
+    /// 响应侧：本次上游下发的 `__cf_bm` 签发 TTL（秒，取 Set-Cookie 的 Max-Age，
+    /// 无 Max-Age 时用 Expires-now）。**中性诊断数值**——实测证明不能据此判降智。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfbm_ttl: Option<u32>,
 }
 
-/// 响应侧回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
+/// 响应侧/组装后回填补丁：只填 `Some(..)` 的字段，`None` 保持不动。
 #[derive(Default)]
 pub struct ResponsePatch {
+    /// 实际发送给上游的 turn-state 票短指纹（在最终请求组装后回填，非请求侧的 pin uuid）。
+    pub ticket_in: Option<String>,
     pub set_cookie: Option<bool>,
     pub ticket_out: Option<String>,
     pub ticket_len: Option<usize>,
     pub service_tier: Option<String>,
     pub served_model: Option<String>,
     pub resp_cookies: Option<Vec<String>>,
+    pub cfbm_ttl: Option<u32>,
 }
 
 fn buffer() -> &'static Mutex<VecDeque<RequestLogRecord>> {
@@ -97,6 +104,9 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
     if let Ok(mut buf) = buffer().lock()
         && let Some(rec) = buf.iter_mut().rev().find(|r| r.id == id)
     {
+        if patch.ticket_in.is_some() {
+            rec.ticket_in = patch.ticket_in;
+        }
         if patch.set_cookie.is_some() {
             rec.set_cookie = patch.set_cookie;
         }
@@ -114,6 +124,9 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
         }
         if patch.resp_cookies.is_some() {
             rec.resp_cookies = patch.resp_cookies;
+        }
+        if patch.cfbm_ttl.is_some() {
+            rec.cfbm_ttl = patch.cfbm_ttl;
         }
     }
 }
@@ -175,6 +188,7 @@ mod tests {
                 service_tier: None,
                 served_model: None,
                 resp_cookies: None,
+                cfbm_ttl: None,
             });
         }
         let recent = recent(1000);
@@ -204,6 +218,7 @@ mod tests {
             service_tier: None,
             served_model: None,
             resp_cookies: None,
+            cfbm_ttl: None,
         });
         // 第一次回填 cookie/票，第二次只回填档位+实际模型，前者都应保留。
         update_response(

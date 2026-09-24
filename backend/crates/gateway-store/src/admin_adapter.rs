@@ -115,6 +115,8 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 account_auto_freeze_probe_model: command.account_auto_freeze_probe_model,
                 account_auto_freeze_adaptive_concurrency: command
                     .account_auto_freeze_adaptive_concurrency,
+                request_log_enabled: command.request_log_enabled,
+                request_log_test_key_id: command.request_log_test_key_id,
             },
             audit: mutation_audit(
                 context,
@@ -259,6 +261,8 @@ pub(crate) fn admin_runtime_settings(
         account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
         account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
         account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
+        request_log_enabled: settings.request_log_enabled,
+        request_log_test_key_id: settings.request_log_test_key_id,
         updated_at: settings.updated_at,
     })
 }

@@ -14,6 +14,7 @@ import SettingsBackupSection from './components/backup/SettingsBackupSection.vue
 import ClientProfileCard from './components/ClientProfileCard.vue'
 import ModelAliasesCard from './components/ModelAliasesCard.vue'
 import RequestLocationCard from './components/RequestLocationCard.vue'
+import RequestLogCard from './components/RequestLogCard.vue'
 import RequestQueueCard from './components/RequestQueueCard.vue'
 import RotationStrategyCard from './components/RotationStrategyCard.vue'
 import RuntimeSettingsCard from './components/RuntimeSettingsCard.vue'
@@ -164,6 +165,11 @@ watch(section, (value) => {
             v-model:probe-enabled="form.accountAutoFreezeProbeEnabled"
             v-model:probe-model="form.accountAutoFreezeProbeModel"
             v-model:adaptive-concurrency="form.accountAutoFreezeAdaptiveConcurrency"
+          />
+          <RequestLogCard
+            v-model:enabled="form.requestLogEnabled"
+            v-model:test-key-id="form.requestLogTestKeyId"
+            :disabled="disabled"
           />
         </template>
 

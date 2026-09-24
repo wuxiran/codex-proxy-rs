@@ -148,6 +148,16 @@ pub trait AccountsService: Send + Sync {
         upstream_model: UpstreamModelId,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
 
+    /// 测智台：对指定账号发一条自定义 prompt（可选思考强度）的测试请求，流式回输出。
+    /// 走 probe 路径钉住该账号；钉票随账号自动带（有则带、无则按无票客户跑）。
+    async fn run_test_bench(
+        &self,
+        account_id: ProviderAccountId,
+        upstream_model: UpstreamModelId,
+        prompt: String,
+        reasoning_effort: Option<String>,
+    ) -> Result<AccountConnectionTestEventStream, AdminError>;
+
     /// 账号级 state 缺失或将在 `margin` 内到期、需要自动续期的账号。
     async fn turn_state_renewals(
         &self,
@@ -1089,6 +1099,79 @@ impl AccountsService for DefaultAccountsService {
             AccountConnectionTestEvent::Request {
                 model,
                 input_text: CONNECTION_TEST_INPUT.to_owned(),
+                stream: true,
+                store: false,
+            },
+        ];
+        let probe = Arc::clone(&self.probe);
+        let terminal = futures::stream::once(async move {
+            let result = probe
+                .probe(AccountProbeRequest {
+                    account_id,
+                    provider_kind: account.provider_kind,
+                    upstream_model,
+                    operation,
+                    egress: None,
+                })
+                .await;
+            match result {
+                Ok(result) => result
+                    .text
+                    .into_iter()
+                    .map(|text| AccountConnectionTestEvent::Content { text })
+                    .chain(std::iter::once(AccountConnectionTestEvent::Completed))
+                    .collect(),
+                Err(error) => {
+                    let upstream_status = error
+                        .upstream_response()
+                        .map(gateway_core::engine::probe::AccountProbeUpstreamResponse::status);
+                    let upstream_content_type = error
+                        .upstream_response()
+                        .and_then(|response| response.content_type())
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .map(ToOwned::to_owned);
+                    let upstream_body = error
+                        .upstream_response()
+                        .map(|response| String::from_utf8_lossy(response.body()).into_owned());
+                    let message = error.client_message().to_owned();
+                    vec![AccountConnectionTestEvent::Failed {
+                        source: error.source(),
+                        gateway_error_code: error.kind(),
+                        send_state: error.send_state(),
+                        message,
+                        provider_error_code: error.client_error_code().map(ToOwned::to_owned),
+                        provider_error_type: error.client_error_type().map(ToOwned::to_owned),
+                        upstream_status,
+                        upstream_content_type,
+                        upstream_body,
+                    }]
+                }
+            }
+        })
+        .flat_map(futures::stream::iter);
+        Ok(Box::pin(futures::stream::iter(initial).chain(terminal)))
+    }
+
+    async fn run_test_bench(
+        &self,
+        account_id: ProviderAccountId,
+        upstream_model: UpstreamModelId,
+        prompt: String,
+        reasoning_effort: Option<String>,
+    ) -> Result<AccountConnectionTestEventStream, AdminError> {
+        let (stored, provider) = self.provider_for_account(&account_id).await?;
+        let account = stored.account;
+        let model = upstream_model.as_str().to_owned();
+        let operation = provider
+            .test_bench_operation(&upstream_model, &prompt, reasoning_effort.as_deref())
+            .map_err(|error| map_provider_error(error, "provider test bench"))?;
+        let initial = vec![
+            AccountConnectionTestEvent::Started {
+                model: model.clone(),
+            },
+            AccountConnectionTestEvent::Request {
+                model,
+                input_text: prompt,
                 stream: true,
                 store: false,
             },

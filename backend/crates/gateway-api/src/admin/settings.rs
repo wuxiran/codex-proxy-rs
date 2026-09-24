@@ -60,6 +60,8 @@ pub struct RuntimeSettingsView {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub request_log_enabled: bool,
+    pub request_log_test_key_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -95,6 +97,10 @@ pub struct UpdateRuntimeSettingsRequest {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    #[serde(default)]
+    pub request_log_enabled: bool,
+    #[serde(default)]
+    pub request_log_test_key_id: Option<String>,
 }
 
 impl UpdateRuntimeSettingsRequest {
@@ -220,6 +226,11 @@ impl UpdateRuntimeSettingsRequest {
             account_auto_freeze_probe_enabled: self.account_auto_freeze_probe_enabled,
             account_auto_freeze_probe_model: self.account_auto_freeze_probe_model,
             account_auto_freeze_adaptive_concurrency: self.account_auto_freeze_adaptive_concurrency,
+            request_log_enabled: self.request_log_enabled,
+            request_log_test_key_id: self
+                .request_log_test_key_id
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
         })
     }
 }
@@ -258,6 +269,8 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
             account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
             account_auto_freeze_adaptive_concurrency: settings
                 .account_auto_freeze_adaptive_concurrency,
+            request_log_enabled: settings.request_log_enabled,
+            request_log_test_key_id: settings.request_log_test_key_id,
             updated_at: settings.updated_at,
         }
     }

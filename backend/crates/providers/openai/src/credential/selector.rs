@@ -763,7 +763,9 @@ impl CodexCredentialSelector {
                             cf_injected = true;
                         }
                         // 请求日志观测（诊断，只存短标识/短指纹，绝不存原文）。
-                        {
+                        // 门控：仅采集测试来源流量（配置的测试 key）；客户流量与关闭时都不记，
+                        // 也不做任何哈希/摘要构造。决定在请求开始已冻结（AttemptContext）。
+                        if request.attempt.should_capture_request_log() {
                             use secrecy::ExposeSecret as _;
                             // __cf_bm cookie 值的短哈希桶（cfbm-XX）。不是网关节点号，命名刻意
                             // 避开 unified-N，防止和 chat.gateway.unified-N 真节点混淆。
@@ -776,10 +778,8 @@ impl CodexCredentialSelector {
                                         "cfbm",
                                     )
                                 });
-                            let ticket_in = runtime
-                                .turn_state_pin
-                                .as_deref()
-                                .map(gateway_core::request_log::fingerprint);
+                            // ticket_in（实际发送的票指纹）在 execution 最终组装后回填；
+                            // 这里不能用 runtime.turn_state_pin——那是 pin 的 uuid 代次标识、非真票。
                             let cookie_action = if has_own_cf {
                                 "reuse"
                             } else if cf_injected {
@@ -797,13 +797,14 @@ impl CodexCredentialSelector {
                                         &egress_fp, "egr",
                                     ),
                                     unified,
-                                    ticket_in,
+                                    ticket_in: None,
                                     set_cookie: None,
                                     ticket_out: None,
                                     ticket_len: None,
                                     service_tier: None,
                                     served_model: None,
                                     resp_cookies: None,
+                                    cfbm_ttl: None,
                                 },
                             );
                         }

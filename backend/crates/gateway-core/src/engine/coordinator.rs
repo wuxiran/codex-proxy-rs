@@ -840,6 +840,10 @@ where
                 .with_disable_fast(self.plan.disable_fast())
                 .with_pricing(self.plan.pricing())
                 .with_request_location(self.plan.request_location().cloned())
+                .with_request_log_capture(
+                    self.plan.request_log_enabled(),
+                    self.plan.request_log_test_key_id().map(str::to_owned),
+                )
                 .with_concurrency_wait_budget(self.concurrency_wait_budget.clone())
                 .with_timing_started_at(self.observation.timing_started_at)
                 .with_trace(self.trace.clone()),
