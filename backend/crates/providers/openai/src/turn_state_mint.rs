@@ -781,6 +781,9 @@ impl CloudMintService {
         .map_err(|_| MintError::InvalidResponse)?;
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        // 2026-09-25 在 89 实测：带 `x-openai-internal-codex-residency: us` 时上游只签 `__cf_bm`，
+        // 不签路由对 `__cflb/__oailb`；裸打去掉它才拿得到 pair（巴西家宽→unified-83，89 直连→unified-119）。
+        headers.remove("x-openai-internal-codex-residency");
         if let Some(pair) = steered {
             headers.insert(
                 COOKIE,

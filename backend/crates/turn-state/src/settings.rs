@@ -105,7 +105,8 @@ impl Default for CloudMintSettings {
             relay_url: String::new(),
             relay_key: String::new(),
             proxy_url: String::new(),
-            gateway: "unified-95".to_owned(),
+            // 空 = 任意网关：哪个节点不降智没有证据，先观测再定，不默认钉某个节点。
+            gateway: String::new(),
             ticket_len: 780,
             ticket_ttl_seconds: 240,
             models: Vec::new(),
