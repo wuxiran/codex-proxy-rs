@@ -2,6 +2,7 @@
 import {
   ArrowUpCircle,
   ChartNoAxesColumn,
+  FlaskConical,
   FolderTree,
   Info,
   KeyRound,
@@ -12,7 +13,6 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
-  FlaskConical,
   ScrollText,
   Settings,
   Sun,

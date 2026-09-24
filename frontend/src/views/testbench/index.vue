@@ -291,18 +291,19 @@ onMounted(() => {
   <div class="flex w-full flex-col gap-5 px-4 py-6">
     <BasePageHeader
       title="测智台"
-      description="选一批账号并行发同一条测试 prompt（可选思考强度），并排看输出、人工判满血/降智。走 probe 路径钉住账号，钉票随账号自动带。" />
+      description="选一批账号并行发同一条测试 prompt（可选思考强度），并排看输出、人工判满血/降智。走 probe 路径钉住账号，钉票随账号自动带。"
+    />
 
     <BaseCard>
       <div class="flex flex-col gap-4">
         <!-- 参数行 -->
         <div class="flex flex-wrap items-end gap-3">
           <div class="w-48">
-            <label class="block text-xs text-neutral-500">分组</label>
+            <span class="block text-xs text-neutral-500">分组</span>
             <BaseSelect v-model="groupId" :options="groupOptions" class="mt-1" @update:model-value="onGroupChange" />
           </div>
           <div class="w-48">
-            <label class="block text-xs text-neutral-500">模型</label>
+            <span class="block text-xs text-neutral-500">模型</span>
             <BaseSelect
               v-model="model" class="mt-1"
               :options="[
@@ -310,14 +311,15 @@ onMounted(() => {
                 { label: 'gpt-6-sol', value: 'gpt-6-sol' },
                 { label: 'gpt-5.6-sol', value: 'gpt-5.6-sol' },
                 { label: 'gpt-5.5', value: 'gpt-5.5' },
-              ]" />
+              ]"
+            />
           </div>
           <div class="w-40">
-            <label class="block text-xs text-neutral-500">思考强度</label>
+            <span class="block text-xs text-neutral-500">思考强度</span>
             <BaseSelect v-model="effort" :options="effortOptions" class="mt-1" />
           </div>
           <div class="w-32">
-            <label class="block text-xs text-neutral-500">并发上限</label>
+            <span class="block text-xs text-neutral-500">并发上限</span>
             <BaseNumberInput v-model="concurrency" label="并发上限" :min="1" :max="8" class="mt-1" />
           </div>
           <BaseButton :loading="running" :disabled="running || selected.size === 0" @click="runBatch">
@@ -327,22 +329,23 @@ onMounted(() => {
 
         <!-- prompt -->
         <div>
-          <label class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</label>
+          <span class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</span>
           <BaseTextarea v-model="prompt" :rows="3" class="mt-1" placeholder="输入测试 prompt" />
         </div>
 
         <!-- 账号选择 -->
         <div>
           <div class="mb-2 flex items-center gap-3">
-            <label class="text-xs text-neutral-500">
+            <span class="text-xs text-neutral-500">
               账号
               <span v-if="accountsLoading" class="ml-1 text-amber-500">加载中…</span>
               <span v-else class="ml-1 text-neutral-400">（{{ filteredAccounts.length }} 个，已选 {{ selected.size }}）</span>
-            </label>
+            </span>
             <BaseInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-56 text-xs" />
             <BaseCheckbox
               :model-value="allVisibleSelected" label="全选可见" show-label
-              class="text-xs" @update:model-value="toggleAllVisible" />
+              class="text-xs" @update:model-value="toggleAllVisible"
+            />
             <button class="text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="clearSelection">
               清空
             </button>
@@ -350,20 +353,24 @@ onMounted(() => {
           <div class="max-h-64 overflow-auto rounded-md border border-neutral-200 dark:border-neutral-800">
             <div
               v-for="a in filteredAccounts" :key="a.id"
-              class="flex items-center gap-2 border-b border-neutral-100 px-3 py-1.5 text-sm last:border-b-0 dark:border-neutral-800/60">
+              class="flex items-center gap-2 border-b border-neutral-100 px-3 py-1.5 text-sm last:border-b-0 dark:border-neutral-800/60"
+            >
               <BaseCheckbox
                 :model-value="selected.has(a.id)" :label="a.name || a.id"
-                @update:model-value="(v: boolean) => toggle(a.id, v)" />
+                @update:model-value="(v: boolean) => toggle(a.id, v)"
+              />
               <span class="min-w-0 flex-1 truncate">{{ a.name || a.id }}</span>
               <span class="shrink-0 text-xs text-neutral-400">{{ a.provider }}</span>
               <span
                 class="shrink-0 rounded px-1.5 py-0.5 text-[10px]"
-                :class="a.enabled ? 'text-emerald-500' : 'text-neutral-400'">
+                :class="a.enabled ? 'text-emerald-500' : 'text-neutral-400'"
+              >
                 {{ a.enabled ? '启用' : '停用' }}
               </span>
               <span
                 v-for="g in a.groups" :key="g.id"
-                class="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-neutral-500 ring-1 ring-neutral-300 dark:ring-neutral-700">
+                class="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-neutral-500 ring-1 ring-neutral-300 dark:ring-neutral-700"
+              >
                 {{ g.name }}
               </span>
             </div>
@@ -393,13 +400,15 @@ onMounted(() => {
               <button
                 class="rounded px-2 py-0.5 text-[11px] ring-1 transition"
                 :class="run.verdict === 'full' ? 'bg-emerald-500/15 text-emerald-500 ring-emerald-500/40' : 'text-neutral-500 ring-neutral-300 hover:ring-emerald-400 dark:ring-neutral-700'"
-                @click="setVerdict(run, 'full')">
+                @click="setVerdict(run, 'full')"
+              >
                 满血
               </button>
               <button
                 class="rounded px-2 py-0.5 text-[11px] ring-1 transition"
                 :class="run.verdict === 'degraded' ? 'bg-rose-500/15 text-rose-500 ring-rose-500/40' : 'text-neutral-500 ring-neutral-300 hover:ring-rose-400 dark:ring-neutral-700'"
-                @click="setVerdict(run, 'degraded')">
+                @click="setVerdict(run, 'degraded')"
+              >
                 降智
               </button>
               <BaseInput v-model="run.note" placeholder="备注" class="h-6 flex-1 text-[11px]" />
@@ -415,11 +424,15 @@ onMounted(() => {
           </div>
           <div v-if="run.output" class="flex flex-col gap-2">
             <iframe
+              :title="`输出预览 ${run.accountId}`"
               :srcdoc="previewSrcdoc(run.output)"
               sandbox=""
-              class="h-80 w-full rounded-md border border-neutral-200 bg-white dark:border-neutral-800" />
+              class="h-80 w-full rounded-md border border-neutral-200 bg-white dark:border-neutral-800"
+            />
             <details>
-              <summary class="cursor-pointer text-xs text-neutral-500">原文（{{ run.output.length }} 字符）</summary>
+              <summary class="cursor-pointer text-xs text-neutral-500">
+                原文（{{ run.output.length }} 字符）
+              </summary>
               <pre class="mt-1 max-h-64 overflow-auto rounded-md border border-neutral-200 bg-neutral-50 p-2 text-[11px] leading-relaxed dark:border-neutral-800 dark:bg-neutral-900">{{ run.output }}</pre>
             </details>
           </div>

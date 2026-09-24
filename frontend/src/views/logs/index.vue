@@ -6,15 +6,15 @@
 import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
 import type { BaseTablePagination as Pagination } from '@/components/base/BaseTable/pagination'
 import { computed, onMounted, ref, watch } from 'vue'
+import request from '@/api/request'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import request from '@/api/request'
+import BaseTable from '@/components/base/BaseTable/index.vue'
 
 interface BackendRecord {
   atMs: number
@@ -146,8 +146,9 @@ const emptyText = computed(() => {
 onMounted(load)
 
 const actionLabel = (a: LogRow['action']) => (a === 'reuse' ? '沿用' : a === 'inject' ? '注入' : '无 cookie')
-const actionClass = (a: LogRow['action']) =>
-  a === 'reuse' ? 'text-emerald-500' : a === 'inject' ? 'text-amber-500' : 'text-neutral-400'
+function actionClass(a: LogRow['action']) {
+  return a === 'reuse' ? 'text-emerald-500' : a === 'inject' ? 'text-amber-500' : 'text-neutral-400'
+}
 
 // TTL 只作中性诊断数值展示（老板实测：TTL 判降智不科学），不再红黄绿上「降智」色。
 function ttlClass(ttl?: number) {
@@ -202,7 +203,9 @@ const filtered = computed(() => {
       return false
     if (kw) {
       const hay = [r.unified, r.egress, r.ticketIn, r.ticketOut, r.servedModel, r.model, r.tier]
-        .filter(Boolean).join(' ').toLowerCase()
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
       if (!hay.includes(kw))
         return false
     }
@@ -251,16 +254,19 @@ const stats = computed(() => {
   <div class="mx-auto flex max-w-[1600px] flex-col gap-5 px-4 py-6">
     <BasePageHeader
       title="请求日志台"
-      description="逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——均为中性诊断事实，不作满血/降智判定。">
+      description="逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——均为中性诊断事实，不作满血/降智判定。"
+    >
       <template #actions>
         <span
           class="rounded-full border px-2.5 py-1 font-mono text-[11px]"
-          :class="usingSample ? 'border-amber-500/40 text-amber-500' : 'border-emerald-500/40 text-emerald-500'">
+          :class="usingSample ? 'border-amber-500/40 text-amber-500' : 'border-emerald-500/40 text-emerald-500'"
+        >
           {{ usingSample ? '示例数据 · 暂无实时' : '实时' }}
         </span>
         <button
           class="rounded-full border border-neutral-300 px-2.5 py-1 text-[11px] text-neutral-600 hover:border-neutral-400 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
-          :disabled="loading" @click="load">
+          :disabled="loading" @click="load"
+        >
           {{ loading ? '刷新中…' : '↻ 刷新' }}
         </button>
       </template>
@@ -268,26 +274,40 @@ const stats = computed(() => {
 
     <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
       <BaseCard>
-        <div class="text-xs text-neutral-500">筛选后请求</div>
-        <div class="mt-2 text-2xl font-semibold tabular-nums">{{ stats.total }}</div>
+        <div class="text-xs text-neutral-500">
+          筛选后请求
+        </div>
+        <div class="mt-2 text-2xl font-semibold tabular-nums">
+          {{ stats.total }}
+        </div>
       </BaseCard>
       <BaseCard>
-        <div class="text-xs text-neutral-500">统一库沿用</div>
-        <div class="mt-2 text-2xl font-semibold tabular-nums text-emerald-500">{{ stats.reuse }}</div>
+        <div class="text-xs text-neutral-500">
+          统一库沿用
+        </div>
+        <div class="mt-2 text-2xl font-semibold tabular-nums text-emerald-500">
+          {{ stats.reuse }}
+        </div>
       </BaseCard>
       <BaseCard>
-        <div class="text-xs text-neutral-500">统一库注入</div>
-        <div class="mt-2 text-2xl font-semibold tabular-nums text-amber-500">{{ stats.inject }}</div>
+        <div class="text-xs text-neutral-500">
+          统一库注入
+        </div>
+        <div class="mt-2 text-2xl font-semibold tabular-nums text-amber-500">
+          {{ stats.inject }}
+        </div>
       </BaseCard>
       <BaseCard>
-        <div class="text-xs text-neutral-500">短 TTL(&lt;300s) 计数</div>
+        <div class="text-xs text-neutral-500">
+          短 TTL(&lt;300s) 计数
+        </div>
         <div class="mt-2 text-2xl font-semibold tabular-nums text-neutral-600 dark:text-neutral-300">
           {{ stats.shortTtl }}<span class="ml-1 text-sm font-normal text-neutral-400">/ {{ stats.ttlSamples }} 有 TTL</span>
         </div>
       </BaseCard>
     </div>
 
-    <BaseCard :padding="'none'">
+    <BaseCard padding="none">
       <div class="flex flex-wrap items-center gap-2 border-b border-neutral-200 px-4 py-3 dark:border-neutral-800">
         <BaseInput v-model="q" placeholder="搜索 cf指纹 / 出口 / 票 / 实际模型…" class="w-60" />
         <BaseSelect v-model="modelFilter" :options="modelOptions" class="w-40" />
@@ -310,17 +330,21 @@ const stats = computed(() => {
           <span class="font-mono text-xs font-semibold">{{ (row as LogRow).model }}</span>
         </template>
         <template #servedModel="{ row }">
-          <span v-if="(row as LogRow).servedModel"
+          <span
+            v-if="(row as LogRow).servedModel"
             class="font-mono text-xs"
-            :class="isMole(row as LogRow) ? 'font-semibold text-amber-600 dark:text-amber-400' : 'text-neutral-500'">
+            :class="isMole(row as LogRow) ? 'font-semibold text-amber-600 dark:text-amber-400' : 'text-neutral-500'"
+          >
             {{ (row as LogRow).servedModel }}<span v-if="isMole(row as LogRow)" class="text-neutral-400"> ≠请求</span>
           </span>
           <span v-else class="text-neutral-300 dark:text-neutral-600">—</span>
         </template>
         <template #tier="{ row }">
-          <span v-if="(row as LogRow).tier"
+          <span
+            v-if="(row as LogRow).tier"
             class="whitespace-nowrap rounded-md border px-1.5 py-0.5 font-mono text-xs"
-            :class="(row as LogRow).tier === 'priority' ? 'border-emerald-500/35 text-emerald-600 dark:text-emerald-400' : 'border-neutral-300 text-neutral-500 dark:border-neutral-700'">
+            :class="(row as LogRow).tier === 'priority' ? 'border-emerald-500/35 text-emerald-600 dark:text-emerald-400' : 'border-neutral-300 text-neutral-500 dark:border-neutral-700'"
+          >
             {{ (row as LogRow).tier }}
           </span>
           <span v-else class="text-neutral-300 dark:text-neutral-600">—</span>

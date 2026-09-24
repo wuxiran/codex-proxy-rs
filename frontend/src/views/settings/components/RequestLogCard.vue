@@ -21,18 +21,20 @@ const testKeyText = computed({
 <template>
   <BaseCard
     title="请求日志采集"
-    description="只采集我们自己的测试来源流量（指定测试 Client Key）；客户流量不采集。关闭则任何来源都不新增诊断日志。">
+    description="只采集我们自己的测试来源流量（指定测试 Client Key）；客户流量不采集。关闭则任何来源都不新增诊断日志。"
+  >
     <template #body>
       <div>
         <BaseSwitch v-model="enabled" label="启用请求日志采集" show-label :disabled="disabled" />
       </div>
       <BaseForm class="mt-4 max-w-2xl">
-        <label class="block text-xs text-cp-text-secondary">测试 Client Key ID（只有它的流量会被采集；留空则不采集任何客户端流量）</label>
+        <span class="block text-xs text-cp-text-secondary">测试 Client Key ID（只有它的流量会被采集；留空则不采集任何客户端流量）</span>
         <BaseInput
           v-model="testKeyText"
           class="mt-1.5"
           placeholder="粘贴测试 Client Key 的 id（如 ck_...）"
-          :disabled="disabled || !enabled" />
+          :disabled="disabled || !enabled"
+        />
       </BaseForm>
     </template>
   </BaseCard>

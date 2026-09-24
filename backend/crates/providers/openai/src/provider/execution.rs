@@ -336,29 +336,6 @@ fn summarize_set_cookies(headers: &[String]) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod cfbm_ttl_tests {
-    use super::cfbm_issued_ttl_seconds;
-
-    #[test]
-    fn parses_max_age_short_and_long() {
-        let short = vec!["__cf_bm=abc.def; Path=/; Max-Age=120; Domain=.chatgpt.com; HttpOnly".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&short), Some(120));
-        let long = vec!["__cf_bm=xyz; Max-Age=1800; Path=/".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&long), Some(1800));
-    }
-
-    #[test]
-    fn ignores_non_cfbm_and_missing() {
-        let other = vec!["_cfuvid=zzz; Max-Age=600".to_owned(), "cf_clearance=q; Max-Age=999".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&other), None);
-        assert_eq!(cfbm_issued_ttl_seconds(&[]), None);
-        // 有 __cf_bm 但既无 Max-Age 也无 Expires → None（不瞎猜）。
-        let no_ttl = vec!["__cf_bm=abc; Path=/; HttpOnly".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&no_ttl), None);
-    }
-}
-
 pub(super) fn decode_openai_session_state(request: &GenerateRequest) -> Option<OpenAiSessionState> {
     request
         .provider_session_state(PROVIDER_NAME)
@@ -1447,4 +1424,31 @@ async fn merge_response_metadata_updates(
         changed |= observation_state.observe_upstream_response_model(decoder.response_model());
     }
     Some(changed)
+}
+
+#[cfg(test)]
+mod cfbm_ttl_tests {
+    use super::cfbm_issued_ttl_seconds;
+
+    #[test]
+    fn parses_max_age_short_and_long() {
+        let short =
+            vec!["__cf_bm=abc.def; Path=/; Max-Age=120; Domain=.chatgpt.com; HttpOnly".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&short), Some(120));
+        let long = vec!["__cf_bm=xyz; Max-Age=1800; Path=/".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&long), Some(1800));
+    }
+
+    #[test]
+    fn ignores_non_cfbm_and_missing() {
+        let other = vec![
+            "_cfuvid=zzz; Max-Age=600".to_owned(),
+            "cf_clearance=q; Max-Age=999".to_owned(),
+        ];
+        assert_eq!(cfbm_issued_ttl_seconds(&other), None);
+        assert_eq!(cfbm_issued_ttl_seconds(&[]), None);
+        // 有 __cf_bm 但既无 Max-Age 也无 Expires → None（不瞎猜）。
+        let no_ttl = vec!["__cf_bm=abc; Path=/; HttpOnly".to_owned()];
+        assert_eq!(cfbm_issued_ttl_seconds(&no_ttl), None);
+    }
 }
