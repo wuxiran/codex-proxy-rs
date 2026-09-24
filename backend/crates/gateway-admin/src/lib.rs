@@ -25,6 +25,7 @@ use serde::Deserialize;
 pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
+pub mod ops_report;
 pub mod ports;
 pub mod ticket_cipher;
 pub mod ticket_revive;
@@ -206,9 +207,15 @@ pub struct AdminServices {
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
     public_import: Arc<dyn PublicImportService>,
+    ops_report: Arc<ops_report::OpsReportService>,
 }
 
 impl AdminServices {
+    #[must_use]
+    pub fn ops_report(&self) -> &ops_report::OpsReportService {
+        self.ops_report.as_ref()
+    }
+
     #[must_use]
     pub fn public_import(&self) -> &dyn PublicImportService {
         self.public_import.as_ref()
@@ -323,6 +330,8 @@ pub struct AdminRuntimePorts {
     pub public_import_dir: PathBuf,
     /// 登录票据加密密钥所在目录，位于 runtime 数据目录下（蓝绿槽位共享）。
     pub account_ticket_dir: PathBuf,
+    /// 经营日报快照目录，位于 runtime 数据目录下（蓝绿槽位共享）。
+    pub ops_report_dir: PathBuf,
 }
 
 /// 校验配置、建立动态 Provider 注册表并完成默认管理员幂等初始化。
@@ -347,6 +356,7 @@ pub async fn initialize(
         client_key_verifier,
         public_import_dir,
         account_ticket_dir,
+        ops_report_dir,
     } = runtime;
     config
         .resolve_and_validate(Path::new("."))
@@ -429,7 +439,12 @@ pub async fn initialize(
         store.account_runtime(),
         snapshot.clone(),
     ));
+    let ops_report = Arc::new(ops_report::OpsReportService::new(
+        store.ops_report(),
+        ops_report_dir,
+    ));
     let services = AdminServices {
+        ops_report: Arc::clone(&ops_report),
         key_usage,
         public_import: Arc::new(use_case::public_import::DefaultPublicImportService::new(
             public_import_dir,
@@ -500,6 +515,9 @@ pub async fn initialize(
             store.accounts(),
         ),
     )?);
+    worker_contributions.extend(ops_report_worker_contribution(ops_report::OpsReportTask(
+        ops_report,
+    ))?);
     Ok(AdminBundle {
         services,
         worker_contributions,
@@ -585,6 +603,37 @@ fn ticket_revive_worker_contribution(
         },
     )
     .map_err(|_| AdminError::internal("票据复活 Worker 注册信息不合法"))?;
+    Ok(vec![WorkerContribution::Registration(registration)])
+}
+
+/// 经营日报 Worker 注册：加跨实例租约，同一时刻只有一个实例写快照。
+fn ops_report_worker_contribution(
+    task: ops_report::OpsReportTask,
+) -> Result<Vec<WorkerContribution>, AdminError> {
+    let id = WorkerId::try_new(
+        WorkerKind::AccountFreezeRecovery,
+        ops_report::OPS_REPORT_WORKER_OWNER,
+    )
+    .map_err(|_| AdminError::internal("经营日报 Worker ID 不合法"))?;
+    let schedule = WorkerSchedule::try_new(
+        ops_report::OPS_REPORT_INTERVAL,
+        ops_report::WORKER_INITIAL_BACKOFF,
+        ops_report::WORKER_MAXIMUM_BACKOFF,
+        freeze_recovery::WORKER_LEASE_TTL,
+        freeze_recovery::WORKER_LEASE_RENEWAL,
+    )
+    .map_err(|_| AdminError::internal("经营日报 Worker 调度配置不合法"))?;
+    let lease = WorkerLeaseRequest::try_new(id.clone(), freeze_recovery::WORKER_LEASE_TTL)
+        .map_err(|_| AdminError::internal("经营日报 Worker 租约配置不合法"))?;
+    let registration = WorkerRegistration::try_new(
+        id,
+        WorkerRunnable::Scheduled {
+            schedule,
+            lease: Some(lease),
+            task: Box::new(task),
+        },
+    )
+    .map_err(|_| AdminError::internal("经营日报 Worker 注册信息不合法"))?;
     Ok(vec![WorkerContribution::Registration(registration)])
 }
 

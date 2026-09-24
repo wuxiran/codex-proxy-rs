@@ -17,6 +17,7 @@ pub mod backups;
 pub mod client_keys;
 mod extract;
 pub mod observability;
+pub mod ops_report;
 pub mod presenter;
 pub mod proxies;
 pub mod public_import;
@@ -45,6 +46,7 @@ where
         .merge(backups::router::<S>())
         .merge(client_keys::router::<S>())
         .merge(observability::router::<S>())
+        .merge(ops_report::router::<S>())
         .merge(request_log::router::<S>())
         .merge(settings::router::<S>())
         .merge(system::router::<S>())

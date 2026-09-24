@@ -547,6 +547,7 @@ pub struct AdminStorePorts {
     observability: Arc<dyn ObservabilityStore>,
     settings: Arc<dyn SettingsStore>,
     backup: BackupStorePorts,
+    ops_report: Option<Arc<dyn super::ops_report::OpsReportSource>>,
 }
 
 impl AdminStorePorts {
@@ -566,7 +567,20 @@ impl AdminStorePorts {
             observability,
             settings,
             backup,
+            ops_report: None,
         }
+    }
+
+    /// 挂上经营日报数据源；未挂时日报页只显示未配置。
+    #[must_use]
+    pub fn with_ops_report(mut self, source: Arc<dyn super::ops_report::OpsReportSource>) -> Self {
+        self.ops_report = Some(source);
+        self
+    }
+
+    #[must_use]
+    pub fn ops_report(&self) -> Option<Arc<dyn super::ops_report::OpsReportSource>> {
+        self.ops_report.clone()
     }
 
     #[must_use]

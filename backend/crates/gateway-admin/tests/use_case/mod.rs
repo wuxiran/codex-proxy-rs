@@ -268,6 +268,8 @@ impl AdminHarness {
                     .join(format!("cpr-public-import-{}", uuid::Uuid::now_v7())),
                 account_ticket_dir: std::env::temp_dir()
                     .join(format!("cpr-tickets-{}", uuid::Uuid::now_v7())),
+                ops_report_dir: std::env::temp_dir()
+                    .join(format!("cpr-ops-report-{}", uuid::Uuid::now_v7())),
             },
         )
         .await

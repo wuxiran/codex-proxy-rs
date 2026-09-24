@@ -65,6 +65,7 @@ pub async fn run() -> Result<(), BootstrapError> {
 
     let public_import_dir = host.runtime_data_dir().join("public_import");
     let account_ticket_dir = host.runtime_data_dir().join("account_tickets");
+    let ops_report_dir = host.runtime_data_dir().join("ops_report");
     let host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
     let mut store = gateway_store::initialize(store).await?;
@@ -92,6 +93,7 @@ pub async fn run() -> Result<(), BootstrapError> {
             client_key_verifier: core.client_key_verifier(),
             public_import_dir,
             account_ticket_dir,
+            ops_report_dir,
         },
     )
     .await?;

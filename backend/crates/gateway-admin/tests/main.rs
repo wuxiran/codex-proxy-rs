@@ -21,6 +21,7 @@ use gateway_admin::{
 
 mod backup;
 mod model;
+mod ops_report;
 mod use_case;
 
 #[test]

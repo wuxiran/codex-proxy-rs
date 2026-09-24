@@ -125,7 +125,11 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             control_plane: postgres::PgControlPlaneRepository::new(pool.clone()),
         }),
         backup_ports(pool.clone(), &config)?,
-    );
+    )
+    .with_ops_report(Arc::new(postgres::PgOpsReportSource::new(
+        pool.clone(),
+        config.ops_report.sub2api_database_url.as_deref(),
+    )?));
 
     let execution_repository = Arc::new(postgres::PgExecutionStore::new(pool.clone()));
     let (execution, execution_writer) =

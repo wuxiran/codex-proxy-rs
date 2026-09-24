@@ -24,8 +24,19 @@ pub struct StoreConfig {
     pub(crate) redis: StoreConnectionConfig,
     #[serde(default)]
     pub(crate) pool: StorePoolConfig,
+    /// 经营日报的只读数据源；不配置时日报只统计 CPR 自身数据。
+    #[serde(default)]
+    pub(crate) ops_report: OpsReportStoreConfig,
     #[serde(skip)]
     backup_staging_dir: PathBuf,
+}
+
+/// 经营日报数据源配置。
+#[derive(Clone, Default, Deserialize)]
+pub(crate) struct OpsReportStoreConfig {
+    /// sub2api PostgreSQL 连接串（建议只读角色），含密码，只放服务器配置里。
+    #[serde(default)]
+    pub(crate) sub2api_database_url: Option<String>,
 }
 
 /// PostgreSQL 连接池预算；acquire 超时决定池耗尽时快速失败而非排队积压。
@@ -143,6 +154,14 @@ impl fmt::Debug for StoreConfig {
             .field("database", &"[REDACTED]")
             .field("redis", &"[REDACTED]")
             .field("pool", &self.pool)
+            .field(
+                "ops_report.sub2api_database_url",
+                &self
+                    .ops_report
+                    .sub2api_database_url
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
