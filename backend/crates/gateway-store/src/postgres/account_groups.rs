@@ -1,6 +1,11 @@
 //! PostgreSQL owner for provider-neutral account groups and memberships.
 
-use std::{collections::BTreeMap, str::FromStr as _};
+use std::{
+    collections::BTreeMap,
+    str::FromStr as _,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -37,12 +42,17 @@ const ENTITY: &str = "account group";
 #[derive(Clone)]
 pub struct PgAccountGroupRepository {
     pool: PgPool,
+    /// 组成本（今日/保留期累计）是对 model_requests 全保留期的求和，按组 ID 集做 SWR 缓存。
+    costs: Arc<GroupCostCache>,
 }
 
 impl PgAccountGroupRepository {
     #[must_use]
-    pub const fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            costs: Arc::default(),
+        }
     }
 
     async fn current_revision(&self) -> AdminStoreResult<gateway_admin::model::Revision> {
@@ -59,7 +69,9 @@ impl PgAccountGroupRepository {
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?
             .ok_or_else(|| not_found(id.as_str()))?;
-        let costs = group_costs(&self.pool, &[id.as_str().to_owned()])
+        let costs = self
+            .costs
+            .get_or_load(&self.pool, &[id.as_str().to_owned()])
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
         if let Some(usage) = costs.get(id.as_str()) {
@@ -135,7 +147,9 @@ impl AccountGroupStore for PgAccountGroupRepository {
             .iter()
             .map(|record| record.id.as_str().to_owned())
             .collect::<Vec<_>>();
-        let costs = group_costs(&self.pool, &group_ids)
+        let costs = self
+            .costs
+            .get_or_load(&self.pool, &group_ids)
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
         for record in &mut items {
@@ -519,6 +533,104 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
             .try_get("updated_at")
             .map_err(|_| invalid("invalid updated_at"))?,
     })
+}
+
+/// 超过此年龄的组成本仍会返回，但触发一次后台重算。
+const GROUP_COST_TTL: Duration = Duration::from_secs(20);
+/// 不同分页/单组查询各占一项，上限防止无界增长。
+const GROUP_COST_MAX_ENTRIES: usize = 32;
+
+struct GroupCostEntry {
+    computed_at: Instant,
+    costs: Arc<BTreeMap<String, AccountGroupUsage>>,
+    refreshing: bool,
+}
+
+/// 组成本的 stale-while-revalidate 缓存。
+///
+/// `group_costs` 要对 model_requests 全保留期按 routing_group_refs 求和（现网 24 万行 3 s+），
+/// 而分组页随账号页一起轮询。成本只由请求历史推导，组的增删改不影响，命中即返回；
+/// 过期由后台重算，失败保留旧值。
+#[derive(Default)]
+pub(super) struct GroupCostCache {
+    entries: Mutex<BTreeMap<String, GroupCostEntry>>,
+}
+
+impl GroupCostCache {
+    async fn get_or_load(
+        self: &Arc<Self>,
+        pool: &PgPool,
+        group_ids: &[String],
+    ) -> StoreResult<Arc<BTreeMap<String, AccountGroupUsage>>> {
+        if group_ids.is_empty() {
+            return Ok(Arc::default());
+        }
+        let mut key = group_ids.to_vec();
+        key.sort();
+        let key = key.join("\n");
+        let cached = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.get_mut(&key).map(|entry| {
+                let stale = entry.computed_at.elapsed() > GROUP_COST_TTL;
+                let refresh = stale && !entry.refreshing;
+                if refresh {
+                    entry.refreshing = true;
+                }
+                (Arc::clone(&entry.costs), refresh)
+            })
+        };
+        if let Some((costs, refresh)) = cached {
+            if refresh {
+                self.spawn_refresh(pool.clone(), key, group_ids.to_vec());
+            }
+            return Ok(costs);
+        }
+        let costs = Arc::new(group_costs(pool, group_ids).await?);
+        self.store(key, Arc::clone(&costs));
+        Ok(costs)
+    }
+
+    fn store(&self, key: String, costs: Arc<BTreeMap<String, AccountGroupUsage>>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= GROUP_COST_MAX_ENTRIES && !entries.contains_key(&key) {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.computed_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            key,
+            GroupCostEntry {
+                computed_at: Instant::now(),
+                costs,
+                refreshing: false,
+            },
+        );
+    }
+
+    fn spawn_refresh(self: &Arc<Self>, pool: PgPool, key: String, group_ids: Vec<String>) {
+        let cache = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = group_costs(&pool, &group_ids).await;
+            let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = entries.get_mut(&key) else {
+                return;
+            };
+            entry.refreshing = false;
+            match result {
+                Ok(costs) => {
+                    entry.computed_at = Instant::now();
+                    entry.costs = Arc::new(costs);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "account group cost refresh failed");
+                }
+            }
+        });
+    }
 }
 
 async fn group_costs(
