@@ -1029,6 +1029,34 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
     scope: &ProviderAccountAdminScope,
     account_ids: &[String],
 ) -> StoreResult<()> {
+    // 删账号要把 model_requests / ops_events 里的外键置空（on delete set null）：
+    // 外键触发器按被删行逐个 UPDATE，账号请求多时（现网一号一天数千行、表上十几个索引）
+    // 一批就超出连接级 30s statement_timeout，整个事务回滚、后台「无法删除」。
+    // 这里先集合式一次置空、再删，并把本事务的语句超时放宽（SET LOCAL 仅作用于本事务）。
+    sqlx::query("set local statement_timeout = '600s'")
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "set provider account deletion statement timeout");
+            postgres_unavailable("prepare provider account admin deletion")
+        })?;
+    for (table, label) in [
+        ("model_requests", "detach provider account from model requests"),
+        ("ops_events", "detach provider account from ops events"),
+    ] {
+        // 表名来自上面的固定列表，不含外部输入。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update {table} set provider_account_id = null
+              where provider_account_id = any($1::text[])"
+        )))
+        .bind(account_ids)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, table, "provider account deletion detach failed");
+            postgres_unavailable(label)
+        })?;
+    }
     let deleted = sqlx::query_scalar::<_, String>(
         "delete from provider_accounts
          where id = any($1::text[]) and provider_kind = $2
@@ -1038,7 +1066,10 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
     .bind(&scope.provider_kind)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("delete provider account in admin transaction"))?;
+    .map_err(|error| {
+        tracing::warn!(error = %error, "provider account deletion failed");
+        postgres_unavailable("delete provider account in admin transaction")
+    })?;
     let deleted = deleted.into_iter().collect::<BTreeSet<_>>();
     let expected = account_ids.iter().cloned().collect::<BTreeSet<_>>();
     if deleted == expected {
