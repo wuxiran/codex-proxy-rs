@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use turn_state::{
     BucketSummary, CloudMintSettings, InjectMode, ObservationSnapshot, Settings, TurnStateError,
-    TurnStateService,
+    TurnStateService, WarmPoolSettings,
 };
 
 use super::{AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse};
@@ -34,6 +34,9 @@ pub struct UpdateTurnStateSettingsRequest {
     /// 省略时保留现有云端打票设置；`relayKey` 为 `<set>` 占位时沿用磁盘上的密钥。
     #[serde(default)]
     cloud_mint: Option<CloudMintSettings>,
+    /// 省略时保留现有 WS 保活设置。
+    #[serde(default)]
+    warm_pool: Option<WarmPoolSettings>,
 }
 
 impl UpdateTurnStateSettingsRequest {
@@ -49,6 +52,7 @@ impl UpdateTurnStateSettingsRequest {
             cloud_mint: self
                 .cloud_mint
                 .unwrap_or_else(|| current.cloud_mint.clone()),
+            warm_pool: self.warm_pool.unwrap_or_else(|| current.warm_pool.clone()),
         }
         .merge_secret_placeholders(current)
     }

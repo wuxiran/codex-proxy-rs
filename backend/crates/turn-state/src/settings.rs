@@ -55,6 +55,82 @@ pub struct Settings {
     pub degraded_lengths: Vec<usize>,
     /// 云端打票：账号缺票时向 relay 铸票并钉住路由 cookie 对。
     pub cloud_mint: CloudMintSettings,
+    /// WS 保活：在乐观窗口内为账号预建并挂住上游 WebSocket，用 canary 验满血。
+    pub warm_pool: WarmPoolSettings,
+}
+
+/// WS 保活设置。图里说法：风控号首次碰到新节点有 ~200s 乐观窗口，窗口内建立的
+/// WebSocket 挂住后 1h 满血；预建一批满血 WS 供业务复用。默认关，开了也只在
+/// 后台开连接跑 canary，不改业务链路（业务复用是 Phase 2，另有开关）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct WarmPoolSettings {
+    pub enabled: bool,
+    /// 每个账号预热并挂住多少条 WS。
+    pub connections_per_account: u32,
+    /// 预热的模型列表；空 = 用账号支持的模型 / cloud_mint.models。
+    pub models: Vec<String>,
+    /// 一条 WS 最多挂多久（秒），到点主动弃用；应 < 上游 55min。
+    pub max_age_seconds: u64,
+    /// canary 复探间隔（秒）：开连接后每隔这么久在同一条 WS 上再问一次探针题。
+    pub reprobe_seconds: u64,
+    /// 是否跑 canary 探针（发探针题、按答案判满血）；关掉则只开连接挂住不验。
+    pub probe: bool,
+    /// 探针题正文；空 = 用内置糖果题。
+    pub probe_prompt: String,
+    /// 满血判据：答案去空白后以此开头即判满血（如 "21"）。
+    pub probe_expect: String,
+    /// 探针用的模型；空 = 用 models 里的第一个。
+    pub probe_model: String,
+    /// 探针 effort：low/medium/high/xhigh。
+    pub probe_effort: String,
+}
+
+impl Default for WarmPoolSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connections_per_account: 2,
+            models: Vec::new(),
+            // 50 分钟：卡在上游 55min 硬上限之内。
+            max_age_seconds: 3000,
+            reprobe_seconds: 120,
+            probe: true,
+            probe_prompt: String::new(),
+            probe_expect: "21".to_owned(),
+            probe_model: String::new(),
+            probe_effort: "high".to_owned(),
+        }
+    }
+}
+
+impl WarmPoolSettings {
+    pub fn max_age(&self) -> Duration {
+        Duration::from_secs(self.max_age_seconds)
+    }
+
+    pub fn reprobe(&self) -> Duration {
+        Duration::from_secs(self.reprobe_seconds)
+    }
+
+    fn validate(&self) -> Result<(), SettingsError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(1..=16).contains(&self.connections_per_account) {
+            return Err(SettingsError::WarmConnections);
+        }
+        if !(60..=3300).contains(&self.max_age_seconds) {
+            return Err(SettingsError::WarmMaxAge);
+        }
+        if !(15..=1800).contains(&self.reprobe_seconds) {
+            return Err(SettingsError::WarmReprobe);
+        }
+        if !matches!(self.probe_effort.as_str(), "low" | "medium" | "high" | "xhigh") {
+            return Err(SettingsError::WarmEffort);
+        }
+        Ok(())
+    }
 }
 
 /// 云端打票设置。relay 即 `deploy/cloud-mint/index.js`（阿里 FC 或 89 上的容器）。
@@ -182,6 +258,7 @@ impl Default for Settings {
             template_lengths: Vec::new(),
             degraded_lengths: Vec::new(),
             cloud_mint: CloudMintSettings::default(),
+            warm_pool: WarmPoolSettings::default(),
         }
     }
 }
@@ -204,6 +281,14 @@ pub enum SettingsError {
     LengthTooShort,
     #[error("template and degraded lengths must not overlap")]
     Overlap,
+    #[error("warm pool connections per account must be between 1 and 16")]
+    WarmConnections,
+    #[error("warm pool max age must be between 60 and 3300 seconds")]
+    WarmMaxAge,
+    #[error("warm pool reprobe interval must be between 15 and 1800 seconds")]
+    WarmReprobe,
+    #[error("warm pool probe effort must be low, medium, high or xhigh")]
+    WarmEffort,
 }
 
 impl Settings {
@@ -240,7 +325,8 @@ impl Settings {
         {
             return Err(SettingsError::Overlap);
         }
-        self.cloud_mint.validate()
+        self.cloud_mint.validate()?;
+        self.warm_pool.validate()
     }
 
     /// 前端展示用副本：relay 密钥不回显。

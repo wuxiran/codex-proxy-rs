@@ -260,3 +260,29 @@ fn cloud_mint_settings_validate_and_redact() {
     assert!(json.contains("\"cloudMint\""));
     assert!(json.contains("\"ticketTtlSeconds\":240"));
 }
+
+#[test]
+fn warm_pool_settings_default_off_and_bounds() {
+    let defaults = Settings::default();
+    assert!(!defaults.warm_pool.enabled, "warm pool is opt-in");
+    assert_eq!(defaults.validate(), Ok(()), "disabled warm pool is always valid");
+
+    let json = serde_json::to_string(&Settings::default()).expect("json");
+    assert!(json.contains("\"warmPool\""));
+    assert!(json.contains("\"maxAgeSeconds\":3000"));
+
+    let mut settings = Settings::default();
+    settings.warm_pool.enabled = true;
+    assert_eq!(settings.validate(), Ok(()), "sane defaults validate when enabled");
+
+    settings.warm_pool.connections_per_account = 0;
+    assert!(settings.validate().is_err(), "zero connections rejected");
+    settings.warm_pool.connections_per_account = 2;
+
+    settings.warm_pool.max_age_seconds = 4000;
+    assert!(settings.validate().is_err(), "max age above upstream cap rejected");
+    settings.warm_pool.max_age_seconds = 3000;
+
+    settings.warm_pool.probe_effort = "insane".to_owned();
+    assert!(settings.validate().is_err(), "unknown effort rejected");
+}

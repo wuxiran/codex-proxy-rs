@@ -25,4 +25,7 @@ pub use service::{
     AccountWidePin, Attempt, BucketSummary, PinRejected, PinStatus, RequestFacts, TurnStateError,
     TurnStateService,
 };
-pub use settings::{CloudMintSettings, DEFAULT_TTL, InjectMode, MintMode, Settings, SettingsError};
+pub use settings::{
+    CloudMintSettings, DEFAULT_TTL, InjectMode, MintMode, Settings, SettingsError,
+    WarmPoolSettings,
+};
