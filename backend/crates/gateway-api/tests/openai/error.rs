@@ -572,6 +572,36 @@ async fn gateway_error_response_should_expose_only_structured_client_visible_ups
 }
 
 #[tokio::test]
+async fn upstream_message_too_big_returns_actionable_http_error() {
+    let error = EngineError::Provider(
+        ProviderError::new(
+            ProviderErrorKind::MessageTooBig,
+            UpstreamSendState::Ambiguous,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "message too big",
+            Some("message_too_big".to_owned()),
+            Some("invalid_request_error".to_owned()),
+        )),
+    );
+
+    let response = engine_error_response(&error);
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read message-too-big response");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("OpenAI error JSON");
+    assert_eq!(
+        body["error"],
+        serde_json::json!({
+            "message": "message too big",
+            "type": "invalid_request_error",
+            "code": "message_too_big",
+        })
+    );
+}
+
+#[tokio::test]
 async fn continuation_recovery_should_preserve_the_official_retry_signal() {
     let error = GatewayError::from_provider(
         &ProviderError::new(

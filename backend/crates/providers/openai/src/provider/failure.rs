@@ -541,11 +541,13 @@ pub(super) fn apply_websocket_recovery_policy(
         );
         return;
     }
-    let session_budget_exhausted = context.session_affinity_key.is_some_and(|key| {
-        context
-            .session_transport_recovery
-            .record_websocket_failure(key, context.max_retries)
-    });
+    // close 1009 只拒绝当前请求，不代表会话的 WS 传输不可用。
+    let session_budget_exhausted = failure.error.kind() != ProviderErrorKind::MessageTooBig
+        && context.session_affinity_key.is_some_and(|key| {
+            context
+                .session_transport_recovery
+                .record_websocket_failure(key, context.max_retries)
+        });
     let send_state = failure.error.send_state();
     let post_send = matches!(
         send_state,
@@ -1238,14 +1240,33 @@ pub(super) fn websocket_client_visible_error(
         ));
     }
     let close = error.close_before_terminal()?;
+    let message_too_big = close.code() == Some(WEBSOCKET_CLOSE_MESSAGE_TOO_BIG);
     let message = close
         .reason()
         .filter(|reason| !reason.is_empty())
-        .map_or_else(|| close.to_string(), str::to_owned);
+        .map_or_else(
+            || {
+                if message_too_big {
+                    "upstream websocket message too big".to_owned()
+                } else {
+                    close.to_string()
+                }
+            },
+            str::to_owned,
+        );
+    // RFC 6455 close 1009 是请求过大，客户端需收到可行动的错误码。
+    let (code, error_type) = if message_too_big {
+        (Some("message_too_big".to_owned()), "invalid_request_error")
+    } else {
+        (
+            close.code().map(|code| code.to_string()),
+            "websocket_close_error",
+        )
+    };
     Some(ClientVisibleUpstreamError::new(
         message,
-        close.code().map(|code| code.to_string()),
-        Some("websocket_close_error".to_owned()),
+        code,
+        Some(error_type.to_owned()),
     ))
 }
 
@@ -1499,11 +1520,21 @@ pub(super) fn websocket_error_kind(error: &CodexWebSocketExchangeError) -> Provi
         CodexWebSocketExchangeError::ConnectionLimitReached(_) => ProviderErrorKind::RateLimited,
         CodexWebSocketExchangeError::Transport(_)
         | CodexWebSocketExchangeError::Connect(_)
-        | CodexWebSocketExchangeError::PostSendAmbiguous { .. }
-        | CodexWebSocketExchangeError::ClosedBeforeTerminal(_)
         | CodexWebSocketExchangeError::StreamEndedBeforeTerminal { .. }
         | CodexWebSocketExchangeError::ReusedConnectionDiedBeforeFirstEvent { .. } => {
             ProviderErrorKind::Transport
+        }
+        // live 流可能包在 PostSendAmbiguous 中；RFC 6455 close 1009 是请求过大。
+        CodexWebSocketExchangeError::ClosedBeforeTerminal(_)
+        | CodexWebSocketExchangeError::PostSendAmbiguous { .. } => {
+            if error
+                .close_before_terminal()
+                .is_some_and(|close| close.code() == Some(WEBSOCKET_CLOSE_MESSAGE_TOO_BIG))
+            {
+                ProviderErrorKind::MessageTooBig
+            } else {
+                ProviderErrorKind::Transport
+            }
         }
         CodexWebSocketExchangeError::ConnectionObserved { .. } => {
             unreachable!("classified websocket errors never retain observation wrappers")
