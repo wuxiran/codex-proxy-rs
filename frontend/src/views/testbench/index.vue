@@ -17,6 +17,7 @@ const PELICAN_PROMPT
   = 'Create an HTML page with an SVG drawing of a pelican riding a bicycle in 2D. Output only the HTML, no explanation, no markdown fences.'
 
 const accounts = ref<Account[]>([])
+const accountsLoading = ref(false)
 const accountId = ref('')
 const model = ref('gpt-6-astra')
 const effort = ref('medium')
@@ -45,6 +46,7 @@ const previewSrcdoc = computed(() => {
 })
 
 async function loadAccounts() {
+  accountsLoading.value = true
   try {
     const res = await getAccounts({ page: 1, pageSize: 200 })
     accounts.value = res.items ?? []
@@ -54,17 +56,32 @@ async function loadAccounts() {
   catch {
     toast.error('账号列表加载失败')
   }
+  finally {
+    accountsLoading.value = false
+  }
 }
 
 onMounted(loadAccounts)
 
-function handleEvent(ev: { type?: string, text?: string, message?: string }) {
-  if (ev.type === 'content' && typeof ev.text === 'string')
-    output.value += ev.text
-  else if (ev.type === 'completed')
-    status.value = 'success'
-  else if (ev.type === 'failed')
-    { status.value = 'error'; errorMsg.value = ev.message || '测试失败' }
+function handleEvent(ev: { type?: string, text?: string, message?: string, success?: boolean }) {
+  switch (ev.type) {
+    case 'content':
+      if (typeof ev.text === 'string')
+        output.value += ev.text
+      break
+    case 'test_complete':
+      status.value = ev.success === false ? 'error' : 'success'
+      if (ev.success === false && !errorMsg.value)
+        errorMsg.value = '上游返回失败'
+      break
+    case 'error':
+      status.value = 'error'
+      errorMsg.value = ev.message || ev.text || '测试失败'
+      break
+    default:
+      // test_start / request / status 等：忽略
+      break
+  }
 }
 
 async function runTest() {
@@ -96,28 +113,35 @@ async function runTest() {
     const reader = resp.body.getReader()
     const decoder = new TextDecoder()
     let buf = ''
+    const flush = (chunk: string) => {
+      for (const line of chunk.split(/\r?\n/)) {
+        if (line.startsWith('data:')) {
+          try {
+            handleEvent(JSON.parse(line.slice(5).trim()))
+          }
+          catch {
+            // 忽略非 JSON 行（keep-alive 注释等）
+          }
+        }
+      }
+    }
+    // 事件以空行分隔，兼容 \n\n 与 \r\n\r\n。
+    const sep = /\r?\n\r?\n/
     while (true) {
       const { done, value } = await reader.read()
       if (done)
         break
       buf += decoder.decode(value, { stream: true })
-      let idx = buf.indexOf('\n\n')
-      while (idx >= 0) {
-        const chunk = buf.slice(0, idx)
-        buf = buf.slice(idx + 2)
-        for (const line of chunk.split('\n')) {
-          if (line.startsWith('data:')) {
-            try {
-              handleEvent(JSON.parse(line.slice(5).trim()))
-            }
-            catch {
-              // 忽略非 JSON 行（keep-alive 等）
-            }
-          }
-        }
-        idx = buf.indexOf('\n\n')
+      let m = sep.exec(buf)
+      while (m) {
+        flush(buf.slice(0, m.index))
+        buf = buf.slice(m.index + m[0].length)
+        m = sep.exec(buf)
       }
     }
+    buf += decoder.decode()
+    if (buf.trim())
+      flush(buf)
     if (status.value === 'running')
       status.value = 'success'
   }
@@ -142,7 +166,7 @@ function downloadOutput() {
 </script>
 
 <template>
-  <div class="mx-auto flex max-w-[1600px] flex-col gap-5 px-4 py-6">
+  <div class="flex w-full flex-col gap-5 px-4 py-6">
     <BasePageHeader
       title="测智台"
       description="对指定账号发一条测试 prompt（可选思考强度），并排看输出质量、人工判满血/降智。走 probe 路径钉住账号，钉票随账号自动带。" />
@@ -151,7 +175,10 @@ function downloadOutput() {
       <div class="flex flex-col gap-3">
         <div class="flex flex-wrap items-end gap-3">
           <div class="min-w-60 flex-1">
-            <label class="block text-xs text-neutral-500">账号</label>
+            <label class="block text-xs text-neutral-500">
+              账号<span v-if="accountsLoading" class="ml-1 text-amber-500">加载中…</span>
+              <span v-else class="ml-1 text-neutral-400">（{{ accounts.length }}）</span>
+            </label>
             <BaseSelect v-model="accountId" :options="accountOptions" class="mt-1" placeholder="选择账号" />
           </div>
           <div class="w-48">
@@ -217,6 +244,9 @@ function downloadOutput() {
         </div>
         <div v-else-if="status === 'running'" class="text-sm text-neutral-500">
           等待输出…
+        </div>
+        <div v-else-if="status === 'success'" class="text-sm text-neutral-500">
+          测试完成，但上游未返回任何文本内容（可能被拒绝或空响应）。
         </div>
       </template>
     </BaseCard>
