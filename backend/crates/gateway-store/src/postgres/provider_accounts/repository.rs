@@ -719,6 +719,13 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             .await
             .map_err(|_| postgres_unavailable("begin provider account admin deletion"))?;
         let result = async {
+            // 慢的那步（解除请求记录引用，可能几十秒）放在 bump revision 之前，
+            // 否则一路持着 runtime_settings 行锁，其他配置写操作会被 lock_timeout 打掉。
+            detach_provider_account_references_in_transaction(
+                &mut transaction,
+                &command.account_ids,
+            )
+            .await?;
             let revision = bump_config_revision_in_transaction(&mut transaction).await?;
             delete_provider_accounts_in_transaction(
                 &mut transaction,
@@ -1038,7 +1045,10 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
     .bind(&scope.provider_kind)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("delete provider account in admin transaction"))?;
+    .map_err(|error| {
+        tracing::warn!(error = %error, "provider account deletion failed");
+        postgres_unavailable("delete provider account in admin transaction")
+    })?;
     let deleted = deleted.into_iter().collect::<BTreeSet<_>>();
     let expected = account_ids.iter().cloned().collect::<BTreeSet<_>>();
     if deleted == expected {
@@ -1048,6 +1058,44 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
             "all deleted accounts must exist and match Provider scope",
         ))
     }
+}
+
+/// 删账号前先把 model_requests / ops_events 里的外键集合式置空（外键是 on delete set null）。
+///
+/// 外键触发器按被删行逐个 UPDATE，账号请求多时（现网一号一天数千行、表上十几个索引）
+/// 一批就超出连接级 30s statement_timeout，整个事务回滚、后台「无法删除」。这里一次置空
+/// 并放宽本事务的语句超时（SET LOCAL 仅作用于本事务）。**必须在 bump config revision
+/// 之前调用**：这步可能跑几十秒，不能一路持着 runtime_settings 的行锁（lock_timeout 5s
+/// 会把其他管理写操作和 worker 全部打成「依赖服务暂不可用」）。
+pub(crate) async fn detach_provider_account_references_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_ids: &[String],
+) -> StoreResult<()> {
+    sqlx::query("set local statement_timeout = '600s'")
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "set provider account deletion statement timeout");
+            postgres_unavailable("prepare provider account admin deletion")
+        })?;
+    for (table, label) in [
+        ("model_requests", "detach provider account from model requests"),
+        ("ops_events", "detach provider account from ops events"),
+    ] {
+        // 表名来自上面的固定列表，不含外部输入。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update {table} set provider_account_id = null
+              where provider_account_id = any($1::text[])"
+        )))
+        .bind(account_ids)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, table, "provider account deletion detach failed");
+            postgres_unavailable(label)
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_credential_update(update: &ProviderCredentialUpdate) -> StoreResult<()> {
