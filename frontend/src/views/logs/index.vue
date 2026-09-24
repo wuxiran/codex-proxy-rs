@@ -1,12 +1,19 @@
 <script setup lang="ts">
-// 请求日志台（表格）：逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、
-// 上游实际模型(分叉=猫腻)、service_tier(诊断)、以及 __cf_bm 的签发 TTL（短=降智节点特征）。
+// 请求日志台（表格 + 筛选 + 翻页）：逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、
+// turn-state 票、上游实际模型(分叉=猫腻)、service_tier(诊断)、__cf_bm 签发 TTL(短=降智特征)。
+// 数据源 /api/admin/logs/recent 为最近 300 条内存记录，筛选与翻页均在客户端进行。
 // 只如实铺数据；TTL 仅按阈值上色，不替用户下「降智」结论。
 import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
-import { computed, onMounted, ref } from 'vue'
+import type { BaseTablePagination as Pagination } from '@/components/base/BaseTable/pagination'
+import { computed, onMounted, ref, watch } from 'vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
+import BaseInput from '@/components/base/BaseInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
+import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
+import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import request from '@/api/request'
 
 interface BackendRecord {
@@ -62,9 +69,19 @@ const sample: LogRow[] = [
   { id: 3, time: '01:33:58', action: 'none', egress: 'egr-3', model: 'gpt-6-sol' },
 ]
 
-const rows = ref<LogRow[]>(sample)
+const allRows = ref<LogRow[]>(sample)
 const usingSample = ref(true)
 const loading = ref(false)
+
+// —— 筛选状态 ——
+const q = ref('')
+const modelFilter = ref('')
+const actionFilter = ref('')
+const ttlFilter = ref('all')
+const moleOnly = ref(false)
+
+const page = ref(1)
+const pageSize = ref(20)
 
 function fmtTime(ms: number): string {
   try {
@@ -99,7 +116,7 @@ async function load() {
   try {
     const data = await request<BackendRecord[]>({ url: '/api/admin/logs/recent', method: 'GET' })
     if (Array.isArray(data) && data.length) {
-      rows.value = data.map(toRow)
+      allRows.value = data.map(toRow)
       usingSample.value = false
     }
   }
@@ -117,7 +134,6 @@ const actionLabel = (a: LogRow['action']) => (a === 'reuse' ? '沿用' : a === '
 const actionClass = (a: LogRow['action']) =>
   a === 'reuse' ? 'text-emerald-500' : a === 'inject' ? 'text-amber-500' : 'text-neutral-400'
 
-// TTL 上色：短(<300s)=红(降智节点特征)，中(<900s)=黄，长(~1800s)=绿。仅上色，不下结论。
 function ttlClass(ttl?: number) {
   if (ttl == null)
     return 'text-neutral-300 dark:text-neutral-600'
@@ -128,15 +144,93 @@ function ttlClass(ttl?: number) {
   return 'text-emerald-500'
 }
 
-// 实际模型 != 请求模型 = 猫腻（掺假/relay/降级上报）。
 const isMole = (r: LogRow) => Boolean(r.servedModel && r.servedModel !== r.model)
 
+// —— 筛选下拉选项（来自当前数据） ——
+function distinct(getter: (r: LogRow) => string | undefined) {
+  return [...new Set(allRows.value.map(getter).filter((v): v is string => Boolean(v)))].sort()
+}
+const modelOptions = computed(() => [{ label: '全部模型', value: '' }, ...distinct(r => r.model).map(v => ({ label: v, value: v }))])
+const actionOptions = [
+  { label: '全部决策', value: '' },
+  { label: '沿用', value: 'reuse' },
+  { label: '注入', value: 'inject' },
+  { label: '无 cookie', value: 'none' },
+]
+const ttlOptions = [
+  { label: '全部 TTL', value: 'all' },
+  { label: '短 <300s', value: 'short' },
+  { label: '中 300–900s', value: 'mid' },
+  { label: '长 ≥900s', value: 'long' },
+  { label: '无 TTL', value: 'none' },
+]
+
+function matchTtl(ttl: number | undefined, f: string) {
+  if (f === 'all')
+    return true
+  if (f === 'none')
+    return ttl == null
+  if (ttl == null)
+    return false
+  if (f === 'short')
+    return ttl < 300
+  if (f === 'mid')
+    return ttl >= 300 && ttl < 900
+  return ttl >= 900
+}
+
+const filtered = computed(() => {
+  const kw = q.value.trim().toLowerCase()
+  return allRows.value.filter((r) => {
+    if (modelFilter.value && r.model !== modelFilter.value)
+      return false
+    if (actionFilter.value && r.action !== actionFilter.value)
+      return false
+    if (!matchTtl(r.cfbmTtl, ttlFilter.value))
+      return false
+    if (moleOnly.value && !isMole(r))
+      return false
+    if (kw) {
+      const hay = [r.unified, r.egress, r.ticketIn, r.ticketOut, r.servedModel, r.model, r.tier]
+        .filter(Boolean).join(' ').toLowerCase()
+      if (!hay.includes(kw))
+        return false
+    }
+    return true
+  })
+})
+
+const pagedRows = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filtered.value.slice(start, start + pageSize.value)
+})
+
+const pagination = computed<Pagination>(() => ({
+  currentPage: page.value,
+  pageSize: pageSize.value,
+  total: filtered.value.length,
+  pageSizes: [10, 20, 50, 100],
+}))
+
+function handlePageChange(p: number) {
+  page.value = p
+}
+function handlePageSizeChange(s: number) {
+  pageSize.value = s
+  page.value = 1
+}
+
+// 筛选变化时回到第一页。
+watch([q, modelFilter, actionFilter, ttlFilter, moleOnly], () => {
+  page.value = 1
+})
+
 const stats = computed(() => {
-  const withTtl = rows.value.filter(r => r.cfbmTtl != null)
+  const withTtl = filtered.value.filter(r => r.cfbmTtl != null)
   return {
-    total: rows.value.length,
-    reuse: rows.value.filter(r => r.action === 'reuse').length,
-    inject: rows.value.filter(r => r.action === 'inject').length,
+    total: filtered.value.length,
+    reuse: filtered.value.filter(r => r.action === 'reuse').length,
+    inject: filtered.value.filter(r => r.action === 'inject').length,
     shortTtl: withTtl.filter(r => (r.cfbmTtl as number) < 300).length,
     ttlSamples: withTtl.length,
   }
@@ -164,7 +258,7 @@ const stats = computed(() => {
 
     <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
       <BaseCard>
-        <div class="text-xs text-neutral-500">本页请求</div>
+        <div class="text-xs text-neutral-500">筛选后请求</div>
         <div class="mt-2 text-2xl font-semibold tabular-nums">{{ stats.total }}</div>
       </BaseCard>
       <BaseCard>
@@ -184,10 +278,14 @@ const stats = computed(() => {
     </div>
 
     <BaseCard :padding="'none'">
-      <div class="border-b border-neutral-200 px-4 py-3 text-xs text-neutral-500 dark:border-neutral-800">
-        最近请求 · 票为短哈希非原文 · 请求侧发出即记，响应侧（Set-Cookie/票长/档位/实际模型/TTL）于上游响应回来后回填
+      <div class="flex flex-wrap items-center gap-2 border-b border-neutral-200 px-4 py-3 dark:border-neutral-800">
+        <BaseInput v-model="q" placeholder="搜索 cf指纹 / 出口 / 票 / 实际模型…" class="w-60" />
+        <BaseSelect v-model="modelFilter" :options="modelOptions" class="w-40" />
+        <BaseSelect v-model="actionFilter" :options="actionOptions" class="w-32" />
+        <BaseSegmented v-model="ttlFilter" label="TTL 档" :options="ttlOptions" />
+        <BaseCheckbox v-model="moleOnly" label="只看猫腻" class="ml-1 text-xs" />
       </div>
-      <BaseTable :columns="columns" :rows="rows" row-key="id" :loading="loading" density="compact" empty-text="暂无请求">
+      <BaseTable :columns="columns" :rows="pagedRows" row-key="id" :loading="loading" density="compact" empty-text="无匹配请求">
         <template #action="{ row }">
           <span class="font-semibold" :class="actionClass((row as LogRow).action)">{{ actionLabel((row as LogRow).action) }}</span>
         </template>
@@ -242,6 +340,12 @@ const stats = computed(() => {
           </template>
         </template>
       </BaseTable>
+      <BaseTablePagination
+        :pagination="pagination"
+        :loading="loading"
+        @page-change="handlePageChange"
+        @page-size-change="handlePageSizeChange"
+      />
     </BaseCard>
   </div>
 </template>
