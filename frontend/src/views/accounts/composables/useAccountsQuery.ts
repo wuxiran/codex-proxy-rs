@@ -9,7 +9,8 @@ type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
 /** 自动刷新可选间隔（秒）；0 表示关闭。状态、并发、报错与用量随线上流量变化。 */
 export const AUTO_REFRESH_SECONDS = [0, 10, 15, 30, 60] as const
-const DEFAULT_AUTO_REFRESH_SECONDS = 15
+// 列表每次刷新都要对请求表做 24h/额度窗口聚合，默认档放宽到 30 s 降低数据库压力。
+const DEFAULT_AUTO_REFRESH_SECONDS = 30
 
 export function useAccountsQuery() {
   const searchQuery = shallowRef('')

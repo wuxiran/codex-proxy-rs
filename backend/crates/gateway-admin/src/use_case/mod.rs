@@ -16,6 +16,7 @@ pub mod public_import;
 pub mod settings;
 pub mod system;
 mod turn_state_hunt;
+mod usage_projection_cache;
 pub mod xai;
 
 use std::sync::Arc;

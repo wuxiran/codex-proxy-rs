@@ -2354,16 +2354,17 @@ async fn api_key_list_and_detail_should_accumulate_local_usage_without_subscript
 
 #[tokio::test]
 async fn unobserved_quota_should_preserve_local_cost_in_list_detail_and_refresh() {
-    let provider = FakeProviderAdmin::new("openai", events());
     let mut account = account_record("openai");
     account.created_at = Utc::now() - TimeDelta::days(60);
     let added_at = account.created_at;
     let store = FakeAccountStore::with_account(account, events());
-    let services = accounts_service(provider, store.clone()).await;
     let account_id = ProviderAccountId::new("acct_test").unwrap();
 
     // 金额未知、已知零和已有消费都不依赖上游额度；统计范围也不能缩为最近 24 小时。
+    // 列表的用量投影按 service 实例做短 TTL 缓存，每种金额用新实例，避免读到上一轮。
     for amount in [None, Some("0"), Some("12.34")] {
+        let provider = FakeProviderAdmin::new("openai", events());
+        let services = accounts_service(provider, store.clone()).await;
         let mut expected = quota_local_usage("acct_test", 4_330_000);
         expected.costs = amount
             .map(|value| gateway_admin::model::accounts::AccountCost {
