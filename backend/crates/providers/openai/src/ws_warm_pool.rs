@@ -465,7 +465,9 @@ impl WarmPoolService {
             .await
     }
 
-    /// 读上游 SSE 流，只累计文本增量到能判满血为止；不记明文答案。
+    /// 读上游 SSE 流判满血；**必须把流读到自然结束（None）**，上游 WS 连接才会被归还进连接池
+    /// 挂住供业务领养——提前 return/break 会丢弃这条连接（held 永远 0）。拿到判决后继续排空。
+    /// 只累计文本增量判定，不记明文答案。
     async fn read_verdict(
         &self,
         response: CodexBackendStreamingResponse,
@@ -477,13 +479,21 @@ impl WarmPoolService {
         let mut buf: Vec<u8> = Vec::new();
         let mut answer = String::new();
         let mut served_model: Option<String> = None;
+        let mut verdict: Option<Verdict> = None;
         loop {
             let next = match tokio::time::timeout_at(deadline, body.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) => break,
-                Ok(None) => break,
-                Err(_) => return Ok(Verdict::Failed("timeout".to_owned())),
+                Ok(None) => break, // 流自然结束 → 连接已归还池
+                Err(_) => {
+                    verdict.get_or_insert(Verdict::Failed("timeout".to_owned()));
+                    break;
+                }
             };
+            // 判决已定：只排空剩余字节让连接归还，不再解析。
+            if verdict.is_some() {
+                continue;
+            }
             buf.extend_from_slice(&next);
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -505,7 +515,8 @@ impl WarmPoolService {
                             .pointer("/response/model")
                             .and_then(Value::as_str)
                             .map(str::to_owned);
-                        return Ok(Self::judge(&answer, expect, served_model));
+                        verdict = Some(Self::judge(&answer, expect, served_model.take()));
+                        break;
                     }
                     Some("response.failed") | Some("error") => {
                         let code = event
@@ -514,21 +525,20 @@ impl WarmPoolService {
                             .and_then(Value::as_str)
                             .unwrap_or("upstream_error")
                             .to_owned();
-                        return Ok(Verdict::Failed(code));
+                        verdict = Some(Verdict::Failed(code));
+                        break;
                     }
                     _ => {}
                 }
             }
-            // 答案够判就早停（省得等完整长文本）。
-            if answer.trim().len() >= expect.len() && !answer.trim().is_empty() {
-                return Ok(Self::judge(&answer, expect, served_model));
+        }
+        Ok(verdict.unwrap_or_else(|| {
+            if answer.trim().is_empty() {
+                Verdict::Failed("no_answer".to_owned())
+            } else {
+                Self::judge(&answer, expect, served_model)
             }
-        }
-        if answer.trim().is_empty() {
-            Ok(Verdict::Failed("no_answer".to_owned()))
-        } else {
-            Ok(Self::judge(&answer, expect, served_model))
-        }
+        }))
     }
 
     fn judge(answer: &str, expect: &str, served_model: Option<String>) -> Verdict {
