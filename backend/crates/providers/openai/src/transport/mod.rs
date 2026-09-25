@@ -1,6 +1,7 @@
 //! Codex HTTP/SSE/WebSocket 上游 transport。
 
 pub mod canonical;
+pub(crate) mod basispoints;
 pub mod catalog;
 pub mod client;
 mod client_json;
