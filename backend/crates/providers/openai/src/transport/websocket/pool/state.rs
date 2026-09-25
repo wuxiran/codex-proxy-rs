@@ -96,6 +96,13 @@ impl CodexWebSocketPoolKey {
         self.conversation_id.starts_with(WARM_CONVERSATION_PREFIX)
     }
 
+    /// 保活 key 的 slot 序号（`__cpr_warm__:{n}` 里的 n）；非保活 key 返回 `None`。
+    pub(crate) fn warm_slot(&self) -> Option<usize> {
+        self.conversation_id
+            .strip_prefix(WARM_CONVERSATION_PREFIX)
+            .and_then(|suffix| suffix.parse().ok())
+    }
+
     /// `self` 是一条保活 key，且能服务 `business`（同上游、同账号、同出口、同握手画像）。
     /// 忽略 conversation_id 与 downstream_connection_id：领养后会以业务 key 重新登记。
     pub(super) fn serves_warm_target(&self, business: &Self) -> bool {

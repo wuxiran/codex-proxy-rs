@@ -102,6 +102,20 @@ pub(crate) struct WarmPoolService {
     state: Mutex<State>,
 }
 
+/// Drop 守卫：warm 任务无论正常结束还是 panic，都减在途计数并清账号 in_flight，
+/// 避免任务 panic 后账号卡在 in_flight=true 再也不被补齐、in_flight_total 永久虚高。
+struct WarmInFlight {
+    service: Arc<WarmPoolService>,
+    account_id: String,
+}
+
+impl Drop for WarmInFlight {
+    fn drop(&mut self) {
+        self.service.in_flight_total.fetch_sub(1, Ordering::AcqRel);
+        self.service.clear_in_flight(&self.account_id);
+    }
+}
+
 impl WarmPoolService {
     pub(crate) fn new(
         repository: CodexCredentialRepository,
@@ -202,12 +216,16 @@ impl WarmPoolService {
             }
             let id = account.id().as_str().to_owned();
             let want = settings.connections_per_account as usize;
-            let held = self.pool.warm_len_for_account(&id);
+            // 池是「哪些 slot 有活连接」的唯一真相（可能被业务领养/被 evict 掉）。
+            // 先在池锁外取占用序号，再进 warmer 状态锁，避免同时持两把锁。
+            let occupied = self.pool.warm_slots_for_account(&id);
 
-            // 挑一个要开/要复探的 slot。
+            // 挑一个要开/要复探的 slot（open 用空闲序号、reprobe 用已占用且到期的序号）。
             let (slot, reason) = {
-                let mut state = self.state.lock().expect("warm state");
+                let mut state = Self::lock_state(&self.state);
                 let entry = state.accounts.entry(id.clone()).or_default();
+                // 清理已不再占用的 slot 的复探时间戳（被领养/evict 的连接）。
+                entry.verified_at.retain(|slot, _| occupied.contains(slot));
                 if entry.in_flight {
                     continue;
                 }
@@ -221,19 +239,24 @@ impl WarmPoolService {
                     .last_request
                     .is_some_and(|at| at.elapsed() < ACTIVE_WINDOW);
                 let active = imported_recently || recent_traffic;
-                // 缺连接就补一条；补满了看有没有 slot 到复探点。
-                let pick = if held < want {
-                    // 活跃/刚导入的账号补连接；首次见到的启用账号也 bootstrap 一条，
-                    // 让新号一上来就绑好满血连接（当前所有号都是这种）。之后闲置就不再空转。
-                    (active || !entry.bootstrapped).then_some((held, "open"))
+                let pick = if occupied.len() < want {
+                    // 补一条：挑第一个**空闲**序号（不是用计数当序号，否则会反复命中已占用的 slot）。
+                    // 活跃/刚导入的账号补，首次见到的启用账号也 bootstrap 一条。
+                    (active || !entry.bootstrapped)
+                        .then(|| (0..want).find(|slot| !occupied.contains(slot)))
+                        .flatten()
+                        .map(|slot| (slot, "open"))
                 } else if settings.probe && active {
-                    (0..want).find_map(|slot| {
-                        let due = entry
-                            .verified_at
-                            .get(&slot)
-                            .is_none_or(|at| at.elapsed() >= settings.reprobe());
-                        due.then_some((slot, "reprobe"))
-                    })
+                    // 补满了：挑一个**已占用**且到复探点的序号，在其上复用同一条连接复探。
+                    occupied
+                        .iter()
+                        .find(|slot| {
+                            entry
+                                .verified_at
+                                .get(slot)
+                                .is_none_or(|at| at.elapsed() >= settings.reprobe())
+                        })
+                        .map(|slot| (*slot, "reprobe"))
                 } else {
                     None
                 };
@@ -249,8 +272,8 @@ impl WarmPoolService {
                 }
             };
 
-            // 全局在途上限。
-            if self.in_flight_total.load(Ordering::Acquire) + self.pool.warm_len_for_account(&id)
+            // 全局在途上限：在途 + 进程内所有账号的保活连接总数。
+            if self.in_flight_total.load(Ordering::Acquire) + self.pool.warm_len_total()
                 >= settings.max_total_connections as usize
             {
                 self.clear_in_flight(&id);
@@ -264,14 +287,24 @@ impl WarmPoolService {
             let service = Arc::clone(self);
             let task_settings = settings.clone();
             self.in_flight_total.fetch_add(1, Ordering::AcqRel);
+            // Drop 守卫：任务正常结束或 panic 都会减在途计数、清 in_flight，避免卡死账号。
+            let guard = WarmInFlight {
+                service: Arc::clone(self),
+                account_id: id.clone(),
+            };
             self.pool.spawn_connect_task(async move {
                 let _permit = permit;
+                let _guard = guard;
                 service
                     .warm_one(account, slot, reason, &task_settings)
                     .await;
-                service.in_flight_total.fetch_sub(1, Ordering::AcqRel);
             });
         }
+    }
+
+    fn lock_state(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+        // 锁中毒不该让 daemon crash-loop：其余访问器都用 if let Ok，这里也容忍。
+        state.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn clear_in_flight(&self, account_id: &str) {
@@ -314,7 +347,6 @@ impl WarmPoolService {
                 if let Ok(mut state) = self.state.lock() {
                     let entry = state.accounts.entry(id.clone()).or_default();
                     entry.verified_at.insert(slot, now);
-                    entry.in_flight = false;
                 }
             }
             Ok(Verdict::Degraded(model)) => {
@@ -343,16 +375,15 @@ impl WarmPoolService {
         report.held = self.pool.warm_len_for_account(&id);
         if let Ok(mut state) = self.state.lock() {
             let entry = state.accounts.entry(id).or_default();
-            entry.in_flight = false;
             entry.last = Some(report);
         }
+        // in_flight 的清除交给 WarmInFlight 守卫（任务结束/panic 都清），这里不动。
     }
 
     fn set_cooldown(&self, account_id: &str, cooldown: Duration) {
         if let Ok(mut state) = self.state.lock() {
             let entry = state.accounts.entry(account_id.to_owned()).or_default();
             entry.cooldown_until = Some(Instant::now() + cooldown);
-            entry.in_flight = false;
         }
     }
 

@@ -150,7 +150,7 @@ impl CodexWebSocketPool {
         self.connect_semaphore.clone().try_acquire_owned().ok()
     }
 
-    /// 某账号当前挂着的保活连接数（空闲的保活 key slot）。观测/warmer 补齐用。
+    /// 某账号当前挂着的保活连接数（空闲的保活 key slot）。观测用。
     pub(crate) fn warm_len_for_account(&self, account_id: &str) -> usize {
         let state = self.lock_state();
         state
@@ -161,6 +161,33 @@ impl CodexWebSocketPool {
                     && key.account_id() == account_id
                     && matches!(slot, WebSocketPoolSlot::Idle { .. })
             })
+            .count()
+    }
+
+    /// 某账号当前已占用的保活 slot 序号集合（空闲的保活连接）。warmer 据此挑**空闲序号**补齐、
+    /// 挑**已占用序号**复探，避免用「计数」当序号导致反复复探同一条、永不补满。
+    pub(crate) fn warm_slots_for_account(&self, account_id: &str) -> std::collections::BTreeSet<usize> {
+        let state = self.lock_state();
+        state
+            .slots
+            .iter()
+            .filter_map(|(key, slot)| {
+                (key.is_warm()
+                    && key.account_id() == account_id
+                    && matches!(slot, WebSocketPoolSlot::Idle { .. }))
+                .then(|| key.warm_slot())
+                .flatten()
+            })
+            .collect()
+    }
+
+    /// 进程内所有账号的保活连接总数（空闲的保活 slot）；`max_total_connections` 用。
+    pub(crate) fn warm_len_total(&self) -> usize {
+        let state = self.lock_state();
+        state
+            .slots
+            .iter()
+            .filter(|(key, slot)| key.is_warm() && matches!(slot, WebSocketPoolSlot::Idle { .. }))
             .count()
     }
 
