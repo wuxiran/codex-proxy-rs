@@ -13,13 +13,22 @@
 
 mod catalog;
 mod content;
+mod envelope;
 mod error;
+mod history;
+mod plan;
 mod replay;
+mod request;
+mod stream;
+mod usage;
 mod util;
 mod wire;
 
 pub(crate) use error::PrepareError;
 pub(crate) use replay::ReplayCache;
+pub(crate) use request::{Bridge, prepare};
+pub(crate) use stream::StreamTranslator;
+pub(crate) use usage::rewrite_cache_creation_as_input;
 pub(crate) use wire::{NormalizeEffortError, fingerprint, message, normalize_effort};
 
 /// BPS 上游端点。可在测试中被覆盖。

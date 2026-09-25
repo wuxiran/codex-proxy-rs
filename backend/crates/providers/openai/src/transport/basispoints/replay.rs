@@ -98,7 +98,12 @@ impl ReplayCache {
         self.get(scope, call_id, Some(&signature))
     }
 
-    fn get(&mut self, scope: &str, call_id: &str, require_signature: Option<&str>) -> Option<Value> {
+    fn get(
+        &mut self,
+        scope: &str,
+        call_id: &str,
+        require_signature: Option<&str>,
+    ) -> Option<Value> {
         let composed = key(scope, call_id);
         let order = self.next_order;
         let entry = self.entries.get_mut(&composed)?;
@@ -192,7 +197,10 @@ mod tests {
         cache.put("scope", "c1", &native, Some(&client));
 
         let client2 = json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": {"command": "pwd"}});
-        assert_eq!(cache.get_for_call("scope", "c1", &client2), Some(native.clone()));
+        assert_eq!(
+            cache.get_for_call("scope", "c1", &client2),
+            Some(native.clone())
+        );
         assert_eq!(cache.get_any("scope", "c1"), Some(native));
         assert_eq!(
             cache.get_for_call("scope", "c1", &call("c1", json!({"command": "ls"}))),

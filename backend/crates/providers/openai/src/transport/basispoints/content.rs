@@ -138,7 +138,8 @@ mod tests {
         let file = json!([{"type": "input_image", "image_url": "https://example.com/a.png", "file_id": "f1"}]);
         assert!(validate_history_content(Some(&file), 0, "content").is_err());
 
-        let creds = json!([{"type": "input_image", "image_url": "https://user:pw@example.com/a.png"}]);
+        let creds =
+            json!([{"type": "input_image", "image_url": "https://user:pw@example.com/a.png"}]);
         assert!(validate_history_content(Some(&creds), 0, "content").is_err());
     }
 

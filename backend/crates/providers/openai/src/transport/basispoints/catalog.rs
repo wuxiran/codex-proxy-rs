@@ -142,10 +142,11 @@ pub(crate) fn collect_tools(
                 entry.insert(field.to_owned(), v.clone());
             }
         }
-        if tool_kind == ToolKind::Function && !entry.contains_key("parameters") {
-            if let Some(schema) = item.get("inputSchema").or_else(|| item.get("input_schema")) {
-                entry.insert("parameters".to_owned(), schema.clone());
-            }
+        if tool_kind == ToolKind::Function
+            && !entry.contains_key("parameters")
+            && let Some(schema) = item.get("inputSchema").or_else(|| item.get("input_schema"))
+        {
+            entry.insert("parameters".to_owned(), schema.clone());
         }
         let definition = fingerprint(raw);
         if let Some(previous) = catalog.tools.get(&qualified) {
@@ -258,7 +259,10 @@ pub(crate) fn describe_schema(value: Option<&Value>, depth: usize) -> String {
     if let Some(kind) = schema.get("type") {
         parts.push(format!("Value type: {}.", quoted(kind)));
     }
-    let description = schema.get("description").and_then(Value::as_str).unwrap_or("");
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if !description.is_empty() {
         parts.push(description.to_owned());
     }
@@ -292,7 +296,10 @@ pub(crate) fn describe_schema(value: Option<&Value>, depth: usize) -> String {
     }
     let mut constraints = Map::new();
     for (key, value) in schema {
-        if !matches!(key.as_str(), "type" | "description" | "properties" | "items") {
+        if !matches!(
+            key.as_str(),
+            "type" | "description" | "properties" | "items"
+        ) {
             constraints.insert(key.clone(), value.clone());
         }
     }
@@ -327,8 +334,14 @@ mod tests {
         collect_tools(&mut catalog, Some(&tools), "").unwrap();
         assert!(catalog.get("shell").is_some());
         assert!(catalog.get("exec").is_some());
-        assert_eq!(catalog.get("fs.read").map(|t| t.name.as_str()), Some("read"));
-        assert_eq!(catalog.get("fs.read").map(|t| t.namespace.as_str()), Some("fs"));
+        assert_eq!(
+            catalog.get("fs.read").map(|t| t.name.as_str()),
+            Some("read")
+        );
+        assert_eq!(
+            catalog.get("fs.read").map(|t| t.namespace.as_str()),
+            Some("fs")
+        );
         assert_eq!(catalog.unsupported, vec!["web_search".to_owned()]);
         assert_eq!(catalog.entries.len(), 3);
     }
@@ -361,8 +374,16 @@ mod tests {
     #[test]
     fn function_code_detection() {
         let params = json!({"type": "object", "properties": {"code": {"type": "string"}}});
-        assert!(supports_function_code_transport("apply_patch", true, Some(&params)));
-        assert!(!supports_function_code_transport("a/b", true, Some(&params)));
+        assert!(supports_function_code_transport(
+            "apply_patch",
+            true,
+            Some(&params)
+        ));
+        assert!(!supports_function_code_transport(
+            "a/b",
+            true,
+            Some(&params)
+        ));
         let no_code = json!({"type": "object", "properties": {"x": {"type": "string"}}});
         assert!(!supports_function_code_transport("f", true, Some(&no_code)));
     }
@@ -373,7 +394,8 @@ mod tests {
             describe_schema(None, 0),
             "Use the arguments described by the tool."
         );
-        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let schema =
+            json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
         let text = describe_schema(Some(&schema), 0);
         assert!(text.contains("Value type: \"object\"."));
         assert!(text.contains("Field \"a\" (required):"));

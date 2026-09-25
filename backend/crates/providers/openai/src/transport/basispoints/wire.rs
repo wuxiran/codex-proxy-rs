@@ -140,7 +140,10 @@ pub(crate) fn message(role: &str, content: &str) -> Value {
     let mut item = Map::new();
     item.insert("type".to_owned(), Value::from("message"));
     item.insert("role".to_owned(), Value::from(role));
-    item.insert("content".to_owned(), Value::Array(vec![Value::Object(part)]));
+    item.insert(
+        "content".to_owned(),
+        Value::Array(vec![Value::Object(part)]),
+    );
     Value::Object(item)
 }
 
