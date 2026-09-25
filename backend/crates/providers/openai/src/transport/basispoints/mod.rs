@@ -11,9 +11,14 @@
 // TODO(bps P2): 传输接入后移除；协议核心尚未被 provider 调用。
 #![allow(dead_code, unused_imports)]
 
+mod error;
+mod replay;
+mod util;
 mod wire;
 
-pub(crate) use wire::{NormalizeEffortError, fingerprint, normalize_effort};
+pub(crate) use error::PrepareError;
+pub(crate) use replay::ReplayCache;
+pub(crate) use wire::{NormalizeEffortError, fingerprint, message, normalize_effort};
 
 /// BPS 上游端点。可在测试中被覆盖。
 pub(crate) const BASISPOINTS_RESPONSES_URL: &str =
