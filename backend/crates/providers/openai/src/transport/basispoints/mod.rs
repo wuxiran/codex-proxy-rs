@@ -11,6 +11,8 @@
 // TODO(bps P2): 传输接入后移除；协议核心尚未被 provider 调用。
 #![allow(dead_code, unused_imports)]
 
+mod catalog;
+mod content;
 mod error;
 mod replay;
 mod util;
