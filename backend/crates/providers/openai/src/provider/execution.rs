@@ -169,6 +169,7 @@ struct RawJsonEndpointRequest {
 pub(super) struct ColdResponse {
     pub(super) turn_state_pins: crate::turn_state_pin::TurnStatePins,
     pub(super) cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
+    pub(super) ws_warm_pool: Option<Arc<crate::ws_warm_pool::WarmPoolService>>,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -731,6 +732,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
     let ColdResponse {
         turn_state_pins,
         cloud_mint,
+        ws_warm_pool,
         client,
         response_origin,
         mut request,
@@ -805,6 +807,12 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             if pin.needs_template() {
                 mint.prefetch(active_account.id().as_str(), upstream_model.as_str());
             }
+        }
+        // WS 保活：记下活跃账号/模型，让 warmer 优先补齐/续探它们的满血连接。
+        if let Some(warm) = ws_warm_pool.as_ref()
+            && warm.enabled()
+        {
+            warm.note_request(active_account.id().as_str(), upstream_model.as_str());
         }
         let request_id = context.request_id().as_str().to_owned();
         let capture_request_log = context.should_capture_request_log();

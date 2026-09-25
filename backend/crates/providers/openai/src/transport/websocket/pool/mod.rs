@@ -6,7 +6,10 @@ mod supervisor;
 
 use std::{
     future::Future,
-    sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -28,7 +31,8 @@ pub(crate) use self::{
         WebSocketPoolConnectWaiter, WebSocketPoolLease,
     },
     state::{
-        CodexWebSocketConnectionMetadata, PooledWebSocketConnection, WebSocketContinuationState,
+        CodexWebSocketConnectionMetadata, PooledWebSocketConnection, WARM_CONVERSATION_PREFIX,
+        WebSocketContinuationState,
     },
 };
 
@@ -49,6 +53,9 @@ pub struct CodexWebSocketPool {
     shutdown: CancellationToken,
     connect_semaphore: Arc<Semaphore>,
     maintenance_started: Arc<AtomicBool>,
+    /// 业务请求是否可领养 warmer 挂住的满血连接（WS 保活的「业务复用」开关）。
+    /// warmer 每轮按设置刷新；关掉后保活连接仍建/仍验，但业务不领养。
+    warm_reuse: Arc<AtomicBool>,
 }
 
 impl Default for CodexWebSocketPool {
@@ -127,9 +134,61 @@ impl CodexWebSocketPool {
             shutdown: CancellationToken::new(),
             connect_semaphore: Arc::new(Semaphore::new(config.max_connecting)),
             maintenance_started: Arc::new(AtomicBool::new(false)),
+            warm_reuse: Arc::new(AtomicBool::new(true)),
         };
         pool.spawn_maintenance_task();
         pool
+    }
+
+    /// 业务复用开关：warmer 每轮按 `warm_pool.business_reuse` 刷新。
+    pub fn set_warm_reuse(&self, enabled: bool) {
+        self.warm_reuse.store(enabled, Ordering::Release);
+    }
+
+    /// 一条建连许可（不阻塞前台）；warmer 建保活连接前先拿，拿不到就本轮少建。
+    pub(crate) fn try_connect_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.connect_semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// 某账号当前挂着的保活连接数（空闲的保活 key slot）。观测/warmer 补齐用。
+    pub(crate) fn warm_len_for_account(&self, account_id: &str) -> usize {
+        let state = self.lock_state();
+        state
+            .slots
+            .iter()
+            .filter(|(key, slot)| {
+                key.is_warm()
+                    && key.account_id() == account_id
+                    && matches!(slot, WebSocketPoolSlot::Idle { .. })
+            })
+            .count()
+    }
+
+    /// 关掉某账号所有空闲的保活连接（探针判降智时用，避免业务领养到降智连接）。
+    /// 返回关闭的条数。正在被 canary 借用（Busy）的不动，它会在归还后由下一轮处理。
+    pub(crate) async fn evict_warm_for_account(&self, account_id: &str) -> usize {
+        let mut to_close = Vec::new();
+        {
+            let mut state = self.lock_state();
+            let keys: Vec<_> = state
+                .slots
+                .iter()
+                .filter(|(key, slot)| {
+                    key.is_warm()
+                        && key.account_id() == account_id
+                        && matches!(slot, WebSocketPoolSlot::Idle { .. })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                if let Some(WebSocketPoolSlot::Idle { connection }) = state.slots.remove(&key) {
+                    to_close.push(*connection);
+                }
+            }
+        }
+        let count = to_close.len();
+        close_pooled_connections(to_close).await;
+        count
     }
 
     /// pump 后台任务的保活策略（供建连时传入）。
@@ -236,6 +295,13 @@ impl CodexWebSocketPool {
                 WebSocketPoolAcquire::ContinuationLost(observation)
             } else if required_response_id.is_some() {
                 WebSocketPoolAcquire::Bypass(WebSocketPoolBypassReason::ContinuationNotFound)
+            } else if self.warm_reuse.load(Ordering::Acquire)
+                && let Some(reused) =
+                    self.adopt_warm_locked(&mut state, &key, &mut connections_to_close)
+            {
+                // 没有该对话的连接、又是可新拨的请求：优先领养一条 warmer 挂住的满血连接，
+                // 让业务跑在"健康期"内建立的连接上。没有可领养的就落到下面照常新拨（行为不变）。
+                reused
             } else {
                 let connect_permit = self.connect_semaphore.clone().try_acquire_owned().ok();
                 match connect_permit {
@@ -266,6 +332,42 @@ impl CodexWebSocketPool {
         close_pooled_connections(connections_to_close).await;
 
         acquire
+    }
+
+    /// 在已加锁的池状态里，为可新拨的业务 key 领养一条 warmer 挂住的满血连接。
+    /// 命中则从保活 key 摘出、清空探针留下的续接状态、以业务 key 登记为 Busy 并返回 `Reused`；
+    /// 过期/已关的保活连接顺手加入关闭队列并跳过；没有可用的返回 `None`（调用方照常新拨）。
+    fn adopt_warm_locked(
+        &self,
+        state: &mut WebSocketPoolState,
+        key: &CodexWebSocketPoolKey,
+        connections_to_close: &mut Vec<PooledWebSocketConnection>,
+    ) -> Option<WebSocketPoolAcquire> {
+        loop {
+            let warm_key = state.slots.iter().find_map(|(candidate, slot)| {
+                (candidate.serves_warm_target(key)
+                    && matches!(slot, WebSocketPoolSlot::Idle { .. }))
+                .then(|| candidate.clone())
+            })?;
+            let Some(WebSocketPoolSlot::Idle { connection }) = state.slots.remove(&warm_key) else {
+                return None;
+            };
+            let mut connection = connection;
+            if connection.created_at.elapsed() >= self.config.max_age
+                || connection.websocket.is_closed()
+            {
+                connections_to_close.push(*connection);
+                continue;
+            }
+            // 探针 response id 不是业务续接，绑定给对话前清空。
+            connection.continuation = WebSocketContinuationState::default();
+            let lease = WebSocketPoolLease::reserve(self.clone(), key.clone(), None);
+            state.slots.insert(
+                key.clone(),
+                WebSocketPoolSlot::Busy(lease.reservation.clone()),
+            );
+            return Some(WebSocketPoolAcquire::Reused { connection, lease });
+        }
     }
 
     async fn put_reserved(

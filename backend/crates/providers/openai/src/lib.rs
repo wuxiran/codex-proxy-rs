@@ -8,6 +8,7 @@ mod session_transport;
 mod turn_state_auto_hunt;
 mod turn_state_mint;
 mod turn_state_pin;
+mod ws_warm_pool;
 
 use std::sync::Arc;
 
@@ -183,6 +184,18 @@ pub async fn initialize(
         profile.clone(),
         config.base_url(),
     ));
+    // WS 保活 warmer：用带池的客户端经业务同一条路径开/验/挂住满血连接。
+    let ws_warm_pool = Arc::new(ws_warm_pool::WarmPoolService::new(
+        repository.clone(),
+        turn_state_pins.clone(),
+        crate::transport::CodexBackendClient::new(
+            http.clone(),
+            config.base_url().to_owned(),
+            profile.clone(),
+        )
+        .with_websocket_pool(Arc::clone(&websocket_pool)),
+        Arc::clone(&websocket_pool),
+    ));
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,
@@ -198,7 +211,8 @@ pub async fn initialize(
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
         .with_turn_state_pins(turn_state_pins.clone())
-        .with_cloud_mint(Arc::clone(&cloud_mint)),
+        .with_cloud_mint(Arc::clone(&cloud_mint))
+        .with_ws_warm_pool(Arc::clone(&ws_warm_pool)),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -282,6 +296,7 @@ pub async fn initialize(
         )
         .with_turn_state_pins(turn_state_pins)
         .with_cloud_mint(Arc::clone(&cloud_mint))
+        .with_ws_warm_pool(Arc::clone(&ws_warm_pool))
         .with_ticket_login(ticket_login)
         .with_auto_hunt_store(
             turn_state_auto_hunt::AutoHuntStore::new(config.turn_state_data_dir().to_path_buf())
@@ -301,6 +316,7 @@ pub async fn initialize(
         },
         revive,
         cloud_mint,
+        Arc::clone(&ws_warm_pool),
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
 

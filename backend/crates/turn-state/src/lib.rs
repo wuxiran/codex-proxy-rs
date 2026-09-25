@@ -26,6 +26,5 @@ pub use service::{
     TurnStateService,
 };
 pub use settings::{
-    CloudMintSettings, DEFAULT_TTL, InjectMode, MintMode, Settings, SettingsError,
-    WarmPoolSettings,
+    CloudMintSettings, DEFAULT_TTL, InjectMode, MintMode, Settings, SettingsError, WarmPoolSettings,
 };

@@ -84,22 +84,37 @@ pub struct WarmPoolSettings {
     pub probe_model: String,
     /// 探针 effort：low/medium/high/xhigh。
     pub probe_effort: String,
+    /// 业务请求是否可领养保活连接；关掉则只建/只验不复用（观测态）。
+    pub business_reuse: bool,
+    /// 探针判降智/失败后，该账号多久内不再开保活连接（秒）。
+    pub cooldown_seconds: u64,
+    /// 进程内保活连接总数上限。
+    pub max_total_connections: u32,
+    /// 单次探针的整次调用上限（秒）；高 effort 慢，留足。
+    pub probe_timeout_seconds: u64,
 }
 
 impl Default for WarmPoolSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // 老板决策：默认开。安全性来自领养的「无满血连接即照常新拨」降级语义，
+            // 加上 warmer 对反复探针失败的账号（如被标记号）做冷却，避免烧配额空转。
+            enabled: true,
             connections_per_account: 2,
             models: Vec::new(),
             // 50 分钟：卡在上游 55min 硬上限之内。
             max_age_seconds: 3000,
-            reprobe_seconds: 120,
+            // 低频复探（老板选定）：新建连接必验，之后每 5 分钟一次。
+            reprobe_seconds: 300,
             probe: true,
             probe_prompt: String::new(),
             probe_expect: "21".to_owned(),
             probe_model: String::new(),
             probe_effort: "high".to_owned(),
+            business_reuse: true,
+            cooldown_seconds: 600,
+            max_total_connections: 64,
+            probe_timeout_seconds: 180,
         }
     }
 }
@@ -111,6 +126,14 @@ impl WarmPoolSettings {
 
     pub fn reprobe(&self) -> Duration {
         Duration::from_secs(self.reprobe_seconds)
+    }
+
+    pub fn cooldown(&self) -> Duration {
+        Duration::from_secs(self.cooldown_seconds)
+    }
+
+    pub fn probe_timeout(&self) -> Duration {
+        Duration::from_secs(self.probe_timeout_seconds)
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -126,8 +149,20 @@ impl WarmPoolSettings {
         if !(15..=1800).contains(&self.reprobe_seconds) {
             return Err(SettingsError::WarmReprobe);
         }
-        if !matches!(self.probe_effort.as_str(), "low" | "medium" | "high" | "xhigh") {
+        if !matches!(
+            self.probe_effort.as_str(),
+            "low" | "medium" | "high" | "xhigh"
+        ) {
             return Err(SettingsError::WarmEffort);
+        }
+        if !(30..=86_400).contains(&self.cooldown_seconds) {
+            return Err(SettingsError::WarmCooldown);
+        }
+        if !(1..=1024).contains(&self.max_total_connections) {
+            return Err(SettingsError::WarmTotal);
+        }
+        if !(30..=600).contains(&self.probe_timeout_seconds) {
+            return Err(SettingsError::WarmProbeTimeout);
         }
         Ok(())
     }
@@ -289,6 +324,12 @@ pub enum SettingsError {
     WarmReprobe,
     #[error("warm pool probe effort must be low, medium, high or xhigh")]
     WarmEffort,
+    #[error("warm pool cooldown must be between 30 and 86400 seconds")]
+    WarmCooldown,
+    #[error("warm pool max total connections must be between 1 and 1024")]
+    WarmTotal,
+    #[error("warm pool probe timeout must be between 30 and 600 seconds")]
+    WarmProbeTimeout,
 }
 
 impl Settings {

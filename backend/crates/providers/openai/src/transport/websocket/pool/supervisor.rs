@@ -110,6 +110,7 @@ impl CodexWebSocketPool {
         let shutdown = self.shutdown.clone();
         let connect_semaphore = Arc::clone(&self.connect_semaphore);
         let maintenance_started = Arc::clone(&self.maintenance_started);
+        let warm_reuse = Arc::clone(&self.warm_reuse);
         drop(self.tasks.spawn(async move {
             let mut interval = tokio::time::interval(interval_duration);
             loop {
@@ -127,6 +128,7 @@ impl CodexWebSocketPool {
                     shutdown: shutdown.clone(),
                     connect_semaphore: Arc::clone(&connect_semaphore),
                     maintenance_started: Arc::clone(&maintenance_started),
+                    warm_reuse: Arc::clone(&warm_reuse),
                 };
                 if pool.is_shutdown().await {
                     break;

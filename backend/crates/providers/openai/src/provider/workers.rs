@@ -24,6 +24,9 @@ pub(super) const OAUTH_REVIVE_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const CLOUD_MINT_WORKER_OWNER: &str = "openai-cloud-mint";
 /// 票只有 ~240s，续打要比到期余量（60s）扫得更勤。
 pub(super) const CLOUD_MINT_INTERVAL: Duration = Duration::from_secs(20);
+pub(super) const WARM_POOL_WORKER_OWNER: &str = "openai-ws-warm-pool";
+/// WS 保活：补齐/低频复探，20s 扫一轮（也可被账号导入事件唤醒）。
+pub(super) const WARM_POOL_INTERVAL: Duration = Duration::from_secs(20);
 
 // 每个参数都是独立注入的服务，打包成结构体只会多一层无意义的搬运。
 #[expect(clippy::too_many_arguments)]
@@ -36,6 +39,7 @@ pub(crate) fn worker_contributions(
     releases: ClientReleaseServices,
     revive: Arc<crate::credential::CodexReviveService>,
     cloud_mint: Arc<crate::turn_state_mint::CloudMintService>,
+    ws_warm_pool: Arc<crate::ws_warm_pool::WarmPoolService>,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -67,6 +71,20 @@ pub(crate) fn worker_contributions(
             service: cloud_mint,
         }),
     )?));
+    contributions.push(WorkerContribution::Registration(
+        WorkerRegistration::try_new(
+            WorkerId::try_new(WorkerKind::QuotaCatalogHealth, WARM_POOL_WORKER_OWNER)?,
+            WorkerRunnable::Daemon {
+                restart: DaemonRestartPolicy::try_new(
+                    WORKER_INITIAL_BACKOFF,
+                    WORKER_MAXIMUM_BACKOFF,
+                )?,
+                task: Box::new(OpenAiWarmPoolTask {
+                    service: ws_warm_pool,
+                }),
+            },
+        )?,
+    ));
     contributions.extend([
         WorkerContribution::Registration(scheduled_registration(
             WorkerId::try_new(
@@ -279,6 +297,30 @@ pub(super) struct OpenAiCatalogTask {
 
 pub(super) struct OpenAiCatalogEtagTask {
     catalog: Arc<CodexCredentialCatalogService>,
+}
+
+pub(super) struct OpenAiWarmPoolTask {
+    service: Arc<crate::ws_warm_pool::WarmPoolService>,
+}
+
+impl DaemonTask for OpenAiWarmPoolTask {
+    fn run(
+        &self,
+        cancellation: gateway_core::lifecycle::CancellationToken,
+    ) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            let mut interval = tokio::time::interval(WARM_POOL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => return Ok(()),
+                    () = self.service.wait_wake() => {},
+                    _ = interval.tick() => {},
+                };
+                self.service.run_cycle().await;
+            }
+        })
+    }
 }
 
 pub(super) struct OpenAiDesktopReleaseTask {

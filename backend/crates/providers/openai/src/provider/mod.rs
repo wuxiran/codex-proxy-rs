@@ -99,6 +99,7 @@ mod encrypted_content;
 mod execution;
 mod failure;
 mod observation;
+pub(crate) use observation::build_cookie_header;
 mod workers;
 pub(crate) use workers::ClientReleaseServices;
 
@@ -142,6 +143,7 @@ pub enum CodexProviderConfigError {
 pub struct CodexProvider {
     turn_state_pins: crate::turn_state_pin::TurnStatePins,
     cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
+    ws_warm_pool: Option<Arc<crate::ws_warm_pool::WarmPoolService>>,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -209,6 +211,7 @@ impl CodexProvider {
             session_identity: None,
             turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
             cloud_mint: None,
+            ws_warm_pool: None,
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             invalid_encrypted_content: InvalidEncryptedContentCache::default(),
             stream_max_retries,
@@ -228,6 +231,14 @@ impl CodexProvider {
         service: Arc<crate::turn_state_mint::CloudMintService>,
     ) -> Self {
         self.cloud_mint = Some(service);
+        self
+    }
+
+    pub(crate) fn with_ws_warm_pool(
+        mut self,
+        service: Arc<crate::ws_warm_pool::WarmPoolService>,
+    ) -> Self {
+        self.ws_warm_pool = Some(service);
         self
     }
 
@@ -675,6 +686,7 @@ impl Provider for CodexProvider {
         let events = cold_response_stream(ColdResponse {
             turn_state_pins: self.turn_state_pins.clone(),
             cloud_mint: self.cloud_mint.clone(),
+            ws_warm_pool: self.ws_warm_pool.clone(),
             client,
             response_origin: self.responses_url.clone(),
             request: upstream_request,

@@ -89,7 +89,27 @@ impl CodexWebSocketPoolKey {
             && self.conversation_id == other.conversation_id
             && self.egress_key == other.egress_key
     }
+
+    /// 保活连接：warmer 预建的满血连接的 conversation_id 以 `WARM_CONVERSATION_PREFIX` 打头，
+    /// 业务新对话据此领养（见 `serves_warm_target`）。
+    pub(crate) fn is_warm(&self) -> bool {
+        self.conversation_id.starts_with(WARM_CONVERSATION_PREFIX)
+    }
+
+    /// `self` 是一条保活 key，且能服务 `business`（同上游、同账号、同出口、同握手画像）。
+    /// 忽略 conversation_id 与 downstream_connection_id：领养后会以业务 key 重新登记。
+    pub(super) fn serves_warm_target(&self, business: &Self) -> bool {
+        self.is_warm()
+            && !business.is_warm()
+            && self.base_url == business.base_url
+            && self.account_id == business.account_id
+            && self.egress_key == business.egress_key
+            && self.connection_profile == business.connection_profile
+    }
 }
+
+/// 保活连接池 key 的 conversation_id 前缀；业务对话不会用到（它是随机会话锚点）。
+pub(crate) const WARM_CONVERSATION_PREFIX: &str = "__cpr_warm__:";
 
 const CONTINUATION_TOMBSTONE_TTL: Duration = Duration::from_mins(30);
 const MAX_CONTINUATION_TOMBSTONES: usize = 4_096;

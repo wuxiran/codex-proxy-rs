@@ -91,6 +91,7 @@ pub(crate) struct OpenAiAdminProvider {
     desktop_release: CodexDesktopReleaseStatus,
     ticket_login: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
     cloud_mint: Option<Arc<crate::turn_state_mint::CloudMintService>>,
+    ws_warm_pool: Option<Arc<crate::ws_warm_pool::WarmPoolService>>,
 }
 
 pub(crate) struct OpenAiAdminServices {
@@ -126,6 +127,7 @@ impl OpenAiAdminProvider {
             desktop_release,
             ticket_login: None,
             cloud_mint: None,
+            ws_warm_pool: None,
         }
     }
 
@@ -134,6 +136,14 @@ impl OpenAiAdminProvider {
         service: Arc<crate::turn_state_mint::CloudMintService>,
     ) -> Self {
         self.cloud_mint = Some(service);
+        self
+    }
+
+    pub(crate) fn with_ws_warm_pool(
+        mut self,
+        service: Arc<crate::ws_warm_pool::WarmPoolService>,
+    ) -> Self {
+        self.ws_warm_pool = Some(service);
         self
     }
 
@@ -346,12 +356,23 @@ impl ProviderAdmin for OpenAiAdminProvider {
 
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
         self.turn_state_pins.clear(account_id.as_str());
+        if let Some(warm) = &self.ws_warm_pool {
+            warm.forget(account_id.as_str());
+        }
         self.websocket_pool.evict_account(account_id.as_str()).await;
     }
 
     async fn account_facts_changed(&self, account_ids: &[ProviderAccountId]) {
         if account_ids.is_empty() {
             return;
+        }
+        // 账号导入/变更 → 让 warmer 立刻为它们抢窗口建满血连接。
+        if let Some(warm) = &self.ws_warm_pool {
+            let ids: Vec<String> = account_ids
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            warm.notify_accounts_changed(&ids);
         }
         self.quota.invalidate_scheduling(account_ids);
         if let Err(error) = self.catalog.invalidate() {
@@ -1114,9 +1135,14 @@ impl ProviderAdmin for OpenAiAdminProvider {
                         }),
                     })
                 });
+                let warm_pool = self
+                    .ws_warm_pool
+                    .as_ref()
+                    .map(|warm| warm.account_view(account_id.as_str()));
                 let value = serde_json::json!({
                     "guanlanReviveAvailable": guanlan_revive_available,
                     "cloudMint": cloud_mint,
+                    "warmPool": warm_pool,
                     "pinTurnState": data.turn_state_pin.is_some(),
                     // 续期只对开启中的固定有意义；固定关着时即便文件里有残留也不展示、不续期。
                     "turnStateAutoHunt": data.turn_state_pin.as_ref().and_then(|_| self.auto_hunt.get(account_id.as_str())).map(|auto| serde_json::json!({
