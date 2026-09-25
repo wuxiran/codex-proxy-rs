@@ -244,6 +244,17 @@ impl WarmPoolService {
             if !Self::eligible(&account) {
                 continue;
             }
+            // 只保活「已开启 state 绑定（固定自身 state）」的账号——即导入时勾选的新号；
+            // 存量/未绑定号一律不碰（不 hunt、不烧动态网关、不动在用号）。
+            let bound = self
+                .repository
+                .load_runtime_credential(&account)
+                .await
+                .map(|c| c.turn_state_pin.is_some())
+                .unwrap_or(false);
+            if !bound {
+                continue;
+            }
             let id = account.id().as_str().to_owned();
             let want = settings.connections_per_account as usize;
             // 池是「哪些 slot 有活连接」的唯一真相（可能被业务领养/被 evict 掉）。

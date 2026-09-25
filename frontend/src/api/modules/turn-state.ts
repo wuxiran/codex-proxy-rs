@@ -15,6 +15,41 @@ export interface TurnStateSettings {
   degradedLengths: number[]
   /** 云端打票：账号缺票时向 relay 铸票并钉住路由 cookie 对。 */
   cloudMint: TurnStateCloudMintSettings
+  /** WS 保活：为已绑定 state 的账号预建并挂住满血 WebSocket，业务复用。 */
+  warmPool: TurnStateWarmPoolSettings
+}
+
+export interface TurnStateWarmPoolSettings {
+  /** 默认开；只对已开启「固定自身 state」的账号(导入的新号)生效，不碰存量号。 */
+  enabled: boolean
+  /** 业务请求是否可领养保活连接。 */
+  businessReuse: boolean
+  /** 每个账号挂几条满血连接。 */
+  connectionsPerAccount: number
+  /** 预热的模型；空 = 用探针模型。 */
+  models: string[]
+  /** 一条连接最多挂多久(秒)，<上游 55min。 */
+  maxAgeSeconds: number
+  /** 复探间隔(秒)：低频验连接还满不满血。 */
+  reprobeSeconds: number
+  /** 是否跑 canary 探针(糖果题)。 */
+  probe: boolean
+  /** 探针题正文；空 = 内置糖果题。 */
+  probePrompt: string
+  /** 满血判据：答案以此开头(如 21)。 */
+  probeExpect: string
+  /** 探针模型；空 = models 首个。 */
+  probeModel: string
+  /** 探针 effort。 */
+  probeEffort: 'low' | 'medium' | 'high' | 'xhigh'
+  /** 单次探针整次上限(秒)。 */
+  probeTimeoutSeconds: number
+  /** 探到降智时最多再换几个节点重试。 */
+  probeRetries: number
+  /** 降智/失败后该账号冷却多久(秒)。 */
+  cooldownSeconds: number
+  /** 进程内保活连接总数上限。 */
+  maxTotalConnections: number
 }
 
 export type TurnStateMintMode = 'native' | 'relay'

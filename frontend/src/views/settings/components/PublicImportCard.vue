@@ -140,8 +140,8 @@ async function rotate() {
         <AccountGroupCheckboxGrid v-model="groupIds" :groups="groups" :loading="groupsLoading" :disabled="busy" />
       </BaseFormItem>
 
-      <BaseFormItem label="自动开启 state 绑定" description="导入成功后为 OAuth 账号开启「固定自身 state」；API Key 账号不支持，会跳过">
-        <BaseSwitch v-model="pinTurnState" label="导入后自动开启 state 绑定" :disabled="busy" />
+      <BaseFormItem label="自动开启 state 绑定 + WS 保活" description="导入成功后为 OAuth 账号开启「固定自身 state」；开启后 WS 保活暖池会给这些账号预建并挂住满血 WebSocket（在「state 观测」页统一开关与调参）。API Key 账号不支持，会跳过">
+        <BaseSwitch v-model="pinTurnState" label="导入后开启 state 绑定 + WS 保活" :disabled="busy" />
       </BaseFormItem>
 
       <BaseFormItem label="链接有效期" :error="expiryError" :description="`${expiryText}。预设时长从点击保存时起算；到期后链接自动失效，更换链接不会重置有效期`">

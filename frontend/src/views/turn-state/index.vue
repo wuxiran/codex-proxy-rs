@@ -49,6 +49,21 @@ const transportOptions = [
   { label: 'SSE', value: 'sse' },
   { label: 'WebSocket', value: 'websocket' },
 ]
+const effortOptions = [
+  { label: 'low', value: 'low' },
+  { label: 'medium', value: 'medium' },
+  { label: 'high', value: 'high' },
+  { label: 'xhigh', value: 'xhigh' },
+]
+const warmModelsText = computed({
+  get: () => settings.value?.warmPool.models.join(', ') ?? '',
+  set: (value: string) => {
+    if (settings.value) {
+      settings.value.warmPool.models = value.split(/[\s,]+/).map(item => item.trim()).filter(Boolean)
+      markDirty()
+    }
+  },
+})
 const mintModelsText = computed({
   get: () => settings.value?.cloudMint.models.join(', ') ?? '',
   set: (value: string) => {
@@ -401,6 +416,64 @@ onBeforeUnmount(() => {
         </div>
         <p class="m-0 text-xs text-neutral-500">
           native 模式走账号自己绑定的代理出网（出口 = 该代理 IP），relay 模式出口是 relay 所在机器。780 只是预期格式长度，网关名与模型声明都不能证明模型实际能力；是否满血仍以测智台人工判定为准。缺票的账号先裸发一次业务请求触发预热，下一次请求才带票。
+        </p>
+      </div>
+    </BaseCard>
+
+    <BaseCard title="WS 保活（暖池）" description="为已开启「固定自身 state」的账号(导入的新号)预建并挂住满血 WebSocket：探针验满血、降智换节点重试、业务新对话领养这条连接。连接顶约 55 分钟，绕过约 90 秒的票过期(票过期会掉缓存并静默降级)。只碰绑定号，不碰存量/在用号。">
+      <div v-if="settings" class="flex flex-col gap-4">
+        <div class="flex flex-wrap items-center gap-5">
+          <BaseSwitch v-model="settings.warmPool.enabled" label="启用 WS 保活" show-label @update:model-value="markDirty" />
+          <BaseSwitch v-model="settings.warmPool.businessReuse" label="业务可领养" show-label @update:model-value="markDirty" />
+          <BaseSwitch v-model="settings.warmPool.probe" label="跑 canary 探针" show-label @update:model-value="markDirty" />
+          <BaseButton variant="primary" :loading="saving" :disabled="!settingsDirty || saving" @click="saveSettings">
+            保存设置
+          </BaseButton>
+        </div>
+        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">每账号连接数</span>
+            <BaseNumberInput v-model="settings.warmPool.connectionsPerAccount" label="每账号连接数" :min="1" :max="16" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">降智重试次数</span>
+            <BaseNumberInput v-model="settings.warmPool.probeRetries" label="降智重试" :min="0" :max="16" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">复探间隔（秒）</span>
+            <BaseNumberInput v-model="settings.warmPool.reprobeSeconds" label="复探间隔" :min="15" :max="1800" :step="15" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">连接寿命（秒，&lt;55min）</span>
+            <BaseNumberInput v-model="settings.warmPool.maxAgeSeconds" label="连接寿命" :min="60" :max="3300" :step="60" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">失败冷却（秒）</span>
+            <BaseNumberInput v-model="settings.warmPool.cooldownSeconds" label="失败冷却" :min="30" :max="86400" :step="30" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">进程连接总上限</span>
+            <BaseNumberInput v-model="settings.warmPool.maxTotalConnections" label="总上限" :min="1" :max="1024" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">探针整次上限（秒）</span>
+            <BaseNumberInput v-model="settings.warmPool.probeTimeoutSeconds" label="探针上限" :min="30" :max="600" :step="10" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">探针 effort</span>
+            <BaseSelect v-model="settings.warmPool.probeEffort" :options="effortOptions" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">满血判据（答案开头）</span>
+            <BaseInput v-model="settings.warmPool.probeExpect" placeholder="21" class="mt-1" @update:model-value="markDirty" />
+          </div>
+          <div class="md:col-span-2">
+            <span class="block text-xs text-neutral-500">探针模型（逗号分隔；空 = 用内置 gpt-6-astra）</span>
+            <BaseInput v-model="warmModelsText" placeholder="gpt-6-astra" class="mt-1" />
+          </div>
+        </div>
+        <p class="m-0 text-xs text-neutral-500">
+          仅对开启「固定自身 state」的账号生效（导入的新号默认开）。探针走账号自己出口现建连接、去 residency 头，命中满血(答案以「满血判据」开头)就挂住供业务领养；探到降智会 evict 换节点重试。账号级 WS 状态见账号详情的 warmPool。
         </p>
       </div>
     </BaseCard>
