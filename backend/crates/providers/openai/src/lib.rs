@@ -188,12 +188,9 @@ pub async fn initialize(
     let ws_warm_pool = Arc::new(ws_warm_pool::WarmPoolService::new(
         repository.clone(),
         turn_state_pins.clone(),
-        crate::transport::CodexBackendClient::new(
-            http.clone(),
-            config.base_url().to_owned(),
-            profile.clone(),
-        )
-        .with_websocket_pool(Arc::clone(&websocket_pool)),
+        http.clone(),
+        config.base_url().to_owned(),
+        profile.clone(),
         Arc::clone(&websocket_pool),
     ));
     let core_provider: Arc<dyn Provider> = Arc::new(

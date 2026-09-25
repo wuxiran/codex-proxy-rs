@@ -420,6 +420,12 @@ impl CodexWebSocketPool {
                 key.clone(),
                 WebSocketPoolSlot::Busy(lease.reservation.clone()),
             );
+            // 业务领养了一条保活满血连接（决策记为 reuse，这行让它在日志里可辨认）。
+            tracing::debug!(
+                target: "ws_warm",
+                account_id = key.account_id(),
+                "[ws-warm] business adopted a warm connection"
+            );
             return Some(WebSocketPoolAcquire::Reused { connection, lease });
         }
     }

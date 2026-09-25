@@ -27,6 +27,7 @@ use turn_state::WarmPoolSettings;
 use crate::credential::{CODEX_AUTHENTICATION_KIND_OAUTH, CodexCredentialRepository};
 use crate::transport::protocol::responses::CodexResponsesRequest;
 use crate::transport::websocket::WARM_CONVERSATION_PREFIX;
+use crate::transport::profile::CodexWireProfileState;
 use crate::transport::{
     CodexBackendClient, CodexBackendStreamingResponse, CodexRequestContext, CodexWebSocketPool,
 };
@@ -100,8 +101,11 @@ enum Verdict {
 pub(crate) struct WarmPoolService {
     repository: CodexCredentialRepository,
     pins: crate::turn_state_pin::TurnStatePins,
-    /// 带连接池的基础客户端；`for_account` 后即得到账号出口 + 池。
-    client: CodexBackendClient,
+    /// 每次探针从活 profile 快照现建客户端（清掉 residency 头）：既能拿到 __oailb 看网关、
+    /// 让裸开探到不同节点，又跟随线上 profile 版本、不产生 connection_profile 漂移使领养失配。
+    http: reqwest::Client,
+    base_url: String,
+    profile: CodexWireProfileState,
     pool: Arc<CodexWebSocketPool>,
     wake: Notify,
     /// 全局在途开连接/探针数，配合 `max_total_connections` 限流。
@@ -127,18 +131,34 @@ impl WarmPoolService {
     pub(crate) fn new(
         repository: CodexCredentialRepository,
         pins: crate::turn_state_pin::TurnStatePins,
-        client: CodexBackendClient,
+        http: reqwest::Client,
+        base_url: impl Into<String>,
+        profile: CodexWireProfileState,
         pool: Arc<CodexWebSocketPool>,
     ) -> Self {
         Self {
             repository,
             pins,
-            client,
+            http,
+            base_url: base_url.into(),
+            profile,
             pool,
             wake: Notify::new(),
             in_flight_total: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// 现建一个「去 residency」的基础客户端（跟随活 profile 版本）。
+    fn residency_free_client(&self) -> CodexBackendClient {
+        let mut wire = self.profile.snapshot();
+        wire.residency = None;
+        CodexBackendClient::new(
+            self.http.clone(),
+            self.base_url.clone(),
+            CodexWireProfileState::new(wire),
+        )
+        .with_websocket_pool(Arc::clone(&self.pool))
     }
 
     fn settings(&self) -> WarmPoolSettings {
@@ -454,7 +474,7 @@ impl WarmPoolService {
         let cookie_header = crate::provider::build_cookie_header(&credential.cookies)
             .map_err(|_| "cookies".to_owned())?;
         let client = self
-            .client
+            .residency_free_client()
             .for_account(account)
             .map_err(|_| "client".to_owned())?
             .with_authentication(&credential.authentication);
