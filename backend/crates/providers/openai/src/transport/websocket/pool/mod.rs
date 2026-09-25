@@ -218,6 +218,33 @@ impl CodexWebSocketPool {
         count
     }
 
+    /// 关掉某账号某个 slot 的空闲保活连接（降智重试时用：evict 掉这条，下次开就落新节点）。
+    pub(crate) async fn evict_warm_slot(&self, account_id: &str, slot: usize) -> usize {
+        let mut to_close = Vec::new();
+        {
+            let mut state = self.lock_state();
+            let keys: Vec<_> = state
+                .slots
+                .iter()
+                .filter(|(key, s)| {
+                    key.is_warm()
+                        && key.account_id() == account_id
+                        && key.warm_slot() == Some(slot)
+                        && matches!(s, WebSocketPoolSlot::Idle { .. })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                if let Some(WebSocketPoolSlot::Idle { connection }) = state.slots.remove(&key) {
+                    to_close.push(*connection);
+                }
+            }
+        }
+        let count = to_close.len();
+        close_pooled_connections(to_close).await;
+        count
+    }
+
     /// pump 后台任务的保活策略（供建连时传入）。
     pub(crate) fn keepalive(&self) -> PumpKeepalive {
         self.config.keepalive()

@@ -92,6 +92,9 @@ pub struct WarmPoolSettings {
     pub max_total_connections: u32,
     /// 单次探针的整次调用上限（秒）；高 effort 慢，留足。
     pub probe_timeout_seconds: u64,
+    /// 探到降智时，最多再换几个节点重试找满血（同出口重开=落新节点实例）；
+    /// 只有连续这么多次都降智才冷却。0 = 不重试（一次降智就冷却，适合死号多的场景）。
+    pub probe_retries: u32,
 }
 
 impl Default for WarmPoolSettings {
@@ -115,6 +118,8 @@ impl Default for WarmPoolSettings {
             cooldown_seconds: 600,
             max_total_connections: 64,
             probe_timeout_seconds: 180,
+            // 降智时最多再换 4 个节点找满血；干净号一般几次内撞到满血。
+            probe_retries: 4,
         }
     }
 }
@@ -163,6 +168,9 @@ impl WarmPoolSettings {
         }
         if !(30..=600).contains(&self.probe_timeout_seconds) {
             return Err(SettingsError::WarmProbeTimeout);
+        }
+        if self.probe_retries > 16 {
+            return Err(SettingsError::WarmRetries);
         }
         Ok(())
     }
@@ -330,6 +338,8 @@ pub enum SettingsError {
     WarmTotal,
     #[error("warm pool probe timeout must be between 30 and 600 seconds")]
     WarmProbeTimeout,
+    #[error("warm pool probe retries must be at most 16")]
+    WarmRetries,
 }
 
 impl Settings {

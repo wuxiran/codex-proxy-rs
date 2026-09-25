@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use base64::Engine as _;
 use futures::StreamExt as _;
 use gateway_core::account::ProviderAccount;
 use secrecy::ExposeSecret;
@@ -58,6 +59,12 @@ pub(crate) struct WarmReport {
     pub(crate) verdict: Option<&'static str>,
     pub(crate) served_model: Option<String>,
     pub(crate) error: Option<String>,
+    /// 最终这条连接落的网关（`unified-N`），从 `__oailb` 解出；观测/验证换节点用。
+    pub(crate) gateway: Option<String>,
+    /// 本轮实际探了几次（降智会换节点重试）。
+    pub(crate) attempts: u32,
+    /// 重试路上探到的网关序列（含最终那个），看有没有真的换到不同节点。
+    pub(crate) tried_gateways: Vec<String>,
 }
 
 #[derive(Default)]
@@ -193,6 +200,9 @@ impl WarmPoolService {
                 "verdict": r.verdict,
                 "servedModel": r.served_model,
                 "error": r.error,
+                "gateway": r.gateway,
+                "attempts": r.attempts,
+                "triedGateways": r.tried_gateways,
             })),
         })
     }
@@ -321,7 +331,9 @@ impl WarmPoolService {
             && account.enabled()
     }
 
-    /// 为一个账号的一个 slot 开/复探一条保活连接。
+    /// 为一个账号的一个 slot 开/复探一条保活连接。**探到降智会换节点重试**（evict 掉这条→
+    /// 同出口重开=落新节点实例），挑出第一条满血的挂住；只有连续 `probe_retries+1` 次全降智
+    /// 才冷却（那基本是死号）。auth/超时不重试。
     async fn warm_one(
         &self,
         account: ProviderAccount,
@@ -330,8 +342,6 @@ impl WarmPoolService {
         settings: &WarmPoolSettings,
     ) {
         let id = account.id().as_str().to_owned();
-        let outcome = self.warm_probe(&account, slot, settings).await;
-        let now = Instant::now();
         let mut report = WarmReport {
             at: SystemTime::now(),
             held: 0,
@@ -339,38 +349,75 @@ impl WarmPoolService {
             verdict: None,
             served_model: None,
             error: None,
+            gateway: None,
+            attempts: 0,
+            tried_gateways: Vec::new(),
         };
-        match outcome {
-            Ok(Verdict::Verified(model)) => {
-                report.verdict = Some("verified");
-                report.served_model = model;
-                if let Ok(mut state) = self.state.lock() {
-                    let entry = state.accounts.entry(id.clone()).or_default();
-                    entry.verified_at.insert(slot, now);
+        let mut verified = false;
+        let mut all_degraded = false;
+        for attempt in 0..=settings.probe_retries {
+            report.attempts = attempt + 1;
+            match self.warm_probe(&account, slot, settings).await {
+                Ok((Verdict::Verified(model), gateway)) => {
+                    report.verdict = Some("verified");
+                    report.served_model = model;
+                    report.gateway = gateway.clone();
+                    if let Some(gw) = gateway {
+                        report.tried_gateways.push(gw);
+                    }
+                    if let Ok(mut state) = self.state.lock() {
+                        let entry = state.accounts.entry(id.clone()).or_default();
+                        entry.verified_at.insert(slot, Instant::now());
+                    }
+                    tracing::info!(
+                        target: "ws_warm",
+                        account_id = %id,
+                        slot,
+                        attempt = report.attempts,
+                        gateway = report.gateway.as_deref().unwrap_or("?"),
+                        "[ws-warm] verified and held"
+                    );
+                    verified = true;
+                    break;
+                }
+                Ok((Verdict::Degraded(model), gateway)) => {
+                    report.verdict = Some("degraded");
+                    report.served_model = model;
+                    report.gateway = gateway.clone();
+                    if let Some(gw) = gateway {
+                        report.tried_gateways.push(gw);
+                    }
+                    all_degraded = true;
+                    // evict 这条降智连接，下次开就落新节点；到重试上限则跳出去冷却。
+                    self.pool.evict_warm_slot(&id, slot).await;
+                }
+                Ok((Verdict::Failed(code), gateway)) => {
+                    report.verdict = Some("failed");
+                    report.error = Some(code);
+                    report.gateway = gateway;
+                    self.pool.evict_warm_slot(&id, slot).await;
+                    self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
+                    break; // auth/超时重试也没用
+                }
+                Err(error) => {
+                    report.error = Some(error);
+                    self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
+                    break;
                 }
             }
-            Ok(Verdict::Degraded(model)) => {
-                report.verdict = Some("degraded");
-                report.served_model = model;
-                // 降智：关掉该账号所有保活连接，别让业务领养；冷却，别空转续开。
-                let closed = self.pool.evict_warm_for_account(&id).await;
-                tracing::info!(
-                    target: "ws_warm",
-                    account_id = %id,
-                    closed,
-                    "[ws-warm] degraded connection evicted"
-                );
-                self.set_cooldown(&id, settings.cooldown());
-            }
-            Ok(Verdict::Failed(code)) => {
-                report.verdict = Some("failed");
-                report.error = Some(code);
-                self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
-            }
-            Err(error) => {
-                report.error = Some(error);
-                self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
-            }
+        }
+        if !verified && all_degraded {
+            // 换了 probe_retries+1 个节点都降智 → 冷却（死号或该出口全落坏节点）。
+            let closed = self.pool.evict_warm_for_account(&id).await;
+            tracing::info!(
+                target: "ws_warm",
+                account_id = %id,
+                attempts = report.attempts,
+                gateways = ?report.tried_gateways,
+                closed,
+                "[ws-warm] all attempts degraded, cooling down"
+            );
+            self.set_cooldown(&id, settings.cooldown());
         }
         report.held = self.pool.warm_len_for_account(&id);
         if let Ok(mut state) = self.state.lock() {
@@ -388,12 +435,13 @@ impl WarmPoolService {
     }
 
     /// 发一条 canary 请求（WS 强制、store=false），落进保活 key、读答案判满血。
+    /// 返回判决 + 这条连接落的网关（从上游回的 `__oailb` 解出，可能为 None）。
     async fn warm_probe(
         &self,
         account: &ProviderAccount,
         slot: usize,
         settings: &WarmPoolSettings,
-    ) -> Result<Verdict, String> {
+    ) -> Result<(Verdict, Option<String>), String> {
         let credential = self
             .repository
             .load_runtime_credential(account)
@@ -461,8 +509,13 @@ impl WarmPoolService {
             )
             .await
             .map_err(|error| error.to_string())?;
-        self.read_verdict(response, settings.probe_expect.as_str(), timeout)
-            .await
+        // 网关号从上游回的 __oailb（裸开的连接才会带）解出；set_cookie_headers 是响应字段，
+        // 在消费 body 前先取。
+        let gateway = gateway_from_set_cookie(&response.set_cookie_headers);
+        let verdict = self
+            .read_verdict(response, settings.probe_expect.as_str(), timeout)
+            .await?;
+        Ok((verdict, gateway))
     }
 
     /// 读上游 SSE 流判满血；**必须把流读到自然结束（None）**，上游 WS 连接才会被归还进连接池
@@ -559,4 +612,33 @@ impl WarmPoolService {
         }
         DEFAULT_WARM_MODEL.to_owned()
     }
+}
+
+/// 从上游回的 Set-Cookie 列表里找 __oailb，解出网关号（unified-N）。
+/// 只在裸开（凭据里没有活的目标 pair）时上游才会下发 __oailb；否则返回 None。
+fn gateway_from_set_cookie(headers: &[String]) -> Option<String> {
+    for header in headers {
+        let first = header.split(';').next().unwrap_or(header).trim();
+        if let Some(value) = first.strip_prefix("__oailb=")
+            && let Some(gateway) = gateway_from_oailb(value)
+        {
+            return Some(gateway);
+        }
+    }
+    None
+}
+
+/// __oailb 是 JWT，载荷里有 \"host\":\"chat.gateway.unified-N.api.openai.com\"；解出 unified-N。
+fn gateway_from_oailb(oailb: &str) -> Option<String> {
+    let payload = oailb.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let text = String::from_utf8_lossy(&decoded);
+    let start = text.find("unified-")?;
+    let digits: String = text[start + "unified-".len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| format!("unified-{digits}"))
 }
