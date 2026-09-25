@@ -246,12 +246,16 @@ impl WarmPoolService {
             }
             // 只保活「已开启 state 绑定（固定自身 state）」的账号——即导入时勾选的新号；
             // 存量/未绑定号一律不碰（不 hunt、不烧动态网关、不动在用号）。
-            let bound = self
-                .repository
-                .load_runtime_credential(&account)
-                .await
-                .map(|c| c.turn_state_pin.is_some())
-                .unwrap_or(false);
+            // 用当前 account（活跃号 revision 会被业务改）判断，别用列表里的陈旧副本。
+            let bound = match self.repository.store().get_account(account.id()).await {
+                Ok(Some(fresh)) => self
+                    .repository
+                    .load_runtime_credential(&fresh)
+                    .await
+                    .map(|c| c.turn_state_pin.is_some())
+                    .unwrap_or(false),
+                _ => false,
+            };
             if !bound {
                 continue;
             }
@@ -473,6 +477,16 @@ impl WarmPoolService {
         slot: usize,
         settings: &WarmPoolSettings,
     ) -> Result<(Verdict, Option<String>), String> {
+        // 业务流量会并发改凭据 revision，warmer 缓存的 account 会过期→load_runtime_credential
+        // 判 RevisionConflict 报 "credential"（重试第 2 次就中）。每次探针先取当前 account。
+        let fresh = self
+            .repository
+            .store()
+            .get_account(account.id())
+            .await
+            .map_err(|_| "account".to_owned())?
+            .ok_or_else(|| "account".to_owned())?;
+        let account = &fresh;
         let credential = self
             .repository
             .load_runtime_credential(account)
