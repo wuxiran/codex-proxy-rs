@@ -6,7 +6,7 @@
 //! 状态等管理动作会改的事实不进缓存。策略 stale-while-revalidate：命中即返回，
 //! 过期由后台重算，列表永远不等这几条重查询；首次加载或缓存缺失仍内联计算。
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -49,7 +49,34 @@ pub(crate) struct UsageProjectionCache {
 }
 
 pub(crate) fn window_key(query: &AccountUsageWindowQuery) -> WindowKey {
-    (query.account_id.clone(), query.key.clone(), query.range.start)
+    (
+        query.account_id.clone(),
+        query.key.clone(),
+        query.range.start,
+    )
+}
+
+/// 同一账号的同一额度窗口只保留一条查询：后出现的（最新观测到的起点）覆盖先出现的，
+/// 位置沿用第一次出现的位置。
+///
+/// 窗口用量 SQL 只按 (账号, 窗口 key) 聚合、不区分起点。上游 reset 边界每次观测都可能
+/// 漂移几秒，窗口翻期时起点也会整体后移；同一窗口若带着多个起点一起查询，重叠区间的
+/// 请求会被重复累加，账号卡的「按模型价格计费」与「预估额度」随之成倍放大。
+pub(crate) fn dedupe_window_queries(
+    queries: impl IntoIterator<Item = AccountUsageWindowQuery>,
+) -> Vec<AccountUsageWindowQuery> {
+    let mut deduped = Vec::<AccountUsageWindowQuery>::new();
+    let mut positions = BTreeMap::<(String, String), usize>::new();
+    for query in queries {
+        let identity = (query.account_id.clone(), query.key.clone());
+        if let Some(&position) = positions.get(&identity) {
+            deduped[position] = query;
+        } else {
+            positions.insert(identity, deduped.len());
+            deduped.push(query);
+        }
+    }
+    deduped
 }
 
 /// 把窗口查询结果按查询列表回填成键控 map（结果只带 account_id + key，起点取自查询）。
@@ -98,16 +125,12 @@ pub(crate) async fn compute(
         .into_iter()
         .map(|usage| (usage.account_id.clone(), usage))
         .collect();
-    let windows = windows
-        .iter()
-        .cloned()
-        .map(|mut query| {
-            if query.range.end < now {
-                query.range.end = now;
-            }
-            query
-        })
-        .collect::<Vec<_>>();
+    let windows = dedupe_window_queries(windows.iter().cloned().map(|mut query| {
+        if query.range.end < now {
+            query.range.end = now;
+        }
+        query
+    }));
     let usage_by_window = if windows.is_empty() {
         BTreeMap::new()
     } else {
@@ -157,6 +180,9 @@ impl UsageProjectionCache {
     }
 
     /// 内联补查到的窗口并入现有投影（不改年龄，避免延长其余数据的陈旧度）。
+    ///
+    /// 补查意味着该账号窗口的起点变了（reset 边界漂移或翻期），同账号同窗口的旧查询与
+    /// 旧结果一并替换；只追加会让后台重算把新旧起点一起查询并重复累加。
     pub(crate) fn merge_windows(
         &self,
         key: &str,
@@ -166,8 +192,21 @@ impl UsageProjectionCache {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(key) {
             let mut projection = (*entry.projection).clone();
-            projection.windows.extend(queries.iter().cloned());
+            let replaced = queries
+                .iter()
+                .map(|query| (query.account_id.as_str(), query.key.as_str()))
+                .collect::<BTreeSet<_>>();
+            projection
+                .usage_by_window
+                .retain(|(account_id, window, _), _| {
+                    !replaced.contains(&(account_id.as_str(), window.as_str()))
+                });
             projection.usage_by_window.extend(usage);
+            projection.windows = dedupe_window_queries(
+                std::mem::take(&mut projection.windows)
+                    .into_iter()
+                    .chain(queries.iter().cloned()),
+            );
             entry.projection = Arc::new(projection);
         }
     }
@@ -213,5 +252,120 @@ impl UsageProjectionCache {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::{DateTime, Duration, TimeZone as _, Utc};
+
+    use super::{UsageProjection, UsageProjectionCache, dedupe_window_queries, window_key};
+    use crate::model::{
+        accounts::{AccountUsage, AccountUsageWindowQuery},
+        observability::TimeRange,
+    };
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_790_000_000 + seconds, 0).unwrap()
+    }
+
+    fn weekly(account_id: &str, key: &str, start: DateTime<Utc>) -> AccountUsageWindowQuery {
+        AccountUsageWindowQuery {
+            account_id: account_id.to_owned(),
+            key: key.to_owned(),
+            range: TimeRange::new(start, start + Duration::days(7)).unwrap(),
+        }
+    }
+
+    fn usage(account_id: &str, request_count: u64) -> AccountUsage {
+        AccountUsage {
+            billing: Default::default(),
+            account_id: account_id.to_owned(),
+            request_count,
+            success_count: request_count,
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            image_input_tokens: None,
+            image_output_tokens: None,
+            image_request_count: 0,
+            image_request_failed_count: 0,
+            total_tokens: None,
+            cost_coverage: Default::default(),
+            costs: Vec::new(),
+            last_used_at: None,
+            request_buckets: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dedupe_keeps_latest_start_per_account_window() {
+        let queries = vec![
+            weekly("a", "codex.primary", at(0)),
+            weekly("b", "codex.primary", at(0)),
+            weekly("a", "codex.primary", at(2)),
+            weekly("a", "codex.secondary", at(0)),
+            weekly("a", "codex.primary", at(5)),
+        ];
+
+        let deduped = dedupe_window_queries(queries);
+
+        assert_eq!(
+            deduped,
+            vec![
+                weekly("a", "codex.primary", at(5)),
+                weekly("b", "codex.primary", at(0)),
+                weekly("a", "codex.secondary", at(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_replaces_drifted_window_instead_of_accumulating() {
+        let cache = UsageProjectionCache::default();
+        let old_a = weekly("a", "codex.primary", at(0));
+        let b = weekly("b", "codex.primary", at(0));
+        cache.store(
+            "page".to_owned(),
+            UsageProjection {
+                rolling_usage: BTreeMap::new(),
+                windows: vec![old_a.clone(), b.clone()],
+                usage_by_window: BTreeMap::from([
+                    (window_key(&old_a), usage("a", 1)),
+                    (window_key(&b), usage("b", 2)),
+                ]),
+            },
+        );
+
+        // reset 边界先后漂移两次：每次补查都应替换而不是追加。
+        for drift in [1, 3] {
+            let drifted = weekly("a", "codex.primary", at(drift));
+            cache.merge_windows(
+                "page",
+                std::slice::from_ref(&drifted),
+                BTreeMap::from([(window_key(&drifted), usage("a", 10))]),
+            );
+        }
+
+        let (projection, _) = cache.get("page").unwrap();
+        let latest = weekly("a", "codex.primary", at(3));
+        assert_eq!(projection.windows, vec![latest.clone(), b.clone()]);
+        assert_eq!(
+            projection
+                .usage_by_window
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![window_key(&latest), window_key(&b)]
+        );
+        assert_eq!(
+            projection.usage_by_window[&window_key(&latest)].request_count,
+            10
+        );
     }
 }

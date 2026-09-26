@@ -106,6 +106,8 @@ pub trait AccountStore: Send + Sync {
         account_ids: &[String],
     ) -> AdminStoreResult<Vec<AccountUsage>>;
 
+    /// 按 (账号, 窗口 key) 各返回一条聚合；同一账号同一窗口 key 只能出现一次，
+    /// 重复出现（例如带着不同起点）会被合并聚合、重叠区间重复累加。
     async fn load_account_usage_by_windows(
         &self,
         windows: &[AccountUsageWindowQuery],
