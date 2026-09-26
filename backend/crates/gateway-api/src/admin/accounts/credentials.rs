@@ -317,6 +317,7 @@ impl AccountDeletionRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateAccountRequest {
+    pub pin_turn_state: Option<bool>,
     pub provider: String,
     pub account_id: String,
     pub access_token: Option<String>,
@@ -339,6 +340,18 @@ impl RotateAccountRequest {
             if settings.account_id != self.account_id {
                 return Err(WireValidationError::new("settings.accountId"));
             }
+        }
+        if self.pin_turn_state.is_some() {
+            if self.access_token.is_some()
+                || self.refresh_token.is_some()
+                || self.id_token.is_some()
+                || self.base_url.is_some()
+                || self.api_key.is_some()
+                || self.transport.is_some()
+            {
+                return Err(WireValidationError::new("pinTurnState"));
+            }
+            return Ok(());
         }
         if let Some(base_url) = &self.base_url {
             if self.access_token.is_some()
@@ -376,7 +389,9 @@ impl RotateAccountRequest {
     ) -> Result<RotateCredential, WireValidationError> {
         self.validate()?;
         let mut material = Map::new();
-        if let Some(base_url) = self.base_url {
+        if let Some(enabled) = self.pin_turn_state {
+            material.insert("pin_turn_state".to_owned(), Value::Bool(enabled));
+        } else if let Some(base_url) = self.base_url {
             material.insert("base_url".to_owned(), Value::String(base_url));
             material.insert(
                 "transport".to_owned(),

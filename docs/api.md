@@ -338,7 +338,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts` | `page`、`pageSize`、`provider`、`groupId`、`search`、`status`、排序字段 | 分页查询账号与汇总 |
 | `GET` | `/api/admin/accounts/detail` | `accountId` | 查询账号详情、额度和本地用量 |
 | `GET` | `/api/admin/accounts/export` | `accountIds`、`confirm=export_sensitive_accounts` | 显式导出最多 200 个账号的敏感 Provider 文档 |
-| `POST` | `/api/admin/accounts/import` | `{ provider, data, settings?, outboundProxyId? }` | 导入或按上游身份更新账号，可同时应用调度、分组设置与默认代理 |
+| `POST` | `/api/admin/accounts/import` | `{ provider, data, settings?, outboundProxyId? }` | 导入或按上游身份更新账号，可同时应用调度、分组设置与默认代理。OpenAI 的 `data` 可以是观澜 CDK 文档 `{ cdks: ["CDK-..."] }`，网关会兑换并导入已签名账号包 |
 | `POST` | `/api/admin/accounts/import-tasks` | `{ submissionId, items: [{ provider, data, settings?, outboundProxyId? }] }` | 接受后台导入，返回 HTTP 202 和任务摘要 |
 | `GET` | `/api/admin/accounts/import-tasks` | 无 | 当前管理员仍保留的任务，按创建时间倒序 |
 | `GET` | `/api/admin/accounts/import-tasks/detail` | `taskId` | 任务摘要和逐条结果，不含原始凭据 |
@@ -617,6 +617,20 @@ rotation 可选携带 `settings`，字段与 `POST /api/admin/accounts/update` �
 `GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`，不回显密钥。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游。
 
+OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。通过 `rotate` 提交
+`{ provider: "openai", accountId, pinTurnState: true | false, settings? }`，此分支不能混入 token、API Key
+或外部 state。开关使用现有管理员鉴权、账号 CAS 和审计事务，保留凭据健康状态、错误及额度；
+再次提交 `true` 表示重新捕获。普通账号更新和令牌刷新保留开关，其他 Provider / API Key 不支持。
+详情的 `credentialConfiguration` 返回 `{ pinTurnState, maxAgeSeconds, turnStatePins }`；每条缓存摘要仅含
+`model`、`length`、`capturedAt`、`expiresAt` 和 `hits`，不包含原始 state 或令牌。
+
+开启后，从该账号普通生成请求的成功完整响应中捕获首个 292 字符候选，按账号、上游模型及客户端密钥隔离。
+固定期内覆盖发往上游的 state，后续返回值不覆盖已固定值；失败、不完整响应、预热和连接测试不捕获。
+默认关闭。单个候选的本地最长保留时间为 3600 秒，不随命中续期；这不是已验证的上游有效期。
+到期、访问令牌改变、重新捕获或服务重启后等待新的候选，尚无候选时保持原有透传行为。
+此功能偏离常规同轮粘性路由合同，292 / 312 长度不构成模型质量判断，也不保证减少 overload。
+
+
 OAuth start 使用：
 
 ```json
@@ -679,6 +693,9 @@ OAuth start 使用：
   “周/月额度窗口”，不回退到 5 小时、日窗口或历史累计。
   金额原值保持完整精度，USD 展示值
   小于 1 美元时最多保留四位小数，其余保留两位。
+  账号列表「用量」列在已有 Token 汇总外，同时展示本机记录的 USD 已用金额；
+  若当前额度窗口 `usedPercent` 大于 0，再按 `已用 × 100 / usedPercent` 给出近似额度，
+  供对照官方使用率，不代表 OpenAI 账单或站外消耗。
 
 ### 周/月额度预测
 

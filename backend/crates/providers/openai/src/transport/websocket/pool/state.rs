@@ -63,6 +63,10 @@ impl CodexWebSocketPoolKey {
         &self.account_id
     }
 
+    pub(super) fn egress_key(&self) -> &str {
+        &self.egress_key
+    }
+
     pub(crate) fn with_egress_key(mut self, key: &str) -> Self {
         self.egress_key = key.to_owned();
         self
@@ -97,6 +101,7 @@ const MAX_CONTINUATION_TOMBSTONES: usize = 4_096;
 #[derive(Default)]
 pub(super) struct WebSocketPoolState {
     pub(super) slots: HashMap<CodexWebSocketPoolKey, WebSocketPoolSlot>,
+    pub(super) account_egresses: HashMap<String, String>,
     continuation_tombstones: VecDeque<WebSocketContinuationTombstone>,
     pub(super) shutting_down: bool,
 }
@@ -222,13 +227,13 @@ pub(super) struct WebSocketPoolReservation {
 }
 
 pub(super) async fn close_pooled_connection(connection: PooledWebSocketConnection) {
-    connection.websocket.close().await;
+    // 退役出口可能已经失联，不能让 Close 帧的写入拖住整个配置提交。
+    // 超时后释放 owner 会中止 pump 并关闭底层 socket。
+    let _ = tokio::time::timeout(Duration::from_secs(1), connection.websocket.close()).await;
 }
 
 pub(super) async fn close_pooled_connections(connections: Vec<PooledWebSocketConnection>) {
-    for connection in connections {
-        close_pooled_connection(connection).await;
-    }
+    futures::future::join_all(connections.into_iter().map(close_pooled_connection)).await;
 }
 
 /// idle 连接是否应从池中摘除：被后台 pump 标记死亡，或已超过 `max_age`。

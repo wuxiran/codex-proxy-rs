@@ -5,8 +5,9 @@ use super::store::AdminStoreResult;
 use crate::model::{
     MutationContext, Revision,
     proxies::{
-        ImportProxyBinding, NewProxy, ProxyAccountListQuery, ProxyAccountPage, ProxyListQuery,
-        ProxyMutation, ProxyPage, ProxyRecord, ProxyTestResult, UpdateProxy,
+        ImportProxyBinding, NewProxy, ProxyAccountListQuery, ProxyAccountMutation,
+        ProxyAccountPage, ProxyListQuery, ProxyMutation, ProxyPage, ProxyRecord, ProxyTestResult,
+        UpdateProxy,
     },
 };
 
@@ -26,7 +27,7 @@ pub trait ProxyStore: Send + Sync {
         proxy_id: &str,
         account_id: &ProviderAccountId,
         context: &MutationContext,
-    ) -> AdminStoreResult<Revision>;
+    ) -> AdminStoreResult<ProxyAccountMutation>;
     async fn create(
         &self,
         command: NewProxy,

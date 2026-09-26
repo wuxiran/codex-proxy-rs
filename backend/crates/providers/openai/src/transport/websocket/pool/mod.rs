@@ -160,6 +160,13 @@ impl CodexWebSocketPool {
             if !self.config.enabled || state.shutting_down {
                 return WebSocketPoolAcquire::Bypass(WebSocketPoolBypassReason::Disabled);
             }
+            if state
+                .account_egresses
+                .get(key.account_id())
+                .is_some_and(|current| current != key.egress_key())
+            {
+                return WebSocketPoolAcquire::Bypass(WebSocketPoolBypassReason::EgressChanged);
+            }
             let key = if let Some(response_id) = required_response_id {
                 let Some(key) = state.slots.iter().find_map(|(candidate, slot)| {
                     (candidate.same_logical_connection(key)
@@ -396,6 +403,7 @@ pub enum WebSocketPoolBypassReason {
     Busy,
     Cap,
     ContinuationNotFound,
+    EgressChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

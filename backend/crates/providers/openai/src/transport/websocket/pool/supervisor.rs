@@ -15,6 +15,37 @@ use super::state::{
 };
 
 impl CodexWebSocketPool {
+    /// 发布新出口并摘除旧出口的 slot；旧快照只允许独占连接，不得重新入池。
+    pub(crate) async fn reconcile_account_egress(&self, account_id: &str, egress_key: String) {
+        let idle_connections = {
+            let mut state = self.lock_state();
+            state
+                .account_egresses
+                .insert(account_id.to_owned(), egress_key.clone());
+            let keys = state
+                .slots
+                .keys()
+                .filter(|key| key.account_id() == account_id && key.egress_key() != egress_key)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut idle = Vec::new();
+            for key in keys {
+                match state.slots.remove(&key) {
+                    Some(WebSocketPoolSlot::Idle { connection, .. }) => idle.push(*connection),
+                    Some(WebSocketPoolSlot::Connecting(connecting)) => {
+                        connecting.cancellation.cancel();
+                        connecting
+                            .outcome
+                            .send_replace(WebSocketPoolConnectOutcome::Failed);
+                    }
+                    Some(WebSocketPoolSlot::Busy(_)) | None => {}
+                }
+            }
+            idle
+        };
+        close_pooled_connections(idle_connections).await;
+    }
+
     /// 驱逐指定账号的全部 slot，取消 opening，并阻止 busy 连接回收到池中。
     pub async fn evict_account(&self, account_id: &str) {
         let mut idle_connections = Vec::new();

@@ -17,6 +17,101 @@ use gateway_store::postgres::{
 use super::{TestDatabase, admin_account_store, provider_accounts::account};
 
 #[tokio::test]
+async fn proxy_address_update_returns_exact_committed_account_set() {
+    let Some(database) = TestDatabase::create("proxy_retirement").await else {
+        return;
+    };
+    let proxies = PgProxyRepository::new(database.pool.clone());
+    let accounts = PgProviderAccountRepository::new(database.pool.clone());
+    let saved = proxies
+        .create(
+            NewProxy {
+                name: "old".to_owned(),
+                proxy: OutboundProxy::parse("http://127.0.0.1:18081").unwrap(),
+                location: None,
+            },
+            &context(),
+        )
+        .await
+        .unwrap()
+        .record;
+    for id in ["acct_retirement_a", "acct_retirement_b"] {
+        let mut input = account(id, id);
+        input.outbound_proxy = Some(saved.proxy.clone());
+        accounts.insert_provider_account(input).await.unwrap();
+    }
+    accounts
+        .insert_provider_account(account("acct_unrelated", "unrelated"))
+        .await
+        .unwrap();
+    let renamed = proxies
+        .update(
+            UpdateProxy {
+                id: saved.id.clone(),
+                revision: saved.revision,
+                name: "renamed".to_owned(),
+                proxy: None,
+                location: None,
+            },
+            &context(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        renamed.affected_accounts.is_empty(),
+        "改名称不能触发连接重建"
+    );
+    let mut switched = proxies
+        .update(
+            UpdateProxy {
+                id: saved.id.clone(),
+                revision: renamed.record.revision,
+                name: "new".to_owned(),
+                proxy: Some(OutboundProxy::parse("http://127.0.0.1:18082").unwrap()),
+                location: None,
+            },
+            &context(),
+        )
+        .await
+        .unwrap();
+    switched
+        .affected_accounts
+        .sort_by(|a, b| a.account_id.cmp(&b.account_id));
+    assert_eq!(
+        switched
+            .affected_accounts
+            .iter()
+            .map(|a| a.account_id.as_str())
+            .collect::<Vec<_>>(),
+        ["acct_retirement_a", "acct_retirement_b"]
+    );
+    assert!(
+        switched
+            .affected_accounts
+            .iter()
+            .all(|a| a.provider_kind.as_str() == "openai")
+    );
+    let repeated = proxies
+        .update(
+            UpdateProxy {
+                id: saved.id,
+                revision: switched.record.revision,
+                name: "same".to_owned(),
+                proxy: Some(switched.record.proxy),
+                location: None,
+            },
+            &context(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        repeated.affected_accounts.is_empty(),
+        "重复保存同一出口不能中断连接"
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn proxy_location_is_shared_preserved_cleared_and_removed_with_binding() {
     use gateway_core::account::{ProviderAccountStore, RequestLocation};
     let Some(database) = TestDatabase::create("proxy_location").await else {
@@ -269,7 +364,12 @@ async fn proxy_account_removal_preserves_settings_and_rejects_changed_bindings()
         .remove_account(&saved.id, &account_id, &context)
         .await
         .unwrap();
-    assert_eq!(committed.get(), u64::try_from(revision + 1).unwrap());
+    assert_eq!(
+        committed.config_revision.get(),
+        u64::try_from(revision + 1).unwrap()
+    );
+    assert_eq!(committed.account.account_id, account_id);
+    assert_eq!(committed.account.provider_kind.as_str(), "openai");
     let after: serde_json::Value = sqlx::query_scalar(snapshot)
         .fetch_one(&database.pool)
         .await
@@ -319,7 +419,10 @@ async fn proxy_account_removal_preserves_settings_and_rejects_changed_bindings()
             .fetch_one(&database.pool)
             .await
             .unwrap();
-    assert_eq!(u64::try_from(current_revision).unwrap(), committed.get());
+    assert_eq!(
+        u64::try_from(current_revision).unwrap(),
+        committed.config_revision.get()
+    );
     database.close().await;
 }
 

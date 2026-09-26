@@ -106,4 +106,18 @@ pub struct UpdateProxy {
 pub struct ProxyMutation {
     pub config_revision: Revision,
     pub record: ProxyRecord,
+    /// 与代理地址在同一事务中更新的账号，仅用于提交后的运行态通知。
+    pub affected_accounts: Vec<ProxyAccountTransportRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAccountTransportRef {
+    pub account_id: gateway_core::account::ProviderAccountId,
+    pub provider_kind: gateway_core::routing::ProviderKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyAccountMutation {
+    pub config_revision: Revision,
+    pub account: ProxyAccountTransportRef,
 }

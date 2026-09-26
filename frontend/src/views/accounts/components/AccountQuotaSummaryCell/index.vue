@@ -6,7 +6,7 @@ import { groupedAccountQuotaWindows, visibleSummaryQuotaWindows } from '../../co
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'
 import { quotaWindowPresentation } from '../AccountUsageWindow/presenter'
 import AccountQuotaSummaryEntry from './Entry.vue'
-import { recentlyUsedQuotaEntry, representativeQuotaWindow } from './presenter'
+import { accountQuotaUsdSummary, recentlyUsedQuotaEntry, representativeQuotaWindow } from './presenter'
 
 const props = defineProps<{
   account: AccountRow
@@ -26,6 +26,12 @@ const currentUsageTextClass = computed(() => currentUsageWindow.value
   ? quotaWindowPresentation(currentUsageWindow.value, '2px').percentTextClass
   : 'text-cp-text-quaternary')
 const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length - 1, 0))
+const usdSummary = computed(() => accountQuotaUsdSummary(props.account, currentUsageWindow.value))
+const primaryUsageTitle = computed(() => {
+  if (usdSummary.value)
+    return usdSummary.value.title
+  return `${props.account.usage.windowLabelDisplay}总 Token`
+})
 </script>
 
 <template>
@@ -33,10 +39,20 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
     <template v-if="account.authenticationKind === 'api_key'">
       <span
         class="flex min-w-0 items-baseline gap-1 font-mono tabular-nums"
-        title="本地累计总 Token"
+        :title="usdSummary?.title ?? '本地累计总 Token'"
       >
-        <strong class="truncate text-cp-xs font-heavy text-cp-text">{{ account.usage.totalTokensDisplay }}</strong>
-        <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">Tokens</span>
+        <strong class="truncate text-cp-xs font-heavy text-cp-text">
+          {{ usdSummary?.usedDisplay ?? account.usage.totalTokensDisplay }}
+        </strong>
+        <span
+          v-if="usdSummary?.estimatedQuotaDisplay"
+          class="min-w-0 truncate text-[9px] font-emphasis text-cp-text-tertiary"
+        >
+          / ≈{{ usdSummary.estimatedQuotaDisplay }}
+        </span>
+        <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">
+          {{ usdSummary ? 'USD' : 'Tokens' }}
+        </span>
       </span>
       <div class="grid min-w-0 gap-1.5">
         <span class="text-[10px] leading-3 font-bold text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
@@ -50,13 +66,19 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
       >
         <span
           class="flex min-w-0 items-baseline gap-1 font-mono tabular-nums"
-          :title="`${account.usage.windowLabelDisplay}总 Token`"
+          :title="primaryUsageTitle"
         >
           <strong class="truncate text-cp-xs font-heavy text-cp-text">
-            {{ account.usage.totalTokensDisplay }}
+            {{ usdSummary?.usedDisplay ?? account.usage.totalTokensDisplay }}
           </strong>
+          <span
+            v-if="usdSummary?.estimatedQuotaDisplay"
+            class="min-w-0 truncate text-[9px] font-emphasis text-cp-text-tertiary"
+          >
+            / ≈{{ usdSummary.estimatedQuotaDisplay }}
+          </span>
           <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">
-            Tokens
+            {{ usdSummary ? 'USD' : 'Tokens' }}
           </span>
         </span>
         <span
