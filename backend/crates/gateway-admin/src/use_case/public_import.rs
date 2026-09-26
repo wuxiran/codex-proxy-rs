@@ -47,16 +47,28 @@ const ACCOUNT_PROXY_FIELDS: [&str; 3] = ["outboundProxyUrl", "outbound_proxy_url
 
 #[async_trait]
 pub trait PublicImportService: Send + Sync {
-    /// 读取配置；首次读取时生成令牌并落盘。
-    async fn config(&self) -> Result<PublicImportConfig, AdminError>;
-    async fn update(
+    /// 列出全部号商配置（可能为空，不再自动生成默认入口）。
+    async fn list(&self) -> Result<Vec<PublicImportConfig>, AdminError>;
+    /// 新建一个号商配置并生成新令牌。
+    async fn create(
         &self,
         context: &MutationContext,
         command: UpdatePublicImportConfig,
     ) -> Result<PublicImportConfig, AdminError>;
+    /// 按 id 修改一个号商配置。
+    async fn update(
+        &self,
+        context: &MutationContext,
+        id: &str,
+        command: UpdatePublicImportConfig,
+    ) -> Result<PublicImportConfig, AdminError>;
+    /// 按 id 删除一个号商配置。
+    async fn delete(&self, context: &MutationContext, id: &str) -> Result<(), AdminError>;
+    /// 按 id 轮换某个号商的令牌。
     async fn rotate_token(
         &self,
         context: &MutationContext,
+        id: &str,
     ) -> Result<PublicImportConfig, AdminError>;
     /// 令牌无效或入口关闭时返回 `None`，调用方不得区分这两种情况。
     async fn entry(&self, token: &str) -> Result<Option<PublicImportEntry>, AdminError>;
@@ -106,62 +118,66 @@ impl DefaultPublicImportService {
         }
     }
 
-    fn load(&self) -> Result<Option<PublicImportConfig>, AdminError> {
+    /// 读取全部号商配置（文件缺失视为空）；兼容旧单配置格式并原样迁移进列表。
+    fn load_all(&self) -> Result<Vec<PublicImportConfig>, AdminError> {
         let bytes = match fs::read(self.root.join(CONFIG_FILE)) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(_) => return Err(AdminError::unavailable("导入入口配置暂不可读")),
         };
-        let stored: StoredConfig = serde_json::from_slice(&bytes)
+        let stored: StoredFile = serde_json::from_slice(&bytes)
             .map_err(|_| AdminError::internal("导入入口配置已损坏"))?;
-        stored.into_config().map(Some)
+        stored.into_configs()
     }
 
-    fn save(&self, config: &PublicImportConfig) -> Result<(), AdminError> {
+    fn save_all(&self, configs: &[PublicImportConfig]) -> Result<(), AdminError> {
         let unavailable = |_| AdminError::unavailable("导入入口配置暂不可写");
         fs::create_dir_all(&self.root).map_err(unavailable)?;
-        let bytes = serde_json::to_vec_pretty(&StoredConfig::from(config))
+        let bytes = serde_json::to_vec_pretty(&StoredFile::from_configs(configs))
             .map_err(|_| AdminError::internal("导入入口配置无法序列化"))?;
         atomic_write(&self.root.join(CONFIG_FILE), &bytes).map_err(unavailable)
     }
 
-    async fn load_or_create(&self) -> Result<PublicImportConfig, AdminError> {
-        if let Some(config) = self.load()? {
-            return Ok(config);
-        }
-        let _guard = self.write_lock.lock().await;
-        self.load_or_create_locked()
-    }
-
-    /// 调用方必须持有 `write_lock`。
-    fn load_or_create_locked(&self) -> Result<PublicImportConfig, AdminError> {
-        if let Some(config) = self.load()? {
-            return Ok(config);
-        }
-        let config = PublicImportConfig {
-            enabled: false,
-            token: generate_token(),
-            group_ids: Vec::new(),
-            pin_turn_state: true,
-            expires_at: None,
-            updated_at: Utc::now(),
-        };
-        self.save(&config)?;
-        Ok(config)
-    }
-
-    /// 校验令牌；只读取已存在的配置，未初始化的入口视为关闭。
+    /// 校验令牌：遍历全部号商配置做常数时间比较，命中且入口开启、未过期、已配分组时返回该配置。
+    /// 不因某条配置关闭而提前返回，避免通过时间差探测配置状态。
     fn authorize(&self, token: &str) -> Result<Option<PublicImportConfig>, AdminError> {
-        let Some(config) = self.load()? else {
-            return Ok(None);
-        };
-        // 令牌长度固定且公开，长度不等时提前返回不泄露内容。
-        let matches: bool = token.as_bytes().ct_eq(config.token.as_bytes()).into();
-        let expired = config.expires_at.is_some_and(|at| at <= Utc::now());
-        Ok(
-            (matches && config.enabled && !expired && !config.group_ids.is_empty())
-                .then_some(config),
-        )
+        let now = Utc::now();
+        let mut hit: Option<PublicImportConfig> = None;
+        for config in self.load_all()? {
+            let matches: bool = token.as_bytes().ct_eq(config.token.as_bytes()).into();
+            let usable =
+                config.enabled && !config.expires_at.is_some_and(|at| at <= now) && !config.group_ids.is_empty();
+            if matches && usable {
+                hit = Some(config);
+            }
+        }
+        Ok(hit)
+    }
+
+    /// 校验并规范化新建/修改配置的公共字段。
+    async fn validate(&self, command: &UpdatePublicImportConfig) -> Result<String, AdminError> {
+        let name = command.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(AdminError::invalid("请填写号商名称"));
+        }
+        if name.chars().count() > 60 {
+            return Err(AdminError::invalid("号商名称过长"));
+        }
+        let unique = command.group_ids.iter().collect::<BTreeSet<_>>();
+        if unique.len() != command.group_ids.len() {
+            return Err(AdminError::invalid("目标分组重复"));
+        }
+        if command.enabled && command.group_ids.is_empty() {
+            return Err(AdminError::invalid("开启导入入口前请先选择目标分组"));
+        }
+        // 已过期的时间配合开启状态只会得到一个打不开的链接，直接拒绝更容易发现。
+        if command.enabled && command.expires_at.is_some_and(|at| at <= Utc::now()) {
+            return Err(AdminError::invalid("有效期必须晚于当前时间"));
+        }
+        if self.group_names(&command.group_ids).await?.len() != command.group_ids.len() {
+            return Err(AdminError::invalid("目标分组不存在，请刷新后重试"));
+        }
+        Ok(name)
     }
 
     async fn group_names(
@@ -256,59 +272,92 @@ impl DefaultPublicImportService {
 
 #[async_trait]
 impl PublicImportService for DefaultPublicImportService {
-    async fn config(&self) -> Result<PublicImportConfig, AdminError> {
-        self.load_or_create().await
+    async fn list(&self) -> Result<Vec<PublicImportConfig>, AdminError> {
+        self.load_all()
     }
 
-    async fn update(
+    async fn create(
         &self,
         context: &MutationContext,
         command: UpdatePublicImportConfig,
     ) -> Result<PublicImportConfig, AdminError> {
-        let unique = command.group_ids.iter().collect::<BTreeSet<_>>();
-        if unique.len() != command.group_ids.len() {
-            return Err(AdminError::invalid("目标分组重复"));
-        }
-        if command.enabled && command.group_ids.is_empty() {
-            return Err(AdminError::invalid("开启导入入口前请先选择目标分组"));
-        }
-        // 已过期的时间配合开启状态只会得到一个打不开的链接，直接拒绝更容易发现。
-        if command.enabled && command.expires_at.is_some_and(|at| at <= Utc::now()) {
-            return Err(AdminError::invalid("有效期必须晚于当前时间"));
-        }
-        if self.group_names(&command.group_ids).await?.len() != command.group_ids.len() {
-            return Err(AdminError::invalid("目标分组不存在，请刷新后重试"));
-        }
+        let name = self.validate(&command).await?;
         let _guard = self.write_lock.lock().await;
-        let current = self.load_or_create_locked()?;
+        let mut configs = self.load_all()?;
         let config = PublicImportConfig {
+            id: generate_id(),
+            name,
             enabled: command.enabled,
-            token: current.token,
+            token: generate_token(),
             group_ids: command.group_ids,
             pin_turn_state: command.pin_turn_state,
             expires_at: command.expires_at,
             updated_at: Utc::now(),
         };
-        self.save(&config)?;
-        tracing::info!(target: "public_import", request_id = %context.request_id, enabled = config.enabled,
-            groups = config.group_ids.len(), pin_turn_state = config.pin_turn_state,
-            "public import entry updated");
+        configs.push(config.clone());
+        self.save_all(&configs)?;
+        tracing::info!(target: "public_import", request_id = %context.request_id, id = %config.id,
+            enabled = config.enabled, groups = config.group_ids.len(), "public import config created");
         Ok(config)
+    }
+
+    async fn update(
+        &self,
+        context: &MutationContext,
+        id: &str,
+        command: UpdatePublicImportConfig,
+    ) -> Result<PublicImportConfig, AdminError> {
+        let name = self.validate(&command).await?;
+        let _guard = self.write_lock.lock().await;
+        let mut configs = self.load_all()?;
+        let slot = configs
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or_else(|| AdminError::not_found("号商配置不存在，请刷新后重试"))?;
+        slot.name = name;
+        slot.enabled = command.enabled;
+        slot.group_ids = command.group_ids;
+        slot.pin_turn_state = command.pin_turn_state;
+        slot.expires_at = command.expires_at;
+        slot.updated_at = Utc::now();
+        let config = slot.clone();
+        self.save_all(&configs)?;
+        tracing::info!(target: "public_import", request_id = %context.request_id, id = %config.id,
+            enabled = config.enabled, groups = config.group_ids.len(), pin_turn_state = config.pin_turn_state,
+            "public import config updated");
+        Ok(config)
+    }
+
+    async fn delete(&self, context: &MutationContext, id: &str) -> Result<(), AdminError> {
+        let _guard = self.write_lock.lock().await;
+        let mut configs = self.load_all()?;
+        let before = configs.len();
+        configs.retain(|item| item.id != id);
+        if configs.len() == before {
+            return Err(AdminError::not_found("号商配置不存在，请刷新后重试"));
+        }
+        self.save_all(&configs)?;
+        tracing::info!(target: "public_import", request_id = %context.request_id, id = %id,
+            "public import config deleted");
+        Ok(())
     }
 
     async fn rotate_token(
         &self,
         context: &MutationContext,
+        id: &str,
     ) -> Result<PublicImportConfig, AdminError> {
         let _guard = self.write_lock.lock().await;
-        let current = self.load_or_create_locked()?;
-        let config = PublicImportConfig {
-            token: generate_token(),
-            updated_at: Utc::now(),
-            ..current
-        };
-        self.save(&config)?;
-        tracing::info!(target: "public_import", request_id = %context.request_id,
+        let mut configs = self.load_all()?;
+        let slot = configs
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or_else(|| AdminError::not_found("号商配置不存在，请刷新后重试"))?;
+        slot.token = generate_token();
+        slot.updated_at = Utc::now();
+        let config = slot.clone();
+        self.save_all(&configs)?;
+        tracing::info!(target: "public_import", request_id = %context.request_id, id = %config.id,
             "public import token rotated");
         Ok(config)
     }
@@ -360,7 +409,8 @@ impl PublicImportService for DefaultPublicImportService {
                 .import_new_accounts(ImportCredentials {
                     outbound_proxy_id: Some(proxy.id.clone()),
                     settings: Some(AccountImportSettings {
-                        notes: None,
+                        // 号商名写进备注，方便在账号列表追溯是哪个号商丢的号。
+                        notes: Some(config.name.clone()),
                         enabled: true,
                         concurrency_limit: None,
                         weight: AccountWeight::DEFAULT,
@@ -494,7 +544,8 @@ impl DefaultPublicImportService {
             .import_new_accounts(ImportCredentials {
                 outbound_proxy_id: Some(proxy.id.clone()),
                 settings: Some(AccountImportSettings {
-                    notes: None,
+                    // 号商名写进备注，方便在账号列表追溯是哪个号商丢的号。
+                    notes: Some(config.name.clone()),
                     enabled: true,
                     concurrency_limit: None,
                     weight: AccountWeight::DEFAULT,
@@ -639,9 +690,54 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// 迁移旧单配置时给它一个稳定 id（旧格式只可能有一个），避免每次读取都换 id 导致按 id 定位失败。
+const LEGACY_CONFIG_ID: &str = "default";
+
+fn generate_id() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 落盘文件：新格式 `{ "configs": [...] }`；兼容旧的单配置扁平对象。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredFile {
+    Multi(StoredFileMulti),
+    Single(StoredConfig),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredFileMulti {
+    configs: Vec<StoredConfig>,
+}
+
+impl StoredFile {
+    fn into_configs(self) -> Result<Vec<PublicImportConfig>, AdminError> {
+        let stored = match self {
+            StoredFile::Multi(multi) => multi.configs,
+            StoredFile::Single(one) => vec![one],
+        };
+        stored.into_iter().map(StoredConfig::into_config).collect()
+    }
+
+    fn from_configs(configs: &[PublicImportConfig]) -> StoredFileMulti {
+        StoredFileMulti {
+            configs: configs.iter().map(StoredConfig::from).collect(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredConfig {
+    /// 旧格式缺失时留空，读取时补稳定 id。
+    #[serde(default)]
+    id: String,
+    /// 旧格式缺失时留空，读取时补默认号商名。
+    #[serde(default)]
+    name: String,
     enabled: bool,
     token: String,
     group_ids: Vec<String>,
@@ -657,7 +753,19 @@ impl StoredConfig {
         if self.token.is_empty() {
             return Err(AdminError::internal("导入入口配置已损坏"));
         }
+        let id = if self.id.trim().is_empty() {
+            LEGACY_CONFIG_ID.to_owned()
+        } else {
+            self.id
+        };
+        let name = if self.name.trim().is_empty() {
+            "默认号商".to_owned()
+        } else {
+            self.name
+        };
         Ok(PublicImportConfig {
+            id,
+            name,
             enabled: self.enabled,
             token: self.token,
             group_ids: self
@@ -682,6 +790,8 @@ impl StoredConfig {
 impl From<&PublicImportConfig> for StoredConfig {
     fn from(config: &PublicImportConfig) -> Self {
         Self {
+            id: config.id.clone(),
+            name: config.name.clone(),
             enabled: config.enabled,
             token: config.token.clone(),
             group_ids: config.group_ids.iter().map(ToString::to_string).collect(),

@@ -6,7 +6,7 @@ use gateway_admin::{
     model::{
         AdminErrorKind,
         proxies::{ProxyRecord, ProxyTestResult},
-        public_import::{PublicImportItemStatus, UpdatePublicImportConfig},
+        public_import::{PublicImportConfig, PublicImportItemStatus, UpdatePublicImportConfig},
     },
 };
 use gateway_core::account::OutboundProxy;
@@ -83,22 +83,37 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().cloned().expect("object")
 }
 
-async fn enable(fixture: &Fixture, pin_turn_state: bool) -> String {
+fn command(
+    enabled: bool,
+    pin_turn_state: bool,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> UpdatePublicImportConfig {
+    UpdatePublicImportConfig {
+        name: "迷茫".to_owned(),
+        enabled,
+        group_ids: vec![group_id()],
+        pin_turn_state,
+        expires_at,
+    }
+}
+
+/// 新建一个号商配置并返回它（含稳定 id 与令牌）。
+async fn create_entry(
+    fixture: &Fixture,
+    enabled: bool,
+    pin_turn_state: bool,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> PublicImportConfig {
     fixture
         .services
         .public_import()
-        .update(
-            &context("enable-entry"),
-            UpdatePublicImportConfig {
-                enabled: true,
-                group_ids: vec![group_id()],
-                pin_turn_state,
-                expires_at: None,
-            },
-        )
+        .create(&context("create-entry"), command(enabled, pin_turn_state, expires_at))
         .await
-        .expect("enable entry")
-        .token
+        .expect("create entry")
+}
+
+async fn enable(fixture: &Fixture, pin_turn_state: bool) -> PublicImportConfig {
+    create_entry(fixture, true, pin_turn_state, None).await
 }
 
 #[tokio::test]
@@ -106,11 +121,16 @@ async fn entry_should_stay_closed_until_an_administrator_enables_it() {
     let fixture = fixture(vec![proxy("proxy_ok", Some(true))]).await;
     let service = fixture.services.public_import();
 
+    // 没有任何配置时列表为空，随机令牌不可用。
+    assert!(service.list().await.expect("list").is_empty());
     assert_eq!(service.entry("imp-anything").await.expect("entry"), None);
-    let config = service.config().await.expect("config");
+
+    // 建一个未开启的号商配置：令牌可拼链，但入口关闭时不可导入。
+    let config = create_entry(&fixture, false, true, None).await;
     assert!(!config.enabled);
+    assert_eq!(config.name, "迷茫");
     assert!(config.token.starts_with("imp-") && config.token.len() == 68);
-    // 令牌正确但入口未开启时同样不可用。
+    assert_eq!(service.list().await.expect("list").len(), 1);
     assert_eq!(service.entry(&config.token).await.expect("entry"), None);
     assert!(
         service
@@ -127,18 +147,29 @@ async fn entry_should_stay_closed_until_an_administrator_enables_it() {
 }
 
 #[tokio::test]
-async fn update_should_require_existing_groups_before_enabling() {
+async fn create_should_require_name_and_existing_groups_before_enabling() {
     let fixture = fixture(Vec::new()).await;
     let service = fixture.services.public_import();
 
+    // 号商名不能为空。
     let error = service
-        .update(
+        .create(
+            &context("empty-name"),
+            UpdatePublicImportConfig {
+                name: "   ".to_owned(),
+                ..command(false, true, None)
+            },
+        )
+        .await
+        .expect_err("empty name");
+    assert_eq!(error.kind(), AdminErrorKind::Invalid);
+
+    let error = service
+        .create(
             &context("enable-empty"),
             UpdatePublicImportConfig {
-                enabled: true,
                 group_ids: Vec::new(),
-                pin_turn_state: true,
-                expires_at: None,
+                ..command(true, true, None)
             },
         )
         .await
@@ -146,23 +177,53 @@ async fn update_should_require_existing_groups_before_enabling() {
     assert_eq!(error.kind(), AdminErrorKind::Invalid);
 
     let error = service
-        .update(
+        .create(
             &context("enable-missing"),
             UpdatePublicImportConfig {
-                enabled: true,
                 group_ids: vec![
                     gateway_core::routing::AccountGroupId::new(
                         "grp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     )
                     .expect("group ID"),
                 ],
-                pin_turn_state: true,
-                expires_at: None,
+                ..command(true, true, None)
             },
         )
         .await
         .expect_err("missing group");
     assert_eq!(error.kind(), AdminErrorKind::Invalid);
+}
+
+#[tokio::test]
+async fn multiple_suppliers_resolve_by_their_own_token_and_delete_removes_one() {
+    let fixture = fixture(vec![proxy("proxy_ok", Some(true))]).await;
+    let service = fixture.services.public_import();
+
+    let first = create_entry(&fixture, true, true, None).await;
+    let second = create_entry(&fixture, true, true, None).await;
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.token, second.token);
+    assert_eq!(service.list().await.expect("list").len(), 2);
+
+    // 两个令牌各自解析到自己的入口。
+    assert!(service.entry(&first.token).await.expect("entry").is_some());
+    assert!(service.entry(&second.token).await.expect("entry").is_some());
+
+    // 删除一个后，它的令牌立即失效，另一个不受影响。
+    service
+        .delete(&context("delete"), &first.id)
+        .await
+        .expect("delete");
+    assert_eq!(service.entry(&first.token).await.expect("entry"), None);
+    assert!(service.entry(&second.token).await.expect("entry").is_some());
+    assert_eq!(service.list().await.expect("list").len(), 1);
+
+    // 删除不存在的 id 报 NotFound。
+    let error = service
+        .delete(&context("delete-missing"), "nope")
+        .await
+        .expect_err("missing");
+    assert_eq!(error.kind(), AdminErrorKind::NotFound);
 }
 
 #[tokio::test]
@@ -173,7 +234,7 @@ async fn import_should_split_accounts_bind_tested_proxy_groups_and_pin_state() {
         proxy("proxy_ok", Some(true)),
     ])
     .await;
-    let token = enable(&fixture, true).await;
+    let token = enable(&fixture, true).await.token;
     let service = fixture.services.public_import();
 
     let entry = service.entry(&token).await.expect("entry").expect("open");
@@ -222,6 +283,7 @@ async fn import_should_split_accounts_bind_tested_proxy_groups_and_pin_state() {
         }
     }
 
+    // 号商名写进导入账号的备注，便于追溯来源。
     let settings = fixture.store.import_settings();
     assert_eq!(settings.len(), 2);
     for settings in settings
@@ -230,6 +292,7 @@ async fn import_should_split_accounts_bind_tested_proxy_groups_and_pin_state() {
     {
         assert!(settings.enabled);
         assert_eq!(settings.group_ids, [group_id()]);
+        assert_eq!(settings.notes.as_deref(), Some("迷茫"));
     }
     let events = recorded(&fixture.events);
     assert_eq!(
@@ -251,7 +314,7 @@ async fn import_should_split_accounts_bind_tested_proxy_groups_and_pin_state() {
 #[tokio::test]
 async fn import_should_skip_state_pin_when_disabled_and_report_item_failures() {
     let fixture = fixture(vec![proxy("proxy_ok", Some(true))]).await;
-    let token = enable(&fixture, false).await;
+    let token = enable(&fixture, false).await.token;
     fixture
         .provider
         .fail_next(gateway_admin::ports::provider::ProviderAdminErrorKind::Invalid);
@@ -278,7 +341,8 @@ async fn import_should_skip_state_pin_when_disabled_and_report_item_failures() {
 #[tokio::test]
 async fn import_should_reject_wrong_token_rotated_token_and_unsupported_documents() {
     let fixture = fixture(vec![proxy("proxy_ok", Some(true))]).await;
-    let token = enable(&fixture, true).await;
+    let config = enable(&fixture, true).await;
+    let token = config.token.clone();
     let service = fixture.services.public_import();
     let document = || object(json!({ "refresh_token": "rt" }));
 
@@ -303,7 +367,7 @@ async fn import_should_reject_wrong_token_rotated_token_and_unsupported_document
     }
 
     let rotated = service
-        .rotate_token(&context("rotate"))
+        .rotate_token(&context("rotate"), &config.id)
         .await
         .expect("rotate");
     assert_ne!(rotated.token, token);
@@ -321,7 +385,7 @@ async fn import_should_reject_wrong_token_rotated_token_and_unsupported_document
 #[tokio::test]
 async fn import_should_fail_closed_without_a_tested_proxy() {
     let fixture = fixture(vec![proxy("proxy_untested", None)]).await;
-    let token = enable(&fixture, true).await;
+    let token = enable(&fixture, true).await.token;
 
     let error = fixture
         .services
@@ -337,28 +401,19 @@ async fn import_should_fail_closed_without_a_tested_proxy() {
 async fn link_should_stop_working_once_the_configured_expiry_passes() {
     let fixture = fixture(vec![proxy("proxy_ok", Some(true))]).await;
     let service = fixture.services.public_import();
-    let update = |expires_at| UpdatePublicImportConfig {
-        enabled: true,
-        group_ids: vec![group_id()],
-        pin_turn_state: true,
-        expires_at,
-    };
 
-    // 开启时不接受已经过去的有效期。
+    // 新建时不接受已经过去的有效期。
     let error = service
-        .update(
+        .create(
             &context("expired"),
-            update(Some(Utc::now() - chrono::Duration::seconds(1))),
+            command(true, true, Some(Utc::now() - chrono::Duration::seconds(1))),
         )
         .await
         .expect_err("past expiry");
     assert_eq!(error.kind(), AdminErrorKind::Invalid);
 
     let expires_at = Utc::now() + chrono::Duration::milliseconds(300);
-    let config = service
-        .update(&context("short-lived"), update(Some(expires_at)))
-        .await
-        .expect("short-lived link");
+    let config = create_entry(&fixture, true, true, Some(expires_at)).await;
     assert_eq!(config.expires_at, Some(expires_at));
     let entry = service
         .entry(&config.token)
@@ -382,14 +437,14 @@ async fn link_should_stop_working_once_the_configured_expiry_passes() {
     );
     // 更换链接不重置有效期：过期后必须由管理员重新设定。
     let rotated = service
-        .rotate_token(&context("rotate"))
+        .rotate_token(&context("rotate"), &config.id)
         .await
         .expect("rotate");
     assert_eq!(rotated.expires_at, Some(expires_at));
     assert_eq!(service.entry(&rotated.token).await.expect("entry"), None);
 
     let renewed = service
-        .update(&context("renew"), update(None))
+        .update(&context("renew"), &config.id, command(true, true, None))
         .await
         .expect("renew");
     assert!(

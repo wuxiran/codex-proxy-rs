@@ -1,7 +1,11 @@
 import type { RequestOptions } from '../request'
 import request from '../request'
 
+/** 一个号商（上游供应商）的免登录导入配置；每个号商一条，各自独立令牌与设置。 */
 export interface PublicImportConfig {
+  id: string
+  /** 号商名称，例如「迷茫」；导入的账号会带上它便于追溯来源。 */
+  name: string
   enabled: boolean
   token: string
   groupIds: string[]
@@ -11,17 +15,25 @@ export interface PublicImportConfig {
   updatedAt: string
 }
 
-export type PublicImportConfigUpdate = Pick<PublicImportConfig, 'enabled' | 'groupIds' | 'pinTurnState' | 'expiresAt'>
+export type PublicImportUpsert = Pick<PublicImportConfig, 'name' | 'enabled' | 'groupIds' | 'pinTurnState' | 'expiresAt'>
 
-export function getPublicImportConfig(options: RequestOptions = {}) {
-  return request<PublicImportConfig>({
+export function listPublicImportConfigs(options: RequestOptions = {}) {
+  return request<{ configs: PublicImportConfig[] }>({
     url: '/api/admin/public-import',
     method: 'GET',
     ...options,
   })
 }
 
-export function updatePublicImportConfig(data: PublicImportConfigUpdate) {
+export function createPublicImportConfig(data: PublicImportUpsert) {
+  return request<PublicImportConfig>({
+    url: '/api/admin/public-import/create',
+    method: 'POST',
+    data,
+  })
+}
+
+export function updatePublicImportConfig(data: { id: string } & PublicImportUpsert) {
   return request<PublicImportConfig>({
     url: '/api/admin/public-import/update',
     method: 'POST',
@@ -29,11 +41,19 @@ export function updatePublicImportConfig(data: PublicImportConfigUpdate) {
   })
 }
 
-export function rotatePublicImportToken() {
+export function deletePublicImportConfig(id: string) {
+  return request<{ id: string }>({
+    url: '/api/admin/public-import/delete',
+    method: 'POST',
+    data: { id },
+  })
+}
+
+export function rotatePublicImportToken(id: string) {
   return request<PublicImportConfig>({
     url: '/api/admin/public-import/rotate-token',
     method: 'POST',
-    data: {},
+    data: { id },
   })
 }
 

@@ -8,9 +8,14 @@ use gateway_core::routing::AccountGroupId;
 /// 单次提交最多拆出的账号数，与 Provider 的 `accounts` 上限一致。
 pub const MAX_PUBLIC_IMPORT_ACCOUNTS: usize = 200;
 
-/// 入口配置。`token` 是页面地址里的密链令牌，持有者无需登录即可导入。
+/// 入口配置。每个配置对应一个上游号商（供应商），`token` 是页面地址里的密链令牌，
+/// 持有者无需登录即可导入；`name` 是号商名，导入的账号会带上它便于追溯来源。
 #[derive(Clone, PartialEq, Eq)]
 pub struct PublicImportConfig {
+    /// 稳定标识，用于管理端定位某个号商配置（不外泄给密链持有者）。
+    pub id: String,
+    /// 号商名称，例如「迷茫」。
+    pub name: String,
     pub enabled: bool,
     pub token: String,
     pub group_ids: Vec<AccountGroupId>,
@@ -24,6 +29,8 @@ impl fmt::Debug for PublicImportConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PublicImportConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("enabled", &self.enabled)
             .field("token", &"[REDACTED]")
             .field("group_ids", &self.group_ids)
@@ -34,9 +41,10 @@ impl fmt::Debug for PublicImportConfig {
     }
 }
 
-/// 管理员可修改的字段；令牌只能通过轮换更新。
+/// 新建或修改一个号商配置的字段；令牌只能通过轮换更新。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePublicImportConfig {
+    pub name: String,
     pub enabled: bool,
     pub group_ids: Vec<AccountGroupId>,
     pub pin_turn_state: bool,
