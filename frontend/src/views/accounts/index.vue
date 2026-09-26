@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ChevronDown } from '@lucide/vue'
+import { useMediaQuery } from '@vueuse/core'
 import { ref } from 'vue'
 
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
@@ -7,6 +8,7 @@ import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
+import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
@@ -25,10 +27,12 @@ import AccountOverviewCards from './components/AccountOverviewCards.vue'
 import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
+import AccountStateBindingCell from './components/AccountStateBindingCell.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
+import { useAccountConfigurations } from './composables/useAccountConfigurations'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
 import { useAccountEditor } from './composables/useAccountEditor'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
@@ -38,7 +42,13 @@ import { useAccountsTable } from './composables/useAccountsTable'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
-const { visibleColumns, columnOptions, setColumnVisible, resetColumns } = useTableColumns(accountColumns, 'accounts')
+const narrowTable = useMediaQuery('(max-width: 639px)')
+const { visibleColumns, columnOptions, setColumnVisible, resetColumns } = useTableColumns(
+  () => accountColumns.map(column => narrowTable.value && column.key === 'actions'
+    ? { ...column, kind: 'custom' as const }
+    : column),
+  'accounts',
+)
 const {
   loading,
   accounts,
@@ -56,6 +66,7 @@ const {
   handlePageSizeChange,
   handleSortChange,
 } = useAccountsQuery()
+const { entries: accountConfigurations, reload: reloadConfigurations } = useAccountConfigurations(accounts)
 
 const {
   groups,
@@ -85,6 +96,9 @@ const {
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
+  updatingSchedulingAccountIds,
+  updatingTurnStateAccountIds,
+  revivingAccountIds,
   deletingAccount,
   creatingAccount,
   authorizingOAuth,
@@ -103,12 +117,16 @@ const {
   handleRecover,
   handleRefresh,
   handleRefreshQuota,
+  handleToggleScheduling,
+  handleToggleTurnState,
+  handleReviveGuanlan,
 } = useAccountMutations({
   onImportTaskCreated: importTasks.created,
   accounts,
   selectedIds,
   reload: () => Promise.all([loadAccounts(), loadGroups()]),
   replaceAccount,
+  reloadConfigurations,
 })
 
 const {
@@ -166,6 +184,10 @@ const {
 
 const {
   apiKey: editingApiKey,
+  pinTurnState: editingPinTurnState,
+  recaptureTurnState: editingRecaptureTurnState,
+  turnStatePins: editingTurnStatePins,
+  turnStateCaptureRule: editingTurnStateCaptureRule,
   configurationLoading,
   configurationReady,
   showEditModal,
@@ -297,6 +319,41 @@ const {
               />
             </template>
 
+            <template #enabled="{ row }">
+              <BaseSwitch
+                :model-value="row.enabled"
+                :label="`${row.name} 调度`"
+                :disabled="updatingSchedulingAccountIds.has(row.id)"
+                :aria-busy="updatingSchedulingAccountIds.has(row.id)"
+                :title="row.enabled ? '关闭调度' : '开启调度'"
+                @update:model-value="handleToggleScheduling(row, $event)"
+              />
+            </template>
+
+            <template #turnState="{ row }">
+              <BaseSwitch
+                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
+                :model-value="accountConfigurations[row.id]?.value?.pinTurnState ?? false"
+                :label="`${row.name} State`"
+                :disabled="!accountConfigurations[row.id]?.value || accountConfigurations[row.id]?.loading || updatingTurnStateAccountIds.has(row.id) || revivingAccountIds.has(row.id)"
+                :title="accountConfigurations[row.id]?.error || '切换 state 绑定'"
+                @update:model-value="handleToggleTurnState(row.id, $event)"
+              />
+              <span v-else class="text-cp-text-quaternary">不适用</span>
+            </template>
+
+            <template #stateBinding="{ row }">
+              <AccountStateBindingCell
+                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
+                :configuration="accountConfigurations[row.id]?.value"
+                :loading="accountConfigurations[row.id]?.loading"
+                :error="accountConfigurations[row.id]?.error"
+                @configure="openAccountEdit(row)"
+                @retry="reloadConfigurations"
+              />
+              <span v-else class="text-cp-text-quaternary">不适用</span>
+            </template>
+
             <template #planType="{ row }">
               <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
             </template>
@@ -322,12 +379,15 @@ const {
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
                 :testing="testingConnectionIds.has(row.id)"
+                :guanlan-revive-available="accountConfigurations[row.id]?.value?.guanlanReviveAvailable ?? false"
+                :reviving="revivingAccountIds.has(row.id)"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"
                 @recover="handleRecover"
                 @refresh="handleRefresh"
                 @reauthorize="openReauthorizeAccount"
                 @test="openConnectionTest"
+                @revive="handleReviveGuanlan"
               />
             </template>
 
@@ -405,6 +465,8 @@ const {
     <AccountEditModal
       v-model="showEditModal"
       v-model:api-key="editingApiKey"
+      v-model:pin-turn-state="editingPinTurnState"
+      v-model:recapture-turn-state="editingRecaptureTurnState"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
       v-model:concurrency-limit="editingConcurrencyLimit"
@@ -413,6 +475,8 @@ const {
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
+      :turn-state-pins="editingTurnStatePins"
+      :turn-state-capture-rule="editingTurnStateCaptureRule"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick } from 'vue'
 
 const props = withDefaults(
   defineProps<{
@@ -22,6 +22,12 @@ const props = withDefaults(
 )
 
 const model = defineModel<boolean>({ default: false })
+async function syncChecked(event: Event) {
+  const input = event.target as HTMLInputElement
+  // 受控开关可能等待异步保存；父级未接受新值时，原生 checkbox 也应回显当前值。
+  await nextTick()
+  input.checked = model.value
+}
 const hasStateText = computed(() => Boolean(props.activeText || props.inactiveText))
 const inlineText = computed(() => model.value ? props.activeText : props.inactiveText)
 const trackStyle = computed(() => props.width === ''
@@ -76,6 +82,7 @@ const activeTextClasses = computed(() => [
       class="peer sr-only"
       :aria-label="label"
       :disabled="disabled"
+      @change="syncChecked"
     >
     <span
       :class="trackClasses"

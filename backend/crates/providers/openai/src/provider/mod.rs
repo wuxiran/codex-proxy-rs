@@ -139,6 +139,7 @@ pub enum CodexProviderConfigError {
 }
 
 pub struct CodexProvider {
+    turn_state_pins: crate::turn_state_pin::TurnStatePins,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -190,10 +191,19 @@ impl CodexProvider {
             image_edits_url,
             search_url,
             session_identity: None,
+            turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             invalid_encrypted_content: InvalidEncryptedContentCache::default(),
             stream_max_retries,
         })
+    }
+
+    pub(crate) fn with_turn_state_pins(
+        mut self,
+        pins: crate::turn_state_pin::TurnStatePins,
+    ) -> Self {
+        self.turn_state_pins = pins;
+        self
     }
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
@@ -590,6 +600,7 @@ impl Provider for CodexProvider {
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
         let events = cold_response_stream(ColdResponse {
+            turn_state_pins: self.turn_state_pins.clone(),
             client: self
                 .client
                 .for_account(lease.account())

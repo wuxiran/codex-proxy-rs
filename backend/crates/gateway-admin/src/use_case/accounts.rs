@@ -264,16 +264,20 @@ impl DefaultAccountsService {
         Ok(())
     }
 
-    async fn load_api_key_usage(
+    async fn load_lifetime_usage(
         &self,
         accounts: &[AccountPageItem],
+        quotas: &[ProviderQuota],
     ) -> Result<BTreeMap<String, AccountUsage>, AdminError> {
         let now = Utc::now();
-        // API Key 没有套餐周期；本地累计直接查询账号创建后仍保留的请求记录。
+        // API Key 或尚无额度窗口的账号展示本地累计，仅统计账号创建后仍保留的请求记录。
         let windows = accounts
             .iter()
-            .filter(|item| item.account.authentication_kind == "api_key")
-            .map(|item| AccountUsageWindowQuery {
+            .zip(quotas)
+            .filter(|(item, quota)| {
+                item.account.authentication_kind == "api_key" || quota.windows.is_empty()
+            })
+            .map(|(item, _)| AccountUsageWindowQuery {
                 account_id: item.account.id.clone(),
                 key: "account-lifetime".to_owned(),
                 range: TimeRange {
@@ -289,7 +293,7 @@ impl DefaultAccountsService {
             .accounts
             .load_account_usage_by_windows(&windows)
             .await
-            .map_err(|error| map_store_error(error, "API Key account usage"))?
+            .map_err(|error| map_store_error(error, "lifetime account usage"))?
             .into_iter()
             .map(|result| (result.account_id, result.usage))
             .collect())
@@ -333,7 +337,7 @@ impl DefaultAccountsService {
         )
         .await?;
         let usage = self
-            .load_api_key_usage(std::slice::from_ref(&stored))
+            .load_lifetime_usage(std::slice::from_ref(&stored), std::slice::from_ref(&quota))
             .await?
             .remove(&stored.account.id)
             .or_else(|| {
@@ -428,13 +432,13 @@ impl AccountsService for DefaultAccountsService {
         .collect::<Result<Vec<_>, AdminError>>()?;
         self.attach_quota_local_usage(&page.items, &mut quotas)
             .await?;
-        let mut api_key_usage = self.load_api_key_usage(&page.items).await?;
+        let mut lifetime_usage = self.load_lifetime_usage(&page.items, &quotas).await?;
         let items = page
             .items
             .into_iter()
             .zip(quotas)
             .map(|(mut item, quota)| {
-                let usage = api_key_usage.remove(&item.account.id).or_else(|| {
+                let usage = lifetime_usage.remove(&item.account.id).or_else(|| {
                     quota
                         .usage_window()
                         .and_then(|(window, _)| window.local_usage.clone())

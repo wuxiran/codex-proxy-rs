@@ -1,8 +1,8 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, ApiKeyConfiguration, getAccounts } from '@/api'
+import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
 import { computed, ref, shallowRef, watch } from 'vue'
-import { getAccountDetail, updateAccount, updateAccountApiKey } from '@/api'
+import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountTurnState } from '@/api'
 import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
@@ -19,6 +19,11 @@ export function useAccountEditor(options: {
 }) {
   const showEditModal = shallowRef(false)
   const editingAccountId = shallowRef<string | null>(null)
+  const pinTurnState = shallowRef(false)
+  const savedPinTurnState = shallowRef(false)
+  const recaptureTurnState = shallowRef(false)
+  const turnStatePins = ref<TurnStatePinStatus[]>([])
+  const turnStateCaptureRule = ref<TurnStateCaptureRule | null>(null)
   const notes = shallowRef('')
   const schedulingEnabled = shallowRef(true)
   const concurrencyLimit = shallowRef('')
@@ -41,10 +46,19 @@ export function useAccountEditor(options: {
       const detail = await getAccountDetail({ accountId }, { signal: configurationRequest.signal })
       if (!configurationRequest.isCurrent(requestId))
         return
-      if (!detail.credentialConfiguration)
-        throw new Error('该账号没有 API Key 上游设置')
-      apiKey.value = { ...emptyApiKeyAccountForm(), ...detail.credentialConfiguration }
-      savedConfiguration.value = detail.credentialConfiguration
+      const configuration = detail.credentialConfiguration
+      if (!configuration)
+        throw new Error('该账号没有可读取的上游设置')
+      if ('pinTurnState' in configuration) {
+        pinTurnState.value = configuration.pinTurnState
+        savedPinTurnState.value = configuration.pinTurnState
+        turnStatePins.value = configuration.turnStatePins
+        turnStateCaptureRule.value = configuration.turnStateCaptureRule ?? null
+      }
+      else {
+        apiKey.value = { ...emptyApiKeyAccountForm(), ...configuration }
+        savedConfiguration.value = configuration
+      }
       configurationReady.value = true
     }
     catch (error) {
@@ -66,6 +80,11 @@ export function useAccountEditor(options: {
     configurationRequest.invalidate()
     editingAccountId.value = account.id
     notes.value = account.notes ?? ''
+    pinTurnState.value = false
+    savedPinTurnState.value = false
+    recaptureTurnState.value = false
+    turnStatePins.value = []
+    turnStateCaptureRule.value = null
     proxyMode.value = 'preserve'
     proxyId.value = ''
     schedulingEnabled.value = account.enabled
@@ -77,7 +96,7 @@ export function useAccountEditor(options: {
     savedConfiguration.value = undefined
     configurationReady.value = false
     showEditModal.value = true
-    if (account.authenticationKind === 'api_key')
+    if (account.provider === 'openai')
       void loadConfiguration(account.id)
   }
 
@@ -85,6 +104,7 @@ export function useAccountEditor(options: {
     const accountId = editingAccountId.value
     if (!accountId || saving.value)
       return
+    const isOpenAi = editingAccount.value?.provider === 'openai'
     const isApiKey = editingAccount.value?.authenticationKind === 'api_key'
     if (isApiKey) {
       if (!configurationReady.value)
@@ -129,6 +149,9 @@ export function useAccountEditor(options: {
       if (connectionChanged) {
         await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
       }
+      else if (isOpenAi && !isApiKey && configurationReady.value && (pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value)) {
+        await updateAccountTurnState({ accountId, pinTurnState: pinTurnState.value, settings })
+      }
       else {
         await updateAccount(settings)
       }
@@ -158,6 +181,10 @@ export function useAccountEditor(options: {
 
   return {
     apiKey,
+    pinTurnState,
+    recaptureTurnState,
+    turnStatePins,
+    turnStateCaptureRule,
     configurationLoading,
     configurationReady,
     showEditModal,

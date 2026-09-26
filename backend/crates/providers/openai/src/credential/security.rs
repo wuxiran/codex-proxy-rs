@@ -23,6 +23,7 @@ pub struct CodexRuntimeCredential {
     pub cookies: Vec<RuntimeCodexCookie>,
     pub oauth_client_id: Option<String>,
     pub oauth_scope: Option<String>,
+    pub turn_state_pin: Option<String>,
 }
 
 impl std::fmt::Debug for CodexRuntimeCredential {
@@ -122,6 +123,7 @@ impl CodexCredentialCodec {
     ) -> Result<PlaintextCredential, CodexCredentialDataError> {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
+            turn_state_pin: None,
             principal,
             installation_id,
             access_token: secret.access_token.expose_secret().to_owned(),
@@ -172,6 +174,7 @@ impl CodexCredentialCodec {
         let data = serde_json::from_value::<CodexCredentialData>(value)
             .map_err(|_| CodexCredentialDataError::Invalid)?;
         validate(&data)?;
+        let turn_state_pin = data.oauth().and_then(|oauth| oauth.turn_state_pin.clone());
         let (authentication, principal, installation_id, cookies, oauth_client_id, oauth_scope) =
             match data {
                 CodexCredentialData::ApiKey(data) => (
@@ -200,6 +203,7 @@ impl CodexCredentialCodec {
             };
         Ok(CodexRuntimeCredential {
             authentication,
+            turn_state_pin,
             principal,
             installation_id,
             cookies: cookies
@@ -238,6 +242,7 @@ impl CodexCredentialCodec {
         match (&mut incoming, existing) {
             (CodexCredentialData::OAuth(incoming), CodexCredentialData::OAuth(existing)) => {
                 incoming.installation_id = existing.installation_id;
+                incoming.turn_state_pin = existing.turn_state_pin;
             }
             (CodexCredentialData::ApiKey(incoming), CodexCredentialData::ApiKey(existing)) => {
                 incoming.installation_id = existing.installation_id;
@@ -249,6 +254,13 @@ impl CodexCredentialCodec {
 }
 
 fn validate(data: &CodexCredentialData) -> Result<(), CodexCredentialDataError> {
+    if data
+        .oauth()
+        .and_then(|oauth| oauth.turn_state_pin.as_deref())
+        .is_some_and(|generation| uuid::Uuid::parse_str(generation).is_err())
+    {
+        return Err(CodexCredentialDataError::Invalid);
+    }
     if let CodexCredentialData::ApiKey(data) = data {
         return if data.validate() && valid_installation_id(&data.installation_id) {
             Ok(())

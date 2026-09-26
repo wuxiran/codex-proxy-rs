@@ -4,9 +4,9 @@ import type { AccountRow } from '../../constants'
 import { computed } from 'vue'
 import { groupedAccountQuotaWindows, visibleSummaryQuotaWindows } from '../../constants'
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'
-import { quotaWindowPresentation } from '../AccountUsageWindow/presenter'
+import { quotaWindowPresentation, readUsdCost } from '../AccountUsageWindow/presenter'
 import AccountQuotaSummaryEntry from './Entry.vue'
-import { recentlyUsedQuotaEntry, representativeQuotaWindow } from './presenter'
+import { accountQuotaUsdSummary, recentlyUsedQuotaEntry, representativeQuotaWindow } from './presenter'
 
 const props = defineProps<{
   account: AccountRow
@@ -26,6 +26,17 @@ const currentUsageTextClass = computed(() => currentUsageWindow.value
   ? quotaWindowPresentation(currentUsageWindow.value, '2px').percentTextClass
   : 'text-cp-text-quaternary')
 const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length - 1, 0))
+// 缺少上游额度窗口时仍展示本机已记录的金额；缺失金额与已知零金额分开处理。
+const unobservedUsd = computed(() => readUsdCost(props.account.usage.costs))
+const unobservedCostTitle = computed(() => unobservedUsd.value
+  ? `${props.account.usage.windowLabelDisplay}：本机已用 ${unobservedUsd.value.display}，按本机用量记录估算，不含站外消耗`
+  : '尚无可用的本机美元金额记录')
+const usdSummary = computed(() => accountQuotaUsdSummary(props.account, currentUsageWindow.value))
+const primaryUsageTitle = computed(() => {
+  if (usdSummary.value)
+    return usdSummary.value.title
+  return `${props.account.usage.windowLabelDisplay}总 Token`
+})
 </script>
 
 <template>
@@ -33,10 +44,20 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
     <template v-if="account.authenticationKind === 'api_key'">
       <span
         class="flex min-w-0 items-baseline gap-1 font-mono tabular-nums"
-        title="本地累计总 Token"
+        :title="usdSummary?.title ?? '本地累计总 Token'"
       >
-        <strong class="truncate text-cp-xs font-heavy text-cp-text">{{ account.usage.totalTokensDisplay }}</strong>
-        <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">Tokens</span>
+        <strong class="truncate text-cp-xs font-heavy text-cp-text">
+          {{ usdSummary?.usedDisplay ?? account.usage.totalTokensDisplay }}
+        </strong>
+        <span
+          v-if="usdSummary?.estimatedQuotaDisplay"
+          class="min-w-0 truncate text-[9px] font-emphasis text-cp-text-tertiary"
+        >
+          / ≈{{ usdSummary.estimatedQuotaDisplay }}
+        </span>
+        <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">
+          {{ usdSummary ? 'USD' : 'Tokens' }}
+        </span>
       </span>
       <div class="grid min-w-0 gap-1.5">
         <span class="text-[10px] leading-3 font-bold text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
@@ -50,13 +71,19 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
       >
         <span
           class="flex min-w-0 items-baseline gap-1 font-mono tabular-nums"
-          :title="`${account.usage.windowLabelDisplay}总 Token`"
+          :title="primaryUsageTitle"
         >
           <strong class="truncate text-cp-xs font-heavy text-cp-text">
-            {{ account.usage.totalTokensDisplay }}
+            {{ usdSummary?.usedDisplay ?? account.usage.totalTokensDisplay }}
           </strong>
+          <span
+            v-if="usdSummary?.estimatedQuotaDisplay"
+            class="min-w-0 truncate text-[9px] font-emphasis text-cp-text-tertiary"
+          >
+            / ≈{{ usdSummary.estimatedQuotaDisplay }}
+          </span>
           <span class="shrink-0 text-[9px] font-emphasis tracking-[0.02em] text-cp-text-quaternary">
-            Tokens
+            {{ usdSummary ? 'USD' : 'Tokens' }}
           </span>
         </span>
         <span
@@ -87,6 +114,13 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
         </span>
       </div>
     </template>
-    <AccountUsageWindow v-else variant="compact" />
+    <template v-else>
+      <div class="flex min-w-0 items-baseline gap-1 leading-none" :title="unobservedCostTitle">
+        <span class="shrink-0 text-[9px] font-emphasis text-cp-text-quaternary">已用</span>
+        <strong class="truncate font-mono text-cp-xs font-heavy tabular-nums text-cp-text">{{ unobservedUsd?.display ?? '—' }}</strong>
+        <span v-if="unobservedUsd" class="shrink-0 text-[9px] font-emphasis text-cp-text-quaternary">USD</span>
+      </div>
+      <AccountUsageWindow variant="compact" />
+    </template>
   </div>
 </template>

@@ -2,6 +2,7 @@
 import type { AccountRow } from '../constants'
 import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
 import BasePopover from '@/components/base/BasePopover.vue'
@@ -12,6 +13,8 @@ defineProps<{
   recovering: boolean
   refreshing: boolean
   testing: boolean
+  guanlanReviveAvailable?: boolean
+  reviving?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -21,11 +24,22 @@ const emit = defineEmits<{
   test: [account: AccountRow]
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
+  revive: [accountId: string]
 }>()
 </script>
 
 <template>
   <div class="relative flex items-center justify-start gap-1">
+    <BaseButton
+      v-if="guanlanReviveAvailable"
+      size="sm"
+      :loading="reviving"
+      :disabled="reviving || refreshing || recovering"
+      @click.stop="emit('revive', account.id)"
+    >
+      <RotateCcw class="size-3.5" />
+      guanlan 复活
+    </BaseButton>
     <BaseIconButton
       variant="ghost"
       size="sm"

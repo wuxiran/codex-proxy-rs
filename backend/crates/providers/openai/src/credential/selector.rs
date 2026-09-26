@@ -709,6 +709,7 @@ impl CodexCredentialSelector {
                         }
                         return Ok(CodexCredentialLease {
                             installation_id: runtime.installation_id,
+                            turn_state_pin: runtime.turn_state_pin,
                             account,
                             authentication: runtime.authentication,
                             cookies,
@@ -1353,6 +1354,7 @@ impl fmt::Debug for CodexCredentialSelector {
 }
 
 pub struct CodexCredentialLease {
+    turn_state_pin: Option<String>,
     account: ProviderAccount,
     authentication: CodexRuntimeAuthentication,
     cookies: Vec<RuntimeCodexCookie>,
@@ -1366,6 +1368,10 @@ pub struct CodexCredentialLease {
 }
 
 impl CodexCredentialLease {
+    pub(crate) fn turn_state_pin(&self) -> Option<&str> {
+        self.turn_state_pin.as_deref()
+    }
+
     #[must_use]
     pub const fn account(&self) -> &ProviderAccount {
         &self.account

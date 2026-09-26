@@ -969,3 +969,76 @@ mod import_settings {
         }
     }
 }
+
+#[test]
+fn turn_state_pin_wire_rejects_external_state_and_mixed_credentials() {
+    use gateway_api::admin::accounts::RotateAccountRequest;
+    use serde_json::json;
+    for enabled in [true, false] {
+        let value = json!({"provider":"openai", "accountId":"acct_pin", "pinTurnState":enabled});
+        assert!(
+            serde_json::from_value::<RotateAccountRequest>(value.clone())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for key in [
+            "accessToken",
+            "refreshToken",
+            "idToken",
+            "baseUrl",
+            "apiKey",
+            "transport",
+        ] {
+            let mut mixed = value.clone();
+            mixed[key] = json!("untrusted");
+            assert!(
+                serde_json::from_value::<RotateAccountRequest>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut raw = value;
+        raw["turnState"] = json!("not-accepted");
+        assert!(serde_json::from_value::<RotateAccountRequest>(raw).is_err());
+    }
+}
+
+#[test]
+fn guanlan_revive_wire_requires_explicit_exclusive_action() {
+    use gateway_api::admin::accounts::RotateAccountRequest;
+    use serde_json::json;
+    let valid = json!({"provider":"openai", "accountId":"acct_revive", "guanlanRevive":true});
+    assert!(
+        serde_json::from_value::<RotateAccountRequest>(valid.clone())
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
+    for (key, value) in [
+        ("guanlanRevive", json!(false)),
+        ("provider", json!("xai")),
+        ("pinTurnState", json!(false)),
+        ("accessToken", json!("test-token")),
+        ("refreshToken", json!("test-token")),
+        ("idToken", json!("test-token")),
+        ("baseUrl", json!("https://example.com")),
+        ("apiKey", json!("test-key")),
+        ("transport", json!("http")),
+        (
+            "settings",
+            json!({"accountId":"acct_revive","enabled":true,"concurrencyLimit":null,"weight":1,"groupIds":[]}),
+        ),
+    ] {
+        let mut mixed = valid.clone();
+        mixed[key] = value;
+        assert!(
+            serde_json::from_value::<RotateAccountRequest>(mixed)
+                .unwrap()
+                .validate()
+                .is_err(),
+            "{key}"
+        );
+    }
+}
