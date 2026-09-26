@@ -17,6 +17,7 @@ const modeOptions = {
     { label: 'AT', value: 'access_token' },
     { label: 'RT', value: 'refresh_token' },
     { label: '账号文件', value: 'json' },
+    { label: '观澜 CDK', value: 'cdk' },
   ],
   xai: [
     { label: 'OAuth', value: 'oauth' },
@@ -75,7 +76,7 @@ function resolveModal(
 
   let description = '粘贴或上传包含 OAuth Token 的 JSON，匹配已有账号时更新凭据'
   if (provider === 'batch')
-    description = '粘贴或上传 CPR 账号包，一次导入多个平台账号'
+    description = '粘贴或上传 CPR 账号包或 Sub2API 导出，一次导入多个平台账号'
   else if (provider === 'xai' && input.form.mode === 'oauth')
     description = '通过浏览器授权导入 xAI 账号'
   else if (provider === 'xai')
@@ -88,6 +89,8 @@ function resolveModal(
     description = '逐行粘贴 Access Token；未包含 Refresh Token 时无法自动续期'
   else if (input.form.mode === 'refresh_token')
     description = '逐行粘贴 Refresh Token，导入时将自动换取 Access Token'
+  else if (input.form.mode === 'cdk')
+    description = '粘贴观澜 CDK，由本页按官方 SDK 兑换后导入已签名账号'
 
   return {
     title: '导入账号',
@@ -131,10 +134,17 @@ function resolveImportInput(
       uploadable: false,
     }
   }
+  if (form.mode === 'cdk') {
+    return {
+      label: '观澜 CDK',
+      placeholder: '每行一个 CDK，例如 CDK-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX',
+      uploadable: false,
+    }
+  }
   if (provider === 'batch') {
     return {
       label: '批量账号文件',
-      placeholder: '粘贴 CPR 多平台导出文件内容',
+      placeholder: '粘贴 CPR 多平台导出或 Sub2API 账号导出 JSON',
       uploadable: true,
     }
   }
@@ -147,7 +157,7 @@ function resolveImportInput(
   }
   return {
     label: '账号文件',
-    placeholder: '粘贴 OAuth 或 API Key 账号 JSON 内容',
+    placeholder: '粘贴 Sub2API 导出、OAuth 或 API Key 账号 JSON',
     uploadable: true,
   }
 }
@@ -162,6 +172,8 @@ function resolveSubmitLabel(
     return '完成导入'
   if (provider === 'batch')
     return '批量导入'
+  if (input.form.mode === 'cdk')
+    return '兑换并导入'
   return '导入账号'
 }
 

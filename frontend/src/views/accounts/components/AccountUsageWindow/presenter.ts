@@ -2,6 +2,7 @@ import type { AccountQuotaWindow } from '../../constants'
 import { clamp } from 'es-toolkit'
 import { formatInteger } from '@/utils/number'
 import { isRecord } from '@/utils/object'
+import { formatUsd } from '@/views/usage/utils/format'
 
 export type AccountUsageWindowVariant = 'compact' | 'detail' | 'metric'
 
@@ -19,11 +20,17 @@ export interface AccountRequestBar {
   title: string
 }
 
+export interface AccountUsdCost {
+  amount: number
+  display: string
+}
+
 interface AccountLocalUsage {
   requestCount?: number
   requestCountDisplay?: string
   totalTokens?: number
   totalTokensDisplay?: string
+  usd?: AccountUsdCost
   requestBuckets?: AccountRequestBucket[]
 }
 
@@ -187,7 +194,36 @@ function accountLocalUsage(value: unknown): AccountLocalUsage | null {
     localUsage.totalTokens = value.totalTokens
   if (typeof value.totalTokensDisplay === 'string')
     localUsage.totalTokensDisplay = value.totalTokensDisplay
+  const usd = readUsdCost(value.costs)
+  if (usd)
+    localUsage.usd = usd
   return localUsage
+}
+
+export function readUsdCost(value: unknown): AccountUsdCost | null {
+  if (!Array.isArray(value))
+    return null
+
+  for (const item of value) {
+    if (!isRecord(item))
+      continue
+    const currency = typeof item.currency === 'string' ? item.currency : ''
+    if (currency.toUpperCase() !== 'USD')
+      continue
+    const amount = finiteNumber(item.estimatedAmount)
+      ? item.estimatedAmount
+      : typeof item.estimatedAmount === 'string'
+        ? Number(item.estimatedAmount)
+        : Number.NaN
+    if (!Number.isFinite(amount) || amount < 0)
+      continue
+    const display = typeof item.estimatedAmountDisplay === 'string' && item.estimatedAmountDisplay.trim()
+      ? item.estimatedAmountDisplay.trim()
+      : formatUsd(amount)
+    return { amount, display }
+  }
+
+  return null
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -240,6 +276,10 @@ function localTokenDisplay(localUsage: AccountLocalUsage | null) {
 export function quotaWindowLocalUsageDisplay(window: AccountQuotaWindow) {
   const localUsage = accountLocalUsage(window.localUsage)
   return localTokenDisplay(localUsage) || null
+}
+
+export function quotaWindowLocalUsd(window: AccountQuotaWindow | undefined) {
+  return accountLocalUsage(window?.localUsage)?.usd ?? null
 }
 
 function requestCountDisplay(localUsage: AccountLocalUsage | null) {

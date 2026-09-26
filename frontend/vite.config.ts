@@ -19,6 +19,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: path => path.replace(/^\/dev/, ''),
       },
+      '/guanlan': {
+        target: 'https://zzledu.kdns.fr',
+        changeOrigin: true,
+        rewrite: path => path.replace(/^\/guanlan/, ''),
+      },
     },
   },
   build: {
