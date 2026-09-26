@@ -644,8 +644,36 @@ export interface ApiKeyConfiguration {
   transport: 'http' | 'prefer_websocket'
 }
 
+export interface TurnStatePinStatus {
+  model: string
+  length: number
+  capturedAt: string
+  expiresAt: string
+  hits: number
+}
+
+export interface TurnStateCaptureRule {
+  defaultLength: number | null
+  modelLengths: Record<string, number>
+}
+
+export interface OAuthStateConfiguration {
+  pinTurnState: boolean
+  turnStatePins: TurnStatePinStatus[]
+  turnStateCaptureRule?: TurnStateCaptureRule
+  maxAgeSeconds: number
+}
+
+export function updateAccountTurnState(data: { accountId: string, pinTurnState: boolean, settings?: AccountUpdateParam }) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/rotate',
+    method: 'POST',
+    data: { provider: 'openai', ...data },
+  })
+}
+
 export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
-  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration }>({
+  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration | OAuthStateConfiguration }>({
     url: '/api/admin/accounts/detail',
     method: 'GET',
     params: data,

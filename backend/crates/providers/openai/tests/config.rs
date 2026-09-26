@@ -110,6 +110,8 @@ fn openai_config_defaults_to_the_provider_owned_operating_values() {
             config.auth.refresh_enabled,
             config.auth.oauth_client_id.as_str(),
             config.auth.oauth_token_endpoint.as_str(),
+            config.auth.revive.enabled,
+            config.auth.revive.base_url.as_str(),
             config.stream_max_retries(),
         ),
         (
@@ -122,6 +124,8 @@ fn openai_config_defaults_to_the_provider_owned_operating_values() {
             true,
             "app_EMoamEEZ73f0CkXaXp7hrann",
             "https://auth.openai.com/oauth/token",
+            false,
+            "https://zzledu.kdns.fr/api/revive/v1",
             u32::try_from(DEFAULT_STREAM_MAX_RETRIES).expect("default retry budget fits u32"),
         )
     );
