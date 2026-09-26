@@ -334,7 +334,7 @@ const {
             </template>
 
             <template #ticket="{ row }">
-              <AccountTicketCell :ticket="row.ticket" />
+              <AccountTicketCell :ticket="row.ticket" :added-at-display="row.addedAtDisplay" />
             </template>
 
             <template #status="{ row }">

@@ -41,12 +41,15 @@ async fn admin_configuration_should_require_administrator_authentication() {
     for (path, body) in [
         ("/api/admin/public-import", None),
         (
-            "/api/admin/public-import/update",
-            Some(
-                json!({"enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null}),
-            ),
+            "/api/admin/public-import/create",
+            Some(json!({"name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null})),
         ),
-        ("/api/admin/public-import/rotate-token", Some(json!({}))),
+        (
+            "/api/admin/public-import/update",
+            Some(json!({"id": "x", "name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null})),
+        ),
+        ("/api/admin/public-import/delete", Some(json!({"id": "x"}))),
+        ("/api/admin/public-import/rotate-token", Some(json!({"id": "x"}))),
     ] {
         let (status, _) = request(&fixture, path, body, false, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
@@ -58,39 +61,44 @@ async fn public_entry_should_work_without_session_only_with_the_link_token() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
 
-    let (status, config) = request(&fixture, "/api/admin/public-import", None, true, None).await;
+    // 初始没有任何号商配置。
+    let (status, list) = request(&fixture, "/api/admin/public-import", None, true, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(config["data"]["enabled"], false);
-    let token = config["data"]["token"].as_str().expect("token").to_owned();
+    assert_eq!(list["data"]["configs"], json!([]));
 
-    // 未开启、缺令牌和错令牌对外表现一致。
-    for candidate in [None, Some("imp-wrong"), Some(token.as_str())] {
+    // 有效期字段必填：漏传不能被当成「长期有效」。
+    let (status, _) = request(
+        &fixture,
+        "/api/admin/public-import/create",
+        Some(json!({"name": "迷茫", "enabled": true, "groupIds": [PRIMARY_GROUP_ID], "pinTurnState": true})),
+        true,
+        None,
+    )
+    .await;
+    assert!(status.is_client_error());
+
+    // 新建一个号商配置。
+    let (status, created) = request(
+        &fixture,
+        "/api/admin/public-import/create",
+        Some(json!({"name": "迷茫", "enabled": true, "groupIds": [PRIMARY_GROUP_ID], "pinTurnState": true, "expiresAt": "2999-01-01T00:00:00Z"})),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["data"]["name"], "迷茫");
+    assert_eq!(created["data"]["enabled"], true);
+    assert_eq!(created["data"]["expiresAt"], "2999-01-01T00:00:00Z");
+    let token = created["data"]["token"].as_str().expect("token").to_owned();
+    let id = created["data"]["id"].as_str().expect("id").to_owned();
+
+    // 缺令牌和错令牌对外表现与未开启一致。
+    for candidate in [None, Some("imp-wrong")] {
         let (status, _) =
             request(&fixture, "/api/public-import/entry", None, false, candidate).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
-
-    let (status, _) = request(
-        &fixture,
-        "/api/admin/public-import/update",
-        Some(json!({"enabled": true, "groupIds": [PRIMARY_GROUP_ID], "pinTurnState": true})),
-        true,
-        None,
-    )
-    .await;
-    // 有效期字段必填：漏传不能被当成“长期有效”。
-    assert!(status.is_client_error());
-    let (status, updated) = request(
-        &fixture,
-        "/api/admin/public-import/update",
-        Some(json!({"enabled": true, "groupIds": [PRIMARY_GROUP_ID], "pinTurnState": true, "expiresAt": "2999-01-01T00:00:00Z"})),
-        true,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(updated["data"]["expiresAt"], "2999-01-01T00:00:00Z");
-    assert_eq!(updated["data"]["token"], token);
 
     let (status, entry) = request(
         &fixture,
@@ -129,10 +137,11 @@ async fn public_entry_should_work_without_session_only_with_the_link_token() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["message"].as_str().expect("message").contains("代理"));
 
+    // 轮换令牌后旧令牌立即失效。
     let (status, rotated) = request(
         &fixture,
         "/api/admin/public-import/rotate-token",
-        Some(json!({})),
+        Some(json!({"id": id})),
         true,
         None,
     )
@@ -148,4 +157,18 @@ async fn public_entry_should_work_without_session_only_with_the_link_token() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 删除后列表清空。
+    let (status, _) = request(
+        &fixture,
+        "/api/admin/public-import/delete",
+        Some(json!({"id": id})),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, list) = request(&fixture, "/api/admin/public-import", None, true, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"]["configs"], json!([]));
 }
