@@ -74,7 +74,9 @@ mod personal_info {
 }
 
 mod query {
-    use gateway_admin::model::accounts::{AccountSortField, AccountStatus, SortDirection};
+    use gateway_admin::model::accounts::{
+        AccountListStatus, AccountSortField, AccountStatus, SortDirection,
+    };
     use gateway_api::admin::accounts::ListQuery;
     use serde_json::json;
 
@@ -98,7 +100,7 @@ mod query {
             Some(ref provider) if provider.as_str() == "xai"
         ));
         assert_eq!(query.search.as_deref(), Some("operator"));
-        assert_eq!(query.status, Some(AccountStatus::Normal));
+        assert_eq!(query.status, Some(AccountStatus::Normal.into()));
         assert_eq!(
             query.sort.expect("sort").field,
             AccountSortField::LastUsedAt
@@ -118,7 +120,20 @@ mod query {
 
         assert_eq!(
             query.validate().expect("validate account query").status,
-            Some(AccountStatus::RateLimited)
+            Some(AccountStatus::RateLimited.into())
+        );
+    }
+
+    #[test]
+    fn account_query_should_parse_ticket_expired_status() {
+        let query: ListQuery = serde_json::from_value(json!({
+            "status": "expired"
+        }))
+        .expect("deserialize account query");
+
+        assert_eq!(
+            query.validate().expect("validate account query").status,
+            Some(AccountListStatus::TicketExpired)
         );
     }
 

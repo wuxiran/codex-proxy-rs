@@ -30,6 +30,7 @@ pub(super) fn account_page_data(
             rate_limited: result.summary.rate_limited,
             disabled: result.summary.disabled,
             error: result.summary.error,
+            expired: result.summary.expired,
         },
     }
 }
@@ -70,7 +71,16 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         usage,
         quota,
     } = item;
-    let status = projection.status.as_str().to_owned();
+    // fork：票据到点的账号在目录里显示为「已过期」，与 store 的筛选口径一致；调度状态不变。
+    let ticket_expired = ticket
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now);
+    let status = if ticket_expired {
+        AccountListStatus::TicketExpired.as_str()
+    } else {
+        projection.status.as_str()
+    }
+    .to_owned();
     let cooldown = projection.cooldown;
     let expires_at = account.access_token_expires_at.as_ref().map(china_rfc3339);
     let added_at = china_rfc3339(&account.created_at);
@@ -109,8 +119,9 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         status,
         error_reason: projection
             .error_reason
+            .filter(|_| !ticket_expired)
             .map(|reason| reason.as_str().to_owned()),
-        error_message: projection.error_message,
+        error_message: projection.error_message.filter(|_| !ticket_expired),
         enabled: account.enabled,
         concurrency_limit: account.concurrency_limit.map(|limit| limit.get()),
         concurrency: AccountConcurrencyView {

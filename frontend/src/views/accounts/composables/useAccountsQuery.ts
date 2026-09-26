@@ -25,6 +25,7 @@ export function useAccountsQuery() {
     rateLimited: 0,
     disabled: 0,
     error: 0,
+    expired: 0,
   })
 
   const query = usePagedQuery({

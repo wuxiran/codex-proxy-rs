@@ -58,10 +58,13 @@ pub(crate) async fn load_admin_account_page(
         String::new()
     };
 
+    // fork：票据（account_tickets.expires_at）到点的账号归入 'expired'，优先于五态；
+    // 默认目录与 summary_total 不含它们，只有显式筛 'expired' 才列出。
     let statement = format!(
         "with account_statuses as (
            select a.id,
                   case
+                    when ticket.expires_at <= $2 then 'expired'
                     when not a.enabled then 'disabled'
                     when a.credential_state <> 'ready'
                       or a.access_token_expires_at <= $2 then 'error'
@@ -70,9 +73,11 @@ pub(crate) async fn load_admin_account_page(
                     else 'normal'
                   end as admin_status
              from provider_accounts a
+             left join account_tickets ticket on ticket.provider_account_id = a.id
          ),
          global_summary as (
-           select count(*)::bigint as summary_total,
+           select count(*) filter (where admin_status <> 'expired')::bigint as summary_total,
+                  count(*) filter (where admin_status = 'expired')::bigint as summary_expired,
                   count(*) filter (where admin_status = 'normal')::bigint as summary_normal,
                   count(*) filter (where admin_status = 'quota_exhausted')::bigint
                     as summary_quota_exhausted,
@@ -94,7 +99,8 @@ pub(crate) async fn load_admin_account_page(
                    lower(coalesce(a.email, '')) like $4 escape '\\' or
                    lower(coalesce(a.upstream_account_id, '')) like $4 escape '\\' or
                    lower(coalesce(a.upstream_user_id, '')) like $4 escape '\\')
-              and ($5::text is null or status.admin_status = $5)
+              and (($5::text is null and status.admin_status <> 'expired')
+                   or status.admin_status = $5)
               and ($6::smallint = 0 or
                    ($6 = 1 and exists (
                      select 1
@@ -127,6 +133,7 @@ pub(crate) async fn load_admin_account_page(
                 global_summary.summary_total, global_summary.summary_normal,
                 global_summary.summary_quota_exhausted, global_summary.summary_rate_limited,
                 global_summary.summary_disabled, global_summary.summary_error,
+                global_summary.summary_expired,
                 settings.config_revision
            from filtered_total
            cross join global_summary
@@ -176,6 +183,7 @@ pub(crate) async fn load_admin_account_page(
         rate_limited: unsigned_metadata(metadata, "summary_rate_limited")?,
         disabled: unsigned_metadata(metadata, "summary_disabled")?,
         error: unsigned_metadata(metadata, "summary_error")?,
+        expired: unsigned_metadata(metadata, "summary_expired")?,
     };
     let accounts = rows
         .into_iter()

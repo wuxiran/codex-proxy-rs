@@ -15,7 +15,7 @@ const overviewItems = computed(() => [
   {
     label: '总账号',
     value: formatInteger(props.summary.total),
-    caption: '账号池规模',
+    caption: props.summary.expired ? `账号池规模 · 已过期 ${formatInteger(props.summary.expired)}` : '账号池规模',
     tone: 'neutral',
     icon: Users,
   },

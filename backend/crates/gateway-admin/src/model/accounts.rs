@@ -62,8 +62,45 @@ pub struct AccountListQuery {
     pub provider_kind: Option<ProviderKind>,
     pub group_filter: Option<AccountGroupFilter>,
     pub search: Option<String>,
-    pub status: Option<AccountStatus>,
+    pub status: Option<AccountListStatus>,
     pub sort: Option<AccountSort>,
+}
+
+/// 账号目录的状态筛选：对外五态之一，或 fork 追加的「票据已过期」。
+///
+/// 已过期只存在于管理目录，不进入调度用的 [`AccountStatus`]（调度照旧看凭据与额度）。
+/// 票据 `expires_at` 到点的账号归入已过期且优先于五态；不带筛选时目录隐藏它们，
+/// 只有显式筛「已过期」才列出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountListStatus {
+    Status(AccountStatus),
+    TicketExpired,
+}
+
+impl AccountListStatus {
+    pub const TICKET_EXPIRED: &'static str = "expired";
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status(status) => status.as_str(),
+            Self::TicketExpired => Self::TICKET_EXPIRED,
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        if value == Self::TICKET_EXPIRED {
+            return Some(Self::TicketExpired);
+        }
+        AccountStatus::parse(value).map(Self::Status)
+    }
+}
+
+impl From<AccountStatus> for AccountListStatus {
+    fn from(status: AccountStatus) -> Self {
+        Self::Status(status)
+    }
 }
 
 /// Admin query service 从运行态存储取得的当前账号冷却快照。
@@ -237,7 +274,8 @@ pub struct AccountPageItem {
 
 /// 统一账号目录的全局状态计数，不受当前筛选和分页影响。
 ///
-/// 计数与 [`AccountStatus`] 一一对应，由 store 按派生状态聚合。
+/// 计数与 [`AccountListStatus`] 一一对应，由 store 按派生状态聚合。
+/// `total` 与五态计数都不含票据已过期账号，已过期单独计入 `expired`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountSummary {
     pub total: u64,
@@ -246,6 +284,7 @@ pub struct AccountSummary {
     pub rate_limited: u64,
     pub disabled: u64,
     pub error: u64,
+    pub expired: u64,
 }
 
 /// 账号可编辑事实的一次性替换命令。

@@ -183,7 +183,7 @@ impl ListQuery {
         let status = match self.status.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(value) => Some(
-                DomainAccountStatus::parse(&value.to_ascii_lowercase())
+                AccountListStatus::parse(&value.to_ascii_lowercase())
                     .ok_or_else(|| WireValidationError::new("status"))?,
             ),
         };
@@ -260,6 +260,8 @@ pub struct AccountSummaryView {
     pub rate_limited: u64,
     pub disabled: u64,
     pub error: u64,
+    /// 票据已过期的账号数；不计入 `total` 与五态计数。
+    pub expired: u64,
 }
 
 /// 账号成本、到期与票据状态（fork 子表）；票据只回显打码邮箱。

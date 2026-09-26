@@ -12,9 +12,9 @@ use gateway_admin::{
     model::{
         MutationActor, MutationContext, PageSize,
         accounts::{
-            AccountListQuery, AccountRuntimeSnapshot, AccountSort, AccountSortField, AccountStatus,
-            AccountUsageWindowQuery, BatchUpdateAccounts, DeleteAccounts, SortDirection,
-            UpdateAccount,
+            AccountListQuery, AccountListStatus, AccountRuntimeSnapshot, AccountSort,
+            AccountSortField, AccountStatus, AccountUsageWindowQuery, BatchUpdateAccounts,
+            DeleteAccounts, SortDirection, UpdateAccount,
         },
         observability::TimeRange,
         provider_credentials::{
@@ -829,7 +829,7 @@ async fn terminal_admin_list_filters_and_sorts_before_pagination_with_retained_u
                 provider_kind: Some(ProviderKind::new("openai").expect("Provider kind")),
                 group_filter: None,
                 search: Some("ALPHA@EXAMPLE".to_owned()),
-                status: Some(AccountStatus::Normal),
+                status: Some(AccountStatus::Normal.into()),
                 sort: None,
             },
             Default::default(),
@@ -849,7 +849,7 @@ async fn terminal_admin_list_filters_and_sorts_before_pagination_with_retained_u
                 provider_kind: None,
                 group_filter: None,
                 search: None,
-                status: Some(AccountStatus::RateLimited),
+                status: Some(AccountStatus::RateLimited.into()),
                 sort: None,
             },
             AccountRuntimeSnapshot {
@@ -892,7 +892,7 @@ async fn terminal_admin_list_filters_and_sorts_before_pagination_with_retained_u
                 provider_kind: None,
                 group_filter: None,
                 search: None,
-                status: Some(AccountStatus::Error),
+                status: Some(AccountStatus::Error.into()),
                 sort: None,
             },
             Default::default(),
@@ -902,6 +902,68 @@ async fn terminal_admin_list_filters_and_sorts_before_pagination_with_retained_u
     assert_eq!(error_accounts.items.len(), 2);
     assert_eq!(error_accounts.items[0].account.id, "acct_beta");
     assert_eq!(error_accounts.items[1].account.id, "acct_invalid");
+
+    // fork：票据到点的账号归入「已过期」，默认目录与 total 都不含它；未到点的票据不影响状态。
+    sqlx::query(
+        "insert into account_tickets (provider_account_id, expires_at)
+         values ('acct_invalid', $1), ('acct_alpha', $2)",
+    )
+    .bind(now - TimeDelta::minutes(1))
+    .bind(now + TimeDelta::days(1))
+    .execute(&database.pool)
+    .await
+    .expect("seed account tickets");
+    let default_page = store
+        .list_accounts(
+            AccountListQuery {
+                page: 1,
+                page_size: PageSize::new(10).expect("page size"),
+                provider_kind: None,
+                group_filter: None,
+                search: None,
+                status: None,
+                sort: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("hide expired accounts by default");
+    assert_eq!(default_page.total, 5);
+    assert!(
+        default_page
+            .items
+            .iter()
+            .all(|item| item.account.id != "acct_invalid")
+    );
+    assert_eq!(default_page.summary.total, 5);
+    assert_eq!(default_page.summary.expired, 1);
+    assert_eq!(default_page.summary.error, 1);
+    assert_eq!(default_page.summary.normal, 1);
+    assert_eq!(
+        default_page.summary.total,
+        default_page.summary.normal
+            + default_page.summary.quota_exhausted
+            + default_page.summary.rate_limited
+            + default_page.summary.disabled
+            + default_page.summary.error
+    );
+    let expired_accounts = store
+        .list_accounts(
+            AccountListQuery {
+                page: 1,
+                page_size: PageSize::new(10).expect("page size"),
+                provider_kind: None,
+                group_filter: None,
+                search: None,
+                status: Some(AccountListStatus::TicketExpired),
+                sort: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("filter expired accounts");
+    assert_eq!(expired_accounts.total, 1);
+    assert_eq!(expired_accounts.items[0].account.id, "acct_invalid");
     database.close().await;
 }
 

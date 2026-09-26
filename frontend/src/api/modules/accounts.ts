@@ -3,8 +3,9 @@ import type { AccountGroupRef } from './account-groups'
 import { API_BASE_URL } from '../constants'
 import request from '../request'
 
+/** 前五态来自后端调度状态；`expired` 是 fork 追加的目录状态：票据到期，默认列表隐藏。 */
 export type AccountStatus
-  = 'normal' | 'quota_exhausted' | 'rate_limited' | 'disabled' | 'error'
+  = 'normal' | 'quota_exhausted' | 'rate_limited' | 'disabled' | 'error' | 'expired'
 
 export type AccountErrorReason
   = 'account_unverified'
@@ -274,6 +275,8 @@ export interface AccountSummary {
   rateLimited: number
   disabled: number
   error: number
+  /** 票据已过期的账号数；不计入 total 与五态计数。 */
+  expired: number
 }
 
 export interface AccountListResponse {

@@ -20,8 +20,8 @@ use gateway_admin::model::{
     AdminError as AdminServiceError, PageSize,
     accounts::{
         AccountConcurrencyLimit, AccountConnectionTestEvent as DomainConnectionTestEvent,
-        AccountCost, AccountGroupFilter, AccountListQuery, AccountModelUsage, AccountSort,
-        AccountSortField, AccountStatus as DomainAccountStatus, AccountUpdateResult, AccountUsage,
+        AccountCost, AccountGroupFilter, AccountListQuery, AccountListStatus, AccountModelUsage,
+        AccountSort, AccountSortField, AccountUpdateResult, AccountUsage,
         AccountWeight, AccountsUpdateResult, BatchUpdateAccounts, SortDirection, UpdateAccount,
     },
     provider_credentials::{

@@ -1,6 +1,6 @@
 import type { Component } from 'vue'
 import type { AccountErrorReason, AccountStatus } from '@/api'
-import { AlertTriangle, CircleCheck, Gauge, Power, Timer } from '@lucide/vue'
+import { AlertTriangle, CalendarX, CircleCheck, Gauge, Power, Timer } from '@lucide/vue'
 
 import { formatDateTime, parseTimestamp } from '@/utils/date'
 import { errorReasonLabels, statusLabels, statusTones } from '../../constants'
@@ -129,6 +129,13 @@ const displayDefinitions: Record<AccountStatusDisplayMode, AccountStatusDisplayD
     recoveryHint: '重新测试连接以获取最新状态',
     icon: AlertTriangle,
   },
+  expired: {
+    tone: statusTones.expired,
+    label: statusLabels.expired,
+    description: '票据已到期，账号已从默认列表隐藏',
+    recoveryHint: '在「成本与票据」里延后到期时间后回到原状态',
+    icon: CalendarX,
+  },
 }
 
 const errorRecoveryHints: Record<AccountErrorReason, string> = {
@@ -146,6 +153,7 @@ export function resolveAccountStatusPresentation(
     ? null
     : parseTimestamp(input.nextRefreshAt)
   const isBackoff = input.status !== 'disabled'
+    && input.status !== 'expired'
     && nextRefreshTimestamp !== null
     && nextRefreshTimestamp > input.now
   const mode: AccountStatusDisplayMode = isBackoff ? 'refresh_backoff' : input.status

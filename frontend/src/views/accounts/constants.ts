@@ -68,6 +68,7 @@ export const statusLabels: Record<AccountStatus, string> = {
   rate_limited: '限流中',
   disabled: '已停用',
   error: '错误',
+  expired: '已过期',
 }
 
 export const statusTones: Record<AccountStatus, 'success' | 'danger' | 'warning' | 'info' | 'normal'> = {
@@ -76,6 +77,7 @@ export const statusTones: Record<AccountStatus, 'success' | 'danger' | 'warning'
   rate_limited: 'warning',
   disabled: 'normal',
   error: 'danger',
+  expired: 'normal',
 }
 
 export const accountStatusFilterOptions = [
@@ -85,6 +87,7 @@ export const accountStatusFilterOptions = [
   { label: statusLabels.rate_limited, value: 'rate_limited' },
   { label: statusLabels.disabled, value: 'disabled' },
   { label: statusLabels.error, value: 'error' },
+  { label: statusLabels.expired, value: 'expired' },
 ]
 
 /** `error` 分类下具体原因的展示文案（对应后端 `errorReason`）。 */
@@ -97,7 +100,7 @@ export const errorReasonLabels: Record<AccountErrorReason, string> = {
 }
 
 /**
- * 后端已派生互斥状态（正常 / 配额耗尽 / 限流中 / 已停用 / 错误）；
+ * 后端已派生互斥状态（正常 / 配额耗尽 / 限流中 / 已停用 / 错误 / 已过期）；
  * 前端只渲染，不再独立派生。
  */
 export function derivedAccountStatus(row: AccountRow): AccountStatus {

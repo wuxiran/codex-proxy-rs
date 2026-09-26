@@ -781,6 +781,7 @@ impl AccountStore for FakeAccountStore {
                 rate_limited: 0,
                 disabled: 0,
                 error: 0,
+                expired: 0,
             },
         })
     }
