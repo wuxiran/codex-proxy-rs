@@ -419,6 +419,7 @@ PostgreSQL 周期对账才是正确性基础。
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | OpenAI upstream | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
+| OpenAI 实验 state 固定开关 / 候选 | PostgreSQL 凭据 JSON / Provider 进程内有界缓存 | 开关持久化；候选不落盘，最多 2048 条、固定一小时，按账号、令牌指纹、捕获代次、模型和客户端密钥隔离 |
 | Provider 公开模型与请求画像 | Provider/runtime cache | 由官方目录或发布源刷新，不写成第二份业务配置 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 

@@ -286,6 +286,9 @@ pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
 #[serde(deny_unknown_fields)]
 pub struct CodexOAuthCredentialData {
     pub schema_version: u32,
+    /// 管理员显式开启时生成；重新捕获会更换代次，原始 state 不入凭据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_state_pin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,

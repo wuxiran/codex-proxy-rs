@@ -617,6 +617,20 @@ rotation 可选携带 `settings`，字段与 `POST /api/admin/accounts/update` �
 `GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`，不回显密钥。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游。
 
+OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。通过 `rotate` 提交
+`{ provider: "openai", accountId, pinTurnState: true | false, settings? }`，此分支不能混入 token、API Key
+或外部 state。开关使用现有管理员鉴权、账号 CAS 和审计事务，保留凭据健康状态、错误及额度；
+再次提交 `true` 表示重新捕获。普通账号更新和令牌刷新保留开关，其他 Provider / API Key 不支持。
+详情的 `credentialConfiguration` 返回 `{ pinTurnState, maxAgeSeconds, turnStatePins }`；每条缓存摘要仅含
+`model`、`length`、`capturedAt`、`expiresAt` 和 `hits`，不包含原始 state 或令牌。
+
+开启后，从该账号普通生成请求的成功完整响应中捕获首个 292 字符候选，按账号、上游模型及客户端密钥隔离。
+固定期内覆盖发往上游的 state，后续返回值不覆盖已固定值；失败、不完整响应、预热和连接测试不捕获。
+默认关闭。单个候选的本地最长保留时间为 3600 秒，不随命中续期；这不是已验证的上游有效期。
+到期、访问令牌改变、重新捕获或服务重启后等待新的候选，尚无候选时保持原有透传行为。
+此功能偏离常规同轮粘性路由合同，292 / 312 长度不构成模型质量判断，也不保证减少 overload。
+
+
 OAuth start 使用：
 
 ```json
