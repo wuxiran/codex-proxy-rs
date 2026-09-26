@@ -40,6 +40,7 @@ fn account_profile_debug_redacts_identity_fields() {
 fn plaintext_provider_schema_round_trips_dynamic_cookie_data() {
     let data = CodexCredentialData::OAuth(CodexOAuthCredentialData {
         schema_version: 1,
+        turn_state_pin: None,
         principal: Some(CodexCredentialPrincipal {
             oauth_subject: "subject-private".to_owned(),
             poid: Some("poid-private".to_owned()),
