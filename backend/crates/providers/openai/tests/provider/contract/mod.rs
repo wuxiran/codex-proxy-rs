@@ -269,7 +269,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
 }
 
 const OFFICIAL_FIXTURE: &[u8] =
-    include_bytes!("../transport/fixtures/official_models_snapshot.json");
+    include_bytes!("../../transport/fixtures/official_models_snapshot.json");
 
 #[tokio::test]
 async fn replay_compatibility_should_remove_only_reasoning_status_on_both_transports() {
