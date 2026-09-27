@@ -219,5 +219,6 @@ pub struct OpsReport {
 }
 
 fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    // 空集合的 f64 求和是 -0.0；`+ 0.0` 规整成 0.0，前端才不会显示「¥-0」。
+    (value * 100.0).round() / 100.0 + 0.0
 }

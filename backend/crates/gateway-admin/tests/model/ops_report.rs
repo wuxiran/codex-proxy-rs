@@ -118,3 +118,10 @@ fn sync_purchases_follows_tickets_into_finalized_days() {
 
     assert!(!sync_purchases(&mut records, &tickets));
 }
+
+#[test]
+fn empty_day_purchase_is_positive_zero() {
+    let view = OpsDayRecord::new(day(), Utc::now()).view();
+    assert!(view.purchase_cny == 0.0 && view.purchase_cny.is_sign_positive());
+    assert!(view.purchase_usd.is_sign_positive());
+}
