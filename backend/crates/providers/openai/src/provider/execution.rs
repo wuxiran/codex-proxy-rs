@@ -992,7 +992,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
-        let mut pre_commit_events = PreCommitClientEvents::new();
+        let mut pre_commit_events = PreCommitClientEvents::new(trace);
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
                 if allows_account_state_mutation {
@@ -1037,7 +1037,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             let next = match next {
                 Ok(PreCommitPoll::Upstream(next)) => next,
                 Ok(PreCommitPoll::GraceElapsed) => {
-                    for event in pre_commit_events.commit_pending() {
+                    for event in pre_commit_events.commit_pending(PreCommitReleaseReason::GraceTimeout) {
                         yield event;
                     }
                     continue;

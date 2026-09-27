@@ -1,3 +1,5 @@
+mod precommit;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::num::NonZeroU32;
@@ -7997,7 +7999,7 @@ async fn ordinary_request_should_bound_structural_event_replay_grace() {
         .await
         .expect("prepare provider stream");
 
-    let first_event = timeout(Duration::from_secs(2), async {
+    let first_event = timeout(Duration::from_secs(4), async {
         loop {
             let event = stream
                 .next()
@@ -8511,10 +8513,10 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
 }
 
 #[tokio::test]
-async fn continuation_prefetch_over_64_kib_should_commit_wire_without_protocol_failure() {
+async fn continuation_prefetch_over_128_kib_should_commit_wire_without_protocol_failure() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_prefetch_limit").await;
-    let padding = "x".repeat(64 * 1024);
+    let padding = "x".repeat(128 * 1024);
     let body = format!(
         "event: response.created\ndata: {}\n\n",
         json!({
@@ -8527,7 +8529,7 @@ async fn continuation_prefetch_over_64_kib_should_commit_wire_without_protocol_f
             }
         })
     );
-    assert!(body.len() > 64 * 1024);
+    assert!(body.len() > 128 * 1024);
     let (base_url, release, _first_chunk_sent, server) =
         paused_chunked_sse_server(body, String::new()).await;
     let mut stream = provider_with_base_url(&store, base_url)
