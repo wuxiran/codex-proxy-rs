@@ -2,6 +2,7 @@
 //!
 //! 不建表，避免与其它 fork 子表迁移编号冲突。任务加跨实例租约，蓝绿两个槽位不会同时写快照；
 //! 今天每轮刷新，过去未定稿的日子（含首次启动时最近 [`BACKFILL_DAYS`] 天）逐轮补齐。
+//! 买入成本不受定稿限制：每轮按票据现状校正全部日期，事后补录的成本也会计入。
 
 use std::fs;
 use std::io::Write as _;
@@ -14,7 +15,7 @@ use chrono_tz::Asia::Shanghai;
 use gateway_core::task::{ScheduledTask, WorkerCycleContext, WorkerTaskError};
 
 use crate::model::AdminError;
-use crate::model::ops_report::{OpsDayRecord, OpsReport};
+use crate::model::ops_report::{OpsDayRecord, OpsReport, sync_purchases};
 use crate::ports::ops_report::OpsReportSource;
 
 pub const OPS_REPORT_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -117,6 +118,15 @@ impl OpsReportService {
                 }
             }
             changed = true;
+        }
+        if !context.cancellation().is_cancelled() {
+            match source.purchase_tickets().await {
+                Ok(tickets) => changed |= sync_purchases(&mut records, &tickets),
+                Err(error) => {
+                    tracing::warn!(target: "ops_report", error_kind = ?error.kind(),
+                        "ops report purchase sync failed");
+                }
+            }
         }
         if !changed {
             return;

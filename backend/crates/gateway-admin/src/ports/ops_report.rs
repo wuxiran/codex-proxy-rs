@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::model::ops_report::OpsDayFacts;
+use crate::model::ops_report::{OpsDayFacts, OpsPurchaseTicket};
 use crate::ports::store::AdminStoreResult;
 
 #[async_trait]
@@ -17,4 +17,7 @@ pub trait OpsReportSource: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> AdminStoreResult<OpsDayFacts>;
+
+    /// 全部未删除账号的买入票据现状（数据量小，每轮全量）。
+    async fn purchase_tickets(&self) -> AdminStoreResult<Vec<OpsPurchaseTicket>>;
 }

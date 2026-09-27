@@ -91,6 +91,42 @@ pub struct OpsPurchaseAmount {
     pub currency: String,
 }
 
+/// 一张票据当前的买入成本事实；每轮全量读取，用来校正已定稿日期的买入成本。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpsPurchaseTicket {
+    pub account_id: String,
+    /// 买入时间（缺省入库时间）所在的北京时间自然日。
+    pub day: NaiveDate,
+    /// 票据上没有买入金额时为 `None`。
+    pub amount: Option<OpsPurchaseAmount>,
+}
+
+/// 按票据现状校正所有日期的买入成本，返回是否有改动。
+///
+/// 定稿只冻结请求与消费这类重指标；买入成本常在事后补录或改买入时间，必须跟随票据：
+/// 补录的回填到归属日，改期的从旧日期挪走，清掉金额的移除。
+/// 不在 `tickets` 里的账号（已删除）保留原值；归属日早于快照范围的不计入任何一天。
+pub fn sync_purchases(records: &mut [OpsDayRecord], tickets: &[OpsPurchaseTicket]) -> bool {
+    let mut changed = false;
+    for ticket in tickets {
+        for record in records.iter_mut() {
+            let wanted = ticket.amount.as_ref().filter(|_| record.day == ticket.day);
+            match wanted {
+                Some(amount) => {
+                    if record.purchases.get(&ticket.account_id) != Some(amount) {
+                        record
+                            .purchases
+                            .insert(ticket.account_id.clone(), amount.clone());
+                        changed = true;
+                    }
+                }
+                None => changed |= record.purchases.remove(&ticket.account_id).is_some(),
+            }
+        }
+    }
+    changed
+}
+
 impl OpsDayRecord {
     #[must_use]
     pub fn new(day: NaiveDate, refreshed_at: DateTime<Utc>) -> Self {

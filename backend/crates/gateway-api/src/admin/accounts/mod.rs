@@ -21,8 +21,8 @@ use gateway_admin::model::{
     accounts::{
         AccountConcurrencyLimit, AccountConnectionTestEvent as DomainConnectionTestEvent,
         AccountCost, AccountGroupFilter, AccountListQuery, AccountListStatus, AccountModelUsage,
-        AccountSort, AccountSortField, AccountUpdateResult, AccountUsage,
-        AccountWeight, AccountsUpdateResult, BatchUpdateAccounts, SortDirection, UpdateAccount,
+        AccountSort, AccountSortField, AccountUpdateResult, AccountUsage, AccountWeight,
+        AccountsUpdateResult, BatchUpdateAccounts, SortDirection, UpdateAccount,
     },
     provider_credentials::{
         AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,

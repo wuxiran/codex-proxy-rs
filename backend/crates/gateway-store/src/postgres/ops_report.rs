@@ -8,7 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gateway_admin::model::ops_report::{
-    CprDayFacts, OpsDayFacts, OpsPurchase, Sub2apiDayFacts, Sub2apiSlice,
+    CprDayFacts, OpsDayFacts, OpsPurchase, OpsPurchaseAmount, OpsPurchaseTicket, Sub2apiDayFacts,
+    Sub2apiSlice,
 };
 use gateway_admin::ports::ops_report::OpsReportSource;
 use gateway_admin::ports::store::AdminStoreResult;
@@ -211,5 +212,45 @@ impl OpsReportSource for PgOpsReportSource {
             cpr,
             sub2api,
         })
+    }
+
+    async fn purchase_tickets(&self) -> AdminStoreResult<Vec<OpsPurchaseTicket>> {
+        let rows = sqlx::query(
+            "select t.provider_account_id,
+                    (coalesce(t.purchased_at, pa.created_at) at time zone 'Asia/Shanghai')::date
+                      as day,
+                    t.purchase_amount::float8 as amount, t.purchase_currency
+               from account_tickets t
+               join provider_accounts pa on pa.id = t.provider_account_id
+              order by t.provider_account_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(target: "ops_report", error = %error, "purchase ticket query failed");
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("load ops report purchase tickets"),
+            )
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                let amount = row.try_get::<Option<f64>, _>("amount")?;
+                let currency = row.try_get::<Option<String>, _>("purchase_currency")?;
+                Ok(OpsPurchaseTicket {
+                    account_id: row.try_get("provider_account_id")?,
+                    day: row.try_get("day")?,
+                    amount: amount
+                        .zip(currency)
+                        .map(|(amount, currency)| OpsPurchaseAmount { amount, currency }),
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(|_| {
+                admin_store_error(
+                    ENTITY,
+                    postgres_unavailable("decode ops report purchase tickets"),
+                )
+            })
     }
 }
