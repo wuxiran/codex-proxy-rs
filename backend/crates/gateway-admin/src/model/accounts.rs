@@ -69,8 +69,8 @@ pub struct AccountListQuery {
 /// 账号目录的状态筛选：对外五态之一，或 fork 追加的「票据已过期」。
 ///
 /// 已过期只存在于管理目录，不进入调度用的 [`AccountStatus`]（调度照旧看凭据与额度）。
-/// 票据 `expires_at` 到点的账号归入已过期且优先于五态；不带筛选时目录隐藏它们，
-/// 只有显式筛「已过期」才列出。
+/// 票据 `expires_at` 到点、且五态已不是正常/限流（不能再调度）的账号归入已过期；
+/// 票据到点但还能调度的照常显示五态。不带筛选时目录隐藏已过期，只有显式筛「已过期」才列出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountListStatus {
     Status(AccountStatus),

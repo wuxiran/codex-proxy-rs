@@ -132,8 +132,8 @@ const displayDefinitions: Record<AccountStatusDisplayMode, AccountStatusDisplayD
   expired: {
     tone: statusTones.expired,
     label: statusLabels.expired,
-    description: '票据已到期，账号已从默认列表隐藏',
-    recoveryHint: '在「成本与票据」里延后到期时间后回到原状态',
+    description: '票据已到期且账号已无法调度，已从默认列表隐藏',
+    recoveryHint: '账号恢复正常，或在「成本与票据」里延后到期时间后，会回到原状态',
     icon: CalendarX,
   },
 }

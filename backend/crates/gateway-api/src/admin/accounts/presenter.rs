@@ -71,10 +71,15 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         usage,
         quota,
     } = item;
-    // fork：票据到点的账号在目录里显示为「已过期」，与 store 的筛选口径一致；调度状态不变。
+    // fork：票据到点且已不能调度（不是正常/限流）的账号在目录里显示为「已过期」，
+    // 与 store 的筛选口径一致；调度状态不变。
     let ticket_expired = ticket
         .expires_at
-        .is_some_and(|expires_at| expires_at <= now);
+        .is_some_and(|expires_at| expires_at <= now)
+        && !matches!(
+            projection.status,
+            DomainAccountStatus::Normal | DomainAccountStatus::RateLimited
+        );
     let status = if ticket_expired {
         AccountListStatus::TicketExpired.as_str()
     } else {

@@ -3,7 +3,7 @@ import type { AccountGroupRef } from './account-groups'
 import { API_BASE_URL } from '../constants'
 import request from '../request'
 
-/** 前五态来自后端调度状态；`expired` 是 fork 追加的目录状态：票据到期，默认列表隐藏。 */
+/** 前五态来自后端调度状态；`expired` 是 fork 追加的目录状态：票据到期且已不能调度，默认列表隐藏。 */
 export type AccountStatus
   = 'normal' | 'quota_exhausted' | 'rate_limited' | 'disabled' | 'error' | 'expired'
 

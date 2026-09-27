@@ -58,22 +58,31 @@ pub(crate) async fn load_admin_account_page(
         String::new()
     };
 
-    // fork：票据（account_tickets.expires_at）到点的账号归入 'expired'，优先于五态；
-    // 默认目录与 summary_total 不含它们，只有显式筛 'expired' 才列出。
+    // fork：票据（account_tickets.expires_at）到点、且已不能调度（五态不是正常/限流）的账号
+    // 归入 'expired'；默认目录与 summary_total 不含它们，只有显式筛 'expired' 才列出。
     let statement = format!(
-        "with account_statuses as (
+        "with base_statuses as (
            select a.id,
+                  ticket.expires_at <= $2 as ticket_expired,
                   case
-                    when ticket.expires_at <= $2 then 'expired'
                     when not a.enabled then 'disabled'
                     when a.credential_state <> 'ready'
                       or a.access_token_expires_at <= $2 then 'error'
                     when a.quota_access_state = 'exhausted' then 'quota_exhausted'
                     when a.id = any($1::text[]) then 'rate_limited'
                     else 'normal'
-                  end as admin_status
+                  end as base_status
              from provider_accounts a
              left join account_tickets ticket on ticket.provider_account_id = a.id
+         ),
+         account_statuses as (
+           select id,
+                  case
+                    when ticket_expired and base_status not in ('normal', 'rate_limited')
+                      then 'expired'
+                    else base_status
+                  end as admin_status
+             from base_statuses
          ),
          global_summary as (
            select count(*) filter (where admin_status <> 'expired')::bigint as summary_total,
