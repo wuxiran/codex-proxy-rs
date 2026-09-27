@@ -3625,7 +3625,7 @@ async fn websocket_pong_timeout_diagnosis_survives_ambiguous_send_wrapping() {
         ));
         let provider = provider_with_base_url(&store, base_url);
         if reuse {
-            let mut warmup = Arc::clone(&provider)
+            let mut warmup = provider
                 .execute(
                     planned_request("openai", operation.clone()),
                     context("req_pong_warmup", CancellationToken::new()),
