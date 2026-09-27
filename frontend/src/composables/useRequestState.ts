@@ -1,7 +1,7 @@
 import { onScopeDispose, shallowRef } from 'vue'
 
 import { ApiError } from '@/api/request'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 export function useRequestState(onError?: (error: unknown) => void) {
   const loading = shallowRef(false)

@@ -4,14 +4,21 @@
 具体 HTTP 字段见 [接口文档](api.md)，部署参数见 [部署文档](../deploy/README.md)；上游 URL、超时、
 重试间隔和 UI 布局属于源码或配置，不在架构文档重复维护。
 
+| 阅读目标 | 章节 |
+| --- | --- |
+| 了解模块与插件边界 | [运行拓扑](#2-运行拓扑)、[Workspace](#3-workspace-边界)、[插件扩展](#31-插件扩展) |
+| 跟踪一次请求 | [请求生命周期](#4-数据面请求生命周期)、[协议边界](#5-provider-与协议边界)、[路由与结算](#6-路由账号范围与-continuation) |
+| 修改配置与持久化 | [控制面](#7-控制面与-revision)、[状态所有权](#8-状态所有权) |
+| 维护运行行为 | [凭据与额度](#9-credential额度与主动重置)、[观测与任务](#10-观测与后台任务)、[生命周期](#11-生命周期安全与恢复) |
+
 ## 1. 系统定位
 
 Codex Proxy RS 是单进程、单副本运行的多 Provider AI 网关，同时提供：
 
 - 面向客户端的 OpenAI Responses、Images、standalone Search 和模型目录协议；
 - 面向管理员的 `/api/admin/*` 控制面和 Vue 管理端；
-- 面向 Key 持有者的 `/api/key-usage/*` 用量与客户端配置接口、独立 `/key-usage` 页面，以及 Bearer 鉴权的 `/v1/usage` 额度查询；
-- OpenAI 与 xAI 两个编译期 Provider；
+- 面向 Key 持有者的 `/api/key-usage/*` 用量与客户端配置接口、独立 `/key-usage` 页面，以及复用数据面认证的 `/v1/usage` 额度查询；
+- 固定的 OpenAI 与 xAI 两个编译期 Provider，以及插件提供的认证、中间件和管理扩展；
 - PostgreSQL 持久化、Redis 协调状态以及 S3/R2 数据库备份。
 
 系统不提供 `/v1/chat/completions`，不存在 Provider Instance 层，也不支持通过复制应用容器进行多副本
@@ -21,37 +28,30 @@ Codex Proxy RS 是单进程、单副本运行的多 Provider AI 网关，同时�
 ## 2. 运行拓扑
 
 ```mermaid
-flowchart LR
-  Client[API Client] --> API[gateway-api]
-  Browser[Vue Admin] --> API
-
-  API --> Core[gateway-core]
-  API --> Admin[gateway-admin]
-
+flowchart TB
+  Client[API 客户端 / 管理端] --> API[gateway-api]
+  Host[gateway-host] -. 生命周期与后台任务 .-> API
+  API --> Core[gateway-core<br/>请求执行]
+  API --> Admin[gateway-admin<br/>管理用例]
   Core --> Registry[Provider Registry]
   Admin --> Registry
-  Registry --> OpenAI[provider-openai]
-  Registry --> XAI[provider-xai]
-  OpenAI --> TurnState[turn-state]
+  Registry --> Builtin[OpenAI / xAI]
+  Registry --> Plugins[Plugin Runtime / 插件进程]
+  Builtin --> Upstream[上游服务]
+  Plugins --> Upstream
+  Builtin --> TurnState[turn-state]
   API --> TurnState
   TurnState --> StateFiles[(runtime_data_dir/turn_state)]
-  OpenAI --> OpenAIUpstream[OpenAI upstream]
-  XAI --> XAIUpstream[xAI upstream]
-
   Core --> Store[gateway-store]
   Admin --> Store
-  OpenAI --> Store
-  XAI --> Store
+  Builtin --> Store
   Store --> PG[(PostgreSQL)]
   Store --> Redis[(Redis)]
   Store --> Object[(S3 / R2)]
-
-  Host[gateway-host] -. lifecycle / workers / update .-> API
-  Host -. lazy client distribution resolver .-> Admin
-  Host --> StoreLinks[RG-Adguard / Microsoft CDN]
 ```
 
-`backend/apps/gateway` 是唯一组合根，按 Host → Store → Provider → Core → Admin → API → Worker 的顺序
+图中表示运行时协作，不是 crate 的直接依赖。`backend/apps/gateway` 是网关的唯一组合根，
+按 Host → Store → Provider → Core → Admin → API → Worker 的顺序
 初始化具体实现。其余 crate 只暴露自己的配置、端口和 Bundle，不自行定位别的实现。
 
 ## 3. Workspace 边界
@@ -59,16 +59,21 @@ flowchart LR
 | 路径 | 责任 |
 | --- | --- |
 | `backend/apps/gateway` | 读取顶层配置、连接 Bundle、注册 Provider 与 Worker |
+| `backend/apps/plugin-cli`（包名 `codex-proxy-plugin-cli`） | `cpr-plugin package` 校验作者清单并生成平台元数据、资源摘要与归档；内部仅依赖 SDK，不参与网关运行时加载 |
 | `gateway-protocol` | 跨层共享的 OpenAI wire contract、SSE 编解码与无业务 owner 的解析事实，不依赖其他 workspace crate |
 | `gateway-core` | operation、canonical event、请求快照、路由、admission、attempt 协调、交付边界和计量 |
 | `gateway-admin` | 管理领域、Key 用量查询、Provider/Store 端口、审计语义和备份策略 |
 | `gateway-api` | HTTP/WS/SSE 解码与交付、Admin 与 Key 用量 wire、静态 Web UI；不直接访问 Store 或具体 Provider |
 | `gateway-store` | PostgreSQL、Redis、S3/R2、`pg_dump` 适配器；不拥有业务策略 |
 | `gateway-host` | 配置加载、日志、HTTP 生命周期、Worker 监督、系统更新及外部价格源适配 |
+| `gateway-plugin/sdk`（包名 `gateway-plugin-sdk`） | 公开插件清单与线协议，独立于网关领域；异步收发通过可选 `io` feature 提供 |
+| `gateway-plugin/runtime`（包名 `gateway-plugin-runtime`） | 插件包校验、能力适配、双向 RPC 与发布集合；通过 Host 管理子进程和受管 HTTP |
 | `providers/openai` | OpenAI OAuth、账号选择、目录、额度、Responses/Images/Search transport |
 | `providers/xai` | xAI OAuth session、账号选择、目录、额度和 Grok/Responses 转换 |
 | `turn-state` | Codex `X-Codex-Turn-State` 模板的桶存储（账号 × 模型，落运行数据目录）、Fernet 到期、注入决策、观测统计；纯逻辑 + 文件，不依赖其它 workspace crate，由 `providers/openai` 在请求前/响应后两处钩子调用，管理接口由 `gateway-api` 直接持有服务句柄 |
 | `frontend` | Vue 管理端与 Key 用量页，仅通过各自身份允许的控制面 API 访问状态 |
+| 独立仓库 `codex-proxy-ui` | 管理端与插件页面共用的 Vue 基础组件、纯主题算法和样式，不依赖宿主业务状态、路由或 API |
+| 独立仓库 `codex-proxy-plugins` | 官方维护综合示例，依赖公开 SDK，Rust 处理器和已构建页面合成一个可安装包，不随宿主构建发版 |
 
 依赖方向遵守四条规则：
 
@@ -77,10 +82,105 @@ flowchart LR
 3. API 只调用 Core/Admin 抽象；Store 只实现端口。
 4. 具体实现只在组合根相遇。
 
+`frontend/` 是独立的 Node 项目，自行管理依赖、pnpm 配置、锁文件和 ESLint；仓库根目录不建立前端 workspace。
+管理端与独立示例仓库分别依赖 `@codex-proxy/ui` 的固定 GitHub 标签或提交，通过锁文件固定实际提交并校验源码归档完整性，不要求同级源码目录。安装与构建许可见 [贡献与审查](../CONTRIBUTING.md#验证)。
+`modules/ui` 与 `modules/plugins` 是可选的 Git 子模块，分别指向两个独立仓库；不加入宿主的 Cargo 或 pnpm workspace，不参与宿主发行构建。源码联调和版本指针维护见 [开发指南](development.md)。
+UI 包只公开组件、主题与样式入口；Pinia 持久化、登录、路由和管理请求仍由各自应用持有。
+插件页面把所需 UI、Vue 和 Tailwind CSS 4 样式编译进包内静态资源，通过隔离页面与受限消息桥使用自己的管理接口，
+不在运行时借用宿主 Vue 实例或内部模块。组件与主题扩展方式见 [管理端主题](theme.md)。
+
+### 3.1 插件扩展
+
+`gateway-plugin/` 只是目录分组，包含独立 SDK 和宿主 Runtime，不存在聚合 crate。
+SDK 定义双方通信合同；Runtime 把插件能力接入既有 Core / Admin 端口，不另建请求引擎或持久化体系。
+当前合同为 SDK `0.1.0`、清单 `manifestVersion: 1`、进程协议 `1`；宿主只准备通过当前合同与兼容范围校验的制品。
+
+下图表示运行时协作，不表示 crate 直接依赖；具体实现由组合根注入：
+
+```mermaid
+flowchart LR
+  API["管理端 / API"] --> Admin["Admin<br/>制品接受、配置、绑定"]
+  Admin -->|持久化| Store["Store<br/>包体、接受事实、配置与私有状态"]
+  Admin -->|校验与准备| Runtime["Plugin Runtime<br/>包校验、能力适配、RPC"]
+  Core["Core<br/>请求执行与发布快照"] -->|调用扩展| Runtime
+  Runtime <-->|SDK 协议| Plugin["插件进程"]
+  Runtime -->|受管资源| Host["Host<br/>进程、网络、Worker"]
+  Runtime -->|账号事务端口| Admin
+  Runtime -->|模型执行端口| Core
+```
+
+#### 职责与源码入口
+
+| 模块 | 负责什么 | 不负责什么 |
+| --- | --- | --- |
+| [SDK](../backend/crates/gateway-plugin/sdk/README.md) | 清单、调用数据、消息与帧；可选 `io` 会话辅助 | 不依赖其他 workspace crate，不启动宿主 |
+| [Runtime](../backend/crates/gateway-plugin/runtime/src/lib.rs) | 校验包与声明、准备能力集合、RPC、访问域执行与资源回收 | 不持久化安装选择，不重新决定账号资格或费用 |
+| Core | 发布不可变扩展快照；准入、路由、租约、请求交付与计费 | 不解释插件私有协议与存储格式 |
+| Admin / Store | 制品接受与配置用例 / 事务、版本校验、加密存储与审计 | 缓存目录和进程内状态不能替代数据库事实 |
+| Host | 下载、受管 HTTP、子进程容量与生命周期、维护任务监督 | 不解释插件业务协议 |
+| [Plugin CLI](../backend/apps/plugin-cli/README.md) | 校验作者清单，生成平台包与摘要 | workspace 内仅依赖 SDK，不构建源码、不安装或启用插件 |
+
+#### 发布与执行边界
+
+- **模型目录与路由共用事实。** `model_catalog` 的直接别名保存在发布代次引用中，Core 校验原生模型、静态映射与插件 ID 冲突及目标存在性后发布。
+  公开列表、详情、原生目录和受管模型查询复用相同别名与账号访问范围，不另维护插件专用目录。
+- **重试由 Core 裁决。** `retry_policy` 只能停止或继续 Core 已允许的恢复路径；绑定按确定顺序委托，故障回退宿主。
+  发送、交付、续接、外部副作用、预算和取消限制不进入插件控制面，策略返回后继续复核。
+- **转换声明不替代正文事实。** middleware v2 在 request 阶段声明具体承担的功能和额外上游需求，原始需求保留用于诊断，实际正文与未承担的原始功能仍参与选路。
+  attempt 阶段拒绝需求声明。没有改写的正文、header 和响应帧在相同网关边界保留原字节与顺序。
+
+- **制品接受固定访问域。** 只读校验不持久化；上传、URL 和 GitHub 的确认安装接受精确摘要声明的访问域，
+  官方发行导入仍须管理员确认。若插件尚无实例，Admin 以稳定 ID 合并 schema 默认值与适用贡献项 binding：
+  配置完整则启用，缺少必填项则停用待补；已有实例时不复制配置或切换版本。实例不能增删制品访问域。
+- **一份发布快照。** 数据面和管理页面使用同一不可变扩展集合；CLI 复用准备与调用合同，按次读取持久化配置。
+  新配置准备成功后才提交发布，在途请求持有旧集合直到结束；管理目标和回调另按当前身份与版本复验。
+- **插件故障按实例隔离。** 恢复时将启动失败的实例及其错误保留在发布集合中，正常实例和原生能力继续发布；
+  用户正在修改的实例仍须准备成功才能提交。集合区分进程就绪、可继续服务与需要后台重建，单个进程退出不撤销全部请求快照。
+  故障绑定保留原有作用范围和拒绝／委托策略，入口认证故障不降级为其他认证方式；宿主配置存储与 revision 无法确认时仍停止新请求。
+- **宿主持有业务事实。** 插件返回能力结果，Core 继续决定账号资格、发送状态、标准用量与费用；账号变更由 Admin / Store
+  执行版本校验、事务和审计。Provider 由组合根静态注册为 OpenAI 与 xAI；插件停用不删除账号或历史记录，失败的观察回调不改变响应和账单。
+- **能力开放不承接插件业务。** 宿主向插件提供独立、可组合的受控原生能力，负责授权、资源隔离、事务与审计。
+  插件自身的触发条件、跨资源业务关联、策略和流程编排归插件所有；宿主不能因某个插件的使用场景代为实现这些流程。
+- **数据加工走中间件。** `request` 包裹逻辑请求，`attempt` 包裹每次已选号的执行；请求顺序进入、响应逆序返回。
+  正文按需读取，透传无需额外读取权限；转换和改写不能绕过 Core 的交付、取消与结算边界。
+  数据面插件通过受管 HTTP 已发送或无法证明未发送时，Runtime 把该事实并入 Core 的请求副作用水位，后续不能按
+  Provider 的 `not_sent` 结果透明重放。
+- **访问域不跨调用。** `network`、`models`、`accounts`、`data`、`requests`、`public_endpoints`、`groups`、`keys`、`key_budgets`、`quota_observations` 只开放对应资源域；
+  账号、HTTP、模型、私有状态和日志回调仍绑定有效父调用与阶段。管理页和 CLI 不预绑定 Client Key，模型调用按次
+  选择当前 Key；页面 Responses 桥还复核精确实例目标和 `models` 域，并在等待与交付期间持续撤销检查。
+  `frontend_authentication` 必须显式配置 principal 到 Key 的映射；公开登录回调使用一次性票据且不继承宿主回调权限。
+  `data` 仅向管理、命令和维护阶段提供账号、Key 基础投影与已有额度观测，不提供凭据、预测或 SQL，不进入客户端请求链。
+  `key_budgets` 在这三个阶段管理所有 Client Key 的预算查询、日／周金额上限和用量重置，不授予其他 Key 配置、密钥或模型执行权限。
+  `quota_observations` 在这三个阶段读取及刷新账号额度观测，复用 Provider 管理路径；不暴露凭据或执行上游额度重置。
+  两个域分别作用于本地预算和上游观测，不建立账号到 Key 的自动同步关系；`data` 仍仅提供已有事实。
+- **维护只作用于已发布实例。** `maintenance` 由 Host 监督的 Runtime worker 调用，启用、恢复、配置发布和周期补偿共用对账入口。
+  发布通知只用于唤醒，事实始终来自当前快照与数据库；同实例串行，通知合并，停用与版本替换取消旧任务。
+  自有分组和 Key 按实例、资源类型与稳定资源键登记；Admin 组织用例，Store 在同一事务复核当前启用 revision、
+  制品授权与归属，并复用原生资源写入、审计和配置发布。无变化不递增 revision；插件不能接管管理员资源，
+  成员变更不覆盖账号的其他分组。停用保留资源；删除实例只解除归属。
+- **版本切换保持数据一致。** 同一插件最多启用一个实例；每个实例与制品摘要保存最近启用时提交的配置、密钥和绑定，
+  快照与实例修改共享事务，停用草稿不覆盖恢复点。版本切换优先恢复目标快照，否则合并缺失默认值并保留显式设置。
+  私有状态按实例、schema 与配置版本隔离，写入使用精确记录版本。
+  不兼容升级须停用、排空并完成迁移，再原子提交配置与状态；失败不能覆盖并发修改。回滚也须通过兼容检查。
+
+#### 信任与资源边界
+
+插件以与宿主相同的 OS 身份运行；接受制品访问域是管理员确认，不是操作系统沙箱。
+进程、RPC、下载、缓存与回调均有容量和期限限制；Host 提供受管资源，Runtime 负责协议、访问域与调用上下文校验。
+下载来源、凭据与代理按目标匹配，网络操作不占用数据库事务，提交前重新校验来源与代理版本。
+
+管理页面使用无同源权限的 sandbox iframe，通过固定目标的宿主桥访问已声明路由；
+UI、Vue 与样式随插件打包，不读取宿主内部模块。
+官方插件身份仅来自受信宿主发行物内的封口清单，普通安装不能指定 `builtin`；封口标记不是密码学签名。
+宿主更新与回滚必须通过已启用插件的兼容检查，不能自动接受制品或停用实例来绕过检查。
+
+安装到使用见 [插件使用](plugins.md)，清单与能力合同见 [SDK](../backend/crates/gateway-plugin/sdk/README.md)，
+HTTP 字段见 [插件 API](api.md#12-插件管理)，更新与数据恢复见 [部署说明](../deploy/README.md#插件兼容与发行目录)。
+
 组合根的 workspace architecture tests 冻结成员清单、依赖 DAG、公开模块面、源码纪律以及生产/测试模块
 镜像关系；具体行为边界由各 crate 的集成测试维护。
 
-### 3.1 Rust 模块组织约定
+### 3.2 Rust 模块组织约定
 
 后端采用目录模块的 `mod.rs` 风格；以下规则由组合根的 workspace architecture tests 扫描全部生产源码与
 测试模块树：
@@ -95,14 +195,14 @@ flowchart LR
    不能依靠同一 crate 内可见性掩盖循环边界。
 5. 每个 crate 的 `src/` 与 `tests/` 平级，生产源码不承载测试。`tests/` 镜像 `src/` 的模块目录形态：例如
    `src/foo/mod.rs` 对应 `tests/foo/mod.rs`，`src/foo/bar.rs` 对应 `tests/foo/bar.rs`。一个生产模块可以没有
-   测试；额外场景测试必须放在最近的生产 owner 目录下。根级 `support` 和冻结的 crate/workspace 架构场景
+   测试；额外场景测试必须放在最近的生产 owner 目录下。根级 `support` 及其辅助模块和冻结的 crate/workspace 架构场景
    是明确例外。
 
 较大的模块门面只负责组合和 re-export：账号 Admin HTTP 边界按 `wire`、`credentials`、`handlers`、
 `presenter` 划分；Provider 执行按 continuation、stream、failure、observation 和 worker 等职责拆分；xAI
 请求转换按 response、tools 与 history 拆分。各子模块之间只使用 owner 内最小可见性。
 
-### 3.2 `gateway-core` 内部 owner
+### 3.3 `gateway-core` 内部 owner
 
 `gateway-core` 内共享事实按语义 owner 划分：
 
@@ -125,6 +225,8 @@ flowchart LR
 Provider 模型能力、目录代次与 `ProviderCatalogPort` 由 `routing::catalog` 定义。快照编译和对账只消费
 该只读合同，不反向依赖执行注册表；`ProviderRegistry` 实现目录端口，维护唯一的 Provider
 注册集合。已知空目录与查询失败的未知目录保持不同语义，目录替身无需实现请求执行。
+Provider 可为模型提供来源账号集合；Core 在公开目录查询时结合冻结账号范围与政策过滤来源，
+配置发布复用已缓存的来源事实。来源集合只约束目录展示，不改变发现型目录的推理准入语义。
 
 客户端原生模型目录同样由 Provider 拥有，通过 `ExecutionService` 和现有 Registry 的只读调用传递。
 `routing::catalog` 的原生条目只包含模型 ID 与不透明协议正文，Core 负责冻结账号范围和整对象模型映射，
@@ -156,29 +258,38 @@ Client Key 费用账本独立累计各次 attempt 的实际费用，不能因请
 
 ```mermaid
 sequenceDiagram
-  participant C as Client
-  participant A as API Adapter
-  participant E as Core Engine
+  participant C as 客户端
+  participant A as API
+  participant E as Core
   participant P as Provider
-  participant S as Store / Ops queue
+  participant S as Store
 
-  C->>A: authenticated request
-  A->>E: Operation + client context
-  E->>E: freeze snapshot and compile routing plan
-  E->>S: enqueue request / attempt observations
-  E->>S: check Key budget against recorded usage
-  E->>P: one candidate, one credential, one attempt
-  P-->>E: cold canonical stream + raw wire
-  E->>E: enforce send and downstream commit barriers
-  E-->>A: committed response stream
+  C->>A: 请求与认证
+  A->>E: Operation 与客户端上下文
+  E->>E: 冻结策略，生成路由计划
+  E->>S: 检查 Key 预算
+  E->>P: 一个凭据的一次尝试
+  P-->>E: 冷流与原始协议数据
+  E->>E: 检查发送与交付边界
+  E-->>A: 提交响应流
   A-->>C: JSON / SSE / WebSocket
-  E->>S: settle charge idempotently
-  E->>S: enqueue terminal observation and metering
+  E->>S: 幂等费用结算
+  E->>S: 异步投递观测与计量
 ```
 
 请求开始时冻结 `RuntimeSnapshot`、Client Key 的账号范围及账号模型政策、模型映射、Codex 客户端最低版本、Provider
 候选顺序和调度策略。
 运行中的请求始终使用该快照，不拼接不同版本的配置，也不在热路径查询分组关系。
+
+智能调度配置由 Core 定义和校验，Store 随运行设置及配置 revision 原子保存，快照编译器将其纳入
+`AccountSelectionPolicy`。内置选号与诊断复用同一评分函数，近似最优容差随参与立即选号的五项系数总和缩放。
+额度重置复用 Provider 的有效重置时间投影，未知或已过期时间不加分。排队系数不影响立即选号的分数和容差，
+只在选择账号等待队列时结合其他评分与当前进程内的实时等待人数。评分规则由 Core 账号模块统一拥有，
+`ConcurrencyWaitQueue` 在同一锁内读取队长并入队；Provider 只传递已限定续写范围的候选。
+排队系数为零时保留最短队列规则；已入队位置、队内 FIFO、取消回收、容量上限和请求共享等待预算保持原合同。
+高权重回切仅影响智能调度的软亲和：先验证候选资格，再决定是否由更高权重层覆盖亲和；同层亲和保留。
+Provider 限定的原生续写账号范围仍是硬约束。回切在请求选号时发生，不新增后台任务或主动历史重放。
+插件显式选号沿用既有候选校验和实际亲和结果，委托内置选号时才应用智能调度配置。
 
 Client Key 鉴权完成后，API adapter 从有界请求头识别 Codex Desktop/CLI，Core 使用同一请求冻结的
 `RuntimeSnapshot` 比较对应最低版本。Desktop 优先于其 User-Agent 内嵌的 CLI/Core 标记；未知客户端不
@@ -222,6 +333,9 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 - OpenAI 是透明边界。Responses 请求保留未知字段和字段顺序；SSE、WebSocket、Images 与 standalone
   Search 的业务正文按原始字节转发，原生续写额度恢复遵循下述 continuation 例外。
   canonical facts 从同一数据旁路提取，用于路由、恢复判断、观测和计费。
+  非流式 Responses 由 API 聚合 wire：终态省略或清空 `output` 时，使用同一响应的 `output_item.done`
+  按 `output_index` 还原完整输出；已有非空终态输出不改写。完成项缺失或冲突时在下游提交前拒绝，
+  不凭 canonical 增量补造内容，也不让 SSE/WS 转发额外保存整份输出。
 - Responses 的业务扩展头保留原始多值字节。API 负责剥离鉴权、账号身份和 HTTP 传输字段，
   并提取会话语义；`gateway-protocol` 共享 HTTP 传输与网关链路字段分类。客户端兼容规则集中在
   `providers/openai/src/transport/downstream/`：`headers.rs` 管理下游环境头和已提取语义的头部别名，
@@ -232,7 +346,8 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
   由 Provider 在选定 Codex/OAuth 账号后、HTTP/WS 分流前调用；API Key 上游跳过该入口。
   `transport/headers.rs` 负责上游身份保护和官方头组装。
   会话别名只规范化请求头，不清除正文身份字段；未知业务扩展与响应诊断头不受影响，字段见
-  [Responses 合同](api.md#3-openai-数据面与模型目录)。提示词、工具及业务正文不做客户端品牌清洗。
+  [Responses 合同](api.md#3-openai-数据面与模型目录)。Grok 专属请求标记和已知指令开场白的兼容只在
+  `downstream/grok.rs` 内判断，且仅用于 Codex/OAuth 上游；普通请求的提示词、工具及业务正文不做品牌清洗。
 - xAI 是翻译边界。Provider 把 Grok wire 转换为 Responses wire；上游结构化错误的 message/code/type
   可以透出，但账号指纹会先脱敏。
 - response ID 是不透明 UTF-8 bytes，不假设 UUID、固定长度或跨 Provider 可复用。
@@ -241,7 +356,10 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
   各 Provider 唯一负责默认值、校验、版本来源及 UA 生成，Admin 提供管理和生效预览。
   首次初始化只写入内置默认选择；YAML 不定义客户端身份，也不作为数据库初始化或请求解析的来源。
   官方发布资料与用户选择分开：OpenAI 在 Redis 按 Provider、客户端、平台、架构隔离可重建版本缓存，
-  Desktop 完整制品元组原子更新，固定配置不被刷新覆盖。普通连接按已有身份键匹配，精确续写保留原连接。
+  Desktop 完整制品元组原子更新。CLI 的 TUI/Exec 入口共用官方 CLI 版本资料，Provider 在一次身份解析中
+  生成一致的 UA、入口后缀与配套请求头，后台更新不修改用户选择的运行环境。
+  完整自定义 UA 经 Provider 校验后原样传递，配套头统一解析；固定和自定义配置不受后台更新影响。
+  普通连接按已有身份键匹配，精确续写保留原连接。
   后台账号和 Desktop 专属操作使用独立官方 Desktop 画像，不接受 Key 覆盖。
   xAI 以内置画像为版本检查基线，在进程内更新 Grok CLI 发布资料；模型与压缩请求使用已保存的用户选择，
   OAuth、后台目录和额度查询使用内置官方画像。两者均不回写 `config.yaml`。
@@ -339,11 +457,12 @@ Vue 普通管理请求的错误提示由 `api/request.ts` 响应拦截器统一�
 规范化异常保留 `status`、`code`、`requestId` 与 `kind`。页面和 `useAsyncAction` 不重复弹出接口错误；
 查询可以保留失败状态与重试入口，本地校验、文件操作、SSE 诊断和成功响应中的业务结果仍归各自 owner。
 
-API 模块按 `url`、`method`、`data`（POST）或 `params: data`（GET）排列请求配置；
-仅在实际调用方需要时提供 `RequestOptions`（`signal`、`timeout`、`silent`），并放在请求配置末尾。取消或已被新查询取代的请求
-不弹提示；后台轮询、重启探测等显式使用 `silent`，它只关闭提示，不吞异常，也不跳过会话失效处理。
+取消或已被新查询取代的请求不弹提示；后台轮询、重启探测等显式使用 `silent`，它只关闭提示，
+不吞异常，也不跳过会话失效处理。
 批量操作的部分成功汇总、不可逆操作的结果未知等必要业务处理先将对应请求静默，再由业务 owner 提供
 一次有上下文的反馈；不得为普通失败重新维护一套消息或业务码映射。
+
+### 登录与查询身份
 
 管理员和密钥登录共用 `/api/auth/*`、AuthService、Redis 会话结构和 `cpr_session` Cookie。
 登录类型只选择凭据校验方式，权限来自服务端保存的身份。管理入口只接受管理员身份或部署级管理 API Key；
@@ -353,8 +472,8 @@ AuthService 每次恢复 Key 会话时重新检查 Key 是否存在且启用；K
 管理员会话保存由已加盐密码哈希派生的指纹，每次恢复时与 PostgreSQL 当前密码核对；普通设置变更不影响该绑定。
 改密在 AuthService 验证当前密码和新密码策略，Store 以旧哈希条件更新密码并在同一 PostgreSQL 事务记录审计。
 事务提交后旧管理员会话的指纹失配，不依赖 Redis 批量删除完成撤销；原始密码及密码哈希不进入 Redis。
-KeyUsageService 从 AuthService 的服务端身份或 Core 的 ClientKeyVerifier 只读校验确定唯一查询范围，复用 ClientKeyStore 的额度账本投影和
-ObservabilityStore 的范围查询；Bearer 查询仅提供当前额度，不执行推理准入或开启窗口。
+KeyUsageService 从 AuthService 的服务端身份或 Core 的入口认证结果确定唯一查询范围，复用 ClientKeyStore 的额度账本投影和
+ObservabilityStore 的范围查询；数据面额度查询不执行推理准入或开启窗口，入口认证和适用的请求中间件仍会执行。
 API 只输出各入口所需的字段白名单，不复用管理员的宽响应。
 客户端配置通过 ClientKeyStore 显式读取当前会话绑定 Key 的明文，不进入用量响应。
 前端 `/key-usage` 独立于管理布局，不挂载管理员菜单或请求管理接口；配置弹窗和 Codex / CCSwitch
@@ -395,6 +514,9 @@ Continuation 仍受原请求的 Client Key、账号范围、Provider 和发送/�
 - scope 外账号、跨 Key 复用或不明确发送结果均 fail closed。
 
 会话亲和是优先选择提示，不是硬账号绑定；native continuation 才携带不可跨越的 owner 约束。
+OpenAI 启用账号排队时，可等待的已有亲和绑定优先保留；子线程首绑前继承的根偏好仍允许分流。
+快照满载、原子租约争用与已有等待者均进入原账号队列，等待重查仍执行完整资格校验。
+显式策略选号和内置高权重回切保留各自裁决；亲和等待不将暂忙升级成失效，也不覆盖原生续写约束。
 
 ### 并发等待
 
@@ -417,6 +539,10 @@ Key 的 RPM 在成功准入时才计数，金额限制在入队前及成功准�
 Core 负责准入与结算时序，Store 持久化费用账本，Admin 负责限额配置。
 Admin 的手动重置复用同一账本与 Key 行锁，在一个事务中清零所选周期金额、推进计费起点并写入审计，
 保留窗口到期时间与费用事件，不推进配置 revision。结算仍按完成时间判断归属，重置前完成的费用不会重新扣入已重置周期。
+插件预算回调通过 `PluginClientKeyAccess` 进入同一 `ClientKeyService` 和 `ClientKeyStore`，存储事务先复用插件写入授权，
+再执行原生预算操作；不建立另一份预算状态。查询复用账本投影，不触发准入。局部更新金额上限不改用量或窗口，
+仅在值变化时提交配置 revision、审计并发布；重置仍不推进配置版本。重复调用及结果未知的合同见
+[SDK 预算接口](../backend/crates/gateway-plugin/sdk/docs/capabilities.md#client-key-预算)。
 
 - 日窗口按北京时间零点划分；七天窗口从首次准入当天零点开始，到期后由下一次使用重新开启，不固定为周一。
 - 金额优先使用 Provider 上报的 USD，否则按现有模型价格估算；订阅账号的估算费用不代表上游订阅账单。
@@ -425,6 +551,10 @@ Admin 的手动重置复用同一账本与 Key 行锁，在一个事务中清零
 - SSE 持有并发名额直到终态；WebSocket 每个 `response.create` 独立准入，空闲连接不占名额。
   Core 在每次请求开始时重新鉴权并冻结当前策略，既有连接也应用已发布的限额与授权范围变更。
   换号和内部重试复用同一名额，Key 与账号并发上限同时生效；预算拒绝或启动失败释放名额。
+- 响应中断入口由 Core 的根执行持有，API 只控制当前连接正在交付的执行。Provider 在收到上游
+  `response.created` 后注册活动响应 owner，在终态、失败或断连时释放；控制句柄本身不延长 owner
+  生命周期。中断信号交给占用原账号、原 socket 的 exchange，不经过全局响应查询、新选号或独立 attempt。
+  API 暂存的下一轮请求和连接泵接收队列共用容量名额，控制帧处理不取消中间件正在读取响应体的 future。
 
 完成、失败、取消和断连使用同一结算路径，在结束时以网关请求 ID 幂等累计已取得费用。
 执行会话持有结算与准入释放的同一个清理 future；协议等待被取消后，后续驱动或宿主 detached finalizer
@@ -468,8 +598,9 @@ HTTP validation
 ```
 
 会改变路由快照或安全配置的 mutation 在同一 PostgreSQL 事务中提交业务事实、推进内部
-`config_revision` 并写入脱敏审计。Admin mutation 不要求客户端提交 revision；少数账号/分组响应
-返回已提交的 `configRevision`，不将它当作乐观并发前置条件。
+`config_revision` 并写入脱敏审计。`configRevision` 不作为客户端写入的乐观并发前置条件；
+少数账号/分组响应返回它用于标识已提交的配置。插件配置等资源另有 `revision` / `expectedRevision` 检查，
+不能与全局配置版本混用。
 
 额度、cooldown、目录 generation、请求统计和自动 credential refresh 属于运行时观测，不推进全局
 revision；credential 轮换只推进账号自己的 `credential_revision`。Redis 通知用于缩短收敛延迟，
@@ -485,12 +616,13 @@ PostgreSQL 周期对账才是正确性基础。
 | --- | --- | --- |
 | 账号、credential、分组、Client Key、设置、审计、请求与备份记录 | PostgreSQL | 业务持久化事实 |
 | Client Key 金额窗口与费用事件 | PostgreSQL | 准入与幂等结算的权威账本，独立于请求观测与日志保留策略 |
+| 插件包体、安装来源、制品接受事实、实例配置与私有状态 | PostgreSQL | 制品访问域由已接受摘要派生；进程内发布集合由持久化事实构建 |
 | admission、lease、cooldown、circuit、会话亲和、continuation、OAuth pending、目录 cache | Redis | 可重建、可过期的协调状态 |
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
-| 重置卡库存与消费结果 | OpenAI upstream | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
+| 重置卡库存与消费结果 | 对应 Provider 的上游 | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
 | OpenAI 实验 state 固定开关 / 候选 | PostgreSQL 凭据 JSON / Provider 进程内有界缓存 | 开关持久化；候选不落盘，最多 2048 条、固定一小时，按账号、令牌指纹、捕获代次、模型和客户端密钥隔离 |
-| Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理，不写成第二份业务配置 |
+| Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
 账号对外状态不是独立列，而是 PostgreSQL credential/quota 事实与 Redis cooldown 的统一投影：
@@ -509,9 +641,9 @@ PostgreSQL schema 由迁移目录按编号管理。已应用迁移按字节冻�
 credential 与 quota 是两组独立事实：credential refresh 不等于 quota refresh，额度接口的 401/403
 也不能单独证明 refresh token 永久失效。
 
-- OpenAI 支持 OAuth、AT/RT 与 OAuth JSON，导入识别 camelCase 和官方 `auth.json` 的 snake_case token 字段；
-  RT-only 导入先换取 AT，AT-only 导入没有
-  自动续期能力。OAuth 身份只从官方 JWT claims 投影，不信任导入文档顶层身份字段。
+- OpenAI 支持 OAuth、AT/RT、PAT 和上游 API Key。OAuth 身份来自官方 JWT claims，PAT 经官方身份接口验证，
+  不信任导入文档顶层身份字段。RT-only 导入先换取 AT；AT-only、PAT 与 API Key 不参加 OAuth 自动续期。
+  输入形态和适用操作见 [账号能力与导入](api.md#账号能力导入与-oauth)。
 - xAI 使用 OAuth session；API Key 不是受支持的账号 credential。刷新额度时同步查询官方实时订阅，
   只把套餐事实写入现有 quota JSON。明确无付费订阅的个人账号显示 Free；查询失败、缺失字段或
   团队身份不推断为 Free，订阅查询失败不影响额度观测。
@@ -536,8 +668,10 @@ OpenAI 订阅周期属于按需个人信息，不是额度事实。Admin 账号�
 ## 10. 观测与后台任务
 
 账号容量预测属于 Admin 的只读派生规则，不参与 quota 权威状态、调度或金额结算。Store 通过专用采样端口
-在同一 SQL 快照内返回截至观测时间的累计数值及有界历史 Provider 文档；文档仅由具体 Provider 复用协议
-解析器解释，Admin 按中立的额度事实选择近期进度段预测剩余量，再加本周期已记录用量形成周期总量。
+在同一 SQL 快照内返回截至观测时间的累计数值及有界历史 Provider 文档；原生 Provider 复用协议解析器解释
+文档，插件由 Runtime 本地解释 SDK 声明的版本化额度观测，不在历史查询中调用插件进程。观测通过 Core 原有
+请求结算持久化，账号关联由实际执行上下文确定，窗口身份与归属必须匹配当前额度窗口。Admin 按中立的额度
+事实选择近期进度段预测剩余量，再加本周期已记录用量形成周期总量。
 周期以额度重置为边界，重置后累计与样本重新开始。该采样不改变全站完整交付用量口径，不创建第二份
 持久化额度状态。部分 Token/美元费用缺失仅提示精度限制，继续按已记录数值估算；对应数值完全不可用时
 才不返回该项预测，不按请求数量补齐未知消耗。历史请求完成时间只是额度时间的近似，不承诺严格扣额归因
@@ -599,10 +733,8 @@ worker 复用连接测试探针执行真实上游调用，并按冻结代次处�
 
 启动只有在配置、PostgreSQL、Redis、Provider、Core、Admin、API 和 Worker 全部初始化成功后才进入服务。
 健康检查综合 Core、Store 与 Worker 状态，但不会把单个 Provider 的业务降级等同于整个进程失活。
-组合根在启动时只把 Host 的 `ClientDistributionResolver` 能力注入 Admin；此时不访问 RG-Adguard，下载
-HTTP Client 构造失败也不会阻断网关启动。外部解析在已认证管理员首次打开客户端下载弹窗时惰性执行，
-失败时按架构使用 OpenAI 官方稳定地址。Microsoft Store 内容通道返回的 HTTP/80 临时链接保留原始 scheme，
-不会被错误改写到该 host 不保证支持的 HTTPS 虚拟主机。
+客户端下载解析由 Host 的 `ClientDistributionResolver` 实现，组合根注入 Admin；只在管理员请求时访问外部来源，
+不阻塞启动。失败时使用官方稳定地址，临时直链不持久化或代理下载，字段与来源规则见 [客户端下载 API](api.md#windows-客户端下载)。
 
 关闭分为两段：先停止接收新连接并 drain HTTP/WS，再取消并等待 Worker；两段各有独立预算，Compose 的
 `stop_grace_period` 必须覆盖二者之和。超时后只丢弃仍未落盘的可恢复观测，不执行隐式业务重放。
@@ -626,9 +758,16 @@ HTTP Client 构造失败也不会阻断网关启动。外部解析在已认证�
 - 真实 secret 不进入普通日志、Debug、fixture 或 audit details；明文只能通过账号导出、Key reveal、
   备份设置等明确的敏感 Admin 合同返回。
 - OAuth pending flow 使用有期限、带 owner 的一次性 claim；事务成功后才消费，失败释放 claim。
-- 在线更新校验 Release host、大小、SHA-256 和归档路径，并只允许同一大版本内更新。
+- 在线更新校验 Release host、大小、SHA-256 和归档路径，并只允许同一大版本内更新；更新与回滚的目标发行清单
+  还要通过全部启用插件的静态兼容检查，文件交换前后复核同一插件配置版本，失败或取消时恢复二进制、Web 与
+  官方插件目录。
   Host 在受理时持久化任务并转交后台执行，任务持有操作锁与终态写入责任，不依赖 HTTP 请求的生命周期。
-  状态文件是更新结果的权威来源，SSE 终态在状态落盘后发送；Host 关闭与任务析构都必须收敛状态。
+  状态文件记录操作结果，SSE 终态在状态落盘后发送；Host 关闭与任务析构都必须收敛状态。
+  安装状态由 Host 对照启动时的发行文件指纹、磁盘文件与安装记录校准，历史成功记录本身不构成待重启事实。
+  二进制、Web 资源、官方插件目录及回滚备份须整体匹配，无法核实的备份不参与回滚。
+  通道是单次查询或安装的参数，不持久化偏好；默认按运行版本推导，检查和执行共用候选策略，
+  缓存隔离通道并拒绝过期写回，安装在受理时冻结确认的通道与目标；
+  Admin/API 只转发策略事实，前端分别展示运行版本、通道候选与待生效版本。
 
 PostgreSQL 备份恢复属于人工维护操作。当前没有部署级维护模式开关，需要先停止应用，
 离线处理快照中的非终态任务、计划游标和到期清理条件，再重新验证对象存储并恢复计划。
@@ -639,6 +778,20 @@ PostgreSQL 备份恢复属于人工维护操作。当前没有部署级维护模
 
 变更应落在拥有该事实的边界：协议适配进 API，执行策略进 Core，Provider 差异进对应 Provider，持久化
 实现进 Store，生命周期进 Host，管理规则进 Admin。不要用兼容 shim、第二套状态机或跨层旁路绕开 owner。
+
+### 后端自审
+
+提交前沿受影响的完整调用链复核最终差异，不能只读新增函数或等待 CI、PR 审查者发现问题。按改动涉及的职责检查：
+
+- **职责归属**：说明业务决定由哪个模块负责、哪些层只传递合同或投影结果，对照 [Workspace 边界](#3-workspace-边界) 与现有同类路径，避免调用方重新解释被调用方已拥有的规则。
+- **事实与状态**：同一解析、校验、错误分类和业务规则复用所属模块的实现；检查新增字段、缓存、标志或状态机能否由已有状态推导，避免多个可写来源。必要缓存明确更新、失效与并发约束。
+- **失败与资源**：从成功、错误、取消和超时出口核对事务、锁、连接、任务与租约的释放；涉及异步清理时确认返回后的下一次操作不会被尚未完成的清理误挡。
+- **并发与副作用**：按实际改动核对 revision、幂等、重试、部分成功与过期结果，明确谁提交状态、谁发布变化、谁负责重试，不在不同层重复补偿或放宽既有隔离合同。
+- **必要性与验证**：删除本次引入的重复分支、无用转换、死代码和无明确职责的转发包装；保留特殊分支需说明真实场景。测试覆盖可观察结果与失败条件，不靠增加防御代码或改弱断言让检查通过。
+
+在 PR 中简述与本次变更相关的归属、复用判断和验证结果，标明仍未覆盖的边界；无需复制整张检查清单，也不借自审扩大为无关重构。
+
+### 验证命令
 
 后端验证从 `backend/Cargo.toml` 执行，仓库根目录没有 Cargo manifest：
 
@@ -651,6 +804,15 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --
 线程栈设置与当前 CI 一致。PostgreSQL/Redis 集成测试需按
 [迁移文档](../backend/migrations/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
 其他检查与界面验证按 [贡献与审查](../CONTRIBUTING.md#验证) 执行。
+
+插件 Runtime 的真实子进程与持久化测试使用 `CPR_PLUGIN_TEST_DATABASE_URL` 和
+`CPR_PLUGIN_TEST_REDIS_URL` 指向专用实例，密码及隔离要求与上述 Store 测试一致。
+设置 `CPR_PLUGIN_TEST_LIVE_HTTP=1` 会额外请求 GitHub 公共 HTTPS API，验证受管出站链路；这不代表模型推理验收。
+若测试环境使用 Fake-IP 或私网 DNS，需通过 `CPR_PLUGIN_TEST_LIVE_NETWORK_RANGES` 显式提供逗号分隔的
+CIDR 授权。该选项只用于真实网络测试，默认为空，不改变生产网络策略或其他测试的授权。
+
+独立插件包的构建、安装与功能验证说明位于 `codex-proxy-plugins` 仓库的 `examples/workbench/README.md`。
+功能测试与性能、隔离和平台实测分别记录，不相互替代。
 
 改动使现有说明失真或缺少必要信息时，修订所属文档：用户入口写入根 README，HTTP 合同写入 `docs/api.md`，
 部署操作写入 `deploy/README.md`，架构不变量保留在本文。

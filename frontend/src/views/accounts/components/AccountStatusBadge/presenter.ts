@@ -2,7 +2,7 @@ import type { Component } from 'vue'
 import type { AccountErrorReason, AccountStatus } from '@/api'
 import { AlertTriangle, CalendarX, CircleCheck, Gauge, Power, Timer } from '@lucide/vue'
 
-import { formatDateTime, parseTimestamp } from '@/utils/date'
+import { formatDateTime, parseTimestamp } from '@/utils/format'
 import { errorReasonLabels, statusLabels, statusTones } from '../../constants'
 
 export type AccountStatusDisplayMode = AccountStatus | 'refresh_backoff'

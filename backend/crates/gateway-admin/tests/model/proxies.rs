@@ -2,6 +2,7 @@ use gateway_admin::model::proxies::*;
 
 fn base(success: bool) -> ProxyTestResult {
     ProxyTestResult {
+        location: Default::default(),
         success,
         latency_ms: 150,
         exit_ip: success.then(|| "203.0.113.7".parse().unwrap()),

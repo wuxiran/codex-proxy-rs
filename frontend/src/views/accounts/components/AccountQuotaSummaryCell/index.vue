@@ -3,6 +3,7 @@ import type { AccountRow } from '../../constants'
 
 import { computed } from 'vue'
 import { groupedAccountQuotaWindows, visibleSummaryQuotaWindows } from '../../constants'
+import AccountCapacityIndicator from '../AccountCapacityIndicator.vue'
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'
 import AccountQuotaSummaryEntry from './Entry.vue'
 import { recentlyUsedQuotaEntry } from './presenter'
@@ -28,7 +29,10 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
       <span class="text-[10px] text-cp-text-tertiary">
         真实上游费用：<span class="font-mono tabular-nums">{{ account.usage.billing?.upstreamCostAmountUsdDisplay ?? '未提供' }}</span>
       </span>
-      <span class="text-[10px] text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
+      <span class="flex min-w-0 items-center justify-between gap-2">
+        <span class="truncate text-[10px] text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
+        <AccountCapacityIndicator :capacity="account.capacity" />
+      </span>
     </div>
     <div v-if="recentUsageEntry" class="flex min-w-0 items-end gap-2">
       <div class="flex min-w-0 flex-1">

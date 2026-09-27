@@ -2,7 +2,7 @@ import type { EChartsOption, LineSeriesOption } from 'echarts'
 import type { AccountQuotaForecast } from '@/api'
 import dayjs from 'dayjs'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
-import { parseTimestamp } from '@/utils/date'
+import { parseTimestamp } from '@/utils/format'
 
 interface BurnChartColors {
   surface: string

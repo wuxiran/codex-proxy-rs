@@ -1,13 +1,26 @@
 import type { RequestOptions } from '../request'
 import type { RequestLocation } from '../types/request-location'
-import type { ClientProfileSelection, XaiClientProfileSelection } from './client-profiles'
+import type { ClientProfileSelection, ProviderRequestProfiles, ProviderRequestProfileUpdates, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
 
+export interface SmartSchedulingConfig {
+  loadWeight: number
+  quotaWeight: number
+  healthWeight: number
+  latencyWeight: number
+  resetWeight: number
+  queueWeight: number
+  preferHigherWeight: boolean
+}
+
 export interface RuntimeSettings {
-  openaiClientProfile: ClientProfileSelection
-  xaiClientProfile: XaiClientProfileSelection
+  smartScheduling: SmartSchedulingConfig
+  smartSchedulingDefaults: SmartSchedulingConfig
+  providerRequestProfiles: ProviderRequestProfiles
+  openaiClientProfile: ClientProfileSelection | null
+  xaiClientProfile: XaiClientProfileSelection | null
 
   requestLocationEnabled: boolean
   requestLocation: RequestLocation
@@ -35,6 +48,9 @@ export interface RuntimeSettings {
   accountAutoFreezeAdaptiveConcurrency: boolean
   requestLogEnabled: boolean
   requestLogTestKeyId: string | null
+  accountWarmupEnabled: boolean
+  accountWarmupScheduleTime: string
+  accountWarmupModel: string | null
   updatedAt: string
 }
 
@@ -78,7 +94,9 @@ export function getSettings(options: RequestOptions = {}) {
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'smartSchedulingDefaults' | 'openaiClientProfile' | 'xaiClientProfile' | 'providerRequestProfiles'> & {
+  providerRequestProfiles: ProviderRequestProfileUpdates
+}
 
 export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({

@@ -1,21 +1,15 @@
 <script setup lang="ts">
 import type { AccountGroup, PublicImportConfig } from '@/api'
+import { BaseButton, BaseConfirmModal, BaseFormItem, BaseIconButton, BaseInput, BaseSegmented, toast } from '@codex-proxy/ui'
 import { Copy, RefreshCw, Save, Trash2 } from '@lucide/vue'
-import { computed, ref, shallowRef, watch } from 'vue'
 
+import { computed, ref, shallowRef, watch } from 'vue'
 import { deletePublicImportConfig, rotatePublicImportToken, updatePublicImportConfig } from '@/api'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
-import { toast } from '@/components/base/BaseToast'
+import SyncedSwitch from '@/components/SyncedSwitch.vue'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useCopyText } from '@/composables/useCopyText'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{
   config: PublicImportConfig
@@ -166,7 +160,7 @@ async function remove() {
         <BaseInput v-model="name" maxlength="60" :disabled="busy" aria-label="号商名称" placeholder="例如：迷茫" />
       </BaseFormItem>
       <BaseFormItem label="开启入口" description="关闭后该号商链接立即不可用，对外表现与链接错误一致">
-        <BaseSwitch v-model="enabled" label="开启免登录导入入口" :disabled="busy" />
+        <SyncedSwitch v-model="enabled" label="开启免登录导入入口" :disabled="busy" />
       </BaseFormItem>
     </div>
 
@@ -175,7 +169,7 @@ async function remove() {
     </BaseFormItem>
 
     <BaseFormItem label="自动开启 state 绑定 + WS 保活" description="导入成功后为 OAuth 账号开启「固定自身 state」；开启后 WS 保活暖池会给这些账号预建并挂住满血 WebSocket。API Key 账号不支持，会跳过">
-      <BaseSwitch v-model="pinTurnState" label="导入后开启 state 绑定 + WS 保活" :disabled="busy" />
+      <SyncedSwitch v-model="pinTurnState" label="导入后开启 state 绑定 + WS 保活" :disabled="busy" />
     </BaseFormItem>
 
     <BaseFormItem label="链接有效期" :error="expiryError" :description="`${expiryText}。预设时长从点击保存时起算；到期后链接自动失效，更换链接不会重置有效期`">

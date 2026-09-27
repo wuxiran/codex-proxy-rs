@@ -1,9 +1,7 @@
 <script setup lang="ts">
+import { BaseCard, BaseForm, BaseInput } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import SyncedSwitch from '@/components/SyncedSwitch.vue'
 
 defineProps<{ disabled: boolean }>()
 const enabled = defineModel<boolean>('enabled', { required: true })
@@ -25,7 +23,7 @@ const testKeyText = computed({
   >
     <template #body>
       <div>
-        <BaseSwitch v-model="enabled" label="启用请求日志采集" show-label :disabled="disabled" />
+        <SyncedSwitch v-model="enabled" label="启用请求日志采集" show-label :disabled="disabled" />
       </div>
       <BaseForm class="mt-4 max-w-2xl">
         <span class="block text-xs text-cp-text-secondary">测试 Client Key ID（只有它的流量会被采集；留空则不采集任何客户端流量）</span>

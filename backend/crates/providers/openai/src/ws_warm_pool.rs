@@ -25,9 +25,9 @@ use tokio::sync::Notify;
 use turn_state::WarmPoolSettings;
 
 use crate::credential::{CODEX_AUTHENTICATION_KIND_OAUTH, CodexCredentialRepository};
+use crate::transport::profile::CodexWireProfileState;
 use crate::transport::protocol::responses::CodexResponsesRequest;
 use crate::transport::websocket::WARM_CONVERSATION_PREFIX;
-use crate::transport::profile::CodexWireProfileState;
 use crate::transport::{
     CodexBackendClient, CodexBackendStreamingResponse, CodexRequestContext, CodexWebSocketPool,
 };

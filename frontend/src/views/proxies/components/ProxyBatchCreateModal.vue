@@ -1,14 +1,9 @@
 <script setup lang="ts">
 import type { OutboundProxyRecord } from '@/api'
+import { BaseButton, BaseForm, BaseFormItem, BaseModal, BaseTextarea, toast } from '@codex-proxy/ui'
 import { ListPlus } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import { batchCreateProxies } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { parseProxyLines } from '../presenter'
 

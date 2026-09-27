@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { ApiKey } from '@/api'
+import { BasePopover } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{ apiKey: ApiKey }>()
 const windows = computed(() => [

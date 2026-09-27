@@ -4,6 +4,7 @@ use super::*;
 
 pub(crate) struct AdminAccountPageRows {
     pub(crate) config_revision: AdminRevision,
+    pub(crate) default_concurrency: u64,
     pub(crate) accounts: Vec<ProviderAccountSummary>,
     pub(crate) total: u64,
     pub(crate) summary: AccountSummary,
@@ -62,7 +63,7 @@ pub(crate) async fn load_admin_account_page(
     // 归入 'expired'；默认目录与 summary_total 不含它们，只有显式筛 'expired' 才列出。
     let statement = format!(
         "with base_statuses as (
-           select a.id,
+           select a.id, a.provider_kind,
                   ticket.expires_at <= $2 as ticket_expired,
                   case
                     when not a.enabled then 'disabled'
@@ -76,7 +77,7 @@ pub(crate) async fn load_admin_account_page(
              left join account_tickets ticket on ticket.provider_account_id = a.id
          ),
          account_statuses as (
-           select id,
+           select id, provider_kind,
                   case
                     when ticket_expired and base_status not in ('normal', 'rate_limited')
                       then 'expired'
@@ -127,11 +128,11 @@ pub(crate) async fn load_admin_account_page(
            select count(*)::bigint as filtered_total from filtered
          ),
          settings as (
-           select config_revision, usage_retention_days
+           select config_revision, usage_retention_days, max_concurrent_per_account
              from runtime_settings
             where id = 1
          )
-         select p.location_country, p.location_region, p.location_city, p.location_timezone, a.outbound_proxy_url, a.id, a.provider_kind, a.name, a.notes, a.email, a.upstream_user_id,
+         select p.auto_location, p.detected_location_json, p.location_country, p.location_region, p.location_city, p.location_timezone, a.outbound_proxy_url, a.id, a.provider_kind, a.name, a.notes, a.email, a.upstream_user_id,
                 a.upstream_account_id, a.plan_type, a.authentication_kind,
                 a.credential_revision, a.has_refresh_token, a.access_token_expires_at,
                 a.next_refresh_at, a.enabled, a.concurrency_limit, a.weight, a.model_access_json,
@@ -143,7 +144,7 @@ pub(crate) async fn load_admin_account_page(
                 global_summary.summary_quota_exhausted, global_summary.summary_rate_limited,
                 global_summary.summary_disabled, global_summary.summary_error,
                 global_summary.summary_expired,
-                settings.config_revision
+                settings.config_revision, settings.max_concurrent_per_account
            from filtered_total
            cross join global_summary
            cross join settings
@@ -184,6 +185,7 @@ pub(crate) async fn load_admin_account_page(
         )
     })?;
     let config_revision = revision_from_row(metadata)?;
+    let default_concurrency = unsigned_metadata(metadata, "max_concurrent_per_account")?;
     let total = unsigned_metadata(metadata, "filtered_total")?;
     let summary = AccountSummary {
         total: unsigned_metadata(metadata, "summary_total")?,
@@ -207,6 +209,7 @@ pub(crate) async fn load_admin_account_page(
         .map_err(|error| admin_store_error(ENTITY, error))?;
     Ok(AdminAccountPageRows {
         config_revision,
+        default_concurrency,
         accounts,
         total,
         summary,

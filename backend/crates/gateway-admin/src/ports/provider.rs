@@ -1,4 +1,4 @@
-//! Provider 管理能力与动态注册表。
+//! 原生 Provider 管理能力与启动时注册表。
 
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
@@ -16,9 +16,9 @@ use crate::model::observability::{
 };
 use crate::model::provider_credentials::{
     AuthorizationStarted, CompleteAuthorization, ConsumeProviderResetCredit,
-    PendingAuthorizationMutation, PrepareCredentialImport, PrepareCredentialRefresh,
-    PrepareCredentialRotation, PreparedAuthorizationCommit, PreparedCredentialImport,
-    PreparedCredentialRotation, ProviderExport, ProviderExportCredentialInput, ProviderModels,
+    PrepareCredentialImport, PrepareCredentialRefresh, PrepareCredentialRotation,
+    PreparedAuthorizationCommit, PreparedCredentialImport, PreparedCredentialRotation,
+    ProviderExport, ProviderExportCredentialInput, ProviderModelCatalogDocument, ProviderModels,
     ProviderProfileAvatar, ProviderProfileStatistics, ProviderQuota, ProviderQuotaRequest,
     ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription, explicit_plan_type,
 };
@@ -212,11 +212,25 @@ pub trait ProviderAdmin: Send + Sync {
 
     fn provider_kind(&self) -> &ProviderKind;
 
+    /// 只读取原生 Provider 能力及账号类型，不执行网络或数据库查询。
+    fn account_capabilities(
+        &self,
+        _account_id: &ProviderAccountId,
+        _authentication_kind: &str,
+    ) -> crate::model::accounts::ProviderAccountCapabilities {
+        Default::default()
+    }
+
     /// 提供该 Provider 的可选客户端身份；通用管理层不解释内部字段。
     fn client_profile_options(
         &self,
     ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 没有持久选择时使用的 Provider 默认画像；只返回已准备的本地事实。
+    fn default_client_profile(&self) -> Option<gateway_core::account::OpaqueProviderData> {
+        None
     }
 
     /// 校验并投影客户端身份，结果不含认证或账号材料。
@@ -245,7 +259,7 @@ pub trait ProviderAdmin: Send + Sync {
     async fn account_facts_changed(&self, _account_ids: &[ProviderAccountId]) {}
 
     /// 生成一次连接测试所需的 Provider-owned operation；Core 负责实际执行与落账。
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
@@ -253,13 +267,14 @@ pub trait ProviderAdmin: Send + Sync {
 
     /// 生成一次「测智台」测试请求的 operation：自定义 prompt + 可选思考强度(reasoning.effort)。
     /// 默认忽略 effort、退化为普通连接测试；支持思考强度的 Provider 可覆写以注入 reasoning。
-    fn test_bench_operation(
+    async fn test_bench_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
         _reasoning_effort: Option<&str>,
     ) -> Result<Operation, ProviderAdminError> {
         self.connection_test_operation(upstream_model, input_text)
+            .await
     }
 
     /// 用票据（邮箱/密码/2FA）经登录服务换回令牌，返回可直接交给导入流程的单账号文档。
@@ -342,7 +357,7 @@ pub trait ProviderAdmin: Send + Sync {
 
     async fn start_authorization(
         &self,
-        pending: PendingAuthorizationMutation,
+        pending: crate::model::provider_credentials::PendingAuthorizationMutation,
     ) -> Result<AuthorizationStarted, ProviderAdminError>;
 
     async fn complete_authorization(
@@ -437,20 +452,27 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 导出该账号的 Provider 原生模型目录正文；不提供原生目录的 Provider 使用默认拒绝。
+    async fn model_catalog_document(
+        &self,
+        _account_id: &ProviderAccountId,
+    ) -> Result<ProviderModelCatalogDocument, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     async fn export_credentials(
         &self,
         credentials: Vec<ProviderExportCredentialInput>,
     ) -> Result<ProviderExport, ProviderAdminError>;
 }
 
-/// 按 ProviderKind 动态发现管理能力；不含具体 Provider 分支。
+/// 启动时注册原生 Provider，按 ProviderKind 查找管理能力。
 #[derive(Clone)]
 pub struct ProviderAdminRegistry {
     providers: Arc<BTreeMap<ProviderKind, Arc<dyn ProviderAdmin>>>,
 }
 
 impl ProviderAdminRegistry {
-    #[must_use]
     pub fn pricing_catalog(&self) -> gateway_core::metering::PricingOverrides {
         self.providers
             .iter()
@@ -510,7 +532,7 @@ impl ProviderAdminRegistry {
         let plan_type = explicit_plan_type(plan_type)?.trim();
         let provider = ProviderKind::new(provider_kind.to_owned())
             .ok()
-            .and_then(|kind| self.providers.get(&kind));
+            .and_then(|kind| self.require(&kind).ok());
         let display = provider.map_or_else(
             || plan_type.to_owned(),
             |provider| provider.plan_type_display(plan_type),
@@ -549,7 +571,7 @@ impl ProviderAdminRegistry {
             .collect()
     }
 
-    /// 动态分派 Provider-owned 费用规则，不含任何具体 Provider 分支。
+    /// 按平台计算请求费用。
     pub fn calculated_billing(
         &self,
         provider_kind: &ProviderKind,

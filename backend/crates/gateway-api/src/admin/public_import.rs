@@ -156,10 +156,7 @@ fn map_wire_error(error: WireValidationError) -> AdminError {
     AdminError::bad_request(format!("{} 字段不合法", error.field()))
 }
 
-async fn list<S>(
-    _auth: AdminAuth,
-    State(state): State<S>,
-) -> Result<impl IntoResponse, AdminError>
+async fn list<S>(_auth: AdminAuth, State(state): State<S>) -> Result<impl IntoResponse, AdminError>
 where
     S: SessionState + Send + Sync,
 {
@@ -172,7 +169,10 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(PublicImportListView {
-            configs: configs.into_iter().map(PublicImportConfigView::from).collect(),
+            configs: configs
+                .into_iter()
+                .map(PublicImportConfigView::from)
+                .collect(),
         }),
     ))
 }

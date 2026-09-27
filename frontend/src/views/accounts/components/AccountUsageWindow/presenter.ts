@@ -1,7 +1,7 @@
 import type { AccountQuotaWindow } from '../../constants'
 import { clamp } from 'es-toolkit'
-import { formatInteger } from '@/utils/number'
-import { isRecord } from '@/utils/object'
+import { isRecord } from '@/utils/data'
+import { formatInteger } from '@/utils/format'
 import { formatUsd } from '@/views/usage/utils/format'
 
 export type AccountUsageWindowVariant = 'compact' | 'detail' | 'metric'

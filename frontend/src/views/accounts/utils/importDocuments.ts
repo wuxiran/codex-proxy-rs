@@ -1,7 +1,7 @@
 // 账号导入 JSON 的解析：把一份文本解析成一个或多个「Provider 文档」。
 // 从 useAccountOnboarding 抽出，供提交流程与「账号文件」多文件合并共用。
 
-import { isRecord } from '@/utils/object'
+import { isRecord } from '@/utils/data'
 import { formatProviderLabel, isSupportedProvider } from '@/utils/providers'
 
 export type ImportProvider = 'openai' | 'xai'

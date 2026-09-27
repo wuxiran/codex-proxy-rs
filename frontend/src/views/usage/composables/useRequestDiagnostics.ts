@@ -1,7 +1,7 @@
 import type { UsageRecordDetail } from '@/api'
 import { shallowRef, watch } from 'vue'
 import { getUsageRecordDetail } from '@/api'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 /** Requests can be switched while a lookup is pending; stale results never replace the active trace. */
 export function useRequestDiagnostics(requestId: () => string) {

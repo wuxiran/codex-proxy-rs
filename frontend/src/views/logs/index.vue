@@ -3,18 +3,10 @@
 // turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——全部只作中性诊断事实。
 // 数据源 /api/admin/logs/recent 为最近 300 条内存记录，筛选与翻页均在客户端进行。
 // 满血/降智不由本页任何被动信号判定（TTL 判降智已被实测否定）；只如实铺数据。
-import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
-import type { BaseTablePagination as Pagination } from '@/components/base/BaseTable/pagination'
+import type { BaseTableColumn, BaseTablePaginationState as Pagination } from '@codex-proxy/ui'
+import { BaseCard, BaseCheckbox, BaseInput, BasePageHeader, BaseSegmented, BaseSelect, BaseTable, BaseTablePagination } from '@codex-proxy/ui'
 import { computed, onMounted, ref, watch } from 'vue'
 import request from '@/api/request'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 
 interface BackendRecord {
   atMs: number

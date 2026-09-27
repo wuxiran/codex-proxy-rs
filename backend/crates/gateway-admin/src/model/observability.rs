@@ -1154,7 +1154,6 @@ pub struct DiagnosticsItem {
     pub non_completion_rate: f64,
     pub retry_count: u64,
     pub retry_rate: f64,
-    pub impact_score: f64,
     pub estimated_cost: Option<DecimalAmount>,
     pub attempt_count: u64,
     pub total_tokens: u64,

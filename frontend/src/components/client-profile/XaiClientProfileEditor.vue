@@ -1,13 +1,9 @@
 <script setup lang="ts">
 import type { XaiClientProfilePreview, XaiClientProfileSelection } from '@/api/modules/client-profiles'
+import { BaseButton, BaseFormItem, BaseInput, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getXaiClientProfileOptions, previewXaiClientProfile } from '@/api/modules/client-profiles'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
 
 const props = withDefaults(defineProps<{ active?: boolean, disabled?: boolean, allowInherit?: boolean }>(), {

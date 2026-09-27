@@ -502,7 +502,31 @@ async fn observability_services_should_calculate_usage_insights_and_diagnostic_s
     );
     assert_eq!(diagnostics.items[0].request_share, 0.75);
     assert_eq!(diagnostics.items[1].request_share, 0.25);
-    assert!((diagnostics.items[0].impact_score - 0.075).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn diagnostics_should_preserve_request_order_when_a_small_sample_fails() {
+    let now = Utc::now();
+    let range = observation_range(now);
+    let store = Arc::new(FixtureObservabilityStore::new(range));
+    let success = diagnostic("popular", 100);
+    let mut failure = diagnostic("single_failure", 1);
+    failure.success_count = 0;
+    failure.failure_count = 1;
+    store.replace_diagnostics(vec![success, failure]);
+    let services = observability_services_with_calculated_billing(store).await;
+
+    let result = services
+        .observability()
+        .diagnostics(range, UsageFilter::default(), DiagnosticDimension::Model)
+        .await
+        .expect("diagnostics");
+
+    assert_eq!(result.items[0].key, "popular");
+    assert_eq!(result.items[1].key, "single_failure");
+    assert_eq!(result.items[0].error_count, 0);
+    assert_eq!(result.items[1].error_count, 1);
+    assert_eq!(result.items[1].error_rate, 1.0);
 }
 
 #[tokio::test]
@@ -808,8 +832,7 @@ impl SettingsStore for FixtureSettingsStore {
     }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
-            openai_client_profile: None,
-            xai_client_profile: None,
+            request_profiles: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
             config_revision: Revision::new(1).expect("revision"),
@@ -822,6 +845,7 @@ impl SettingsStore for FixtureSettingsStore {
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
             rotation_strategy: RotationStrategy::Smart,
             min_codex_desktop_version: None,
             min_codex_cli_version: None,
@@ -838,6 +862,9 @@ impl SettingsStore for FixtureSettingsStore {
             account_auto_freeze_adaptive_concurrency: true,
             request_log_enabled: true,
             request_log_test_key_id: None,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
         })
     }
 

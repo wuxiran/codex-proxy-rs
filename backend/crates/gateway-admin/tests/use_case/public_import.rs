@@ -57,6 +57,8 @@ async fn fixture(pool: Vec<ProxyRecord>) -> Fixture {
 fn proxy(id: &str, tested: Option<bool>) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        auto_location: false,
+        detected_location: None,
         location: None,
         id: id.to_owned(),
         name: format!("出口 {id}"),
@@ -65,6 +67,7 @@ fn proxy(id: &str, tested: Option<bool>) -> ProxyRecord {
         account_count: 0,
         last_test_at: tested.map(|_| now),
         last_test: tested.map(|success| ProxyTestResult {
+            location: Default::default(),
             success,
             latency_ms: 10,
             exit_ip: None,
@@ -107,7 +110,10 @@ async fn create_entry(
     fixture
         .services
         .public_import()
-        .create(&context("create-entry"), command(enabled, pin_turn_state, expires_at))
+        .create(
+            &context("create-entry"),
+            command(enabled, pin_turn_state, expires_at),
+        )
         .await
         .expect("create entry")
 }

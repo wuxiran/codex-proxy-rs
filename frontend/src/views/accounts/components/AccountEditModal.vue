@@ -3,15 +3,12 @@ import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 import type { AccountGroup, AccountModelAccess, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
+import { BaseButton, BaseFormItem, BaseModal, BaseSegmented, BaseTextarea, toast } from '@codex-proxy/ui'
 import { ref, useId, watch } from 'vue'
 import { mintAccountTurnState } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
-import { toast } from '@/components/base/BaseToast'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import SyncedSwitch from '@/components/SyncedSwitch.vue'
+import { isOpenAiApiKeyAccount, isOpenAiOAuthAccount } from '../utils/upstreamApiKey'
 import AccountApiKeyFields from './AccountApiKeyFields.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
@@ -79,6 +76,11 @@ watch(open, (value) => {
 const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
 const pinTurnState = defineModel<boolean>('pinTurnState', { required: true })
 const recaptureTurnState = defineModel<boolean>('recaptureTurnState', { required: true })
+const oauthTransport = defineModel<ApiKeyAccountForm['transport']>('oauthTransport', { required: true })
+const transportOptions = [
+  { label: 'WS', value: 'prefer_websocket' },
+  { label: 'SSE', value: 'http' },
+]
 const notes = defineModel<string>('notes', { required: true })
 const enabled = defineModel<boolean>('enabled', { required: true })
 const concurrencyLimit = defineModel<string>('concurrencyLimit', { required: true })
@@ -114,7 +116,17 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         </div>
       </div>
 
-      <section v-if="account.authenticationKind === 'api_key'" class="grid gap-4">
+      <BaseFormItem v-if="isOpenAiOAuthAccount(account)" label="上游传输方式">
+        <p v-if="configurationLoading" role="status" class="m-0 text-cp-sm text-cp-text-secondary">
+          正在读取上游设置…
+        </p>
+        <p v-else-if="!configurationReady" role="alert" class="m-0 text-cp-sm text-cp-error">
+          传输方式读取失败，其他设置仍可保存
+        </p>
+        <BaseSegmented v-else v-model="oauthTransport" label="上游传输方式" :options="transportOptions" :disabled="saving" />
+      </BaseFormItem>
+
+      <section v-if="isOpenAiApiKeyAccount(account)" class="grid gap-4">
         <h3 class="m-0 text-cp font-heavy text-cp-text">
           上游连接
         </h3>
@@ -157,7 +169,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             <BaseButton variant="soft" size="sm" :disabled="saving" :aria-expanded="showStateHistory" :aria-controls="historyId" @click="showStateHistory = !showStateHistory">
               最近捕获
             </BaseButton>
-            <BaseSwitch v-model="pinTurnState" label="固定自身 state" :disabled="saving || !configurationReady" />
+            <SyncedSwitch v-model="pinTurnState" label="固定自身 state" :disabled="saving || !configurationReady" />
           </div>
         </div>
         <p v-if="configurationLoading" role="status" class="m-0 text-cp-sm text-cp-text-secondary">
@@ -238,6 +250,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         :groups="groups"
         :groups-loading="groupsLoading"
         :disabled="saving"
+        :show-scheduling="false"
         :endpoint="account.outboundProxyEndpoint"
         :account-id="account.id"
       />
@@ -260,7 +273,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
       <BaseButton
         variant="primary"
         :loading="saving"
-        :disabled="!account || groupsLoading || (account.authenticationKind === 'api_key' && !configurationReady)"
+        :disabled="!account || groupsLoading || (isOpenAiApiKeyAccount(account) && !configurationReady)"
         @click="emit('save')"
       >
         保存更改

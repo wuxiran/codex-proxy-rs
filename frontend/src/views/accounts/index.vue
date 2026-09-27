@@ -1,21 +1,14 @@
 <script setup lang="ts">
 import type { AccountRow } from './constants'
+import { BaseCard, BaseCheckbox, BaseConfirmModal, BasePageHeader, BaseTable, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+
 import { ChevronDown } from '@lucide/vue'
 import { useMediaQuery } from '@vueuse/core'
-
 import { ref, shallowRef } from 'vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
-import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
-import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import SyncedSwitch from '@/components/SyncedSwitch.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import AccountAutoRefresh from './components/AccountAutoRefresh.vue'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
@@ -110,14 +103,18 @@ const {
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
-  updatingSchedulingAccountIds,
   updatingTurnStateAccountIds,
   revivingAccountIds,
+  downloadingCatalogAccountIds,
+  togglingSchedulingAccountIds,
   deletingAccount,
   creatingAccount,
   authorizingOAuth,
+  authorization,
+  authorizationCallback,
   batchDeleting,
   exportingAccounts,
+  exportDisabledReason,
   reauthorizingAccount,
   createForm,
   handleCreate,
@@ -128,6 +125,7 @@ const {
   handleDelete,
   handleBatchDelete,
   handleExportAccounts,
+  handleDownloadModelCatalog,
   handleRecover,
   handleRefresh,
   handleRefreshQuota,
@@ -208,6 +206,7 @@ const {
   recaptureTurnState: editingRecaptureTurnState,
   turnStatePins: editingTurnStatePins,
   turnStateCaptureRule: editingTurnStateCaptureRule,
+  oauthTransport: editingOAuthTransport,
   configurationLoading,
   configurationReady,
   showEditModal,
@@ -254,6 +253,7 @@ const {
           :selected-count="selectedIds.size"
           :batch-deleting="batchDeleting"
           :exporting-accounts="exportingAccounts"
+          :export-disabled-reason="exportDisabledReason"
           :has-import-tasks="recentImportTasks.length > 0"
           :active-import-count="activeImportCount"
           @import-tasks="showImportTasks = true"
@@ -363,18 +363,18 @@ const {
             </template>
 
             <template #enabled="{ row }">
-              <BaseSwitch
+              <SyncedSwitch
                 :model-value="row.enabled"
                 :label="`${row.name} 调度`"
-                :disabled="updatingSchedulingAccountIds.has(row.id)"
-                :aria-busy="updatingSchedulingAccountIds.has(row.id)"
+                :disabled="togglingSchedulingAccountIds.has(row.id)"
+                :aria-busy="togglingSchedulingAccountIds.has(row.id)"
                 :title="row.enabled ? '关闭调度' : '开启调度'"
                 @update:model-value="handleToggleScheduling(row, $event)"
               />
             </template>
 
             <template #turnState="{ row }">
-              <BaseSwitch
+              <SyncedSwitch
                 v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
                 :model-value="accountConfigurations[row.id]?.value?.pinTurnState ?? false"
                 :label="`${row.name} State`"
@@ -419,19 +419,23 @@ const {
               <AccountTableActions
                 :account="row"
                 :deleting="deletingAccount"
+                :downloading-catalog="downloadingCatalogAccountIds.has(row.id)"
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
                 :testing="testingConnectionIds.has(row.id)"
                 :guanlan-revive-available="accountConfigurations[row.id]?.value?.guanlanReviveAvailable ?? false"
                 :reviving="revivingAccountIds.has(row.id)"
+                :toggling-scheduling="togglingSchedulingAccountIds.has(row.id)"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"
+                @download-model-catalog="handleDownloadModelCatalog"
                 @recover="handleRecover"
                 @refresh="handleRefresh"
                 @reauthorize="openReauthorizeAccount"
                 @test="openConnectionTest"
                 @revive="handleReviveGuanlan"
                 @ticket="openTicket"
+                @toggle-scheduling="handleToggleScheduling"
               />
             </template>
 
@@ -497,6 +501,8 @@ const {
     <AccountCreateModal
       v-model="showCreateModal"
       v-model:form="createForm"
+      v-model:callback="authorizationCallback"
+      :authorization="authorization"
       :account="reauthorizingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
@@ -518,6 +524,7 @@ const {
       v-model:api-key="editingApiKey"
       v-model:pin-turn-state="editingPinTurnState"
       v-model:recapture-turn-state="editingRecaptureTurnState"
+      v-model:oauth-transport="editingOAuthTransport"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
       v-model:concurrency-limit="editingConcurrencyLimit"

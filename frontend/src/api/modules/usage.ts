@@ -448,7 +448,6 @@ export interface UsageDiagnosticItem {
   nonCompletionRate: number
   retryCount: number
   retryRate: number
-  impactScore: number
   estimatedCost: string | null
   attemptCount: number
   totalTokens: number

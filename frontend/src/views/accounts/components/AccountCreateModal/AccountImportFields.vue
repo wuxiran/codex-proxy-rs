@@ -1,10 +1,8 @@
 <script setup lang="ts">
+import { BaseButton, BaseFormItem, BaseTextarea } from '@codex-proxy/ui'
 import { Upload } from '@lucide/vue'
 import { useFileDialog } from '@vueuse/core'
 import { onScopeDispose, ref, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import { isSupportedProvider } from '@/utils/providers'
 import { combineAccountFilesToEnvelope } from '../../utils/importDocuments'
 

@@ -1,24 +1,26 @@
 import type { Ref } from 'vue'
 import type { AccountImportTask, getAccounts } from '@/api'
 import type { RequestOptions } from '@/api/request'
+import { toast } from '@codex-proxy/ui'
 import dayjs from 'dayjs'
-import { ref, watch } from 'vue'
+import { computed, ref, shallowReactive, watch } from 'vue'
 import {
   batchUpdateAccounts,
   deleteAccounts,
   exportAccounts,
   getAccountDetail,
+  getAccountModelCatalog,
   recoverAccount,
   refreshAccount,
   refreshAccountQuota,
   reviveGuanlanAccount,
   updateAccountTurnState,
 } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useDownload } from '@/composables/useDownload'
 import { useIdSet } from '@/composables/useIdSet'
-import { errorMessage, withMinimumDuration } from '@/utils/async'
+import { errorMessage, withMinimumDuration } from '@/utils/operation'
+import { isSupportedProvider } from '@/utils/providers'
 
 import { useAccountOnboarding } from './useAccountOnboarding'
 
@@ -38,28 +40,42 @@ export function useAccountMutations(options: {
     reload: loadAccounts,
     onImportTaskCreated: options.onImportTaskCreated,
   })
-  const selectedAccountsById = new Map<string, AccountRow>()
+  const selectedAccountsById = shallowReactive(new Map<string, AccountRow>())
   const showDeleteModal = ref(false)
   const showSingleDeleteModal = ref(false)
   const pendingDeleteAccount = ref<AccountRow | null>(null)
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
-  const updatingSchedulingAccounts = useIdSet<string>()
   const updatingTurnStateAccounts = useIdSet<string>()
   const revivingAccounts = useIdSet<string>()
+  const downloadingCatalogAccounts = useIdSet<string>()
+  const togglingSchedulingAccounts = useIdSet<string>()
   const deletingAccountAction = useAsyncAction()
   const batchDeletingAction = useAsyncAction()
   const exportingAccountsAction = useAsyncAction()
   const recoveringAccountIds = recoveringAccounts.ids
   const refreshingAccountIds = refreshingAccounts.ids
   const refreshingQuotaAccountIds = refreshingQuotaAccounts.ids
-  const updatingSchedulingAccountIds = updatingSchedulingAccounts.ids
   const updatingTurnStateAccountIds = updatingTurnStateAccounts.ids
   const revivingAccountIds = revivingAccounts.ids
+  const downloadingCatalogAccountIds = downloadingCatalogAccounts.ids
+  const togglingSchedulingAccountIds = togglingSchedulingAccounts.ids
   const deletingAccount = deletingAccountAction.loading
   const batchDeleting = batchDeletingAction.loading
   const exportingAccounts = exportingAccountsAction.loading
+  const exportDisabledReason = computed(() => {
+    if (options.selectedIds.value.size === 0)
+      return ''
+    for (const id of options.selectedIds.value) {
+      const account = selectedAccountsById.get(id)
+      if (!account)
+        return '所选账号数据已失效，请重新选择'
+      if (!isSupportedProvider(account.provider))
+        return '所选账号包含不支持导出的平台'
+    }
+    return ''
+  })
 
   watch(
     [options.accounts, options.selectedIds],
@@ -143,6 +159,10 @@ export function useAccountMutations(options: {
       toast.warning('请选择要导出的账号')
       return
     }
+    if (exportDisabledReason.value) {
+      toast.warning(exportDisabledReason.value)
+      return
+    }
 
     await exportingAccountsAction.run(
       async () => {
@@ -156,6 +176,19 @@ export function useAccountMutations(options: {
       },
       { errorText: '导出失败' },
     )
+  }
+
+  async function handleDownloadModelCatalog(account: AccountRow) {
+    await downloadingCatalogAccounts.run(account.id, async () => {
+      try {
+        const result = await getAccountModelCatalog({ accountId: account.id })
+        const plan = account.planTypeDisplay.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'unknown-plan'
+        const name = account.name.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'account'
+        await downloadJson(result.catalog, `cpr-model-catalog-${plan}-${name}.json`)
+        toast.success(`已下载模型目录，共 ${result.modelCount} 个模型`)
+      }
+      catch {}
+    })
   }
 
   async function handleRefresh(accountId: string) {
@@ -219,8 +252,9 @@ export function useAccountMutations(options: {
     })
   }
 
-  async function handleToggleScheduling(account: AccountRow, enabled: boolean) {
-    await updatingSchedulingAccounts.run(account.id, async () => {
+  /** 行内调度开关与操作菜单共用：局部更新只提交调度字段，成功后按详情替换本行。 */
+  async function handleToggleScheduling(account: AccountRow, enabled = !account.enabled) {
+    await togglingSchedulingAccounts.run(account.id, async () => {
       try {
         // 局部更新只提交调度字段，避免覆盖其他管理员刚修改的账号配置。
         await batchUpdateAccounts({ accountIds: [account.id], enabled })
@@ -229,7 +263,7 @@ export function useAccountMutations(options: {
         return
       }
 
-      toast.success(enabled ? '已开启调度' : '已关闭调度')
+      toast.success(enabled ? '调度已启用' : '调度已停用')
       try {
         const result = await getAccountDetail({ accountId: account.id })
         const remainsVisible = await options.replaceAccount(result.account)
@@ -246,6 +280,8 @@ export function useAccountMutations(options: {
   }
 
   async function handleQuotaReset(accountId: string) {
+    if (!options.accounts.value.find(account => account.id === accountId)?.capabilities.quotaRefresh)
+      return
     try {
       const result = await refreshAccountQuota({ accountId }, { silent: true })
       await options.replaceAccount(result.account)
@@ -319,16 +355,19 @@ export function useAccountMutations(options: {
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,
-    updatingSchedulingAccountIds,
     updatingTurnStateAccountIds,
     revivingAccountIds,
+    downloadingCatalogAccountIds,
+    togglingSchedulingAccountIds,
     deletingAccount,
     batchDeleting,
     exportingAccounts,
+    exportDisabledReason,
     requestDeleteAccount,
     handleDelete,
     handleBatchDelete,
     handleExportAccounts,
+    handleDownloadModelCatalog,
     handleRecover,
     handleRefresh,
     handleRefreshQuota,

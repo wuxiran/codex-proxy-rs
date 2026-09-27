@@ -65,6 +65,58 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
+async fn account_capabilities_distinguish_oauth_from_api_key_and_unknown_credentials() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let id = ProviderAccountId::new("acct_capabilities").unwrap();
+    let oauth = provider.account_capabilities(&id, "oauth");
+    assert!(
+        oauth.quota
+            && oauth.quota_refresh
+            && oauth.profile
+            && oauth.subscription
+            && oauth.avatar
+            && oauth.reset_credits
+            && oauth.consume_reset_credit
+    );
+    for kind in ["api_key", "unknown"] {
+        assert_eq!(provider.account_capabilities(&id, kind), Default::default());
+    }
+}
+
+#[tokio::test]
+async fn custom_identity_preview_and_dashboard_share_the_exact_request_profile() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let user_agent =
+        "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.156.1)";
+    let configuration = OpaqueProviderData::new(
+        json!({"mode":"custom", "userAgent":user_agent})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let preview = provider.preview_client_profile(&configuration).unwrap();
+    let dashboard = provider.configured_wire_profile(&configuration).unwrap();
+    assert_eq!(preview.expose_to_provider()["userAgent"], user_agent);
+    assert_eq!(dashboard.user_agent, user_agent);
+    assert_eq!(dashboard.product, "codex_exec");
+    assert_eq!(dashboard.version, "0.156.1");
+    assert!(dashboard.verified_at.is_none());
+    assert!(dashboard.release.is_none());
+    assert_ne!(
+        provider.dashboard_wire_profile().unwrap().user_agent,
+        user_agent
+    );
+}
+
+#[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
     let config = valid_config();
     let mut bundle = provider_openai::initialize(config.config.clone(), provider_ports())
@@ -74,11 +126,11 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    // 8 = 6 个无条件 worker + oauth 刷新 + 观澜自动复活（revive 默认开启后随之注册）。
-    // 上游把客户端发布类 worker 拆成多个（7），我方在其上再加 revive（+1）。
-    // +1 云端打票续打 worker（设置未开启时空转）。
+    // 上游 8 个（7 个基础 worker + 定时账号预热 #192），我方在其上再加：
+    // +1 观澜自动复活（revive 默认开启后随之注册）；
+    // +1 云端打票续打 worker（设置未开启时空转）；
     // +1 WS 保活 warmer worker（daemon）。
-    assert_eq!(contributions.len(), 10);
+    assert_eq!(contributions.len(), 11);
 
     assert!(
         contributions
@@ -110,6 +162,7 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
         ("openai-cli-release", APPCAST_POLL_INTERVAL),
         ("openai-platform-desktop-release", APPCAST_POLL_INTERVAL),
         ("openai", Duration::from_secs(30)),
+        ("openai-account-warmup", Duration::from_secs(30)),
         (
             "openai-model-catalog",
             config.config.quota_refresh_policy().interval(),
@@ -270,7 +323,7 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
         .expect("OpenAI payload")
         .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
         let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 initialized_provider_request(operation, account_id),
                 initialized_attempt_context(request_id, account_id),
@@ -720,6 +773,7 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
             &UpstreamModelId::new("gpt-5.4").expect("upstream model"),
             "Reply with exactly OK.",
         )
+        .await
         .expect("connection test operation");
     let Operation::Generate(request) = operation else {
         panic!("connection test must be a generate operation");
@@ -2371,7 +2425,7 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .seed_api_key(
             "acct_api_admin",
             "https://first.example/v1".to_owned(),
-            provider_openai::credential::ApiKeyTransport::Http,
+            provider_openai::credential::ResponsesTransport::Http,
         )
         .await;
     let account = store.account("acct_api_admin").unwrap();
@@ -2680,4 +2734,108 @@ async fn turn_state_pin_team_admin_exposes_model_rules_without_enabling_capture(
             Some(&json!({"defaultLength":0,"modelLengths":{}}))
         );
     }
+}
+
+#[tokio::test]
+async fn oauth_transport_settings_preserve_tokens_refresh_schedule_and_health() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_oauth_transport".to_owned(),
+            name: "OAuth transport".to_owned(),
+            secret: secret("test-oauth-transport"),
+            verified_account: profile("chatgpt-oauth-transport"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_oauth_transport").unwrap();
+    let current = store.load_current_credential(account.id()).await.unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    // fork 的 OAuth 配置文档还带打票/复活/保活等字段，这里只核对 transport。
+    assert_eq!(
+        configuration
+            .expose_to_provider()
+            .expose_to_provider()
+            .get("transport"),
+        Some(&json!("prefer_websocket"))
+    );
+    for transport in ["http", "prefer_websocket"] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"transport":transport}).as_object().unwrap().clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let facts = prepared.facts();
+        let mut expected = current.credential.expose_to_provider().clone();
+        if transport == "http" {
+            expected.insert("transport".to_owned(), json!(transport));
+        }
+        assert_eq!(
+            facts
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider(),
+            &expected
+        );
+        assert_eq!(
+            facts.next_refresh_at,
+            account.next_refresh_at().map(DateTime::<Utc>::from)
+        );
+        assert_eq!(
+            facts.access_token_expires_at,
+            account.access_token_expires_at().map(DateTime::<Utc>::from)
+        );
+        assert_eq!(facts.has_refresh_token, account.has_refresh_token());
+        assert!(facts.preserve_profile && facts.preserve_credential_state);
+    }
+    for invalid in [
+        json!({"transport":"invalid"}),
+        json!({"transport":"http", "base_url":"https://other.example"}),
+        json!({"transport":"http", "api_key":"test-key"}),
+    ] {
+        let error = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    invalid.as_object().unwrap().clone(),
+                )),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
+    }
+    store.set_oauth_transport(
+        "acct_oauth_transport",
+        provider_openai::credential::ResponsesTransport::Http,
+    );
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    // fork 的 OAuth 配置文档还带打票/复活/保活等字段，这里只核对 transport。
+    assert_eq!(
+        configuration
+            .expose_to_provider()
+            .expose_to_provider()
+            .get("transport"),
+        Some(&json!("http"))
+    );
 }

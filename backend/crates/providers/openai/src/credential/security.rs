@@ -17,6 +17,7 @@ const MAX_COOKIES: usize = 128;
 
 /// 已解析且只在 Provider 内可见的认证材料。
 pub struct CodexRuntimeCredential {
+    pub transport: super::ResponsesTransport,
     pub authentication: CodexRuntimeAuthentication,
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,
@@ -124,6 +125,7 @@ impl CodexCredentialCodec {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
             turn_state_pin: None,
+            transport: super::ResponsesTransport::oauth_default(),
             principal,
             installation_id,
             access_token: secret.access_token.expose_secret().to_owned(),
@@ -175,6 +177,10 @@ impl CodexCredentialCodec {
             .map_err(|_| CodexCredentialDataError::Invalid)?;
         validate(&data)?;
         let turn_state_pin = data.oauth().and_then(|oauth| oauth.turn_state_pin.clone());
+        let transport = match &data {
+            CodexCredentialData::OAuth(data) => data.transport,
+            CodexCredentialData::ApiKey(data) => data.transport,
+        };
         let (authentication, principal, installation_id, cookies, oauth_client_id, oauth_scope) =
             match data {
                 CodexCredentialData::ApiKey(data) => (
@@ -202,6 +208,7 @@ impl CodexCredentialCodec {
                 ),
             };
         Ok(CodexRuntimeCredential {
+            transport,
             authentication,
             turn_state_pin,
             principal,
@@ -243,6 +250,7 @@ impl CodexCredentialCodec {
             (CodexCredentialData::OAuth(incoming), CodexCredentialData::OAuth(existing)) => {
                 incoming.installation_id = existing.installation_id;
                 incoming.turn_state_pin = existing.turn_state_pin;
+                incoming.transport = existing.transport;
             }
             (CodexCredentialData::ApiKey(incoming), CodexCredentialData::ApiKey(existing)) => {
                 incoming.installation_id = existing.installation_id;

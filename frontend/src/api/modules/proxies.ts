@@ -10,7 +10,21 @@ export interface OutboundProxyExitGeo {
   city: string | null
 }
 
+export type ProxyLocationDetection
+  = | { status: 'notRequested' }
+    | { status: 'detected', location: RequestLocation }
+    | { status: 'failed', message: string }
+    | { status: 'conflict' }
+
+export interface DetectedProxyLocation {
+  location: RequestLocation
+  exitIpv4: string | null
+  exitIpv6: string | null
+  detectedAt: string
+}
+
 export interface OutboundProxyTest {
+  location: ProxyLocationDetection
   success: boolean
   latencyMs: number
   exitIp: string | null
@@ -58,6 +72,8 @@ export interface ProxyBatchSkip {
 }
 
 export interface OutboundProxyRecord {
+  autoLocation: boolean
+  detectedLocation: DetectedProxyLocation | null
   location: RequestLocation | null
   id: string
   name: string
@@ -125,17 +141,19 @@ export function getProxies(data: { page: number, pageSize: number, search?: stri
   })
 }
 
-export function createProxy(data: { name: string, proxyUrl: string, location?: RequestLocation | null }) {
+export function createProxy(data: { name: string, proxyUrl: string, autoLocation?: boolean, location?: RequestLocation | null }) {
   return request<ProxyMutation>({
     url: '/api/admin/proxies/create',
+    timeout: 25000,
     method: 'POST',
     data,
   })
 }
 
-export function updateProxy(data: { id: string, revision: number, name: string, proxyUrl?: string, location?: RequestLocation | null }) {
+export function updateProxy(data: { id: string, revision: number, name: string, proxyUrl?: string, autoLocation?: boolean, location?: RequestLocation | null }) {
   return request<ProxyMutation>({
     url: '/api/admin/proxies/update',
+    timeout: 25000,
     method: 'POST',
     data,
   })
@@ -150,7 +168,7 @@ export function deleteProxy(data: { id: string, revision: number }) {
 }
 
 // 槽位排队最多 20 秒，其后才是探测本身；超时需要覆盖两段。
-export function testProxy(data: { id: string, revision: number }, options: RequestOptions = {}) {
+export function testProxy(data: { id: string, revision: number, detectLocation?: boolean }, options: RequestOptions = {}) {
   return request<OutboundProxyRecord>({
     url: '/api/admin/proxies/test',
     method: 'POST',
@@ -197,7 +215,7 @@ export function batchDeleteProxies(data: { items: Array<{ id: string, revision: 
   })
 }
 
-export function probeProxy(data: { proxyUrl: string }) {
+export function probeProxy(data: { proxyUrl: string, detectLocation?: boolean }) {
   return request<OutboundProxyTest>({
     url: '/api/admin/proxies/probe',
     method: 'POST',

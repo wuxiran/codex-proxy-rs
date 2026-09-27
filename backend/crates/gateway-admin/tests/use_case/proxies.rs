@@ -123,7 +123,7 @@ impl ProxyStore for TestProxies {
         _: Revision,
         _: ProxyTestResult,
         _: &MutationContext,
-    ) -> AdminStoreResult<ProxyRecord> {
+    ) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))
     }
     async fn record_quality(
@@ -142,7 +142,7 @@ impl ProxyStore for TestProxies {
 
 #[async_trait]
 impl ProxyProbe for TestProxies {
-    async fn test(&self, _: &OutboundProxy) -> ProxyTestResult {
+    async fn test(&self, _: &OutboundProxy, _: bool) -> ProxyTestResult {
         panic!("unexpected proxy probe")
     }
 }
@@ -162,6 +162,8 @@ async fn authorization_uses_selected_proxy_regardless_of_probe_status() {
                 .accounts(FakeAccountStore::new(kind, events.clone()))
                 .proxies(Arc::new(TestProxies {
                     record: Some(ProxyRecord {
+                        auto_location: false,
+                        detected_location: None,
                         location: None,
                         id: "proxy_oauth".to_owned(),
                         name: "授权出口".to_owned(),
@@ -170,6 +172,7 @@ async fn authorization_uses_selected_proxy_regardless_of_probe_status() {
                         account_count: 0,
                         last_test_at: probe_success.map(|_| now),
                         last_test: probe_success.map(|success| ProxyTestResult {
+                            location: Default::default(),
                             success,
                             latency_ms: 10,
                             exit_ip: None,
@@ -193,9 +196,19 @@ async fn authorization_uses_selected_proxy_regardless_of_probe_status() {
                 reauthorization: None,
             };
             let result = if kind == "openai" {
-                services.openai().start_authorization(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("openai").unwrap())
+                    .unwrap()
+                    .start_authorization(command)
+                    .await
             } else {
-                services.xai().start_authorization(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("xai").unwrap())
+                    .unwrap()
+                    .start_authorization(command)
+                    .await
             };
             assert!(result.is_ok(), "{kind}, {probe_success:?}: {result:?}");
             assert_eq!(recorded(&events), ["provider.start_authorization"]);
@@ -303,9 +316,19 @@ async fn credential_import_keeps_proxy_reserved_until_commit_and_releases_on_err
                 document: document(),
             };
             let result = if kind == "openai" {
-                services.openai().import_document(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("openai").unwrap())
+                    .unwrap()
+                    .import_document(command)
+                    .await
             } else {
-                services.xai().import_document(command).await
+                services
+                    .credentials()
+                    .for_provider(&gateway_core::routing::ProviderKind::new("xai").unwrap())
+                    .unwrap()
+                    .import_document(command)
+                    .await
             };
             assert_eq!(result.is_err(), failure.is_some());
             let events = recorded(&events);
@@ -335,6 +358,8 @@ struct MemoryProxies {
 
 fn memory_record(id: &str, url: &str) -> ProxyRecord {
     ProxyRecord {
+        auto_location: false,
+        detected_location: None,
         location: None,
         id: id.to_owned(),
         name: id.to_owned(),
@@ -438,7 +463,7 @@ impl ProxyStore for MemoryProxies {
         _: Revision,
         _: ProxyTestResult,
         _: &MutationContext,
-    ) -> AdminStoreResult<ProxyRecord> {
+    ) -> AdminStoreResult<ProxyMutation> {
         Err(super::unavailable("proxy"))
     }
     async fn record_quality(
@@ -465,13 +490,14 @@ impl ProxyStore for MemoryProxies {
 
 #[async_trait]
 impl ProxyProbe for MemoryProxies {
-    async fn test(&self, _: &OutboundProxy) -> ProxyTestResult {
+    async fn test(&self, _: &OutboundProxy, _: bool) -> ProxyTestResult {
         self.probes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.block_probe {
             std::future::pending::<()>().await;
         }
         ProxyTestResult {
+            location: Default::default(),
             success: true,
             latency_ms: 120,
             exit_ip: Some("203.0.113.9".parse().unwrap()),
@@ -484,7 +510,7 @@ impl ProxyProbe for MemoryProxies {
 
     async fn quality(&self, proxy: &OutboundProxy) -> ProxyQualityProbe {
         ProxyQualityProbe {
-            base: self.test(proxy).await,
+            base: self.test(proxy, false).await,
             items: vec![ProxyQualityItem {
                 target: "chatgpt".to_owned(),
                 status: ProxyQualityItemStatus::Challenge,
@@ -553,6 +579,8 @@ async fn batch_create_and_delete_skip_individual_conflicts_without_failing_the_b
     });
     let services = memory_services(proxies.clone()).await;
     let new_proxy = |name: &str, url: &str| NewProxy {
+        auto_location: false,
+        test: None,
         location: None,
         name: name.to_owned(),
         proxy: OutboundProxy::parse(url).unwrap(),
@@ -627,7 +655,7 @@ async fn busy_test_slots_queue_briefly_then_report_rate_limited() {
         let services = services.clone();
         let proxy = proxy.clone();
         running.push(tokio::spawn(async move {
-            services.proxies().probe(&proxy).await
+            services.proxies().probe(&proxy, false).await
         }));
     }
     while proxies.probes.load(Ordering::SeqCst) < 4 {
@@ -635,7 +663,7 @@ async fn busy_test_slots_queue_briefly_then_report_rate_limited() {
     }
     // 四个槽位都被占用：第五个请求排队到超时才被拒绝，而不是立刻 429。
     let started = tokio::time::Instant::now();
-    let error = services.proxies().probe(&proxy).await.unwrap_err();
+    let error = services.proxies().probe(&proxy, false).await.unwrap_err();
     assert_eq!(error.kind(), AdminErrorKind::RateLimited);
     assert!(started.elapsed() >= std::time::Duration::from_secs(20));
     assert_eq!(proxies.probes.load(Ordering::SeqCst), 4);

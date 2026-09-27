@@ -8,12 +8,26 @@ use gateway_core::provider_ports::ProviderCooldownPort;
 use super::*;
 use crate::postgres::ObservabilityQueryBudget;
 
+fn account_capacity(
+    account: &AccountRecord,
+    default_concurrency: u64,
+    in_flight: Option<&BTreeMap<String, u64>>,
+) -> gateway_admin::model::accounts::AccountCapacity {
+    gateway_admin::model::accounts::AccountCapacity {
+        used_slots: in_flight.map(|counts| counts.get(&account.id).copied().unwrap_or(0)),
+        total_slots: account.concurrency_limit.map_or_else(
+            || (default_concurrency > 0).then_some(default_concurrency),
+            |limit| Some(u64::from(limit.get())),
+        ),
+    }
+}
+
 /// Admin 账号用例所需的公共账号、留存观测与 revision 事务能力。
 ///
 /// 三个 PostgreSQL adapter 都保持私有，调用方只能取得 [`AccountStore`] 暴露的领域能力。
 #[derive(Clone)]
 pub struct PgAdminAccountStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
     accounts: PgProviderAccountRepository,
     observability: PgObservabilityRepository,
     control_plane: PgControlPlaneRepository,
@@ -219,64 +233,13 @@ impl PgAdminAccountStore {
         action: &str,
         outbound_proxy: Option<gateway_admin::model::proxies::ImportProxyBinding>,
     ) -> AdminStoreResult<CredentialImportResult> {
-        let provider_kind = prepared.provider_kind.as_str().to_owned();
-        let accounts = prepared
-            .credentials
-            .into_iter()
-            .map(prepared_account)
-            .collect::<StoreResult<Vec<_>>>()
-            .map_err(|error| admin_store_error(ENTITY, error))?;
-        let mut changed_fields = vec!["credentials".to_owned()];
-        if settings
-            .as_ref()
-            .is_some_and(|settings| settings.model_access.is_some())
-            || accounts
-                .iter()
-                .any(|account| account.model_access.is_some())
-        {
-            changed_fields.push("model_access".to_owned());
-        }
-        if let Some(settings) = &settings {
-            changed_fields
-                .extend(["enabled", "concurrency_limit", "weight", "group_ids"].map(str::to_owned));
-            if settings.notes.is_some() {
-                changed_fields.push("notes".to_owned());
-            }
-        }
+        let command = prepare_import(prepared, settings, context, action, outbound_proxy)?;
         let imported = self
             .accounts
-            .import_provider_accounts(ImportProviderAccounts {
-                settings,
-                outbound_proxy,
-                scope: ProviderAccountAdminScope {
-                    provider_kind: provider_kind.clone(),
-                },
-                accounts,
-                audit: mutation_audit(
-                    context,
-                    action,
-                    "provider_account",
-                    &provider_kind,
-                    changed_fields,
-                ),
-            })
+            .import_provider_accounts(command)
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
-        Ok(CredentialImportResult {
-            config_revision: admin_revision(imported.config_revision)?,
-            credential_ids: imported
-                .account_ids
-                .into_iter()
-                .map(CoreProviderAccountId::new)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| {
-                    AdminStoreError::new(
-                        AdminStoreErrorKind::Unavailable,
-                        ENTITY,
-                        "provider account import returned an invalid account ID",
-                    )
-                })?,
-        })
+        import_result(imported)
     }
 
     async fn commit_prepared_rotation(
@@ -287,61 +250,13 @@ impl PgAdminAccountStore {
         action: &str,
     ) -> AdminStoreResult<CredentialMutationResult> {
         let account_id = prepared.account_id.clone();
-        let scope = ProviderAccountAdminScope {
-            provider_kind: prepared.provider_kind.as_str().to_owned(),
-        };
-        let mut changed_fields = vec!["credentials".to_owned()];
-        if let Some(settings) = &settings {
-            changed_fields
-                .extend(["enabled", "concurrency_limit", "weight", "groups"].map(str::to_owned));
-            if settings.model_access.is_some() {
-                changed_fields.push("model_access".to_owned());
-            }
-            if settings.outbound_proxy.is_some() {
-                changed_fields.push("outbound_proxy".to_owned());
-            }
-            if settings.notes.is_some() {
-                changed_fields.push("notes".to_owned());
-            }
-        }
+        let command = prepare_rotation(prepared, settings, context, action)?;
         let rotation = self
             .accounts
-            .rotate_provider_account(RotateProviderAccount {
-                settings,
-                scope,
-                profile: UpdateProviderAccount {
-                    id: account_id.as_str().to_owned(),
-                    name: prepared.name,
-                    email: prepared.email,
-                    plan_type: prepared.plan_type,
-                },
-                replacement_identity: prepared.replacement_identity,
-                credential: ProviderCredentialUpdate {
-                    account_id: account_id.as_str().to_owned(),
-                    expected_revision: store_revision(prepared.expected_credential_revision)?,
-                    provider_credentials_json: provider_document_json(prepared.provider_material)
-                        .map_err(|error| admin_store_error(ENTITY, error))?,
-                    has_refresh_token: prepared.has_refresh_token,
-                    access_token_expires_at: prepared.access_token_expires_at,
-                    next_refresh_at: prepared.next_refresh_at,
-                    preserve_profile: prepared.preserve_profile,
-                    preserve_credential_state: prepared.preserve_credential_state,
-                },
-                audit: mutation_audit(
-                    context,
-                    action,
-                    "provider_account",
-                    account_id.as_str(),
-                    changed_fields,
-                ),
-            })
+            .rotate_provider_account(command)
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
-        Ok(CredentialMutationResult {
-            config_revision: admin_revision(rotation.config_revision)?,
-            account_id,
-            credential_revision: Some(admin_revision(rotation.credential_revision)?),
-        })
+        rotation_result(rotation, account_id)
     }
 
     /// 与导入 upsert 的冲突键一致（provider_kind, upstream_user_id, coalesce(upstream_account_id, '')）；
@@ -435,6 +350,45 @@ impl PgAdminAccountStore {
 
 #[async_trait]
 impl AccountStore for PgAdminAccountStore {
+    async fn list_plugin_accounts(
+        &self,
+        query: PluginAccountListQuery,
+    ) -> AdminStoreResult<PluginAccountPage> {
+        let limit = i64::from(query.limit.get());
+        let mut accounts = self
+            .accounts
+            .list_plugin_accounts(
+                query.provider_kind.as_ref().map(ProviderKind::as_str),
+                query.cursor.as_ref().map(CoreProviderAccountId::as_str),
+                limit + 1,
+            )
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let has_more = accounts.len() > usize::from(query.limit.get());
+        if has_more {
+            accounts.pop();
+        }
+        let next_cursor = has_more
+            .then(|| accounts.last().map(|account| account.id.clone()))
+            .flatten()
+            .map(CoreProviderAccountId::new)
+            .transpose()
+            .map_err(|_| {
+                AdminStoreError::new(
+                    AdminStoreErrorKind::Invalid,
+                    ENTITY,
+                    "plugin account cursor is invalid",
+                )
+            })?;
+        Ok(PluginAccountPage {
+            accounts: accounts
+                .into_iter()
+                .map(admin_account_record)
+                .collect::<AdminStoreResult<_>>()?,
+            next_cursor,
+        })
+    }
+
     async fn list_accounts(
         &self,
         query: AdminAccountListQuery,
@@ -476,6 +430,11 @@ impl AccountStore for PgAdminAccountStore {
                 let mut account = admin_account_record(summary)?;
                 account.groups = groups_by_account.remove(&account_id).unwrap_or_default();
                 Ok(AccountPageItem {
+                    capacity: account_capacity(
+                        &account,
+                        page.default_concurrency,
+                        runtime.in_flight.as_ref(),
+                    ),
                     account,
                     projection,
                 })
@@ -511,7 +470,21 @@ impl AccountStore for PgAdminAccountStore {
             .await?;
         let mut account = admin_account_record(record.summary)?;
         account.groups = groups.remove(&account_id).unwrap_or_default();
+        let default_concurrency: i64 = sqlx::query_scalar(
+            "select max_concurrent_per_account from runtime_settings where id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account concurrency")))?;
+        let default_concurrency = u64::try_from(default_concurrency).map_err(|_| {
+            AdminStoreError::new(
+                AdminStoreErrorKind::Invalid,
+                ENTITY,
+                "invalid default account concurrency",
+            )
+        })?;
         Ok(Some(AccountPageItem {
+            capacity: account_capacity(&account, default_concurrency, runtime.in_flight.as_ref()),
             account,
             projection,
         }))
@@ -869,6 +842,25 @@ impl AccountStore for PgAdminAccountStore {
             .transpose()
     }
 
+    async fn credential_details_by_id(
+        &self,
+        account_id: &CoreProviderAccountId,
+    ) -> AdminStoreResult<Option<CredentialDetails>> {
+        let (control_plane, account) = futures::try_join!(
+            self.control_plane.load_control_plane(),
+            self.accounts.load_provider_account(account_id.as_str()),
+        )
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+        account
+            .map(|record| {
+                Ok(CredentialDetails {
+                    config_revision: admin_revision(control_plane.settings.config_revision)?,
+                    credential: admin_account_record(record.summary)?,
+                })
+            })
+            .transpose()
+    }
+
     async fn load_credentials_for_export(
         &self,
         provider_kind: &ProviderKind,
@@ -910,93 +902,60 @@ impl AccountStore for PgAdminAccountStore {
         Ok(credentials)
     }
 
+    async fn load_credential_for_plugin(
+        &self,
+        account_id: &CoreProviderAccountId,
+    ) -> AdminStoreResult<Option<ProviderExportCredentialInput>> {
+        self.accounts
+            .load_provider_account(account_id.as_str())
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?
+            .map(|record| {
+                Ok(ProviderExportCredentialInput {
+                    account: admin_account_record(record.summary)?,
+                    provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                        record.provider_credentials_json.fields().clone(),
+                    )),
+                })
+            })
+            .transpose()
+    }
+
     async fn commit_credential_import(
         &self,
         command: CredentialImportCommit,
         context: &MutationContext,
     ) -> AdminStoreResult<CredentialImportResult> {
+        // fork：免登录导入等来源要求不覆盖已存在的身份。
         if command.reject_existing {
             self.reject_existing_identities(&command.prepared).await?;
         }
-        self.commit_prepared_import(
-            command.prepared,
-            command.settings,
-            context,
-            "import_document",
-            command.outbound_proxy,
-        )
-        .await
+        let result = self
+            .commit_prepared_import(
+                command.prepared,
+                command.settings,
+                context,
+                "import_document",
+                command.outbound_proxy,
+            )
+            .await?;
+        Ok(result)
     }
 
     async fn commit_authorization(
         &self,
         command: AuthorizationCommit,
         context: &MutationContext,
-    ) -> AdminStoreResult<CredentialMutationResult> {
-        match command.credential {
-            AuthorizationCredentialCommit::Create(credential) => {
-                let CredentialImportResult {
-                    config_revision,
-                    credential_ids,
-                } = self
-                    .commit_prepared_import(
-                        PreparedCredentialImport {
-                            provider_kind: credential.provider_kind.clone(),
-                            credentials: vec![credential],
-                        },
-                        command.settings,
-                        context,
-                        "authorize",
-                        command
-                            .pending
-                            .outbound_proxy_id()
-                            .zip(command.pending.outbound_proxy())
-                            .map(
-                                |(id, proxy)| gateway_admin::model::proxies::ImportProxyBinding {
-                                    id: id.to_owned(),
-                                    proxy: proxy.clone(),
-                                },
-                            ),
-                    )
-                    .await?;
-                let [account_id]: [CoreProviderAccountId; 1] =
-                    credential_ids.try_into().map_err(|_| {
-                        AdminStoreError::new(
-                            AdminStoreErrorKind::Unavailable,
-                            ENTITY,
-                            "authorization import returned an unexpected account count",
-                        )
-                    })?;
-                let details = self
-                    .accounts
-                    .load_provider_account(account_id.as_str())
-                    .await
-                    .map_err(|error| admin_store_error(ENTITY, error))?
-                    .ok_or_else(|| {
-                        AdminStoreError::new(
-                            AdminStoreErrorKind::Unavailable,
-                            ENTITY,
-                            "authorized credential was not visible after commit",
-                        )
-                    })?;
-                Ok(CredentialMutationResult {
-                    config_revision,
-                    account_id,
-                    credential_revision: Some(admin_revision(details.summary.credential_revision)?),
-                })
-            }
-            AuthorizationCredentialCommit::Reauthorize(prepared) => {
-                if command.settings.is_some() {
-                    return Err(AdminStoreError::new(
-                        AdminStoreErrorKind::Invalid,
-                        ENTITY,
-                        "reauthorization cannot change account settings",
-                    ));
-                }
-                self.commit_prepared_rotation(prepared, None, context, "reauthorize")
-                    .await
-            }
-        }
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::AuthorizationCommitResult>
+    {
+        self.commit_authorization_once(command, context).await
+    }
+
+    async fn authorization_receipt(
+        &self,
+        key: &gateway_admin::model::provider_credentials::AuthorizationReceiptKey,
+    ) -> AdminStoreResult<Option<CredentialMutationResult>> {
+        self.load_authorization_receipt(key).await
     }
 
     async fn commit_credential_rotation(
@@ -1345,4 +1304,169 @@ impl AccountStore for PgAdminAccountStore {
             .await
             .map_err(|error| admin_store_error(ENTITY, error))
     }
+}
+
+pub(super) fn prepare_import(
+    prepared: PreparedCredentialImport,
+    settings: Option<AccountImportSettings>,
+    context: &MutationContext,
+    action: &str,
+    outbound_proxy: Option<gateway_admin::model::proxies::ImportProxyBinding>,
+) -> AdminStoreResult<ImportProviderAccounts> {
+    let provider_kind = prepared.provider_kind.as_str().to_owned();
+    let accounts = prepared
+        .credentials
+        .into_iter()
+        .map(prepared_account)
+        .collect::<StoreResult<Vec<_>>>()
+        .map_err(|error| admin_store_error(ENTITY, error))?;
+    let mut changed_fields = vec!["credentials".to_owned()];
+    if settings
+        .as_ref()
+        .is_some_and(|settings| settings.model_access.is_some())
+        || accounts
+            .iter()
+            .any(|account| account.model_access.is_some())
+    {
+        changed_fields.push("model_access".to_owned());
+    }
+    if let Some(settings) = &settings {
+        changed_fields
+            .extend(["enabled", "concurrency_limit", "weight", "group_ids"].map(str::to_owned));
+        if settings.notes.is_some() {
+            changed_fields.push("notes".to_owned());
+        }
+    }
+    Ok(ImportProviderAccounts {
+        settings,
+        outbound_proxy,
+        scope: ProviderAccountAdminScope {
+            provider_kind: provider_kind.clone(),
+        },
+        accounts,
+        audit: mutation_audit(
+            context,
+            action,
+            "provider_account",
+            &provider_kind,
+            changed_fields,
+        ),
+    })
+}
+
+pub(super) fn import_result(
+    imported: ProviderAccountAdminImport,
+) -> AdminStoreResult<CredentialImportResult> {
+    Ok(CredentialImportResult {
+        config_revision: admin_revision(imported.config_revision)?,
+        credential_ids: imported
+            .account_ids
+            .into_iter()
+            .map(|id| {
+                CoreProviderAccountId::new(id).map_err(|_| {
+                    AdminStoreError::new(
+                        AdminStoreErrorKind::Unavailable,
+                        ENTITY,
+                        "provider account import returned an invalid account ID",
+                    )
+                })
+            })
+            .collect::<AdminStoreResult<_>>()?,
+    })
+}
+
+pub(super) fn authorization_import_result(
+    imported: ProviderAccountAdminImport,
+) -> AdminStoreResult<CredentialMutationResult> {
+    let [id]: [String; 1] = imported.account_ids.try_into().map_err(|_| {
+        AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            ENTITY,
+            "authorization must return one account",
+        )
+    })?;
+    let revision = imported.credential_revisions.get(&id).ok_or_else(|| {
+        AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            ENTITY,
+            "authorization credential revision is missing",
+        )
+    })?;
+    Ok(CredentialMutationResult {
+        config_revision: admin_revision(imported.config_revision)?,
+        account_id: CoreProviderAccountId::new(id).map_err(|_| {
+            AdminStoreError::new(
+                AdminStoreErrorKind::Unavailable,
+                ENTITY,
+                "authorization returned an invalid account ID",
+            )
+        })?,
+        credential_revision: Some(admin_revision(*revision)?),
+    })
+}
+
+pub(super) fn prepare_rotation(
+    prepared: PreparedCredentialRotationFacts,
+    settings: Option<UpdateAccount>,
+    context: &MutationContext,
+    action: &str,
+) -> AdminStoreResult<RotateProviderAccount> {
+    let account_id = prepared.account_id.clone();
+    let scope = ProviderAccountAdminScope {
+        provider_kind: prepared.provider_kind.as_str().to_owned(),
+    };
+    let mut changed_fields = vec!["credentials".to_owned()];
+    if let Some(settings) = &settings {
+        changed_fields
+            .extend(["enabled", "concurrency_limit", "weight", "groups"].map(str::to_owned));
+        if settings.model_access.is_some() {
+            changed_fields.push("model_access".to_owned());
+        }
+        if settings.outbound_proxy.is_some() {
+            changed_fields.push("outbound_proxy".to_owned());
+        }
+        if settings.notes.is_some() {
+            changed_fields.push("notes".to_owned());
+        }
+    }
+    Ok(RotateProviderAccount {
+        settings,
+        scope,
+        profile: UpdateProviderAccount {
+            id: account_id.as_str().to_owned(),
+            name: prepared.name,
+            email: prepared.email,
+            plan_type: prepared.plan_type,
+        },
+        replacement_identity: prepared.replacement_identity,
+        credential: ProviderCredentialUpdate {
+            account_id: account_id.as_str().to_owned(),
+            expected_revision: store_revision(prepared.expected_credential_revision)?,
+            provider_credentials_json: provider_document_json(prepared.provider_material)
+                .map_err(|error| admin_store_error(ENTITY, error))?,
+            has_refresh_token: prepared.has_refresh_token,
+            access_token_expires_at: prepared.access_token_expires_at,
+            next_refresh_at: prepared.next_refresh_at,
+            preserve_profile: prepared.preserve_profile,
+            preserve_credential_state: prepared.preserve_credential_state,
+        },
+        audit: mutation_audit(
+            context,
+            action,
+            "provider_account",
+            account_id.as_str(),
+            changed_fields,
+        ),
+    })
+}
+
+pub(super) fn rotation_result(
+    rotation: ProviderAccountAdminRotation,
+    account_id: CoreProviderAccountId,
+) -> AdminStoreResult<CredentialMutationResult> {
+    Ok(CredentialMutationResult {
+        config_revision: admin_revision(rotation.config_revision)?,
+        account_id,
+        credential_revision: Some(admin_revision(rotation.credential_revision)?),
+    })
 }

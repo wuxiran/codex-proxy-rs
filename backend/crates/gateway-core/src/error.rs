@@ -28,6 +28,8 @@ pub enum ProviderErrorKind {
     Unauthorized,
     /// Credential 没有权限。
     PermissionDenied,
+    /// 冻结的请求策略在 Provider 发送前明确拒绝本次请求。
+    RequestPolicyDenied,
     /// Provider 限流。
     RateLimited,
     /// Credential 配额耗尽。
@@ -69,6 +71,7 @@ impl ProviderErrorKind {
             Self::Unsupported => "unsupported",
             Self::Unauthorized => "unauthorized",
             Self::PermissionDenied => "permission_denied",
+            Self::RequestPolicyDenied => "request_policy_denied",
             Self::RateLimited => "rate_limited",
             Self::QuotaExhausted => "quota_exhausted",
             Self::AccountCapacityUnavailable => "account_capacity_unavailable",
@@ -131,6 +134,11 @@ pub enum PreDeliveryRetry {
         retry_index: NonZeroU32,
         /// 发起下一次传输尝试前的退避时长。
         delay: Duration,
+    },
+    /// 可靠 NotSent 的建连恢复；次数与时间由 Core 的请求级预算裁决。
+    SameAccountConnectionRetry {
+        /// Provider 明确指定实际失败的传输，避免 HTTP 恢复重新进入 WS。
+        transport: crate::engine::AttemptTransport,
     },
     /// 固定本次账号，并要求 Provider 使用备用传输。
     SameAccountTransportFallback,
@@ -622,6 +630,14 @@ impl ProviderError {
         }));
     }
 
+    #[must_use]
+    pub fn with_connection_retry(mut self, transport: crate::engine::AttemptTransport) -> Self {
+        self.pre_delivery_retry = Some(Box::new(PreDeliveryRetry::SameAccountConnectionRetry {
+            transport,
+        }));
+        self
+    }
+
     /// 要求 Core 在账号凭据已恢复后仅对原账号重放一次。
     #[must_use]
     pub const fn with_same_account_retry(mut self) -> Self {
@@ -1086,6 +1102,10 @@ impl GatewayError {
             ProviderErrorKind::Unauthorized | ProviderErrorKind::PermissionDenied => Self::new(
                 GatewayErrorKind::UpstreamUnavailable,
                 "upstream authentication resource is unavailable",
+            ),
+            ProviderErrorKind::RequestPolicyDenied => Self::new(
+                GatewayErrorKind::PolicyDenied,
+                "request policy rejected the request",
             ),
             ProviderErrorKind::RateLimited | ProviderErrorKind::QuotaExhausted => Self::new(
                 GatewayErrorKind::RateLimited,

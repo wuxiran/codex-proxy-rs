@@ -1,3 +1,4 @@
+import type { AuthSession } from '@/api'
 import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '@/stores/modules/auth'
@@ -8,6 +9,13 @@ export const router = createRouter({
   routes,
 })
 
+function resolveRoleEntry(role: AuthSession['role']) {
+  const entry = router.getRoutes().find(route => route.meta.role === role && route.meta.defaultEntry)
+  if (!entry)
+    throw new Error(`未配置 ${role} 身份的默认入口`)
+  return { path: entry.path }
+}
+
 router.beforeEach(async (to) => {
   // 密链导入页不属于任何登录身份，既不恢复会话也不跳转登录。
   if (to.name === 'public-import')
@@ -16,13 +24,21 @@ router.beforeEach(async (to) => {
   const authStore = useAuthStore()
 
   // 登录页不依赖会话恢复；只使用当前已知身份决定是否跳转。
-  if (to.name === 'login') {
-    if (authStore.isAuthenticated)
-      return { name: authStore.isAdmin ? 'dashboard' : 'key-usage' }
+  if (to.meta.guestOnly) {
+    if (authStore.session)
+      return resolveRoleEntry(authStore.session.role)
     return
   }
 
-  const login = { name: 'login', query: { redirect: to.fullPath } }
+  const requiredRole = to.meta.role
+  if (!requiredRole)
+    return
+
+  const login = {
+    name: 'login',
+    query: { redirect: to.fullPath },
+    state: { loginMode: requiredRole },
+  }
 
   if (!authStore.sessionChecked) {
     try {
@@ -34,12 +50,10 @@ router.beforeEach(async (to) => {
     }
   }
 
-  if (!authStore.isAuthenticated)
-    return { ...login, state: { loginMode: to.name === 'key-usage' ? 'key' : 'admin' } }
+  if (!authStore.session)
+    return login
 
   // 两种身份各自进入独立页面，Key 不挂载会请求管理接口的布局。
-  if (!authStore.isAdmin && to.name !== 'key-usage')
-    return { name: 'key-usage' }
-  if (authStore.isAdmin && to.name === 'key-usage')
-    return { name: 'dashboard' }
+  if (authStore.session.role !== requiredRole)
+    return resolveRoleEntry(authStore.session.role)
 })

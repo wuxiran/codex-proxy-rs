@@ -106,6 +106,8 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
     let ipv6: Option<String> = row.try_get("last_test_ipv6").map_err(|_| invalid())?;
     let latency: Option<i64> = row.try_get("last_test_latency_ms").map_err(|_| invalid())?;
     Ok(ProxyRecord {
+        auto_location: row.try_get("auto_location").map_err(|_| invalid())?,
+        detected_location: detected_location_from_row(&row)?,
         location: location_from_row(&row)?,
         id: row.try_get("id").map_err(|_| invalid())?,
         name: row.try_get("name").map_err(|_| invalid())?,
@@ -128,6 +130,12 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
         last_test: success
             .map(|success| -> StoreResult<_> {
                 Ok(ProxyTestResult {
+                    location: row
+                        .try_get::<sqlx::types::Json<ProxyLocationDetection>, _>(
+                            "last_location_detection_json",
+                        )
+                        .map_err(|_| invalid())?
+                        .0,
                     success,
                     latency_ms: u64::try_from(latency.ok_or_else(invalid)?)
                         .map_err(|_| invalid())?,
@@ -278,9 +286,8 @@ fn quality_report_from_document(
     })
 }
 
-/// 连通性结果的五个基础列之后依次绑定地区四列；失败结果的地区恒为空以满足表约束。
-// 父表 outbound_proxies 只保连通性 + 上游双栈列；geo（country/code/region/city）迁子表，见 upsert_test_geo。
-const RECORD_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_ipv4 = $6, last_test_ipv6 = $7, last_test_message = $8";
+// 父表 outbound_proxies 只保连通性 + 上游双栈列（普通测试由 save_test 写入）；
+// geo（country/code/region/city）迁子表，见 upsert_test_geo。
 // 质量检测复用连通性基础探测，但 ProxyQualityReport 不携带双栈地址；用 coalesce 保留上次测得的
 // last_test_ipv4/ipv6，避免「先普通测试拿到双栈、再点质量检测把双栈清空」的回归。
 const RECORD_QUALITY_TEST_SET: &str = "last_test_at = now(), last_test_success = $3, last_test_latency_ms = $4,      last_test_ip = $5, last_test_ipv4 = coalesce($6, last_test_ipv4), last_test_ipv6 = coalesce($7, last_test_ipv6), last_test_message = $8";
@@ -366,6 +373,69 @@ pub(crate) fn location_from_row(
             .map_err(|_| invalid())
         })
         .transpose()
+}
+
+fn detected_location_from_row(row: &PgRow) -> StoreResult<Option<DetectedProxyLocation>> {
+    let detected = row
+        .try_get::<Option<sqlx::types::Json<DetectedProxyLocation>>, _>("detected_location_json")
+        .map_err(|_| invalid())?
+        .map(|value| value.0);
+    if let Some(value) = &detected {
+        value.location.validate().map_err(|_| invalid())?;
+    }
+    Ok(detected)
+}
+
+pub(crate) fn effective_location_from_row(
+    row: &PgRow,
+) -> StoreResult<Option<gateway_core::account::RequestLocation>> {
+    if row
+        .try_get::<Option<bool>, _>("auto_location")
+        .map_err(|_| invalid())?
+        .unwrap_or(false)
+    {
+        Ok(detected_location_from_row(row)?.map(|value| value.location))
+    } else {
+        location_from_row(row)
+    }
+}
+
+async fn transaction_record(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: &str,
+) -> StoreResult<ProxyRecord> {
+    let mut builder = QueryBuilder::<Postgres>::new(SELECT);
+    builder
+        .push(" where p.id = ")
+        .push_bind(id)
+        .push(" for update of p");
+    let row = builder
+        .build()
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(|| conflict(id))?;
+    record(row)
+}
+
+async fn save_test(
+    transaction: &mut Transaction<'_, Postgres>,
+    current: &ProxyRecord,
+    result: ProxyTestResult,
+) -> StoreResult<()> {
+    let detected = current.detected_location_after_test(&result);
+    if let Some(value) = &detected {
+        value.location.validate().map_err(|_| invalid())?;
+    }
+    sqlx::query("update outbound_proxies set last_test_at = now(), last_test_success = $2, last_test_latency_ms = $3,
+        last_test_ip = $4, last_test_ipv4 = $5, last_test_ipv6 = $6, last_test_message = $7,
+        last_location_detection_json = $8, detected_location_json = $9 where id = $1")
+        .bind(&current.id).bind(result.success).bind(i64::try_from(result.latency_ms).map_err(|_| invalid())?)
+        .bind(result.exit_ip.map(|ip| ip.to_string())).bind(result.exit_ipv4.map(|ip| ip.to_string()))
+        .bind(result.exit_ipv6.map(|ip| ip.to_string())).bind(result.message)
+        .bind(sqlx::types::Json(result.location)).bind(detected.map(sqlx::types::Json))
+        .execute(&mut **transaction).await.map_err(|_| unavailable())?;
+    Ok(())
 }
 
 async fn save_location(
@@ -748,12 +818,30 @@ impl ProxyStore for PgProxyRepository {
         save_location(&mut transaction, &id, command.location.as_ref())
             .await
             .map_err(store_error)?;
+        sqlx::query("update outbound_proxies set auto_location = $2 where id = $1")
+            .bind(&id)
+            .bind(command.auto_location)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| store_error(unavailable()))?;
+        if let Some(test) = command.test {
+            let current = transaction_record(&mut transaction, &id)
+                .await
+                .map_err(store_error)?;
+            // fork：出口地区写子表，与 record_test 一致。
+            upsert_test_geo(&mut transaction, &id, &test)
+                .await
+                .map_err(store_error)?;
+            save_test(&mut transaction, &current, test)
+                .await
+                .map_err(store_error)?;
+        }
         audit(
             &mut transaction,
             context,
             "create",
             &id,
-            &["name", "proxy_url", "location"],
+            &["name", "proxy_url", "location", "auto_location"],
             revision,
         )
         .await
@@ -813,6 +901,9 @@ impl ProxyStore for PgProxyRepository {
         }
         let changed = sqlx::query(
             "update outbound_proxies set name = $3, proxy_url = coalesce($4, proxy_url), revision = revision + 1, updated_at = now(),
+             auto_location = coalesce($5, auto_location),
+             detected_location_json = case when ($4 is not null and $4 <> proxy_url) or ($5 is not null and $5 <> auto_location) then null else detected_location_json end,
+             last_location_detection_json = case when ($4 is not null and $4 <> proxy_url) or ($5 is not null and $5 <> auto_location) then '{\"status\":\"notRequested\"}'::jsonb else last_location_detection_json end,
              last_test_at = case when $4 is not null and $4 <> proxy_url then null else last_test_at end,
              last_test_success = case when $4 is not null and $4 <> proxy_url then null else last_test_success end,
              last_test_latency_ms = case when $4 is not null and $4 <> proxy_url then null else last_test_latency_ms end,
@@ -822,13 +913,25 @@ impl ProxyStore for PgProxyRepository {
              last_test_message = case when $4 is not null and $4 <> proxy_url then null else last_test_message end
              where id = $1 and revision = $2")
             .bind(&command.id).bind(i64::try_from(command.revision.get()).map_err(|_| store_error(invalid()))?)
-            .bind(&command.name).bind(command.proxy.as_ref().map(OutboundProxy::expose_url))
+            .bind(&command.name).bind(command.proxy.as_ref().map(OutboundProxy::expose_url)).bind(command.auto_location)
             .execute(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
         if changed.rows_affected() != 1 {
             return Err(store_error(conflict(&command.id)));
         }
         if let Some(location) = &command.location {
             save_location(&mut transaction, &command.id, location.as_ref())
+                .await
+                .map_err(store_error)?;
+        }
+        if let Some(test) = command.test {
+            let current = transaction_record(&mut transaction, &command.id)
+                .await
+                .map_err(store_error)?;
+            // fork：出口地区写子表，与 record_test 一致。
+            upsert_test_geo(&mut transaction, &command.id, &test)
+                .await
+                .map_err(store_error)?;
+            save_test(&mut transaction, &current, test)
                 .await
                 .map_err(store_error)?;
         }
@@ -839,11 +942,7 @@ impl ProxyStore for PgProxyRepository {
             context,
             "update",
             &command.id,
-            if command.location.is_some() {
-                &["name", "proxy_url", "location"]
-            } else {
-                &["name", "proxy_url"]
-            },
+            &["name", "proxy_url", "location", "auto_location"],
             revision,
         )
         .await
@@ -916,7 +1015,7 @@ impl ProxyStore for PgProxyRepository {
         revision: AdminRevision,
         result: ProxyTestResult,
         context: &MutationContext,
-    ) -> AdminStoreResult<ProxyRecord> {
+    ) -> AdminStoreResult<ProxyMutation> {
         let mut transaction = self
             .pool
             .begin()
@@ -925,53 +1024,74 @@ impl ProxyStore for PgProxyRepository {
         exclude_active_imports(&mut transaction, id)
             .await
             .map_err(store_error)?;
-        let statement = format!(
-            "update outbound_proxies set {RECORD_TEST_SET} where id = $1 and revision = $2"
-        );
-        let query = sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(id)
-            .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?);
-        let updated = bind_test_result(query, &result)
-            .map_err(store_error)?
-            .execute(&mut *transaction)
+        // 与配置编辑保持一致的锁顺序，检测结果只有生效位置变化时才推进全局版本。
+        let config_revision: i64 = sqlx::query_scalar(
+            "select config_revision from runtime_settings where id = 1 for update",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| store_error(unavailable()))?;
+        let current = transaction_record(&mut transaction, id)
             .await
-            .map_err(|_| store_error(unavailable()))?;
-        if updated.rows_affected() != 1 {
+            .map_err(store_error)?;
+        if current.revision != revision {
+            // Drop 只排队回滚，返回冲突前需释放事务锁，避免误挡紧接着的编辑。
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| store_error(unavailable()))?;
             return Err(store_error(conflict(id)));
         }
-        // 出口地区写子表（连通性+双栈已写父表）；两组数据在同一事务里一起前进。
+        // fork：出口地区写子表（连通性+双栈由 save_test 写父表）；两组数据在同一事务里一起前进。
         upsert_test_geo(&mut transaction, id, &result)
             .await
             .map_err(store_error)?;
-        // 按出口自动设时区：测试成功且地理服务给出 IANA 时区时，用出口地理回填代理的
-        // 请求位置（国家/地区/城市/时区），让绑定该代理的每个账号自动继承正确上游时区。
-        if let Some(geo) = result.exit_geo.as_ref().filter(|_| result.success)
-            && let Some(timezone) = geo.timezone.as_deref()
-            && let Some(location) = gateway_core::account::RequestLocation::from_geo(
-                &geo.country_code,
-                geo.region.as_deref(),
-                geo.city.as_deref(),
-                timezone,
-            )
-        {
-            save_location(&mut transaction, id, Some(&location))
+        // fork：手动位置模式下按出口地理自动回填请求位置（国家/地区/城市/时区），让绑定该代理的
+        // 账号自动继承正确上游时区；自动位置模式由上游的出口位置探测（detected_location）接管。
+        let geo_location = result
+            .exit_geo
+            .as_ref()
+            .filter(|_| result.success && !current.auto_location)
+            .and_then(|geo| {
+                gateway_core::account::RequestLocation::from_geo(
+                    &geo.country_code,
+                    geo.region.as_deref(),
+                    geo.city.as_deref(),
+                    geo.timezone.as_deref()?,
+                )
+            })
+            .filter(|location| current.location.as_ref() != Some(location));
+        save_test(&mut transaction, &current, result)
+            .await
+            .map_err(store_error)?;
+        if let Some(location) = geo_location.as_ref() {
+            save_location(&mut transaction, id, Some(location))
                 .await
                 .map_err(store_error)?;
         }
-        let current: i64 =
-            sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|_| store_error(unavailable()))?;
-        let current = Revision::new(u64::try_from(current).map_err(|_| store_error(invalid()))?)
+        // fork 的地理回填沿用原语义不推进代理 revision；生效位置变化仍会推进全局配置版本（见下）。
+        if current.auto_location {
+            sqlx::query("update outbound_proxies set revision = revision + 1, updated_at = now() where id = $1")
+                .bind(id).execute(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
+        }
+        let updated = transaction_record(&mut transaction, id)
+            .await
             .map_err(store_error)?;
+        let revision = if current.effective_location() != updated.effective_location() {
+            bump_config_revision_in_transaction(&mut transaction)
+                .await
+                .map_err(store_error)?
+        } else {
+            Revision::new(u64::try_from(config_revision).map_err(|_| store_error(invalid()))?)
+                .map_err(store_error)?
+        };
         audit(
             &mut transaction,
             context,
             "test",
             id,
-            &["last_test"],
-            current,
+            &["last_test", "detected_location"],
+            revision,
         )
         .await
         .map_err(store_error)?;
@@ -979,7 +1099,10 @@ impl ProxyStore for PgProxyRepository {
             .commit()
             .await
             .map_err(|_| store_error(unavailable()))?;
-        self.get(id).await
+        Ok(ProxyMutation {
+            config_revision: admin_revision(revision)?,
+            record: updated,
+        })
     }
 
     async fn record_quality(
@@ -1004,6 +1127,8 @@ impl ProxyStore for PgProxyRepository {
             .ok_or_else(|| store_error(invalid()))?;
         // 质量检测的第一项就是一次完整的连通性测试，两组列必须在同一事务里一起前进。
         let test = ProxyTestResult {
+            // 质量检测不做位置探测，也不改写 last_location_detection_json。
+            location: ProxyLocationDetection::NotRequested,
             success: base.status == ProxyQualityItemStatus::Pass,
             latency_ms: base.latency_ms.unwrap_or_default(),
             exit_ip: report.exit_ip,

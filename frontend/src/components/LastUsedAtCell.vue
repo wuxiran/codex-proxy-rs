@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 
 import { useUiClock } from '@/composables/useUiClock'
-import { formatDateTime, formatRelativeTime } from '@/utils/date'
+import { formatDateTime, formatRelativeTime } from '@/utils/format'
 
 const props = defineProps<{
   value: string | null

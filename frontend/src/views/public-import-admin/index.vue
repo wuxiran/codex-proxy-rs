@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
+import { BasePageHeader } from '@codex-proxy/ui'
 import PublicImportCard from '@/views/settings/components/PublicImportCard.vue'
 </script>
 

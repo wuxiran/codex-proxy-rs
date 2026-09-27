@@ -55,6 +55,10 @@ where
         )
         .route("/api/admin/accounts/models", get(account_models::<S>))
         .route(
+            "/api/admin/accounts/models/catalog",
+            get(account_model_catalog::<S>),
+        )
+        .route(
             "/api/admin/accounts/models/refresh",
             post(refresh_account_models::<S>),
         )
@@ -192,17 +196,14 @@ where
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .import_document(command)
-                .await
-        }
-        AccountProvider::Xai => state.admin_services().xai().import_document(command).await,
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .import_document(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
         AdminEnvelope::ok(AccountImportData::from_result(result)),
@@ -220,23 +221,14 @@ where
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .start_authorization(command)
-                .await
-        }
-        AccountProvider::Xai => {
-            state
-                .admin_services()
-                .xai()
-                .start_authorization(command)
-                .await
-        }
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .start_authorization(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::CREATED,
         AdminEnvelope::ok(AccountAuthorizationData::from(result)),
@@ -254,48 +246,14 @@ where
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => {
-            state
-                .admin_services()
-                .openai()
-                .complete_authorization(command)
-                .await
-        }
-        AccountProvider::Xai => {
-            state
-                .admin_services()
-                .xai()
-                .complete_authorization(command)
-                .await
-        }
-    }
-    .map_err(map_service_error)?;
-    Ok(AdminResponse::new(
-        StatusCode::CREATED,
-        AdminEnvelope::ok(AccountMutationData::from(result)),
-    ))
-}
-
-async fn rotate_account<S>(
-    auth: AdminAuth,
-    State(state): State<S>,
-    AdminJson(request): AdminJson<RotateAccountRequest>,
-) -> Result<impl IntoResponse, AdminError>
-where
-    S: SessionState + Send + Sync,
-{
-    let command = request
-        .into_command(auth.context().mutation_context())
-        .map_err(map_wire_error)?;
     let result = state
         .admin_services()
-        .openai()
-        .rotate(command)
+        .credentials()
+        .complete_authorization(&provider, command)
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
-        StatusCode::OK,
+        StatusCode::CREATED,
         AdminEnvelope::ok(AccountMutationData::from(result)),
     ))
 }
@@ -360,8 +318,11 @@ where
         .ticket_restore_material(&account_id)
         .await
         .map_err(map_service_error)?;
+    let provider = ProviderKind::new("openai").map_err(|_| AdminError::internal())?;
     let result = services
-        .openai()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
         .rotate(RotateCredential {
             mutation: CredentialMutation {
                 context: auth.context().mutation_context(),
@@ -378,6 +339,33 @@ where
     ))
 }
 
+/// fork：手工换 OAuth token、观澜复活、钉 turn-state 与自动续期都经此入口（上游已移除 /rotate）。
+async fn rotate_account<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<RotateAccountRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let command = request
+        .into_command(auth.context().mutation_context())
+        .map_err(map_wire_error)?;
+    let provider = ProviderKind::new("openai").map_err(|_| AdminError::internal())?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .rotate(command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(AccountMutationData::from(result)),
+    ))
+}
+
 async fn update_account<S>(
     auth: AdminAuth,
     State(state): State<S>,
@@ -386,13 +374,39 @@ async fn update_account<S>(
 where
     S: SessionState + Send + Sync,
 {
-    let command = request.into_command().map_err(map_wire_error)?;
-    let result = state
-        .admin_services()
-        .accounts()
-        .update(&auth.context().mutation_context(), command)
-        .await
-        .map_err(map_service_error)?;
+    let (command, connection) = request.into_command().map_err(map_wire_error)?;
+    let context = auth.context().mutation_context();
+    let result = if let Some(provider_material) = connection {
+        let provider = ProviderKind::new("openai").map_err(|_| AdminError::internal())?;
+        let account_id = ProviderAccountId::new(command.account_id.clone())
+            .map_err(|_| AdminError::internal())?;
+        let result = state
+            .admin_services()
+            .credentials()
+            .for_provider(&provider)
+            .map_err(map_service_error)?
+            .rotate(RotateCredential {
+                mutation: CredentialMutation {
+                    context,
+                    account_id,
+                },
+                settings: Some(command),
+                provider_material,
+            })
+            .await
+            .map_err(map_service_error)?;
+        AccountUpdateResult {
+            account_id: result.account_id,
+            config_revision: result.config_revision,
+        }
+    } else {
+        state
+            .admin_services()
+            .accounts()
+            .update(&context, command)
+            .await
+            .map_err(map_service_error)?
+    };
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(UpdatedAccountData::from(result)),
@@ -410,11 +424,14 @@ where
     let (provider, command) = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
-    let result = match provider {
-        AccountProvider::OpenAi => state.admin_services().openai().delete(command).await,
-        AccountProvider::Xai => state.admin_services().xai().delete(command).await,
-    }
-    .map_err(map_service_error)?;
+    let result = state
+        .admin_services()
+        .credentials()
+        .for_provider(&provider)
+        .map_err(map_service_error)?
+        .delete(command)
+        .await
+        .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(AccountDeletionData::from(result)),
@@ -664,6 +681,25 @@ where
         .await
         .map_err(map_service_error)?;
     let data = account_models_data(result);
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+async fn account_model_catalog<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<AccountIdQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let account_id = query.into_id().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .accounts()
+        .model_catalog_document(&account_id)
+        .await
+        .map_err(map_service_error)?;
+    let data = AccountModelCatalogData::try_from(result).map_err(|_| AdminError::internal())?;
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
 

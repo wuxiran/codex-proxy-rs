@@ -1,14 +1,14 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
+import type { AccountModelAccess, ApiKeyConfiguration, getAccounts, OAuthStateConfiguration, TurnStateAutoHunt, TurnStateCaptureRule, TurnStatePinStatus } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
-import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountTurnState } from '@/api'
-import { toast } from '@/components/base/BaseToast'
+import { getAccountDetail, updateAccount, updateAccountTurnState } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
 import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
-import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
+import { apiKeyAccountError, emptyApiKeyAccountForm, isOpenAiApiKeyAccount, isOpenAiOAuthAccount, parseApiKeyConfiguration } from '../utils/upstreamApiKey'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
@@ -40,6 +40,8 @@ export function useAccountEditor(options: {
   const configurationLoading = configurationRequest.loading
   const configurationReady = shallowRef(false)
   const savedConfiguration = shallowRef<ApiKeyConfiguration>()
+  const oauthTransport = shallowRef<ApiKeyConfiguration['transport']>('prefer_websocket')
+  const savedOAuthTransport = shallowRef<ApiKeyConfiguration['transport']>('prefer_websocket')
 
   async function loadConfiguration(accountId: string) {
     const requestId = configurationRequest.start()
@@ -47,20 +49,32 @@ export function useAccountEditor(options: {
       const detail = await getAccountDetail({ accountId }, { signal: configurationRequest.signal })
       if (!configurationRequest.isCurrent(requestId))
         return
-      const configuration = detail.credentialConfiguration
+      if (isOpenAiOAuthAccount(detail.account)) {
+        const configuration = detail.credentialConfiguration
+        const transport = configuration?.transport
+        // fork：OAuth 账号的上游设置同时携带「固定自身 state」状态。
+        const state = oauthStateConfiguration(configuration)
+        if (transport !== 'http' && transport !== 'prefer_websocket' && !state)
+          throw new Error('该账号没有 OAuth 上游设置')
+        if (transport === 'http' || transport === 'prefer_websocket') {
+          oauthTransport.value = transport
+          savedOAuthTransport.value = transport
+        }
+        if (state) {
+          pinTurnState.value = state.pinTurnState
+          savedPinTurnState.value = state.pinTurnState
+          turnStatePins.value = state.turnStatePins
+          turnStateCaptureRule.value = state.turnStateCaptureRule ?? null
+          turnStateAutoHunt.value = state.turnStateAutoHunt ?? null
+        }
+        configurationReady.value = true
+        return
+      }
+      const configuration = parseApiKeyConfiguration(detail.credentialConfiguration)
       if (!configuration)
-        throw new Error('该账号没有可读取的上游设置')
-      if ('pinTurnState' in configuration) {
-        pinTurnState.value = configuration.pinTurnState
-        savedPinTurnState.value = configuration.pinTurnState
-        turnStatePins.value = configuration.turnStatePins
-        turnStateCaptureRule.value = configuration.turnStateCaptureRule ?? null
-        turnStateAutoHunt.value = configuration.turnStateAutoHunt ?? null
-      }
-      else {
-        apiKey.value = { ...emptyApiKeyAccountForm(), ...configuration }
-        savedConfiguration.value = configuration
-      }
+        throw new Error('该账号没有 API Key 上游设置')
+      apiKey.value = { ...emptyApiKeyAccountForm(), ...configuration }
+      savedConfiguration.value = configuration
       configurationReady.value = true
     }
     catch (error) {
@@ -137,10 +151,12 @@ export function useAccountEditor(options: {
     modelAccess.value = { ...account.modelAccess, models: [...account.modelAccess.models] }
     selectedGroupIds.value = account.groups.map(group => group.id)
     apiKey.value = emptyApiKeyAccountForm()
+    oauthTransport.value = 'prefer_websocket'
+    savedOAuthTransport.value = 'prefer_websocket'
     savedConfiguration.value = undefined
     configurationReady.value = false
     showEditModal.value = true
-    if (account.provider === 'openai')
+    if (isOpenAiApiKeyAccount(account) || isOpenAiOAuthAccount(account))
       void loadConfiguration(account.id)
   }
 
@@ -148,11 +164,11 @@ export function useAccountEditor(options: {
     const accountId = editingAccountId.value
     if (!accountId || saving.value)
       return
-    const isOpenAi = editingAccount.value?.provider === 'openai'
-    const isApiKey = editingAccount.value?.authenticationKind === 'api_key'
+    const isApiKey = isOpenAiApiKeyAccount(editingAccount.value)
+    const isOAuth = isOpenAiOAuthAccount(editingAccount.value)
+    if (isApiKey && !configurationReady.value)
+      return
     if (isApiKey) {
-      if (!configurationReady.value)
-        return
       const error = apiKeyAccountError(apiKey.value, true)
       if (error) {
         toast.warning(error)
@@ -190,18 +206,24 @@ export function useAccountEditor(options: {
         || apiKey.value.base_url.trim() !== savedConfiguration.value?.base_url
         || apiKey.value.transport !== savedConfiguration.value?.transport
       )
-      if (connectionChanged) {
-        await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
-      }
-      else if (isOpenAi && !isApiKey && configurationReady.value && (pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value)) {
+      const connection = connectionChanged
+        ? { baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined }
+        : isOAuth && configurationReady.value && oauthTransport.value !== savedOAuthTransport.value
+          ? { transport: oauthTransport.value }
+          : undefined
+      // fork：「固定自身 state」开关走独立接口；没有连接变更时它顺带写入本次账号设置。
+      const turnStateChanged = isOAuth && configurationReady.value && (pinTurnState.value !== savedPinTurnState.value || recaptureTurnState.value)
+      if (turnStateChanged && !connection) {
         await updateAccountTurnState({ accountId, pinTurnState: pinTurnState.value, settings })
       }
       else {
-        await updateAccount(settings)
+        await updateAccount({ ...settings, connection })
+        if (turnStateChanged)
+          await updateAccountTurnState({ accountId, pinTurnState: pinTurnState.value })
       }
       showEditModal.value = false
-      await Promise.all([options.reloadAccounts(), options.reloadGroups()])
       toast.success('账号已更新')
+      void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
     })
   }
 
@@ -210,6 +232,8 @@ export function useAccountEditor(options: {
       return
     configurationRequest.invalidate()
     apiKey.value = emptyApiKeyAccountForm()
+    oauthTransport.value = 'prefer_websocket'
+    savedOAuthTransport.value = 'prefer_websocket'
     savedConfiguration.value = undefined
     configurationReady.value = false
     editingAccountId.value = null
@@ -234,6 +258,7 @@ export function useAccountEditor(options: {
     recaptureTurnState,
     turnStatePins,
     turnStateCaptureRule,
+    oauthTransport,
     configurationLoading,
     configurationReady,
     showEditModal,
@@ -250,4 +275,11 @@ export function useAccountEditor(options: {
     open,
     save,
   }
+}
+
+/** fork：OAuth 账号详情里的「固定自身 state」状态；旧后端或非 OpenAI OAuth 账号没有这些字段。 */
+function oauthStateConfiguration(value: Record<string, unknown> | undefined): OAuthStateConfiguration | null {
+  return value && typeof value.pinTurnState === 'boolean' && Array.isArray(value.turnStatePins)
+    ? value as unknown as OAuthStateConfiguration
+    : null
 }

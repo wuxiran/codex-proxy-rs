@@ -166,7 +166,10 @@ impl CodexWebSocketPool {
 
     /// 某账号当前已占用的保活 slot 序号集合（空闲的保活连接）。warmer 据此挑**空闲序号**补齐、
     /// 挑**已占用序号**复探，避免用「计数」当序号导致反复复探同一条、永不补满。
-    pub(crate) fn warm_slots_for_account(&self, account_id: &str) -> std::collections::BTreeSet<usize> {
+    pub(crate) fn warm_slots_for_account(
+        &self,
+        account_id: &str,
+    ) -> std::collections::BTreeSet<usize> {
         let state = self.lock_state();
         state
             .slots

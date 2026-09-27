@@ -29,12 +29,19 @@ use super::{
 
 /// 客户端模型到上游模型的全局精确映射。
 pub type ModelMappings = BTreeMap<String, String>;
+pub type ProviderRequestProfiles = BTreeMap<String, serde_json::Map<String, serde_json::Value>>;
+pub type ProviderRequestProfileUpdates =
+    BTreeMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
 
 /// 运行配置投影与设置页字段的聚合响应。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsView {
+    pub smart_scheduling_defaults: gateway_core::account::SmartSchedulingConfig,
+    pub provider_request_profiles: ProviderRequestProfiles,
+    /// 固定兼容字段；值始终从 provider_request_profiles 派生。
     pub openai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 固定兼容字段；值始终从 provider_request_profiles 派生。
     pub xai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -47,6 +54,7 @@ pub struct RuntimeSettingsView {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub responses_max_decompressed_body_bytes: u64,
+    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -62,6 +70,9 @@ pub struct RuntimeSettingsView {
     pub account_auto_freeze_adaptive_concurrency: bool,
     pub request_log_enabled: bool,
     pub request_log_test_key_id: Option<String>,
+    pub account_warmup_enabled: bool,
+    pub account_warmup_schedule_time: String,
+    pub account_warmup_model: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -69,8 +80,12 @@ pub struct RuntimeSettingsView {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRuntimeSettingsRequest {
+    #[serde(default)]
+    pub provider_request_profiles: ProviderRequestProfileUpdates,
+    /// 兼容既有 wire；与泛化字段冲突时拒绝整个请求。
     #[serde(default, deserialize_with = "deserialize_profile_update")]
     pub openai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 兼容既有 wire；与泛化字段冲突时拒绝整个请求。
     #[serde(default, deserialize_with = "deserialize_profile_update")]
     pub xai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
     pub request_location_enabled: bool,
@@ -84,6 +99,7 @@ pub struct UpdateRuntimeSettingsRequest {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub responses_max_decompressed_body_bytes: u64,
+    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
@@ -101,6 +117,9 @@ pub struct UpdateRuntimeSettingsRequest {
     pub request_log_enabled: bool,
     #[serde(default)]
     pub request_log_test_key_id: Option<String>,
+    pub account_warmup_enabled: bool,
+    pub account_warmup_schedule_time: String,
+    pub account_warmup_model: Option<String>,
 }
 
 impl UpdateRuntimeSettingsRequest {
@@ -180,18 +199,27 @@ impl UpdateRuntimeSettingsRequest {
             self.account_auto_freeze_probe_model.as_deref(),
             "accountAutoFreezeProbeModel",
         )?;
+        if !gateway_core::provider_ports::valid_warmup_schedule_time(
+            &self.account_warmup_schedule_time,
+        ) {
+            return Err(WireValidationError::new("accountWarmupScheduleTime"));
+        }
+        validate_optional_probe_model(self.account_warmup_model.as_deref(), "accountWarmupModel")?;
+        if self.account_warmup_enabled && self.account_warmup_model.is_none() {
+            return Err(WireValidationError::new("accountWarmupModel"));
+        }
         Ok(())
     }
 
     fn into_command(self) -> Result<ReplaceRuntimeSettings, WireValidationError> {
         self.validate()?;
+        let request_profile_updates = normalize_request_profile_updates(
+            self.provider_request_profiles,
+            self.openai_client_profile,
+            self.xai_client_profile,
+        )?;
         Ok(ReplaceRuntimeSettings {
-            openai_client_profile: self
-                .openai_client_profile
-                .map(gateway_core::account::OpaqueProviderData::new),
-            xai_client_profile: self
-                .xai_client_profile
-                .map(gateway_core::account::OpaqueProviderData::new),
+            request_profile_updates,
             request_location_enabled: self.request_location_enabled,
             request_location: self
                 .request_location
@@ -208,6 +236,7 @@ impl UpdateRuntimeSettingsRequest {
             max_waiting_per_account: self.max_waiting_per_account,
             concurrency_wait_timeout_seconds: self.concurrency_wait_timeout_seconds,
             responses_max_decompressed_body_bytes: self.responses_max_decompressed_body_bytes,
+            smart_scheduling: self.smart_scheduling,
             rotation_strategy: RotationStrategy::parse(&self.rotation_strategy)
                 .ok_or_else(|| WireValidationError::new("rotationStrategy"))?,
             min_codex_desktop_version: self.min_codex_desktop_version,
@@ -231,19 +260,24 @@ impl UpdateRuntimeSettingsRequest {
                 .request_log_test_key_id
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
+            account_warmup_enabled: self.account_warmup_enabled,
+            account_warmup_schedule_time: self.account_warmup_schedule_time,
+            account_warmup_model: self.account_warmup_model,
         })
     }
 }
 
 impl From<RuntimeSettings> for RuntimeSettingsView {
     fn from(settings: RuntimeSettings) -> Self {
+        let provider_request_profiles = settings
+            .request_profiles
+            .into_iter()
+            .map(|(provider, profile)| (provider.as_str().to_owned(), profile.into_inner()))
+            .collect::<ProviderRequestProfiles>();
         Self {
-            openai_client_profile: settings
-                .openai_client_profile
-                .map(gateway_core::account::OpaqueProviderData::into_inner),
-            xai_client_profile: settings
-                .xai_client_profile
-                .map(gateway_core::account::OpaqueProviderData::into_inner),
+            openai_client_profile: provider_request_profiles.get("openai").cloned(),
+            xai_client_profile: provider_request_profiles.get("xai").cloned(),
+            provider_request_profiles,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
             model_mappings: wire_model_mappings(settings.model_mappings),
@@ -255,6 +289,8 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
             max_waiting_per_account: settings.max_waiting_per_account,
             concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
             responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
+            smart_scheduling: settings.smart_scheduling,
+            smart_scheduling_defaults: gateway_core::account::SmartSchedulingConfig::default(),
             rotation_strategy: settings.rotation_strategy.as_str().to_owned(),
             min_codex_desktop_version: settings.min_codex_desktop_version,
             min_codex_cli_version: settings.min_codex_cli_version,
@@ -271,6 +307,9 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
                 .account_auto_freeze_adaptive_concurrency,
             request_log_enabled: settings.request_log_enabled,
             request_log_test_key_id: settings.request_log_test_key_id,
+            account_warmup_enabled: settings.account_warmup_enabled,
+            account_warmup_schedule_time: settings.account_warmup_schedule_time,
+            account_warmup_model: settings.account_warmup_model,
             updated_at: settings.updated_at,
         }
     }
@@ -732,6 +771,7 @@ fn map_wire_error(error: WireValidationError) -> AdminError {
         "accountAutoFreezeWindowSeconds" => "账号自动冻结统计窗口应为 60～3600 秒".to_owned(),
         "accountAutoFreezeDurationSeconds" => "账号自动冻结时长应为 300～604800 秒".to_owned(),
         "accountAutoFreezeProbeModel" => "探测模型格式不合法".to_owned(),
+        "providerRequestProfiles" => "Provider 请求画像格式不合法或字段冲突".to_owned(),
         "minCodexDesktopVersion" => "Codex Desktop 最低版本格式不合法".to_owned(),
         "minCodexCliVersion" => "Codex CLI 最低版本格式不合法".to_owned(),
         field => format!("{field} 字段不合法"),
@@ -741,6 +781,43 @@ fn map_wire_error(error: WireValidationError) -> AdminError {
 
 fn map_service_error(error: gateway_admin::model::AdminError) -> AdminError {
     map_admin_service_error(error)
+}
+
+fn normalize_request_profile_updates(
+    profiles: ProviderRequestProfileUpdates,
+    openai: Option<serde_json::Map<String, serde_json::Value>>,
+    xai: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<gateway_admin::model::settings::ProviderRequestProfileUpdates, WireValidationError> {
+    let mut normalized = profiles
+        .into_iter()
+        .map(|(provider, profile)| {
+            if !matches!(provider.as_str(), "openai" | "xai") {
+                return Err(WireValidationError::new("providerRequestProfiles"));
+            }
+            let provider = gateway_core::routing::ProviderKind::new(provider)
+                .map_err(|_| WireValidationError::new("providerRequestProfiles"))?;
+            Ok((
+                provider,
+                profile.map(gateway_core::account::OpaqueProviderData::new),
+            ))
+        })
+        .collect::<Result<gateway_admin::model::settings::ProviderRequestProfileUpdates, _>>()?;
+    for (provider, profile) in [("openai", openai), ("xai", xai)] {
+        let Some(profile) = profile else {
+            continue;
+        };
+        let provider = gateway_core::routing::ProviderKind::new(provider)
+            .expect("static Provider kind is valid");
+        let profile = gateway_core::account::OpaqueProviderData::new(profile);
+        if normalized
+            .get(&provider)
+            .is_some_and(|current| current.as_ref() != Some(&profile))
+        {
+            return Err(WireValidationError::new("providerRequestProfiles"));
+        }
+        normalized.insert(provider, Some(profile));
+    }
+    Ok(normalized)
 }
 
 // 字段省略时保留已有配置；显式 null 不能清空唯一的通用默认。

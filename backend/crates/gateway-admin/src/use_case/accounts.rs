@@ -1,6 +1,9 @@
-//! 统一账号目录与跨 Provider 动态分派。
+//! 统一账号目录与原生 Provider 分派。
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -24,12 +27,15 @@ use crate::{
         observability::TimeRange,
         provider_credentials::{
             AccountConcurrency, AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle,
-            AccountPersonalInfo, AccountRecentErrors, AccountRefreshResult,
-            ConsumeProviderResetCredit, PrepareCredentialRefresh, ProviderModels,
-            ProviderProfileAvatar, ProviderQuota, ProviderQuotaRequest, ProviderQuotaWindow,
-            ProviderResetCreditResult, ProviderResetCredits, QuotaLocalUsageAttribution,
+            AccountPersonalInfo, AccountRecentErrors, AccountRefreshResult, AccountUsagePeriod,
+            ConsumeProviderResetCredit, PrepareCredentialRefresh, ProviderModelCatalogDocument,
+            ProviderModels, ProviderProfileAvatar, ProviderQuota, ProviderQuotaRequest,
+            ProviderQuotaWindow, ProviderResetCreditResult, ProviderResetCredits,
+            QuotaLocalUsageAttribution,
         },
-        quota_forecast::{AccountQuotaForecastReport, account_quota_forecasts},
+        quota_forecast::{
+            AccountQuotaForecastReport, account_quota_forecasts, quota_forecast_source_window,
+        },
         quota_forecast_sampling::{QuotaForecastPoint, select_forecast_sample},
     },
     ports::{
@@ -142,6 +148,11 @@ pub trait AccountsService: Send + Sync {
         account_id: &ProviderAccountId,
         refresh: bool,
     ) -> Result<ProviderModels, AdminError>;
+
+    async fn model_catalog_document(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderModelCatalogDocument, AdminError>;
 
     /// 云端打票（默认不支持）。
     async fn mint_turn_state(
@@ -277,23 +288,30 @@ impl DefaultAccountsService {
 
     /// 账号列表的并发列：实时占用来自 lease 存储，上限未单独设置时继承全局默认。
     /// 两者都只用于展示，任一读取失败只降级为未知，不影响列表。
+    /// `known_in_flight` 为调用方本页已读取的租约占用，避免同一页重复读取 lease 存储。
     async fn concurrency(
         &self,
         accounts: &[&crate::model::accounts::AccountRecord],
+        known_in_flight: Option<Option<BTreeMap<String, u64>>>,
     ) -> BTreeMap<String, AccountConcurrency> {
-        let ids = accounts
-            .iter()
-            .map(|account| account.id.clone())
-            .collect::<Vec<_>>();
-        let (runtime, settings) = futures::join!(
-            self.account_runtime.account_runtime(&ids),
-            self.settings.load_runtime_settings(),
-        );
-        let in_flight = match runtime {
-            Ok(runtime) => runtime.in_flight,
-            Err(error) => {
-                tracing::warn!(error = %error, "account concurrency in-flight is unavailable");
-                None
+        let settings = self.settings.load_runtime_settings();
+        let (in_flight, settings) = match known_in_flight {
+            Some(in_flight) => (in_flight, settings.await),
+            None => {
+                let ids = accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<Vec<_>>();
+                let (runtime, settings) =
+                    futures::join!(self.account_runtime.account_runtime(&ids), settings);
+                let in_flight = match runtime {
+                    Ok(runtime) => runtime.in_flight,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "account concurrency in-flight is unavailable");
+                        None
+                    }
+                };
+                (in_flight, settings)
             }
         };
         let default_limit = match settings {
@@ -385,7 +403,7 @@ impl DefaultAccountsService {
     ) -> Result<
         (
             AccountPageItem,
-            Arc<dyn crate::ports::provider::ProviderAdmin>,
+            std::sync::Arc<dyn crate::ports::provider::ProviderAdmin>,
         ),
         AdminError,
     > {
@@ -500,14 +518,25 @@ impl DefaultAccountsService {
             .await
             .map_err(|error| map_store_error(error, "rolling account usage"))?;
         let rolling_usage = rolling_usage.into_iter().next();
-        let mut quota = provider
+        let mut quota = match provider
             .quota(ProviderQuotaRequest {
                 account_id: account_id.clone(),
                 refresh: refresh_quota,
                 rolling_usage: rolling_usage.clone(),
             })
             .await
-            .map_err(|error| map_provider_error(error, "provider quota"))?;
+        {
+            Ok(quota) => quota,
+            // 凭据更新后的账号投影不要求 Provider 提供额度；显式刷新仍须支持该操作。
+            Err(error)
+                if !refresh_quota
+                    && error.kind()
+                        == crate::ports::provider::ProviderAdminErrorKind::Unsupported =>
+            {
+                empty_quota()
+            }
+            Err(error) => return Err(map_provider_error(error, "provider quota")),
+        };
         let mut stored = if refresh_quota {
             self.load_account(account_id).await?
         } else {
@@ -538,13 +567,13 @@ impl DefaultAccountsService {
             &usage_by_window,
         )
         .remove(&stored.account.id)
-            .or_else(|| {
-                quota
-                    .usage_window()
-                    .and_then(|(window, _)| window.local_usage.clone())
-            });
+        .or_else(|| {
+            quota
+                .usage_window()
+                .and_then(|(window, _)| window.local_usage.clone())
+        });
         let concurrency = self
-            .concurrency(&[&stored.account])
+            .concurrency(&[&stored.account], None)
             .await
             .remove(&stored.account.id)
             .unwrap_or_default();
@@ -554,6 +583,9 @@ impl DefaultAccountsService {
             .remove(&stored.account.id)
             .unwrap_or_default();
         Ok(AccountDirectoryItem {
+            capacity: stored.capacity,
+            capabilities: provider
+                .account_capabilities(account_id, &stored.account.authentication_kind),
             plan_type_display: self.providers.resolve_account_plan(
                 stored.account.provider_kind.as_str(),
                 &mut stored.account.plan_type,
@@ -577,6 +609,7 @@ impl DefaultAccountsService {
 #[async_trait]
 impl AccountsService for DefaultAccountsService {
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError> {
+        let providers = &self.providers;
         let runtime = self
             .account_runtime
             .active_rate_limits()
@@ -593,6 +626,18 @@ impl AccountsService for DefaultAccountsService {
             .iter()
             .map(|item| item.account.id.clone())
             .collect::<Vec<_>>();
+        // 只读取当前页的租约占用；观测失败不能把账号误报为空闲或拖垮目录。
+        let in_flight = if ids.is_empty() {
+            None
+        } else {
+            match self.account_runtime.account_runtime(&ids).await {
+                Ok(runtime) => runtime.in_flight,
+                Err(error) => {
+                    tracing::warn!(error = %error, "account capacity projection is unavailable");
+                    None
+                }
+            }
+        };
         // 用量投影走 SWR 缓存：命中即用（过期则后台重算），缺失才内联计算。
         let cache_key = ids.join("\n");
         let cached = self.usage_cache.get(&cache_key);
@@ -613,7 +658,7 @@ impl AccountsService for DefaultAccountsService {
                 .map_err(|_| AdminError::invalid("Provider 账号 ID 不合法"))?;
             // 单个账号的 quota 投影失败（Provider 未注册或 quota 读取失败）不拖垮整页：
             // 该账号降级为空额度投影，其余账号与页面状态照常返回。
-            let provider = match self.providers.require(&account.provider_kind) {
+            let provider = match providers.require(&account.provider_kind) {
                 Ok(provider) => provider,
                 Err(error) => {
                     tracing::warn!(
@@ -654,7 +699,9 @@ impl AccountsService for DefaultAccountsService {
             .unwrap_or_default();
         let missing = needed_windows
             .iter()
-            .filter(|query| !usage_by_window.contains_key(&usage_projection_cache::window_key(query)))
+            .filter(|query| {
+                !usage_by_window.contains_key(&usage_projection_cache::window_key(query))
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() {
@@ -701,6 +748,7 @@ impl AccountsService for DefaultAccountsService {
                     .iter()
                     .map(|item| &item.account)
                     .collect::<Vec<_>>(),
+                Some(in_flight.clone()),
             )
             .await;
         let mut recent_errors = self.recent_errors(rolling_range, &ids).await;
@@ -710,13 +758,28 @@ impl AccountsService for DefaultAccountsService {
             .into_iter()
             .zip(quotas)
             .map(|(mut item, quota)| {
+                let id = ProviderAccountId::new(item.account.id.clone())
+                    .map_err(|_| AdminError::invalid("Provider 账号 ID 不合法"))?;
+                let capabilities = providers
+                    .require(&item.account.provider_kind)
+                    .map(|provider| {
+                        provider.account_capabilities(&id, &item.account.authentication_kind)
+                    })
+                    .unwrap_or_default();
                 let usage = lifetime_usage.remove(&item.account.id).or_else(|| {
                     quota
                         .usage_window()
                         .and_then(|(window, _)| window.local_usage.clone())
                 });
-                AccountDirectoryItem {
-                    plan_type_display: self.providers.resolve_account_plan(
+                Ok(AccountDirectoryItem {
+                    capacity: crate::model::accounts::AccountCapacity {
+                        used_slots: in_flight
+                            .as_ref()
+                            .map(|counts| counts.get(&item.account.id).copied().unwrap_or(0)),
+                        ..item.capacity
+                    },
+                    capabilities,
+                    plan_type_display: providers.resolve_account_plan(
                         item.account.provider_kind.as_str(),
                         &mut item.account.plan_type,
                         Some(&quota),
@@ -728,9 +791,9 @@ impl AccountsService for DefaultAccountsService {
                     account: item.account,
                     projection: item.projection,
                     quota,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, AdminError>>()?;
         Ok(AccountDirectoryPage {
             config_revision: page.config_revision,
             items,
@@ -744,6 +807,7 @@ impl AccountsService for DefaultAccountsService {
         context: &MutationContext,
         account_ids: Vec<ProviderAccountId>,
     ) -> Result<AccountExportBundle, AdminError> {
+        let providers = &self.providers;
         if account_ids.is_empty() || account_ids.len() > 200 {
             return Err(AdminError::invalid("账号导出数量必须在 1 到 200 之间"));
         }
@@ -762,12 +826,18 @@ impl AccountsService for DefaultAccountsService {
         }) {
             return Err(AdminError::invalid("账号导出列表包含重复 ID"));
         }
-        let mut documents = Vec::with_capacity(grouped.len());
-        for (provider_kind, ids) in grouped {
-            let provider = self
-                .providers
-                .require(&provider_kind)
-                .map_err(|error| map_provider_error(error, "provider account export"))?;
+        // 混选时先确认全部 Provider 已注册，拒绝路径不读取任何一组明文凭据。
+        let export_groups = grouped
+            .into_iter()
+            .map(|(provider_kind, ids)| {
+                let provider = providers
+                    .require(&provider_kind)
+                    .map_err(|error| map_provider_error(error, "provider account export"))?;
+                Ok((provider_kind, provider, ids))
+            })
+            .collect::<Result<Vec<_>, AdminError>>()?;
+        let mut documents = Vec::with_capacity(export_groups.len());
+        for (provider_kind, provider, ids) in export_groups {
             let credentials = self
                 .accounts
                 .load_credentials_for_export(&provider_kind, &ids)
@@ -925,7 +995,7 @@ impl AccountsService for DefaultAccountsService {
         let mut providers = BTreeMap::<
             ProviderKind,
             (
-                Arc<dyn crate::ports::provider::ProviderAdmin>,
+                std::sync::Arc<dyn crate::ports::provider::ProviderAdmin>,
                 Vec<ProviderAccountId>,
             ),
         >::new();
@@ -989,7 +1059,15 @@ impl AccountsService for DefaultAccountsService {
             .map_err(|error| map_provider_error(error, "forecast quota snapshot"))?;
         let now = Utc::now();
         let mut samples = Vec::new();
-        for (window, _) in quota.usage_windows() {
+        let mut selected_keys = BTreeSet::new();
+        for period in [AccountUsagePeriod::Weekly, AccountUsagePeriod::Monthly] {
+            let Some((window, _)) = quota_forecast_source_window(&quota, period) else {
+                continue;
+            };
+            // 缺少一个周期时两个结果会复用同一窗口，只查询一次历史快照。
+            if !selected_keys.insert(window.key.as_str()) {
+                continue;
+            }
             let (Some(mut query), Some(observed), Some(percent)) = (
                 quota_usage_window(account_id.as_str(), window),
                 quota.observed_at,
@@ -1166,6 +1244,17 @@ impl AccountsService for DefaultAccountsService {
             .map_err(|error| map_provider_error(error, "provider model catalog"))
     }
 
+    async fn model_catalog_document(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderModelCatalogDocument, AdminError> {
+        let (_, provider) = self.provider_for_account(account_id).await?;
+        provider
+            .model_catalog_document(account_id)
+            .await
+            .map_err(|error| map_provider_error(error, "provider model catalog document"))
+    }
+
     async fn mint_turn_state(
         &self,
         account_id: &ProviderAccountId,
@@ -1188,6 +1277,7 @@ impl AccountsService for DefaultAccountsService {
         let model = upstream_model.as_str().to_owned();
         let operation = provider
             .connection_test_operation(&upstream_model, CONNECTION_TEST_INPUT)
+            .await
             .map_err(|error| map_provider_error(error, "provider connection test"))?;
         let initial = vec![
             AccountConnectionTestEvent::Started {
@@ -1203,13 +1293,16 @@ impl AccountsService for DefaultAccountsService {
         let probe = Arc::clone(&self.probe);
         let terminal = futures::stream::once(async move {
             let result = probe
-                .probe(AccountProbeRequest {
-                    account_id,
-                    provider_kind: account.provider_kind,
-                    upstream_model,
-                    operation,
-                    egress: None,
-                })
+                .probe(
+                    AccountProbeRequest {
+                        account_id,
+                        provider_kind: account.provider_kind,
+                        upstream_model,
+                        operation,
+                        egress: None,
+                    },
+                    None,
+                )
                 .await;
             match result {
                 Ok(result) => result
@@ -1261,6 +1354,7 @@ impl AccountsService for DefaultAccountsService {
         let model = upstream_model.as_str().to_owned();
         let operation = provider
             .test_bench_operation(&upstream_model, &prompt, reasoning_effort.as_deref())
+            .await
             .map_err(|error| map_provider_error(error, "provider test bench"))?;
         let initial = vec![
             AccountConnectionTestEvent::Started {
@@ -1276,13 +1370,16 @@ impl AccountsService for DefaultAccountsService {
         let probe = Arc::clone(&self.probe);
         let terminal = futures::stream::once(async move {
             let result = probe
-                .probe(AccountProbeRequest {
-                    account_id,
-                    provider_kind: account.provider_kind,
-                    upstream_model,
-                    operation,
-                    egress: None,
-                })
+                .probe(
+                    AccountProbeRequest {
+                        account_id,
+                        provider_kind: account.provider_kind,
+                        upstream_model,
+                        operation,
+                        egress: None,
+                    },
+                    None,
+                )
                 .await;
             match result {
                 Ok(result) => result

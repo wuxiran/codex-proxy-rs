@@ -1,18 +1,12 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
 import type { AccountTicket } from '@/api/modules/accounts'
+import { BaseButton, BaseFormItem, BaseInput, BaseModal, BaseSegmented, BaseTextarea, toast } from '@codex-proxy/ui'
 import dayjs from 'dayjs'
-import { computed, shallowRef, watch } from 'vue'
 
+import { computed, shallowRef, watch } from 'vue'
 import { restoreAccountFromTicket, updateAccountTicket } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
-import { toast } from '@/components/base/BaseToast'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 const props = defineProps<{ account: AccountRow | null }>()
 const emit = defineEmits<{ changed: [] }>()

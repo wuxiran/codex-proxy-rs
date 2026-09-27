@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import type { SelectOption } from '@/components/base/BaseSelect.vue'
+import type { SelectOption } from '@codex-proxy/ui'
+import { BaseIconButton, BaseSelect } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed } from 'vue'
 
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import { AUTO_REFRESH_SECONDS } from '../composables/useAccountsQuery'
 
 defineProps<{

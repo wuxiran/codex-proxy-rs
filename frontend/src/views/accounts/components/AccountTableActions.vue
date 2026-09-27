@@ -1,22 +1,21 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
-import { KeyRound, MoreHorizontal, Pencil, ReceiptText, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { BaseButton, BaseIconButton, BaseMenuItem, BasePopover } from '@codex-proxy/ui'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
+import { Download, KeyRound, MoreHorizontal, Pencil, Power, ReceiptText, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { computed } from 'vue'
 
-defineProps<{
+const props = defineProps<{
   account: AccountRow
   deleting: boolean
+  downloadingCatalog: boolean
   recovering: boolean
   refreshing: boolean
   testing: boolean
   guanlanReviveAvailable?: boolean
   reviving?: boolean
+  togglingScheduling: boolean
 }>()
-
 const emit = defineEmits<{
   edit: [account: AccountRow]
   delete: [account: AccountRow]
@@ -26,7 +25,11 @@ const emit = defineEmits<{
   reauthorize: [account: AccountRow]
   revive: [accountId: string]
   ticket: [account: AccountRow]
+  downloadModelCatalog: [account: AccountRow]
+  toggleScheduling: [account: AccountRow]
 }>()
+
+const credentialEligible = computed(() => props.account.authenticationKind === 'oauth')
 </script>
 
 <template>
@@ -80,7 +83,17 @@ const emit = defineEmits<{
             测试连接
           </BaseMenuItem>
           <BaseMenuItem
-            v-if="account.authenticationKind === 'oauth'"
+            :loading="togglingScheduling"
+            :disabled="togglingScheduling"
+            @click.stop="(close(), emit('toggleScheduling', account))"
+          >
+            <template #icon>
+              <Power class="size-3.5 text-cp-text-quaternary" />
+            </template>
+            {{ account.enabled ? '停用调度' : '启用调度' }}
+          </BaseMenuItem>
+          <BaseMenuItem
+            v-if="credentialEligible"
             :loading="refreshing"
             :disabled="refreshing"
             @click.stop="(close(), emit('refresh', account.id))"
@@ -93,7 +106,7 @@ const emit = defineEmits<{
             </template>
             刷新令牌
           </BaseMenuItem>
-          <BaseMenuItem v-if="account.authenticationKind === 'oauth'" @click.stop="(close(), emit('reauthorize', account))">
+          <BaseMenuItem v-if="credentialEligible" @click.stop="(close(), emit('reauthorize', account))">
             <template #icon>
               <KeyRound class="size-3.5 text-cp-text-quaternary" />
             </template>
@@ -104,6 +117,20 @@ const emit = defineEmits<{
               <ReceiptText class="size-3.5 text-cp-text-quaternary" />
             </template>
             成本与票据
+          </BaseMenuItem>
+          <BaseMenuItem
+            v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'"
+            :loading="downloadingCatalog"
+            :disabled="downloadingCatalog"
+            @click.stop="(close(), emit('downloadModelCatalog', account))"
+          >
+            <template #loading>
+              <RefreshCw class="size-3.5 animate-spin text-cp-text-quaternary motion-reduce:animate-none" />
+            </template>
+            <template #icon>
+              <Download class="size-3.5 text-cp-text-quaternary" />
+            </template>
+            下载模型目录
           </BaseMenuItem>
           <BaseMenuItem
             :loading="recovering"

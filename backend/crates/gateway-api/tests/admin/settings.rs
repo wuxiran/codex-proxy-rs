@@ -52,6 +52,7 @@ fn update_body() -> Value {
         "concurrencyWaitTimeoutSeconds": 30,
         "responsesMaxDecompressedBodyBytes": 67108864,
         "rotationStrategy": "round_robin",
+        "smartScheduling": gateway_core::account::SmartSchedulingConfig::default(),
         "minCodexDesktopVersion": "26.825.6671",
         "minCodexCliVersion": "0.40.0",
         "usageRetentionDays": 32,
@@ -65,8 +66,81 @@ fn update_body() -> Value {
         "accountAutoFreezeProbeModel": null,
         "accountAutoFreezeAdaptiveConcurrency": true,
         "requestLogEnabled": true,
-        "requestLogTestKeyId": null
+        "requestLogTestKeyId": null,
+        "accountWarmupEnabled": false,
+        "accountWarmupScheduleTime": "08:00",
+        "accountWarmupModel": null
     })
+}
+
+#[tokio::test]
+async fn smart_settings_round_trip_and_invalid_updates_leave_the_saved_value_intact() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    let custom = json!({"loadWeight": 2.0, "quotaWeight": 0.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3, "preferHigherWeight": true});
+    body["smartScheduling"] = custom.clone();
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["data"]["smartScheduling"], custom);
+    assert_eq!(
+        response["data"]["smartSchedulingDefaults"],
+        json!(gateway_core::account::SmartSchedulingConfig::default())
+    );
+    let mut invalid_values = vec![
+        json!(null),
+        json!({}),
+        json!({"loadWeight":0,"quotaWeight":0,"healthWeight":0,"latencyWeight":0,"resetWeight":0,"queueWeight":0,"preferHigherWeight":true}),
+        json!({"loadWeight":0.01,"quotaWeight":1,"healthWeight":1,"latencyWeight":1,"resetWeight":0,"queueWeight":0,"preferHigherWeight":false}),
+    ];
+    for field in ["resetWeight", "queueWeight"] {
+        for value in [json!(-0.1), json!(10.1), json!(0.01), json!(null)] {
+            let mut invalid = custom.clone();
+            invalid[field] = value;
+            invalid_values.push(invalid);
+        }
+        let mut missing = custom.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        invalid_values.push(missing);
+    }
+    for invalid in invalid_values {
+        body["smartScheduling"] = invalid;
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    body.as_object_mut().unwrap().remove("smartScheduling");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(response).await["data"]["smartScheduling"],
+        custom
+    );
 }
 
 #[test]
@@ -86,6 +160,19 @@ fn settings_request_accepts_unlimited_default_account_concurrency() {
     let request: UpdateRuntimeSettingsRequest =
         serde_json::from_value(body).expect("decode settings");
     request.validate().expect("zero means unlimited");
+}
+
+#[test]
+fn settings_request_requires_model_when_warmup_is_enabled() {
+    let mut body = update_body();
+    body["accountWarmupEnabled"] = json!(true);
+    let request: UpdateRuntimeSettingsRequest =
+        serde_json::from_value(body).expect("decode settings");
+
+    assert_eq!(
+        request.validate().unwrap_err().field(),
+        "accountWarmupModel"
+    );
 }
 
 #[test]
@@ -113,8 +200,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     use gateway_core::routing::{PublicModelId, UpstreamModelId};
 
     let settings = RuntimeSettings {
-        openai_client_profile: None,
-        xai_client_profile: None,
+        request_profiles: Default::default(),
         request_location_enabled: false,
         request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
@@ -136,6 +222,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: RotationStrategy::RoundRobin,
         min_codex_desktop_version: Some("26.825.6671".to_owned()),
         min_codex_cli_version: Some("0.40.0".to_owned()),
@@ -151,6 +238,9 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         account_auto_freeze_adaptive_concurrency: true,
         request_log_enabled: true,
         request_log_test_key_id: None,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
         updated_at: Utc
             .with_ymd_and_hms(2026, 8, 2, 10, 30, 0)
             .single()
@@ -161,6 +251,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "providerRequestProfiles": {},
             "openaiClientProfile": null,
             "xaiClientProfile": null,
         "requestLocationEnabled": false,
@@ -178,6 +269,8 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "concurrencyWaitTimeoutSeconds": 30,
             "responsesMaxDecompressedBodyBytes": 67108864,
             "rotationStrategy": "round_robin",
+            "smartScheduling": gateway_core::account::SmartSchedulingConfig::default(),
+            "smartSchedulingDefaults": gateway_core::account::SmartSchedulingConfig::default(),
             "minCodexDesktopVersion": "26.825.6671",
             "minCodexCliVersion": "0.40.0",
             "usageRetentionDays": 32,
@@ -192,6 +285,9 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "accountAutoFreezeAdaptiveConcurrency": true,
             "requestLogEnabled": true,
             "requestLogTestKeyId": null,
+            "accountWarmupEnabled": false,
+            "accountWarmupScheduleTime": "08:00",
+            "accountWarmupModel": null,
             "updatedAt": "2026-08-02T10:30:00Z"
         })
     );
@@ -218,8 +314,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .cloned()
         .collect();
     let settings = RuntimeSettings {
-        openai_client_profile: None,
-        xai_client_profile: None,
+        request_profiles: Default::default(),
         request_location_enabled: false,
         request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
@@ -242,6 +337,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+        smart_scheduling: request.smart_scheduling,
         rotation_strategy: RotationStrategy::parse(&request.rotation_strategy)
             .expect("fixture rotation strategy"),
         min_codex_desktop_version: request.min_codex_desktop_version,
@@ -258,6 +354,9 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         account_auto_freeze_adaptive_concurrency: true,
         request_log_enabled: true,
         request_log_test_key_id: None,
+        account_warmup_enabled: false,
+        account_warmup_schedule_time: "08:00".to_owned(),
+        account_warmup_model: None,
         updated_at: chrono::Utc::now(),
     };
 
@@ -270,9 +369,11 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             .cloned()
             .collect();
     let mut expected_fields = request_fields;
+    expected_fields.insert("providerRequestProfiles".to_owned());
     expected_fields.insert("openaiClientProfile".to_owned());
     expected_fields.insert("xaiClientProfile".to_owned());
     expected_fields.insert("updatedAt".to_owned());
+    expected_fields.insert("smartSchedulingDefaults".to_owned());
 
     assert_eq!(response_fields, expected_fields);
 }
@@ -670,6 +771,63 @@ fn global_profile_can_be_omitted_but_cannot_be_cleared() {
         body[field] = json!({"versionMode":"latest"});
         assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_ok());
     }
+}
+
+#[tokio::test]
+async fn generic_global_profiles_decode_native_providers_and_reject_legacy_conflicts() {
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "openai":{"preset":"desktop"},
+        "xai":{"preset":"managed"},
+    });
+    body["openaiClientProfile"] = json!({"preset":"desktop"});
+    let decoded = serde_json::from_value::<UpdateRuntimeSettingsRequest>(body.clone()).unwrap();
+    assert!(decoded.provider_request_profiles.contains_key("xai"));
+
+    body["openaiClientProfile"] = json!({"preset":"cli"});
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn settings_update_rejects_a_new_unknown_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "plugin.unknown":{"preset":"new"}
+    });
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body.clone()),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    body["providerRequestProfiles"] = json!({"plugin.unknown":null});
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 fn custom_pricing() -> Value {

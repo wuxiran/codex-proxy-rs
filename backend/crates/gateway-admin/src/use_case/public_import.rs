@@ -145,8 +145,9 @@ impl DefaultPublicImportService {
         let mut hit: Option<PublicImportConfig> = None;
         for config in self.load_all()? {
             let matches: bool = token.as_bytes().ct_eq(config.token.as_bytes()).into();
-            let usable =
-                config.enabled && !config.expires_at.is_some_and(|at| at <= now) && !config.group_ids.is_empty();
+            let usable = config.enabled
+                && !config.expires_at.is_some_and(|at| at <= now)
+                && !config.group_ids.is_empty();
             if matches && usable {
                 hit = Some(config);
             }

@@ -1,15 +1,10 @@
 <script setup lang="ts">
 import type { OutboundProxyRecord, ProxyQualityItem, ProxyQualityReport } from '@/api'
+import { BaseButton, BaseEmpty, BaseModal, BaseSkeleton, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 import { ShieldCheck } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import { getProxyQualityReport } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 import { exitGeoLabel, qualityItemStatus, qualityStatus, qualityTargetLabel } from '../presenter'
 
 const props = defineProps<{

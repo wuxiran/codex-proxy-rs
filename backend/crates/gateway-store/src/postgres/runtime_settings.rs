@@ -12,15 +12,15 @@ use gateway_core::account::RotationStrategy;
 use gateway_core::policy::CodexClientVersion;
 use gateway_core::provider_ports::{
     ProviderFreezePolicy, ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderStoreError,
-    ProviderStoreErrorKind,
+    ProviderStoreErrorKind, ProviderWarmupPolicy,
 };
 
 use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profiles:
+        BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
     pub config_revision: Revision,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
@@ -31,6 +31,7 @@ pub struct RuntimeSettings {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub responses_max_decompressed_body_bytes: u64,
+    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -47,6 +48,9 @@ pub struct RuntimeSettings {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_warmup_enabled: bool,
+    pub account_warmup_schedule_time: String,
+    pub account_warmup_model: Option<String>,
     pub request_log_enabled: bool,
     pub request_log_test_key_id: Option<String>,
     pub updated_at: DateTime<Utc>,
@@ -56,6 +60,7 @@ impl fmt::Debug for RuntimeSettings {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeSettings")
+            .field("request_profile_count", &self.request_profiles.len())
             .field("config_revision", &self.config_revision)
             .field(
                 "admin_api_key",
@@ -105,6 +110,12 @@ impl fmt::Debug for RuntimeSettings {
                 "account_auto_freeze_adaptive_concurrency",
                 &self.account_auto_freeze_adaptive_concurrency,
             )
+            .field("account_warmup_enabled", &self.account_warmup_enabled)
+            .field(
+                "account_warmup_schedule_time",
+                &self.account_warmup_schedule_time,
+            )
+            .field("account_warmup_model", &self.account_warmup_model)
             .field("request_log_enabled", &self.request_log_enabled)
             .field("request_log_test_key_id", &self.request_log_test_key_id)
             .field("updated_at", &self.updated_at)
@@ -114,8 +125,10 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profile_updates: BTreeMap<
+        gateway_core::routing::ProviderKind,
+        Option<gateway_core::account::OpaqueProviderData>,
+    >,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
@@ -125,6 +138,7 @@ pub struct RuntimeSettingsUpdate {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub responses_max_decompressed_body_bytes: u64,
+    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -141,6 +155,9 @@ pub struct RuntimeSettingsUpdate {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_warmup_enabled: bool,
+    pub account_warmup_schedule_time: String,
+    pub account_warmup_model: Option<String>,
     pub request_log_enabled: bool,
     pub request_log_test_key_id: Option<String>,
 }
@@ -181,7 +198,21 @@ impl RuntimeSettingsUpdate {
             || !valid_client_version(self.min_codex_desktop_version.as_deref())
             || !valid_client_version(self.min_codex_cli_version.as_deref())
             || !valid_probe_model(self.account_auto_freeze_probe_model.as_deref())
+            || !gateway_core::provider_ports::valid_warmup_schedule_time(
+                &self.account_warmup_schedule_time,
+            )
+            || !valid_probe_model(self.account_warmup_model.as_deref())
+            || (self.account_warmup_enabled && self.account_warmup_model.is_none())
             || RotationStrategy::parse(&self.rotation_strategy).is_none()
+            || self.request_profile_updates.len() > 256
+            || self
+                .request_profile_updates
+                .values()
+                .flatten()
+                .any(|profile| {
+                    serde_json::to_vec(profile.expose_to_provider())
+                        .map_or(true, |encoded| encoded.len() > 64 * 1024)
+                })
         {
             return Err(StoreError::InvalidData {
                 entity: "runtime settings",
@@ -240,13 +271,15 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
             "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
                     refresh_concurrency, max_concurrent_per_account, request_interval_ms,
-                    rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
+                    rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
                     min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
                     account_auto_freeze_enabled, account_auto_freeze_threshold,
                     account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                     account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
-                    account_auto_freeze_adaptive_concurrency, request_log_enabled, request_log_test_key_id
+                    account_auto_freeze_adaptive_concurrency,
+                    account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
+                    request_log_enabled, request_log_test_key_id
              from runtime_settings where id = 1",
         )
     .fetch_optional(pool)
@@ -284,6 +317,56 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
         })
     }
 
+    fn load_request_profile_configurations<'a>(
+        &'a self,
+        revision: gateway_core::routing::ConfigRevision,
+        provider: &'a gateway_core::routing::ProviderKind,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Vec<gateway_core::account::OpaqueProviderData>, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            // 单条语句共享一个 MVCC 快照：先核对候选 revision，再只投影配置对象；
+            // Client Key 明文与其它策略字段不会进入插件准备边界。
+            let rows = sqlx::query_as::<_, (i64, Option<sqlx::types::Json<serde_json::Value>>)>(
+                "select settings.config_revision, profiles.profile
+                 from runtime_settings settings
+                 cross join lateral (
+                   select settings.provider_request_profiles_json -> $1 as profile
+                   union
+                   select keys.provider_request_profiles_json -> $1
+                   from client_api_keys keys
+                   where keys.provider_request_profiles_json ? $1
+                 ) profiles
+                 where settings.id = 1",
+            )
+            .bind(provider.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| provider_unavailable("load Provider request profile configurations"))?;
+            let expected_revision = i64::try_from(revision.get())
+                .map_err(|_| provider_invalid("validate Provider request profile revision"))?;
+            if rows.is_empty()
+                || rows
+                    .iter()
+                    .any(|(actual_revision, _)| *actual_revision != expected_revision)
+            {
+                return Err(provider_conflict(
+                    "validate Provider request profile revision",
+                ));
+            }
+            rows.into_iter()
+                .filter_map(|(_, profile)| profile)
+                .map(|profile| {
+                    let serde_json::Value::Object(profile) = profile.0 else {
+                        return Err(provider_invalid("decode Provider request profile"));
+                    };
+                    Ok(gateway_core::account::OpaqueProviderData::new(profile))
+                })
+                .collect()
+        })
+    }
+
     fn load_refresh_policy(
         &self,
     ) -> futures::future::BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
@@ -318,6 +401,21 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
             )
         })
     }
+
+    fn load_warmup_policy(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
+        Box::pin(async move {
+            let settings = RuntimeSettingsRepository::load_runtime_settings(self)
+                .await
+                .map_err(|_| provider_unavailable("load warmup policy"))?;
+            ProviderWarmupPolicy::try_new(
+                settings.account_warmup_enabled,
+                settings.account_warmup_schedule_time,
+                settings.account_warmup_model,
+            )
+        })
+    }
 }
 
 pub(crate) async fn load_runtime_settings_in_transaction(
@@ -326,13 +424,15 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
         "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
                 refresh_concurrency, max_concurrent_per_account, request_interval_ms,
-                rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
+                rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
                 min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
                 account_auto_freeze_enabled, account_auto_freeze_threshold,
                 account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                 account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
-                account_auto_freeze_adaptive_concurrency, request_log_enabled, request_log_test_key_id
+                account_auto_freeze_adaptive_concurrency,
+                account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
+                request_log_enabled, request_log_test_key_id
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
@@ -352,6 +452,24 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     update.validate()?;
     let refresh_margin_seconds =
         i64::try_from(update.refresh_margin_seconds).map_err(|_| invalid_numeric())?;
+    let request_profile_updates = update
+        .request_profile_updates
+        .iter()
+        .filter_map(|(provider, profile)| {
+            profile.as_ref().map(|profile| {
+                (
+                    provider.as_str().to_owned(),
+                    serde_json::Value::Object(profile.expose_to_provider().clone()),
+                )
+            })
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let request_profile_deletions = update
+        .request_profile_updates
+        .iter()
+        .filter(|(_, profile)| profile.is_none())
+        .map(|(provider, _)| provider.as_str().to_owned())
+        .collect::<Vec<_>>();
     let next = sqlx::query_scalar::<_, i64>(
         "update runtime_settings
              set config_revision = config_revision + 1,
@@ -380,11 +498,13 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      request_location_json = $23,
                      request_location_enabled = $24,
                      responses_max_decompressed_body_bytes = $25,
-                     provider_request_profiles_json = provider_request_profiles_json
-                         || case when $26::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $26::jsonb) end
-                         || case when $27::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $27::jsonb) end,
-                     request_log_enabled = $28,
-                     request_log_test_key_id = $29,
+	                 provider_request_profiles_json = (provider_request_profiles_json - $26::text[]) || $27::jsonb,
+                     account_warmup_enabled = $28,
+                     account_warmup_schedule_time = $29,
+                     account_warmup_model = $30,
+                     smart_scheduling_json = $31,
+                     request_log_enabled = $32,
+                     request_log_test_key_id = $33,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -426,8 +546,12 @@ pub(crate) async fn update_runtime_settings_in_transaction(
         i64::try_from(update.responses_max_decompressed_body_bytes)
             .map_err(|_| invalid_numeric())?,
     )
-    .bind(update.openai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
-    .bind(update.xai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
+    .bind(request_profile_deletions)
+    .bind(sqlx::types::Json(request_profile_updates))
+    .bind(update.account_warmup_enabled)
+    .bind(&update.account_warmup_schedule_time)
+    .bind(update.account_warmup_model.as_deref())
+    .bind(sqlx::types::Json(update.smart_scheduling))
     .bind(update.request_log_enabled)
     .bind(update.request_log_test_key_id.as_deref())
     .fetch_optional(&mut **transaction)
@@ -488,6 +612,7 @@ struct RuntimeSettingsRow {
     refresh_concurrency: i64,
     max_concurrent_per_account: i64,
     request_interval_ms: i64,
+    smart_scheduling_json: sqlx::types::Json<gateway_core::account::SmartSchedulingConfig>,
     rotation_strategy: String,
     request_location_enabled: bool,
     request_location_json: sqlx::types::Json<gateway_core::account::RequestLocation>,
@@ -509,28 +634,36 @@ struct RuntimeSettingsRow {
     account_auto_freeze_probe_enabled: bool,
     account_auto_freeze_probe_model: Option<String>,
     account_auto_freeze_adaptive_concurrency: bool,
+    account_warmup_enabled: bool,
+    account_warmup_schedule_time: String,
+    account_warmup_model: Option<String>,
     request_log_enabled: bool,
     request_log_test_key_id: Option<String>,
 }
 
-fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+    let request_profiles = row
+        .provider_request_profiles_json
+        .0
+        .into_iter()
+        .map(|(provider, profile)| {
+            let provider = gateway_core::routing::ProviderKind::new(provider)
+                .map_err(|_| invalid_request_profile())?;
+            Ok((
+                provider,
+                gateway_core::account::OpaqueProviderData::new(profile),
+            ))
+        })
+        .collect::<StoreResult<BTreeMap<_, _>>>()?;
     Ok(RuntimeSettings {
-        openai_client_profile: row
-            .provider_request_profiles_json
-            .0
-            .remove("openai")
-            .map(gateway_core::account::OpaqueProviderData::new),
-        xai_client_profile: row
-            .provider_request_profiles_json
-            .0
-            .remove("xai")
-            .map(gateway_core::account::OpaqueProviderData::new),
+        request_profiles,
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,
         refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
         refresh_concurrency: to_u32(row.refresh_concurrency)?,
         max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
         request_interval_ms: to_u64(row.request_interval_ms)?,
+        smart_scheduling: row.smart_scheduling_json.0,
         rotation_strategy: row.rotation_strategy,
         request_location_enabled: row.request_location_enabled,
         request_location: row
@@ -556,6 +689,9 @@ fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<Runtime
         account_auto_freeze_probe_enabled: row.account_auto_freeze_probe_enabled,
         account_auto_freeze_probe_model: row.account_auto_freeze_probe_model,
         account_auto_freeze_adaptive_concurrency: row.account_auto_freeze_adaptive_concurrency,
+        account_warmup_enabled: row.account_warmup_enabled,
+        account_warmup_schedule_time: row.account_warmup_schedule_time,
+        account_warmup_model: row.account_warmup_model,
         request_log_enabled: row.request_log_enabled,
         request_log_test_key_id: row.request_log_test_key_id,
     })
@@ -576,6 +712,13 @@ fn invalid_location() -> StoreError {
     }
 }
 
+fn invalid_request_profile() -> StoreError {
+    StoreError::InvalidData {
+        entity: "runtime settings",
+        message: "Provider request profile key is invalid".to_owned(),
+    }
+}
+
 fn invalid_numeric() -> StoreError {
     StoreError::InvalidData {
         entity: "runtime settings",
@@ -589,6 +732,10 @@ fn provider_unavailable(operation: &'static str) -> ProviderStoreError {
 
 fn provider_invalid(operation: &'static str) -> ProviderStoreError {
     ProviderStoreError::new(ProviderStoreErrorKind::InvalidData, operation)
+}
+
+fn provider_conflict(operation: &'static str) -> ProviderStoreError {
+    ProviderStoreError::new(ProviderStoreErrorKind::Conflict, operation)
 }
 
 fn valid_model_mappings(mappings: &BTreeMap<String, String>) -> bool {

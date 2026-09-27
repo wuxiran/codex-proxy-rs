@@ -56,10 +56,15 @@ pub trait ProxiesService: Send + Sync {
         &self,
         id: &str,
         revision: Revision,
+        detect_location: bool,
         context: &MutationContext,
     ) -> Result<ProxyRecord, AdminError>;
     /// 探测未保存的连接地址，不写入代理记录或修改账号绑定。
-    async fn probe(&self, proxy: &OutboundProxy) -> Result<ProxyTestResult, AdminError>;
+    async fn probe(
+        &self,
+        proxy: &OutboundProxy,
+        detect_location: bool,
+    ) -> Result<ProxyTestResult, AdminError>;
     /// 经代理探测各上游目标并评分；同时刷新连通性结果。
     async fn quality_check(
         &self,
@@ -227,6 +232,11 @@ impl ProxiesService for DefaultProxiesService {
             .map(|location| location.normalized())
             .transpose()
             .map_err(|_| AdminError::invalid("代理位置不合法"))?;
+        command.test = if command.auto_location {
+            Some(self.probe(&command.proxy, true).await?)
+        } else {
+            None
+        };
         let result = self
             .store
             .create(command, context)
@@ -247,6 +257,24 @@ impl ProxiesService for DefaultProxiesService {
             .map(|location| location.map(|value| value.normalized()).transpose())
             .transpose()
             .map_err(|_| AdminError::invalid("代理位置不合法"))?;
+        // 只在开启自动模式或连接地址变化时检测，普通编辑不刷新已识别位置。
+        command.test = None;
+        if command.auto_location.is_some() || command.proxy.is_some() {
+            let current = self
+                .store
+                .get(&command.id)
+                .await
+                .map_err(|error| map_store_error(error, "proxy"))?;
+            if current.revision != command.revision {
+                return Err(AdminError::conflict("代理已被修改，请刷新后重试"));
+            }
+            let proxy = command.proxy.as_ref().unwrap_or(&current.proxy);
+            if command.auto_location.unwrap_or(current.auto_location)
+                && (!current.auto_location || proxy != &current.proxy)
+            {
+                command.test = Some(self.probe(proxy, true).await?);
+            }
+        }
         let result = self
             .store
             .update(command, context)
@@ -271,9 +299,13 @@ impl ProxiesService for DefaultProxiesService {
         Ok(result)
     }
 
-    async fn probe(&self, proxy: &OutboundProxy) -> Result<ProxyTestResult, AdminError> {
+    async fn probe(
+        &self,
+        proxy: &OutboundProxy,
+        detect_location: bool,
+    ) -> Result<ProxyTestResult, AdminError> {
         let _permit = self.test_slot().await?;
-        Ok(self.probe.test(proxy).await)
+        Ok(self.probe.test(proxy, detect_location).await)
     }
 
     async fn quality_check(
@@ -332,6 +364,32 @@ impl ProxiesService for DefaultProxiesService {
                 continue;
             };
             command.name = name;
+            command.location = match command
+                .location
+                .map(|location| location.normalized())
+                .transpose()
+            {
+                Ok(location) => location,
+                Err(_) => {
+                    result.skipped.push(ProxyBatchSkip {
+                        reference,
+                        reason: "代理位置不合法".to_owned(),
+                    });
+                    continue;
+                }
+            };
+            // 与单条创建一致：自动位置需要随配置原子保存一次出口探测结果。
+            command.test = if command.auto_location {
+                match self.probe(&command.proxy, true).await {
+                    Ok(test) => Some(test),
+                    Err(error) => {
+                        self.publish_batch(result.config_revision).await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             match self.store.create(command, context).await {
                 Ok(mutation) => {
                     result.config_revision = Some(mutation.config_revision);
@@ -401,6 +459,7 @@ impl ProxiesService for DefaultProxiesService {
         &self,
         id: &str,
         revision: Revision,
+        detect_location: bool,
         context: &MutationContext,
     ) -> Result<ProxyRecord, AdminError> {
         let _permit = self.test_slot().await?;
@@ -412,11 +471,20 @@ impl ProxiesService for DefaultProxiesService {
         if record.revision != revision {
             return Err(AdminError::conflict("代理已被修改，请刷新后重新测试"));
         }
-        let result = self.probe.test(&record.proxy).await;
-        self.store
+        // 手动解析只为本次测试请求位置，不改变自动跟随的持久配置。
+        let result = self
+            .probe
+            .test(&record.proxy, record.auto_location || detect_location)
+            .await;
+        let mutation = self
+            .store
             .record_test(id, revision, result, context)
             .await
-            .map_err(|error| map_store_error(error, "proxy"))
+            .map_err(|error| map_store_error(error, "proxy"))?;
+        if record.effective_location() != mutation.record.effective_location() {
+            publish_committed(self.snapshot.as_ref(), mutation.config_revision).await?;
+        }
+        Ok(mutation.record)
     }
 }
 

@@ -82,7 +82,7 @@ async fn encrypted_recovery_http_replays_once_preserving_history_and_single_usag
     let provider = provider_with_base_url(&store, server.uri());
     let input = encrypted_recovery_history();
     let operation = encrypted_recovery_operation(input.clone(), Some("encrypted-session"), false);
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation),
             context("req_encrypted_recovery", CancellationToken::new()),
@@ -193,7 +193,7 @@ async fn encrypted_recovery_http_rejection_budget_and_fail_closed_inputs() {
             .respond_with(ResponseTemplate::new(status).set_body_json(json!({"error":{"code":code,"message":"invalid_encrypted_content in free text is insufficient"}})))
             .mount(&server).await;
         let provider = provider_with_base_url(&store, server.uri());
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -269,7 +269,7 @@ async fn encrypted_recovery_cache_is_session_scoped_preserves_new_reasoning_and_
         if index == 1 {
             input.as_array_mut().unwrap().push(json!({"type":"reasoning", "summary":[], "encrypted_content":"mock-new-valid-ciphertext"}));
         }
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -414,7 +414,7 @@ async fn encrypted_recovery_stream_respects_output_and_tool_boundaries() {
                 (server.uri(), Some(server), None)
             };
             let provider = provider_with_base_url(&store, url);
-            let mut stream = provider
+            let mut stream = Arc::clone(&provider)
                 .execute(
                     planned_request(
                         "openai",
@@ -552,7 +552,7 @@ async fn encrypted_recovery_cache_isolates_account_key_model_and_credential_revi
             Some("shared-session"),
             false,
         );
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request_for_model("openai", operation, model),
                 encrypted_scope_context(key, account),
@@ -595,7 +595,7 @@ async fn encrypted_recovery_cache_capacity_evicts_oldest_digest() {
         let before = server.received_requests().await.unwrap().len();
         let mut input = vec![json!({"role":"user", "content":"preserved"})];
         input.extend(digests.map(|index| json!({"type":"reasoning", "summary":[], "encrypted_content":format!("mock-cipher-{index}")})));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -634,7 +634,7 @@ async fn encrypted_recovery_never_drops_previous_response_or_conversation() {
                 .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
         ));
         let provider = provider_with_base_url(&store, server.uri());
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context_with_state_owner("req_previous_ref", "acct_provider_contract"),
@@ -723,7 +723,7 @@ async fn encrypted_recovery_websocket_wrapped_error_is_bounded_and_disconnect_is
             None,
             CancellationToken::new(),
         );
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -775,7 +775,7 @@ async fn encrypted_recovery_success_keeps_opaque_reasoning_and_never_replays_com
         .await;
     let provider = provider_with_base_url(&store, server.uri());
     let input = encrypted_recovery_history();
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request(
                 "openai",

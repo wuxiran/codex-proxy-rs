@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { OpsError } from '@/api/modules/usage'
-import { computed, shallowRef, useId } from 'vue'
+import { BasePopover } from '@codex-proxy/ui'
 
+import { computed, shallowRef, useId } from 'vue'
 import { getOpsErrors } from '@/api'
-import BasePopover from '@/components/base/BasePopover.vue'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 import { errorRateDisplay } from '../constants'
 
 const props = defineProps<{

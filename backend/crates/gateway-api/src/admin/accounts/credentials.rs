@@ -14,20 +14,8 @@ fn validate_account_notes(notes: Option<&str>) -> Result<(), WireValidationError
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AccountProvider {
-    OpenAi,
-    Xai,
-}
-
-impl AccountProvider {
-    fn parse(value: &str) -> Result<Self, WireValidationError> {
-        match value.trim() {
-            "openai" => Ok(Self::OpenAi),
-            "xai" => Ok(Self::Xai),
-            _ => Err(WireValidationError::new("provider")),
-        }
-    }
+fn parse_provider(value: &str) -> Result<ProviderKind, WireValidationError> {
+    ProviderKind::new(value.trim().to_owned()).map_err(|_| WireValidationError::new("provider"))
 }
 
 /// 导入统一设置，复用编辑账号的备注、调度和分组约束。
@@ -84,7 +72,7 @@ impl AccountImportRequest {
         if let Some(settings) = &self.settings {
             settings.validate()?;
         }
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         if !self.data.is_object()
             || serde_json::to_vec(&self.data)
                 .map_or(true, |encoded| encoded.len() > MAX_IMPORT_DATA_BYTES)
@@ -97,9 +85,9 @@ impl AccountImportRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, ImportCredentials), WireValidationError> {
+    ) -> Result<(ProviderKind, ImportCredentials), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             ImportCredentials {
@@ -115,7 +103,7 @@ impl AccountImportRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartAccountAuthorizationRequest {
     pub outbound_proxy_id: Option<String>,
@@ -127,7 +115,7 @@ pub struct StartAccountAuthorizationRequest {
 
 impl StartAccountAuthorizationRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         require_text(&self.name, MAX_NAME_BYTES, "name")?;
         if let Some(account_id) = self.account_id.as_deref() {
             require_account_id(account_id, "accountId")?;
@@ -138,9 +126,9 @@ impl StartAccountAuthorizationRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, StartAuthorization), WireValidationError> {
+    ) -> Result<(ProviderKind, StartAuthorization), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         let reauthorization = self
             .account_id
             .map(ProviderAccountId::new)
@@ -175,27 +163,17 @@ impl CompleteAccountAuthorizationRequest {
         if let Some(settings) = &self.settings {
             settings.validate()?;
         }
-        let provider = AccountProvider::parse(&self.provider)?;
-        match provider {
-            AccountProvider::OpenAi => {
-                if !URL_SAFE_NO_PAD
-                    .decode(&self.flow_id)
-                    .is_ok_and(|decoded| decoded.len() == 32)
-                {
-                    return Err(WireValidationError::new("flowId"));
-                }
-            }
-            AccountProvider::Xai => require_wire_id(&self.flow_id, "flowId")?,
-        }
+        let provider = parse_provider(&self.provider)?;
+        validate_authorization_flow(&provider, &self.flow_id)?;
         require_text(&self.callback_url, MAX_CALLBACK_URL_BYTES, "callbackUrl")
     }
 
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, CompleteAuthorization), WireValidationError> {
+    ) -> Result<(ProviderKind, CompleteAuthorization), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             CompleteAuthorization {
@@ -211,9 +189,27 @@ impl CompleteAccountAuthorizationRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn validate_authorization_flow(
+    provider: &ProviderKind,
+    flow_id: &str,
+) -> Result<(), WireValidationError> {
+    if provider.as_str() == "openai" {
+        if !URL_SAFE_NO_PAD
+            .decode(flow_id)
+            .is_ok_and(|decoded| decoded.len() == 32)
+        {
+            return Err(WireValidationError::new("flowId"));
+        }
+        Ok(())
+    } else {
+        require_wire_id(flow_id, "flowId")
+    }
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateAccountRequest {
+    pub connection: Option<AccountConnectionUpdateRequest>,
     pub outbound_proxy_id: Option<String>,
     pub outbound_proxy_url: Option<super::wire::AccountProxyUpdate>,
     pub account_id: String,
@@ -229,6 +225,9 @@ pub struct UpdateAccountRequest {
 impl UpdateAccountRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
         require_account_id(&self.account_id, "accountId")?;
+        if let Some(connection) = &self.connection {
+            connection.validate()?;
+        }
         validate_account_notes(self.notes.as_deref())?;
         parse_concurrency_limit(self.concurrency_limit)?;
         parse_account_weight(self.weight)?;
@@ -236,9 +235,14 @@ impl UpdateAccountRequest {
         Ok(())
     }
 
-    pub(super) fn into_command(self) -> Result<UpdateAccount, WireValidationError> {
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(UpdateAccount, Option<ProviderDocument>), WireValidationError> {
         self.validate()?;
-        Ok(UpdateAccount {
+        let connection = self
+            .connection
+            .map(AccountConnectionUpdateRequest::into_document);
+        let settings = UpdateAccount {
             outbound_proxy: super::wire::proxy_selection(
                 self.outbound_proxy_id,
                 self.outbound_proxy_url,
@@ -250,7 +254,48 @@ impl UpdateAccountRequest {
             weight: parse_account_weight(self.weight)?,
             model_access: self.model_access,
             group_ids: validate_wire_group_ids(&self.group_ids)?,
-        })
+        };
+        Ok((settings, connection))
+    }
+}
+
+/// 编辑 OpenAI 账号的连接设置；OAuth 仅接受传输方式。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountConnectionUpdateRequest {
+    pub base_url: Option<String>,
+    pub transport: String,
+    pub api_key: Option<String>,
+}
+
+impl AccountConnectionUpdateRequest {
+    fn validate(&self) -> Result<(), WireValidationError> {
+        if let Some(base_url) = &self.base_url {
+            require_text(base_url, 2048, "connection.baseUrl")?;
+        }
+        if !matches!(self.transport.as_str(), "http" | "prefer_websocket") {
+            return Err(WireValidationError::new("connection.transport"));
+        }
+        if self.api_key.as_ref().is_some_and(|key| {
+            key.is_empty()
+                || key.len() > 16 * 1024
+                || !key.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
+            return Err(WireValidationError::new("connection.apiKey"));
+        }
+        Ok(())
+    }
+
+    fn into_document(self) -> ProviderDocument {
+        let mut material =
+            Map::from_iter([("transport".to_owned(), Value::String(self.transport))]);
+        if let Some(base_url) = self.base_url {
+            material.insert("base_url".to_owned(), Value::String(base_url));
+        }
+        if let Some(key) = self.api_key {
+            material.insert("api_key".to_owned(), Value::String(key));
+        }
+        ProviderDocument::new(OpaqueProviderData::new(material))
     }
 }
 
@@ -279,7 +324,7 @@ pub struct AccountDeletionRequest {
 
 impl AccountDeletionRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
-        AccountProvider::parse(&self.provider)?;
+        parse_provider(&self.provider)?;
         if self.account_ids.is_empty() || self.account_ids.len() > MAX_ACCOUNT_DELETE_BATCH {
             return Err(WireValidationError::new("accountIds"));
         }
@@ -296,9 +341,9 @@ impl AccountDeletionRequest {
     pub(super) fn into_command(
         self,
         context: gateway_admin::model::MutationContext,
-    ) -> Result<(AccountProvider, CredentialDeletion), WireValidationError> {
+    ) -> Result<(ProviderKind, CredentialDeletion), WireValidationError> {
         self.validate()?;
-        let provider = AccountProvider::parse(&self.provider)?;
+        let provider = parse_provider(&self.provider)?;
         Ok((
             provider,
             CredentialDeletion {
@@ -346,7 +391,7 @@ pub struct RotateAccountRequest {
 
 impl RotateAccountRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
-        if AccountProvider::parse(&self.provider)? != AccountProvider::OpenAi {
+        if parse_provider(&self.provider)?.as_str() != "openai" {
             return Err(WireValidationError::new("provider"));
         }
         require_account_id(&self.account_id, "accountId")?;
@@ -354,6 +399,10 @@ impl RotateAccountRequest {
             settings.validate()?;
             if settings.account_id != self.account_id {
                 return Err(WireValidationError::new("settings.accountId"));
+            }
+            // 连接设置只走 /accounts/update；轮换附带的设置只接受调度与分组字段。
+            if settings.connection.is_some() {
+                return Err(WireValidationError::new("settings.connection"));
             }
         }
         if self.guanlan_revive.is_some() {
@@ -469,7 +518,9 @@ impl RotateAccountRequest {
         Ok(RotateCredential {
             settings: self
                 .settings
-                .map(UpdateAccountRequest::into_command)
+                .map(|settings| {
+                    UpdateAccountRequest::into_command(settings).map(|(settings, _)| settings)
+                })
                 .transpose()?,
             mutation: CredentialMutation {
                 context,
@@ -645,6 +696,11 @@ fn require_text(
     }
     Ok(())
 }
+
+// fork：手工轮换 OAuth token 仍走 /accounts/rotate，上游移除该入口时一并删掉了这些校验。
+const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_REFRESH_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_ID_TOKEN_BYTES: usize = 16 * 1024;
 
 fn validate_oauth_material(
     access_token: &str,

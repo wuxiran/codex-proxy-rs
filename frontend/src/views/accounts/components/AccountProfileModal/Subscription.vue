@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountSubscription } from '@/api'
 import { computed } from 'vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{
   subscription: AccountSubscription

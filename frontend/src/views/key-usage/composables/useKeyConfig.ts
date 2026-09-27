@@ -2,7 +2,7 @@ import { computed, onScopeDispose, shallowRef, watch } from 'vue'
 import { getKeyUsageConfig } from '@/api/modules/key-usage'
 import { useCopyText } from '@/composables/useCopyText'
 import { useRequestState } from '@/composables/useRequestState'
-import { resolveServiceRootUrl } from '@/utils/serviceUrl'
+import { resolveServiceRootUrl } from '@/utils/client'
 
 export function useKeyConfig() {
   const showConfig = shallowRef(false)

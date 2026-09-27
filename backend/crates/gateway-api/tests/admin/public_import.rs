@@ -42,14 +42,21 @@ async fn admin_configuration_should_require_administrator_authentication() {
         ("/api/admin/public-import", None),
         (
             "/api/admin/public-import/create",
-            Some(json!({"name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null})),
+            Some(
+                json!({"name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null}),
+            ),
         ),
         (
             "/api/admin/public-import/update",
-            Some(json!({"id": "x", "name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null})),
+            Some(
+                json!({"id": "x", "name": "迷茫", "enabled": false, "groupIds": [], "pinTurnState": true, "expiresAt": null}),
+            ),
         ),
         ("/api/admin/public-import/delete", Some(json!({"id": "x"}))),
-        ("/api/admin/public-import/rotate-token", Some(json!({"id": "x"}))),
+        (
+            "/api/admin/public-import/rotate-token",
+            Some(json!({"id": "x"})),
+        ),
     ] {
         let (status, _) = request(&fixture, path, body, false, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");

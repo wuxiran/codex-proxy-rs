@@ -1,7 +1,8 @@
 import type { AccountGroup, ApiKey } from '@/api'
+import { normalizeRgbaHexColor, toast } from '@codex-proxy/ui'
+
 import { watchDebounced } from '@vueuse/core'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
-
 import {
   createAccountGroup,
   deleteAccountGroup,
@@ -11,13 +12,11 @@ import {
   getApiKeys,
   updateAccountGroup,
 } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useIdSet } from '@/composables/useIdSet'
 import { usePagedQuery } from '@/composables/usePagedQuery'
-import { errorMessage } from '@/utils/async'
-import { normalizeRgbaHexColor } from '@/utils/color'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
+import { errorMessage } from '@/utils/operation'
 import { DEFAULT_ACCOUNT_GROUP_COLOR } from '../constants'
 
 export interface AccountGroupFormValue {

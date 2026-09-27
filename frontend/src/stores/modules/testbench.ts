@@ -1,11 +1,11 @@
 // 测智台状态放 store：切走页面再回来，上一次的结果、进行中的生成都还在（收流循环挂在 store 上，
 // 不随页面卸载中断）。表单配置持久到 localStorage；结果持久到 sessionStorage（刷新不丢已完成的结果）。
 import type { Account, AccountGroup } from '@/api'
+import { toast } from '@codex-proxy/ui'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { getAccountGroups, getAccounts } from '@/api'
 import { API_BASE_URL } from '@/api/constants'
-import { toast } from '@/components/base/BaseToast'
 
 export const PELICAN_PROMPT
   = 'Create an HTML page with an SVG drawing of a pelican riding a bicycle in 2D. Output only the HTML, no explanation, no markdown fences.'

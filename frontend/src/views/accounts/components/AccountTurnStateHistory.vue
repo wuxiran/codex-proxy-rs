@@ -1,13 +1,10 @@
 <script setup lang="ts">
 import type { TurnStateHistoryRow } from '../utils/turnStateHistory'
 import type { TurnStateCaptureRule } from '@/api'
+import { BaseButton, BaseEmpty, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed, ref, watch } from 'vue'
 import { getUsageRecordDetail, getUsageRecords } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import { useRequestState } from '@/composables/useRequestState'
 import { turnStateHistoryRow } from '../utils/turnStateHistory'
 

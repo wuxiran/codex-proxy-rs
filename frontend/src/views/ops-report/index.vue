@@ -2,18 +2,14 @@
 // 经营日报：后台任务每 10 分钟按北京时间自然日汇总 CPR 号池投入与 sub2api 消费、收款。
 // 平台 1 元 = 1 刀；英雄套餐订阅按 1/5 折算为「调整后」。毛利 = Codex 经 CPR 调整后消费 − 当天人民币买入成本。
 import type { EChartsOption } from 'echarts'
+import { BaseButton, BaseCard, BaseEmpty, BasePageHeader, BaseSelect } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import request from '@/api/request'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 interface Slice { requests: number, standard: number, adjusted: number }
 interface Sub2api {

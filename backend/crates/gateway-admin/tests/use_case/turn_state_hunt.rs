@@ -67,6 +67,7 @@ impl AccountProbe for ScriptedProbe {
     fn probe(
         &self,
         request: AccountProbeRequest,
+        _snapshot: Option<std::sync::Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         let egress = request.egress.expect("hunt probes always pin an egress");
         self.egresses
@@ -117,6 +118,8 @@ impl AccountProbe for ScriptedProbe {
 fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        auto_location: false,
+        detected_location: None,
         location: None,
         id: id.to_owned(),
         name: id.to_owned(),
@@ -125,6 +128,7 @@ fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
         account_count: 0,
         last_test_at: Some(now),
         last_test: Some(ProxyTestResult {
+            location: Default::default(),
             success: usable,
             latency_ms: 1,
             exit_ip: None,
@@ -200,6 +204,8 @@ fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
 fn proxy_with(id: &str, url: &str, usable: bool, account_count: u64) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        auto_location: false,
+        detected_location: None,
         location: None,
         id: id.to_owned(),
         name: id.to_owned(),
@@ -208,6 +214,7 @@ fn proxy_with(id: &str, url: &str, usable: bool, account_count: u64) -> ProxyRec
         account_count,
         last_test_at: Some(now),
         last_test: Some(ProxyTestResult {
+            location: Default::default(),
             success: usable,
             latency_ms: 1,
             exit_ip: None,

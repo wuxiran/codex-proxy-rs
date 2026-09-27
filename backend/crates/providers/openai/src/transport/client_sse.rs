@@ -64,11 +64,14 @@ impl CodexBackendClient {
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
+            connection_budget: None,
+            response_control: None,
             direct_client: client.clone(),
             client,
             websocket_origin_key: websocket_origin_key(&base_url),
             outbound_proxy: None,
             egress_key: String::new(),
+            middleware_headers: Vec::new(),
             base_url,
             official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
             protocol: OpenAiUpstreamProtocol::Codex,
@@ -81,6 +84,16 @@ impl CodexBackendClient {
     /// 为 Responses WebSocket 请求启用连接池。
     pub fn with_websocket_pool(mut self, pool: Arc<CodexWebSocketPool>) -> Self {
         self.websocket_pool = Some(pool);
+        self
+    }
+
+    /// 附加当前 attempt 经 Core 复核的业务请求头。
+    #[must_use]
+    pub(crate) fn with_middleware_headers(
+        mut self,
+        middleware_headers: Vec<gateway_core::engine::middleware::MiddlewareHeader>,
+    ) -> Self {
+        self.middleware_headers = middleware_headers;
         self
     }
 
@@ -123,7 +136,8 @@ impl CodexBackendClient {
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
         trace.capture("upstream.request.body", &body);
-        let mut outbound = self.client.post(endpoint).headers(headers);
+        let client = self.http_opening_client()?;
+        let mut outbound = client.post(endpoint).headers(headers);
         let body = if self.protocol == OpenAiUpstreamProtocol::Codex {
             outbound = outbound.header(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
             zstd::stream::encode_all(std::io::Cursor::new(body), 3)
@@ -271,6 +285,7 @@ impl CodexBackendClient {
         )
         .map_err(CodexClientError::WebSocketEncode)?;
         websocket_create.connection.outbound_proxy = self.outbound_proxy.clone();
+        websocket_create.connection.connection_budget = self.connection_budget.clone();
         context.trace.cloned().unwrap_or_default().headers(
             "upstream.request.headers",
             serde_json::json!({"transport": "websocket", "phase": "prepared_opening"}),
@@ -292,7 +307,7 @@ impl CodexBackendClient {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
-        let connection_profile = websocket_connection_profile(&headers);
+        let connection_profile = websocket_connection_profile(&headers, &self.middleware_headers);
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
         let pool_log_context = pool_key.as_ref().map(WebSocketPoolLogContext::from_key);
@@ -439,6 +454,7 @@ impl CodexBackendClient {
                 let mut exchange = execute_prepared_response_create_request_stream(
                     &websocket_request,
                     prepared,
+                    self.response_control.clone(),
                     context
                         .trace
                         .cloned()
@@ -633,15 +649,37 @@ async fn read_model_catalog_body(response: ReqwestResponse) -> CodexClientResult
     Ok(body)
 }
 
-fn websocket_connection_profile(headers: &HeaderMap) -> String {
-    ["originator", "user-agent", X_OPENAI_MEMGEN_REQUEST_HEADER]
-        .map(|name| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        })
-        .join("\0")
+fn websocket_connection_profile(
+    headers: &HeaderMap,
+    middleware_headers: &[gateway_core::engine::middleware::MiddlewareHeader],
+) -> String {
+    let mut profile = [
+        "originator",
+        "user-agent",
+        "version",
+        X_OPENAI_MEMGEN_REQUEST_HEADER,
+    ]
+    .map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    })
+    .join("\0");
+    if !middleware_headers.is_empty() {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        for header in middleware_headers {
+            digest.update(header.name().len().to_le_bytes());
+            digest.update(header.name().as_bytes());
+            digest.update(header.value().len().to_le_bytes());
+            digest.update(header.value());
+        }
+        profile.push('\0');
+        profile.push_str(&hex::encode(digest.finalize()));
+    }
+    profile
 }
 
 fn http_sse_stream(

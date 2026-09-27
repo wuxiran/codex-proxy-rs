@@ -4,6 +4,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+mod admin_adapter;
+mod authorization;
 mod quota_forecast;
 mod timestamps;
 
@@ -19,8 +21,8 @@ use gateway_admin::{
         observability::TimeRange,
         provider_credentials::{
             AuthorizationCommit, AuthorizationCredentialCommit, AuthorizationMutationTarget,
-            AuthorizationOwnerBinding, PendingAuthorizationMutation, PreparedCredentialCreate,
-            ProviderDocument,
+            AuthorizationOwnerBinding, PendingAuthorizationMutation, PluginAccountListQuery,
+            PreparedCredentialCreate, ProviderDocument,
         },
     },
     ports::store::AccountStore,
@@ -2035,6 +2037,12 @@ async fn authorization_create_returns_existing_account_id_when_identity_is_upser
     let result = admin_account_store(&database.pool)
         .commit_authorization(
             AuthorizationCommit {
+                key: gateway_admin::model::provider_credentials::AuthorizationReceiptKey::new(
+                    provider_kind.clone(),
+                    "authorization-upsert",
+                    &context,
+                )
+                .unwrap(),
                 settings: Some(gateway_admin::model::accounts::AccountImportSettings {
                     notes: Some("  OAuth 新建备注  ".to_owned()),
                     model_access: Default::default(),
@@ -2050,33 +2058,37 @@ async fn authorization_create_returns_existing_account_id_when_identity_is_upser
                     },
                     AuthorizationOwnerBinding::from_context(&context),
                 ),
-                credential: AuthorizationCredentialCommit::Create(PreparedCredentialCreate {
-                    model_access: Default::default(),
-                    outbound_proxy: None,
-                    account_id: ProviderAccountId::new("acct_authorization_candidate")
-                        .expect("candidate account ID"),
-                    provider_kind,
-                    name: "authorized account".to_owned(),
-                    email: Some("authorized@example.invalid".to_owned()),
-                    upstream_user_id: Some("user-authorization-upsert".to_owned()),
-                    upstream_account_id: None,
-                    plan_type: Some("free".to_owned()),
-                    authentication_kind: "oauth".to_owned(),
-                    provider_material: ProviderDocument::new(OpaqueProviderData::new(
-                        provider_material,
-                    )),
-                    has_refresh_token: true,
-                    access_token_expires_at: Some(Utc::now() + TimeDelta::hours(1)),
-                    next_refresh_at: None,
-                    enabled: true,
-                    credential_state: CredentialState::Ready,
-                    credential_observed_at: Utc::now(),
-                }),
+                credential: AuthorizationCredentialCommit::Create(Box::new(
+                    PreparedCredentialCreate {
+                        model_access: Default::default(),
+                        outbound_proxy: None,
+                        account_id: ProviderAccountId::new("acct_authorization_candidate")
+                            .expect("candidate account ID"),
+                        provider_kind,
+                        name: "authorized account".to_owned(),
+                        email: Some("authorized@example.invalid".to_owned()),
+                        upstream_user_id: Some("user-authorization-upsert".to_owned()),
+                        upstream_account_id: None,
+                        plan_type: Some("free".to_owned()),
+                        authentication_kind: "oauth".to_owned(),
+                        provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                            provider_material,
+                        )),
+                        has_refresh_token: true,
+                        access_token_expires_at: Some(Utc::now() + TimeDelta::hours(1)),
+                        next_refresh_at: None,
+                        enabled: true,
+                        credential_state: CredentialState::Ready,
+                        credential_observed_at: Utc::now(),
+                    },
+                )),
             },
             &context,
         )
         .await
         .expect("authorize existing identity");
+
+    let result = result.result;
 
     assert_eq!(
         (
@@ -2119,6 +2131,8 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
     let saved = proxies
         .create(
             NewProxy {
+                auto_location: false,
+                test: None,
                 location: None,
                 name: "OAuth".to_owned(),
                 proxy: original.clone(),
@@ -2129,6 +2143,7 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
         .unwrap()
         .record;
     let success = ProxyTestResult {
+        location: Default::default(),
         success: true,
         latency_ms: 1,
         exit_ip: Some("203.0.113.5".parse().unwrap()),
@@ -2145,6 +2160,8 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
     let edited = proxies
         .update(
             UpdateProxy {
+                auto_location: None,
+                test: None,
                 location: None,
                 id: saved.id.clone(),
                 revision: saved.revision,
@@ -3874,5 +3891,62 @@ async fn turn_state_configuration_rotation_preserves_credential_error_and_quota(
     );
     assert_eq!(after.summary.quota, before.summary.quota);
     assert_eq!(after.summary.name, before.summary.name);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn connection_configuration_update_preserves_credential_health() {
+    let Some(database) = TestDatabase::create("connection_configuration_health").await else {
+        return;
+    };
+    let repository = PgProviderAccountRepository::new(database.pool.clone());
+    const ID: &str = "acct_transport_health";
+    repository
+        .insert_provider_account(account(ID, "transport-health-user"))
+        .await
+        .unwrap();
+    sqlx::query("update provider_accounts set credential_state = 'expired', last_error_reason = 'credential_expired', last_error_message = 'test expiration' where id = $1")
+        .bind(ID).execute(&database.pool).await.unwrap();
+    let before: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(a) from provider_accounts a where id = $1")
+            .bind(ID)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let mut credential = credential_update(ID, 1, "same-secret");
+    credential.preserve_credential_state = true;
+    credential.preserve_profile = true;
+    repository
+        .rotate_provider_account(RotateProviderAccount {
+            scope: ProviderAccountAdminScope {
+                provider_kind: "openai".to_owned(),
+            },
+            profile: profile(ID, "must not replace name"),
+            replacement_identity: None,
+            credential,
+            settings: None,
+            audit: audit("audit_transport_health", "rotate", ID),
+        })
+        .await
+        .unwrap();
+    let after: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(a) from provider_accounts a where id = $1")
+            .bind(ID)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    for field in [
+        "name",
+        "credential_state",
+        "credential_observed_at",
+        "last_error_reason",
+        "last_error_message",
+    ] {
+        assert_eq!(
+            after[field], before[field],
+            "configuration update changed {field}"
+        );
+    }
+    assert_eq!(after["credential_revision"], 2);
     database.close().await;
 }

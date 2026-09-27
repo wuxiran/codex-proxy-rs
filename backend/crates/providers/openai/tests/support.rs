@@ -72,11 +72,26 @@ impl MemoryAccountStore {
             .expect("seed test OAuth credential");
     }
 
+    pub(crate) fn set_oauth_transport(
+        &self,
+        id: &str,
+        transport: provider_openai::credential::ResponsesTransport,
+    ) {
+        use provider_openai::credential::CodexCredentialCodec;
+        let mut accounts = self.accounts.lock().unwrap();
+        let stored = accounts
+            .get_mut(&ProviderAccountId::new(id).unwrap())
+            .unwrap();
+        let mut data = CodexCredentialCodec::decode_complete(&stored.credential).unwrap();
+        data.oauth_mut().unwrap().transport = transport;
+        stored.credential = CodexCredentialCodec::encode_complete(data).unwrap();
+    }
+
     pub(crate) async fn seed_api_key(
         &self,
         id: &str,
         base_url: String,
-        transport: provider_openai::credential::ApiKeyTransport,
+        transport: provider_openai::credential::ResponsesTransport,
     ) {
         let credential = provider_openai::credential::CodexCredentialCodec::encode_complete(
             provider_openai::credential::CodexCredentialData::ApiKey(
@@ -653,6 +668,7 @@ pub(crate) struct TestLeaseCoordinator {
     pub(crate) requests: Mutex<Vec<ProviderSchedulingLeaseRequest>>,
     pub(crate) busy: Mutex<bool>,
     pub(crate) busy_accounts: Mutex<BTreeSet<ProviderAccountId>>,
+    pub(crate) signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
     round_robin_cursor: Mutex<u64>,
 }
 
@@ -664,21 +680,24 @@ impl ProviderLeasePort for TestLeaseCoordinator {
         accounts: &'a [ProviderAccountId],
     ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
+            let overrides = self.signals.lock().expect("scheduling signals lock");
             let signals = accounts
                 .iter()
-                .cloned()
                 .map(|account| {
                     (
-                        account,
-                        AccountRuntimeSignals {
-                            in_flight: 0,
-                            last_started_at: None,
-                            quota_reset_at: None,
-                            quota_remaining_rank: None,
-                            cooldown: None,
-                            failure_rate_basis_points: None,
-                            first_output_latency_ms: None,
-                        },
+                        account.clone(),
+                        overrides
+                            .get(account)
+                            .cloned()
+                            .unwrap_or(AccountRuntimeSignals {
+                                in_flight: 0,
+                                last_started_at: None,
+                                quota_reset_at: None,
+                                quota_remaining_rank: None,
+                                cooldown: None,
+                                failure_rate_basis_points: None,
+                                first_output_latency_ms: None,
+                            }),
                     )
                 })
                 .collect();

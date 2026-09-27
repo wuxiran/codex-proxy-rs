@@ -1,10 +1,10 @@
-import type { BaseTableSort } from '@/components/base/BaseTable/columns'
+import type { BaseTableSort } from '@codex-proxy/ui'
 import { watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, shallowRef } from 'vue'
 import { getApiKeys } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 export function useApiKeysQuery() {
   const searchQuery = shallowRef('')

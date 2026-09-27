@@ -86,8 +86,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
             .map_err(|error| admin_store_error("runtime settings", error))?;
         let replacement = postgres::ControlPlaneReplacement {
             settings: postgres::RuntimeSettingsUpdate {
-                openai_client_profile: command.openai_client_profile,
-                xai_client_profile: command.xai_client_profile,
+                request_profile_updates: command.request_profile_updates,
                 admin_api_key: current.settings.admin_api_key,
                 refresh_margin_seconds: command.refresh_margin_seconds,
                 refresh_concurrency: command.refresh_concurrency,
@@ -100,6 +99,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
                 responses_max_decompressed_body_bytes: command
                     .responses_max_decompressed_body_bytes,
+                smart_scheduling: command.smart_scheduling,
                 rotation_strategy: command.rotation_strategy.as_str().to_owned(),
                 model_mappings: store_model_mappings(command.model_mappings),
                 min_codex_desktop_version: command.min_codex_desktop_version,
@@ -115,6 +115,9 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 account_auto_freeze_probe_model: command.account_auto_freeze_probe_model,
                 account_auto_freeze_adaptive_concurrency: command
                     .account_auto_freeze_adaptive_concurrency,
+                account_warmup_enabled: command.account_warmup_enabled,
+                account_warmup_schedule_time: command.account_warmup_schedule_time,
+                account_warmup_model: command.account_warmup_model,
                 request_log_enabled: command.request_log_enabled,
                 request_log_test_key_id: command.request_log_test_key_id,
             },
@@ -137,6 +140,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "concurrency_wait_timeout_seconds".to_owned(),
                     "responses_max_decompressed_body_bytes".to_owned(),
                     "rotation_strategy".to_owned(),
+                    "smart_scheduling_json".to_owned(),
                     "min_codex_desktop_version".to_owned(),
                     "min_codex_cli_version".to_owned(),
                     "retention".to_owned(),
@@ -234,8 +238,7 @@ pub(crate) fn admin_runtime_settings(
         })
         .collect::<AdminStoreResult<ModelMappings>>()?;
     Ok(AdminRuntimeSettings {
-        openai_client_profile: settings.openai_client_profile,
-        xai_client_profile: settings.xai_client_profile,
+        request_profiles: settings.request_profiles,
         config_revision: admin_revision(settings.config_revision)?,
         request_location_enabled: settings.request_location_enabled,
         request_location: settings.request_location,
@@ -248,6 +251,7 @@ pub(crate) fn admin_runtime_settings(
         max_waiting_per_account: settings.max_waiting_per_account,
         concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
         responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
+        smart_scheduling: settings.smart_scheduling,
         rotation_strategy,
         min_codex_desktop_version: settings.min_codex_desktop_version,
         min_codex_cli_version: settings.min_codex_cli_version,
@@ -261,6 +265,9 @@ pub(crate) fn admin_runtime_settings(
         account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
         account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
         account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
+        account_warmup_enabled: settings.account_warmup_enabled,
+        account_warmup_schedule_time: settings.account_warmup_schedule_time,
+        account_warmup_model: settings.account_warmup_model,
         request_log_enabled: settings.request_log_enabled,
         request_log_test_key_id: settings.request_log_test_key_id,
         updated_at: settings.updated_at,

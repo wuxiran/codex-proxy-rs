@@ -4,7 +4,7 @@ import { useIntervalFn } from '@vueuse/core'
 import { shallowRef, watch } from 'vue'
 import { getAccountDetail } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 interface ConfigurationEntry {
   value?: OAuthStateConfiguration
@@ -35,9 +35,11 @@ export function useAccountConfigurations(accounts: Ref<Account[]>) {
           const detail = await getAccountDetail({ accountId: account.id }, { signal, silent: true })
           if (!request.isCurrent(requestId))
             return
-          const value = detail.credentialConfiguration
-          if (!value || !('pinTurnState' in value))
+          const configuration = detail.credentialConfiguration
+          if (!configuration || typeof configuration.pinTurnState !== 'boolean')
             throw new Error('该账号暂不支持 state 配置')
+          // 详情合同是通用 JSON；OpenAI OAuth 账号的 state 字段由 fork 后端提供。
+          const value = configuration as unknown as OAuthStateConfiguration
           entries.value = { ...entries.value, [account.id]: { value, loading: false } }
         }
         catch (error) {

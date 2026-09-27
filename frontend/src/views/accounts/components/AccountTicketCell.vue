@@ -3,7 +3,7 @@ import type { AccountTicket } from '@/api/modules/accounts'
 import { computed } from 'vue'
 
 import { useUiClock } from '@/composables/useUiClock'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{ ticket: AccountTicket, addedAtDisplay?: string | null }>()
 

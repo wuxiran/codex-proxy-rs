@@ -7,19 +7,57 @@ pub mod auth;
 pub mod backup;
 pub mod client_distribution;
 pub mod client_keys;
+pub mod credentials;
 pub mod import_tasks;
 pub mod key_usage;
 pub mod observability;
-pub mod openai;
+pub mod plugin_accounts;
+pub mod plugin_client_keys;
+pub mod plugin_resources;
+pub(crate) mod plugin_update;
+pub mod plugins;
 pub mod proxies;
 pub mod public_import;
 pub mod settings;
 pub mod system;
 mod turn_state_hunt;
 mod usage_projection_cache;
-pub mod xai;
 
-use std::sync::Arc;
+/// fork：票据复活、免登录导入与票据恢复消费的 OpenAI 固定凭据入口。
+///
+/// 上游已把 OpenAI/xAI 固定服务并入通用 [`credentials::CredentialsService`]；这里只保留 fork
+/// 用到的窄 trait，由 `CredentialsService` 每次操作冻结 openai 实现后委托（见 `credentials::flow`）。
+pub mod openai {
+    use async_trait::async_trait;
+
+    use crate::model::{
+        AdminError,
+        account_tickets::TicketSecret,
+        provider_credentials::{
+            CredentialImportResult, CredentialMutationResult, ImportCredentials, ProviderDocument,
+            RotateCredential,
+        },
+    };
+
+    #[async_trait]
+    pub trait OpenAiService: Send + Sync {
+        /// 用票据登录换回单账号导入文档（经 Provider 的登录服务，走给定出口）。
+        async fn ticket_login(
+            &self,
+            ticket: &TicketSecret,
+            proxy: Option<&gateway_core::account::OutboundProxy>,
+        ) -> Result<ProviderDocument, AdminError>;
+        /// 只新建 OAuth 账号：API Key 账号与上游身份已存在的账号整批拒绝，供免登录入口使用。
+        async fn import_new_accounts(
+            &self,
+            command: ImportCredentials,
+        ) -> Result<CredentialImportResult, AdminError>;
+        async fn rotate(
+            &self,
+            command: RotateCredential,
+        ) -> Result<CredentialMutationResult, AdminError>;
+    }
+}
 
 use crate::{
     model::{
@@ -106,7 +144,7 @@ async fn publish_committed(
 }
 
 async fn publish_credentials_and_observe_quota(
-    provider: &Arc<dyn ProviderAdmin>,
+    provider: &std::sync::Arc<dyn crate::ports::provider::ProviderAdmin>,
     snapshot: &dyn SnapshotControl,
     revision: crate::model::Revision,
     account_ids: &[ProviderAccountId],
@@ -116,7 +154,7 @@ async fn publish_credentials_and_observe_quota(
     publish_committed(snapshot, revision).await?;
 
     // 凭据已经提交；额度只是可重建的观察，不能拖住管理请求或回滚提交结果。
-    let provider = Arc::clone(provider);
+    let provider = provider.clone();
     let account_ids = account_ids.to_vec();
     let request_id = request_id.to_owned();
     tokio::spawn(async move {
@@ -150,6 +188,18 @@ async fn required_credential(
 ) -> Result<CredentialDetails, AdminError> {
     accounts
         .credential_details(provider_kind, account_id)
+        .await
+        .map_err(|error| map_store_error(error, resource))?
+        .ok_or_else(|| AdminError::not_found("Provider 凭据不存在"))
+}
+
+async fn required_plugin_credential(
+    accounts: &dyn AccountStore,
+    account_id: &ProviderAccountId,
+    resource: &'static str,
+) -> Result<CredentialDetails, AdminError> {
+    accounts
+        .credential_details_by_id(account_id)
         .await
         .map_err(|error| map_store_error(error, resource))?
         .ok_or_else(|| AdminError::not_found("Provider 凭据不存在"))
@@ -237,7 +287,13 @@ fn validate_prepared_rotation(
     prepared: &PreparedCredentialRotation,
     _resource: &'static str,
 ) -> Result<(), AdminError> {
-    let facts = prepared.facts();
+    validate_prepared_rotation_facts(account, prepared.facts())
+}
+
+fn validate_prepared_rotation_facts(
+    account: &crate::model::accounts::AccountRecord,
+    facts: &crate::model::provider_credentials::PreparedCredentialRotationFacts,
+) -> Result<(), AdminError> {
     if facts.account_id.as_str() != account.id.as_str()
         || facts.provider_kind != account.provider_kind
     {
@@ -298,10 +354,11 @@ async fn validate_authorization_commit(
 async fn commit_authorization(
     accounts: &dyn AccountStore,
     prepared: PreparedAuthorizationCommit,
+    key: crate::model::provider_credentials::AuthorizationReceiptKey,
     settings: Option<crate::model::accounts::AccountImportSettings>,
     context: &MutationContext,
     resource: &'static str,
-) -> Result<CredentialMutationResult, AdminError> {
+) -> Result<crate::model::provider_credentials::AuthorizationCommitResult, AdminError> {
     if settings.is_some()
         && matches!(
             &prepared.credential,
@@ -315,14 +372,19 @@ async fn commit_authorization(
         command,
         credential_guard,
         authorization_guard,
-    } = prepared.into_commit(settings);
+    } = prepared.into_commit(settings, key);
     match accounts.commit_authorization(command, context).await {
         Ok(result) => {
-            if let Some(guard) = credential_guard {
+            if let Some(guard) = credential_guard
+                && result.newly_committed
+            {
                 guard.finish();
             }
-            if let Some(guard) = authorization_guard {
-                guard.commit().await?;
+            if let Some(guard) = authorization_guard
+                && let Err(error) = guard.commit().await
+            {
+                // 账号与回执已经原子提交，Redis 清理失败不能把确定的成功改写为失败。
+                tracing::warn!(resource, settlement_error = %error, "authorization committed but pending cleanup failed");
             }
             Ok(result)
         }

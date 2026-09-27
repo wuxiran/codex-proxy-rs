@@ -1,4 +1,4 @@
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime } from '@/utils/format'
 
 export const KEY_USAGE_TIME_ZONE = 'Asia/Shanghai'
 

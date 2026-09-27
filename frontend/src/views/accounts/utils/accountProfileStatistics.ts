@@ -1,5 +1,5 @@
 import type { AccountProfileDailyUsage } from '@/api'
-import { formatCompactNumber } from '@/utils/number'
+import { formatCompactNumber } from '@/utils/format'
 
 export type ProfileActivityMode = 'daily' | 'weekly' | 'cumulative'
 export type ProfileActivityLevel = 0 | 1 | 2 | 3 | 4

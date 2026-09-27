@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import type { AccountRow } from '../../constants'
+import { BaseButton, BaseSkeleton } from '@codex-proxy/ui'
 import { usePreferredReducedMotion } from '@vueuse/core'
 import { computed, ref, toRef, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useChartPalette } from '@/composables/useChartPalette'
 import { useUiClock } from '@/composables/useUiClock'

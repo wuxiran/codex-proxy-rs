@@ -192,20 +192,9 @@ impl DefaultObservabilityService {
             average(first_token_latency_sum_ms, first_token_latency_count);
         let trend = trend(TrendKind::Usage, observation.trend.clone())?;
         let health_timeline = health_timeline_at(&observation.trend, Utc::now());
-        let mut configurations = std::collections::BTreeMap::new();
-        if let Some(configuration) = &settings.openai_client_profile {
-            configurations.insert(
-                gateway_core::routing::ProviderKind::new("openai").expect("static provider kind"),
-                configuration.clone(),
-            );
-        }
-        if let Some(configuration) = &settings.xai_client_profile {
-            configurations.insert(
-                gateway_core::routing::ProviderKind::new("xai").expect("static provider kind"),
-                configuration.clone(),
-            );
-        }
-        let wire_profiles = self.providers.dashboard_wire_profiles(&configurations);
+        let wire_profiles = self
+            .providers
+            .dashboard_wire_profiles(&settings.request_profiles);
         let max_concurrent_per_account = u64::from(settings.max_concurrent_per_account);
         let (inherited_accounts, overridden_slots) = runtime_slots
             .as_ref()
@@ -353,21 +342,13 @@ impl ObservabilityService for DefaultObservabilityService {
         let total_requests = items.iter().fold(0_u64, |total, item| {
             total.saturating_add(item.request_count)
         });
-        let mut items = items
+        let items = items
             .into_iter()
             .map(|item| {
                 let error_rate = rate_or_zero(item.failure_count, item.request_count);
                 let non_completion_rate =
                     rate_or_zero(item.non_completion_count, item.request_count);
                 let retry_rate = rate_or_zero(item.retry_count, item.request_count);
-                let impact_score = diagnostic_impact_score(
-                    item.request_count,
-                    total_requests,
-                    error_rate,
-                    non_completion_rate,
-                    retry_rate,
-                    item.first_token_p95_ms,
-                );
                 DiagnosticsItem {
                     key: item.key,
                     name: item.name,
@@ -383,19 +364,12 @@ impl ObservabilityService for DefaultObservabilityService {
                     non_completion_rate,
                     retry_count: item.retry_count,
                     retry_rate,
-                    impact_score,
                     estimated_cost: usd_cost(&item.costs),
                     attempt_count: item.attempt_count,
                     total_tokens: item.total_tokens,
                 }
             })
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            right
-                .impact_score
-                .total_cmp(&left.impact_score)
-                .then_with(|| right.request_count.cmp(&left.request_count))
-        });
         Ok(DiagnosticsResult { dimension, items })
     }
 
@@ -733,25 +707,6 @@ fn amount_difference(
 
 fn decimal(value: &DecimalAmount) -> Option<gateway_core::metering::Decimal> {
     value.as_str().parse().ok()
-}
-
-fn diagnostic_impact_score(
-    request_count: u64,
-    total_requests: u64,
-    error_rate: f64,
-    non_completion_rate: f64,
-    retry_rate: f64,
-    first_token_p95_ms: Option<u64>,
-) -> f64 {
-    let request_share = rate_or_zero(request_count, total_requests);
-    let slow_score = first_token_p95_ms
-        .map_or(0.0, |value| value as f64 / 30_000.0)
-        .min(1.0);
-    error_rate * 0.35
-        + non_completion_rate * 0.25
-        + retry_rate.min(1.0) * 0.20
-        + request_share * 0.10
-        + slow_score * 0.10
 }
 
 fn usd_cost(costs: &[CurrencyCost]) -> Option<DecimalAmount> {

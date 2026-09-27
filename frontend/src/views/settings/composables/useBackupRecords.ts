@@ -1,5 +1,6 @@
 import type { BackupRecord, BackupStatus } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { computed, onScopeDispose, shallowRef } from 'vue'
 import {
   createBackup,
@@ -8,9 +9,8 @@ import {
   getBackupRecords,
 } from '@/api'
 import { ApiError } from '@/api/request'
-import { toast } from '@/components/base/BaseToast'
 import { usePagedQuery } from '@/composables/usePagedQuery'
-import { errorMessage } from '@/utils/async'
+import { errorMessage } from '@/utils/operation'
 
 const ACTIVE_STATUSES: BackupStatus[] = ['queued', 'dumping', 'uploading']
 const POLL_INTERVAL_MS = 2000

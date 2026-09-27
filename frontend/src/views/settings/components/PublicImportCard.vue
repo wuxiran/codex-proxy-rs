@@ -1,12 +1,10 @@
 <script setup lang="ts">
 import type { PublicImportConfig } from '@/api'
+import { BaseButton, BaseCard, toast } from '@codex-proxy/ui'
 import { Plus } from '@lucide/vue'
-import { onMounted, ref, shallowRef } from 'vue'
 
+import { onMounted, ref, shallowRef } from 'vue'
 import { createPublicImportConfig, listPublicImportConfigs } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import { toast } from '@/components/base/BaseToast'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import PublicImportSupplierCard from './PublicImportSupplierCard.vue'

@@ -126,6 +126,7 @@ impl DefaultAccountsService {
             .map_err(|error| map_provider_error(error, "provider turn state hunt"))?;
         let operation = provider
             .connection_test_operation(&command.upstream_model, CONNECTION_TEST_INPUT)
+            .await
             .map_err(|error| map_provider_error(error, "provider turn state hunt"))?;
         let egresses = if let Some(ephemeral) = command.ephemeral.as_ref() {
             // 自动撞：即时生成临时出口，不读已存代理，也不看 only_proxy_id。
@@ -593,13 +594,16 @@ impl Hunt {
             let result = self
                 .service
                 .probe
-                .probe(AccountProbeRequest {
-                    egress: Some(DiagnosticEgress::new(
-                        probed.proxy.clone(),
-                        location.clone(),
-                    )),
-                    ..self.request.clone()
-                })
+                .probe(
+                    AccountProbeRequest {
+                        egress: Some(DiagnosticEgress::new(
+                            probed.proxy.clone(),
+                            location.clone(),
+                        )),
+                        ..self.request.clone()
+                    },
+                    None,
+                )
                 .await;
             let error = match result {
                 Ok(result) => {
