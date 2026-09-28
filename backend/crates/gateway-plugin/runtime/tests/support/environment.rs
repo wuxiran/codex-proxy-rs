@@ -501,12 +501,10 @@ impl Environment {
                 )),
                 pricing_source: unavailable.clone(),
                 providers: super::native::admin_registry(),
-                public_import_dir: std::env::temp_dir()
-                    .join(format!("cpr-plugin-public-import-{}", uuid::Uuid::new_v4())),
-                account_ticket_dir: std::env::temp_dir()
-                    .join(format!("cpr-plugin-tickets-{}", uuid::Uuid::new_v4())),
-                ops_report_dir: std::env::temp_dir()
-                    .join(format!("cpr-plugin-ops-report-{}", uuid::Uuid::new_v4())),
+                // fork: runtime dirs；每个 harness 独占目录，避免用例之间共享入口配置。
+                fork: gateway_admin::ForkRuntimePorts::under(
+                    &std::env::temp_dir().join(format!("cpr-plugin-fork-{}", uuid::Uuid::new_v4())),
+                ),
                 snapshot: core.snapshot_control(),
                 account_probe: core.account_probe(),
                 proxy_probe: unavailable.clone(),

@@ -20,10 +20,9 @@ use gateway_admin::model::{
     AdminError as AdminServiceError, PageSize,
     accounts::{
         AccountConcurrencyLimit, AccountConnectionTestEvent as DomainConnectionTestEvent,
-        AccountCost, AccountGroupFilter, AccountListQuery, AccountListStatus, AccountModelUsage,
-        AccountSort, AccountSortField, AccountStatus as DomainAccountStatus, AccountUpdateResult,
-        AccountUsage, AccountWeight, AccountsUpdateResult, BatchUpdateAccounts, SortDirection,
-        UpdateAccount,
+        AccountCost, AccountGroupFilter, AccountListQuery, AccountModelUsage, AccountSort,
+        AccountSortField, AccountStatus as DomainAccountStatus, AccountUpdateResult, AccountUsage,
+        AccountWeight, AccountsUpdateResult, BatchUpdateAccounts, SortDirection, UpdateAccount,
     },
     provider_credentials::{
         AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,
@@ -61,6 +60,13 @@ const MAX_CALLBACK_URL_BYTES: usize = 64 * 1024;
 const MAX_ACCOUNT_DELETE_BATCH: usize = 200;
 const MAX_ACCOUNT_GROUP_BATCH: usize = 1000;
 const MAX_AVATAR_VERSION_BYTES: usize = 32;
+
+// fork: 账号管理的 fork 接口与目录状态
+mod fork_credentials;
+mod fork_handlers;
+pub use fork_credentials::*;
+pub use fork_handlers::router as fork_router;
+use gateway_admin::model::accounts::AccountListStatus;
 
 mod credentials;
 mod handlers;

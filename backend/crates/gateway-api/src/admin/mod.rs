@@ -17,16 +17,19 @@ pub mod backups;
 pub mod client_keys;
 mod extract;
 pub mod observability;
-pub mod ops_report;
 mod plugins;
 pub mod presenter;
 pub mod proxies;
-pub mod public_import;
-pub mod request_log;
 pub mod settings;
 pub mod system;
-pub mod turn_state;
 pub mod wire;
+
+// fork: 自有管理接口，路由汇总见 fork_routes.rs
+mod fork_routes;
+pub mod ops_report;
+pub mod public_import;
+pub mod request_log;
+pub mod turn_state;
 
 pub use auth::AdminAuth;
 pub use extract::{AdminJson, AdminQuery};
@@ -47,17 +50,14 @@ where
     Router::new()
         .merge(account_groups::router::<S>())
         .merge(proxies::router::<S>())
-        .merge(public_import::router::<S>())
         .merge(plugins::router::<S>())
         .merge(accounts::router::<S>())
         .merge(backups::router::<S>())
         .merge(client_keys::router::<S>())
         .merge(observability::router::<S>())
-        .merge(ops_report::router::<S>())
-        .merge(request_log::router::<S>())
         .merge(settings::router::<S>())
         .merge(system::router::<S>())
-        .merge(turn_state::router::<S>())
+        .merge(fork_routes::router::<S>()) // fork: routes
         .method_not_allowed_fallback(method_not_allowed)
         .route("/api/admin", any(admin_not_found))
         .route("/api/admin/{*path}", any(admin_not_found))

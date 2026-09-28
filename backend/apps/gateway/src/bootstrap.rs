@@ -104,9 +104,7 @@ async fn launch(
         openai,
     } = config;
 
-    let public_import_dir = host.runtime_data_dir().join("public_import");
-    let account_ticket_dir = host.runtime_data_dir().join("account_tickets");
-    let ops_report_dir = host.runtime_data_dir().join("ops_report");
+    let fork_ports = gateway_admin::ForkRuntimePorts::under(host.runtime_data_dir()); // fork: runtime dirs
     let plugin_cache = host.runtime_data_dir().join("plugins");
     let host = if command.is_some() {
         gateway_host::initialize_command_line(host).await?
@@ -293,9 +291,7 @@ async fn launch(
                 client_distribution: host.client_distribution_resolver(),
                 system: host.system_operations(),
                 client_key_verifier: core.client_key_verifier(),
-                public_import_dir,
-                account_ticket_dir,
-                ops_report_dir,
+                fork: fork_ports, // fork: runtime dirs
             },
             plugin_accounts,
         )
@@ -332,7 +328,7 @@ async fn launch(
             api,
             core.execution_service(),
             admin.services(),
-            Some(openai.turn_state_service()),
+            Some(openai.turn_state_service()), // fork: turn-state
             probes,
             host.worker_health(),
             host.connection_lifecycle(),

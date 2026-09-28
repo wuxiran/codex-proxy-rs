@@ -50,7 +50,6 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/admin/observability/query.rs",
         "src/admin/observability/routes.rs",
         "src/admin/observability/wire.rs",
-        "src/admin/ops_report.rs",
         "src/admin/plugins/artifacts.rs",
         "src/admin/plugins/distribution.rs",
         "src/admin/plugins/instances.rs",
@@ -58,11 +57,8 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/admin/plugins/mod.rs",
         "src/admin/presenter.rs",
         "src/admin/proxies.rs",
-        "src/admin/public_import.rs",
-        "src/admin/request_log.rs",
         "src/admin/settings.rs",
         "src/admin/system.rs",
-        "src/admin/turn_state.rs",
         "src/admin/wire.rs",
         "src/auth.rs",
         "src/health.rs",
@@ -70,7 +66,6 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/key_usage/query.rs",
         "src/key_usage/presenter.rs",
         "src/lib.rs",
-        "src/public_import.rs",
         "src/openai/middleware/http.rs",
         "src/openai/middleware/mod.rs",
         "src/openai/middleware/request.rs",
@@ -100,6 +95,17 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/provider.rs",
         "src/session_cookie.rs",
     ];
+    // fork: fork 自有文件集中登记，上游清单保持原样
+    expected.extend([
+        "src/admin/accounts/fork_credentials.rs",
+        "src/admin/accounts/fork_handlers.rs",
+        "src/admin/fork_routes.rs",
+        "src/admin/ops_report.rs",
+        "src/admin/public_import.rs",
+        "src/admin/request_log.rs",
+        "src/admin/turn_state.rs",
+        "src/public_import.rs",
+    ]);
     expected.sort_unstable();
 
     assert_eq!(actual, expected);
@@ -112,8 +118,6 @@ fn test_tree_should_match_frozen_rust_mirror() {
     actual.sort();
     let mut expected = vec![
         "tests/admin/account_groups.rs",
-        "tests/admin/accounts/fork_presenter.rs", // fork: billing
-        "tests/admin/accounts/fork_turn_state_wire.rs", // fork: turn-state
         "tests/admin/accounts/handlers.rs",
         "tests/admin/accounts/import_tasks.rs",
         "tests/admin/accounts/mod.rs",
@@ -121,7 +125,6 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/admin/auth.rs",
         "tests/admin/client_keys.rs",
         "tests/admin/errors.rs",
-        "tests/admin/fork_proxy_quality.rs", // fork: proxy-quality
         "tests/admin/mod.rs",
         "tests/admin/observability/mod.rs",
         "tests/admin/observability/query.rs",
@@ -129,10 +132,8 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/admin/plugins/management.rs",
         "tests/admin/plugins/mod.rs",
         "tests/admin/proxies.rs",
-        "tests/admin/public_import.rs",
         "tests/admin/settings.rs",
         "tests/admin/system.rs",
-        "tests/admin/turn_state.rs",
         "tests/admin/wire.rs",
         "tests/architecture.rs",
         "tests/auth.rs",
@@ -161,6 +162,14 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/openai/usage.rs",
         "tests/provider.rs",
     ];
+    // fork: fork 自有文件集中登记，上游清单保持原样
+    expected.extend([
+        "tests/admin/accounts/fork_presenter.rs",
+        "tests/admin/accounts/fork_turn_state_wire.rs",
+        "tests/admin/fork_proxy_quality.rs",
+        "tests/admin/public_import.rs",
+        "tests/admin/turn_state.rs",
+    ]);
     expected.sort_unstable();
 
     assert_eq!(actual, expected);

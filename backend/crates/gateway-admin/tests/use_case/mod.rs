@@ -293,13 +293,10 @@ impl AdminHarness {
                 client_distribution: Arc::new(NoopClientDistribution),
                 system: self.system,
                 client_key_verifier: self.client_key_verifier,
-                // 每个 harness 独占目录，避免用例之间共享入口配置。
-                public_import_dir: std::env::temp_dir()
-                    .join(format!("cpr-public-import-{}", uuid::Uuid::now_v7())),
-                account_ticket_dir: std::env::temp_dir()
-                    .join(format!("cpr-tickets-{}", uuid::Uuid::now_v7())),
-                ops_report_dir: std::env::temp_dir()
-                    .join(format!("cpr-ops-report-{}", uuid::Uuid::now_v7())),
+                // fork: runtime dirs；每个 harness 独占目录，避免用例之间共享入口配置。
+                fork: gateway_admin::ForkRuntimePorts::under(
+                    &std::env::temp_dir().join(format!("cpr-fork-{}", uuid::Uuid::now_v7())),
+                ),
             },
         )
         .await

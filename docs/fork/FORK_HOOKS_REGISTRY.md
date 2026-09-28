@@ -29,6 +29,20 @@
 | `frontend/src/layout/components/AppSidebar.vue` | A | import 一行；`insertForkNavItems(navItems)` 一行（在 `navItems` 定义之后） | `layout/components/menu.fork.ts`（菜单项与锚点） | 取上游，补回 2 行；上游改了 `/accounts`、`/usage` 的路径时同步 `menu.fork.ts` 的锚点 |
 | `frontend/src/api/index.ts` | B | 文件开头 `export * from './index.fork'`（lint 要求全文件按字母序） | `api/index.fork.ts` | 取上游，开头补回 |
 
+## 后端接线
+
+| 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
+| --- | --- | --- | --- | --- |
+| `gateway-admin/src/lib.rs` | B+A | fork 模块声明块（`mod fork;`、`ops_report`、`ticket_cipher`、`ticket_revive`、`turn_state_renewal` 及两行 `pub use`）；`AdminServices.fork`、`AdminRuntimePorts.fork` 字段及其解构、初始化；`fork::AccountsDeps::new(..)` 一个实参；`fork::attach(..)` 一行 | `gateway-admin/src/fork.rs`（fork 服务、运行目录、3 个 worker 注册、访问器 `ops_report()` / `public_import()` / `openai()`） | 取上游，补回 16 行。`attach` 要放在上游 worker 登记之后、`AdminBundle` 构造之前；它从 `services` 里取上游已建好的 proxies、account_groups、accounts、credentials |
+| `gateway-admin/src/use_case/accounts.rs` 的 `new` | B | 构造函数末尾一个 `fork: crate::fork::AccountsDeps` 形参 | `fork.rs` 的 `AccountsDeps` | 上游改构造函数签名时，保留末尾这个形参 |
+| `apps/gateway/src/bootstrap.rs` | B | `ForkRuntimePorts::under(host.runtime_data_dir())` 一行（要在 `host` 被 `initialize` 消费之前）；`fork: fork_ports` 字段；`gateway_api::initialize` 的 `turn_state` 实参 | `gateway-admin/src/fork.rs` | 取上游，补回 3 行 |
+| `gateway-store/src/bundle.rs` | B | `AdminStorePorts::new(..)` 之后链一个 `.with_ops_report(..)` | `gateway-store/src/postgres/ops_report.rs` | 取上游，补回链式调用 |
+| `gateway-api/src/lib.rs` | B | `mod public_import;`（fork 块）；`initialize` 的 `turn_state` 形参；`ApiState.turn_state` 字段及初始化；`.merge(public_import::router())`；`SessionState::turn_state` 实现 | `gateway-api/src/public_import.rs`、`admin/turn_state.rs` | 取上游，补回 12 行 |
+| `gateway-api/src/auth.rs` | B | `SessionState::turn_state()` 默认方法（返回 `None`） | — | 取上游，补回该方法 |
+| `gateway-api/src/admin/mod.rs` | B | fork 模块声明块（`fork_routes`、`ops_report`、`public_import`、`request_log`、`turn_state`）；`.merge(fork_routes::router())` 一行 | `admin/fork_routes.rs`（汇总全部 fork 管理路由） | 取上游，补回声明块和 1 行 merge |
+| `gateway-api/src/admin/accounts/mod.rs` | B | fork 块：`mod fork_credentials;`、`mod fork_handlers;`、两行 `pub use`、`AccountListStatus` 导入 | `accounts/fork_handlers.rs`（票据、rotate、turn-state 打票与遍历、测智台）、`accounts/fork_credentials.rs`（rotate 请求体与校验） | 取上游，补回 fork 块 |
+| `gateway-api/src/admin/accounts/handlers.rs`、`credentials.rs` | — | 无，与上游一致 | 同上 | 直接取上游 |
+
 ## 测试
 
 测试模块统一命名 `fork_<主题>.rs`，和被测的上游测试文件同目录；父模块里用带 `// fork:` 标记的 `mod` 行声明。
@@ -79,7 +93,7 @@
 | `gateway-api/tests/admin/accounts/presenter.rs` | D | 4 个预测字段（`None` / 空） | `accounts/fork_presenter.rs` | 取上游，补字段 |
 | `gateway-api/tests/admin/proxies.rs` | D+C | 共用替身 `MemoryProxies` / `SuccessfulProbe` 里的质量报告存储、重复地址检查、`exit_geo`（44 行，必须和上游替身写在同一个 impl 里）；`request()` 的 `pub(super)` | `admin/fork_proxy_quality.rs` | 取上游替身，把 fork 的质量与重复检查补回同一个 impl |
 | `gateway-api/tests/admin/accounts/handlers.rs` | C | 上游的「rotate 路由不存在」用例改成 `fork_rotation_route_stays_exposed_and_validates_its_material` | 原文件 | 取上游后把该用例改回 fork 版本（fork 保留 `/accounts/rotate`） |
-| `gateway-api/tests/architecture.rs` | D | 测试文件冻结清单里的 fork 文件（带 `// fork:` 标记） | — | 取上游，补回 fork 文件行 |
+| `gateway-api/tests/architecture.rs` | D | 源码清单、测试清单之后各一个 `expected.extend([..])` 块，登记 fork 自有文件（清单运行时排序，上游列表保持原样） | — | 取上游，补回两个 `extend` 块；新增 fork 文件时在块里登记 |
 | `gateway-api/tests/admin/mod.rs`、`admin/accounts/mod.rs` | D | fork `mod` 行；夹具字段 | — | 取上游，补回 |
 
 <!-- 后端接线、数据结构、热点文件的登记随各阶段补充 -->

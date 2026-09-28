@@ -182,6 +182,7 @@ async fn connect(
         plugins.clone(),
         plugins,
     )
+    // fork: ops report
     .with_ops_report(Arc::new(postgres::PgOpsReportSource::new(
         pool.clone(),
         config.ops_report.sub2api_database_url.as_deref(),

@@ -34,8 +34,10 @@ mod health;
 mod key_usage;
 pub mod openai;
 mod provider;
-mod public_import;
 mod session_cookie;
+
+// fork: 免登录导入的公开入口
+mod public_import;
 
 /// API-owned HTTP 与静态资源配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -126,7 +128,7 @@ pub fn initialize(
     mut config: ApiConfig,
     execution: Arc<dyn ExecutionService>,
     admin: AdminServices,
-    turn_state: Option<turn_state::TurnStateService>,
+    turn_state: Option<turn_state::TurnStateService>, // fork: turn-state
     probes: Vec<Arc<dyn HealthProbe>>,
     worker_health: Arc<dyn WorkerHealthSource>,
     lifecycle: Arc<dyn ConnectionLifecycle>,
@@ -137,7 +139,7 @@ pub fn initialize(
         .map_err(|_| ApiError::Config(ApiConfigError::InvalidRequestIdHeader))?;
     let state = ApiState {
         admin,
-        turn_state,
+        turn_state, // fork: turn-state
         openai: OpenAiService::new(execution, lifecycle),
         health: HealthStatus::new(probes, worker_health),
     };
@@ -150,7 +152,7 @@ pub fn initialize(
         .merge(admin::model_router())
         .merge(auth::router::<ApiState>())
         .merge(key_usage::router::<ApiState>())
-        .merge(public_import::router::<ApiState>())
+        .merge(public_import::router::<ApiState>()) // fork: public import
         .fallback_service(
             Router::new()
                 .fallback_service(
@@ -238,7 +240,7 @@ pub enum ApiError {
 #[derive(Clone)]
 pub(crate) struct ApiState {
     admin: AdminServices,
-    turn_state: Option<turn_state::TurnStateService>,
+    turn_state: Option<turn_state::TurnStateService>, // fork: turn-state
     openai: OpenAiService,
     health: HealthStatus,
 }
@@ -260,6 +262,7 @@ impl auth::SessionState for ApiState {
         &self.admin
     }
 
+    // fork: turn-state
     fn turn_state(&self) -> Option<&turn_state::TurnStateService> {
         self.turn_state.as_ref()
     }

@@ -259,27 +259,23 @@ pub(crate) struct DefaultAccountsService {
 
 impl DefaultAccountsService {
     #[must_use]
-    // 组合根一次性注入各项独立能力，拆成参数结构体只会多一层搬运。
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         accounts: Arc<dyn AccountStore>,
         account_runtime: Arc<dyn AccountRuntimeStore>,
-        settings: Arc<dyn SettingsStore>,
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
-        proxies: Arc<dyn ProxyStore>,
-        ticket_dir: std::path::PathBuf,
+        fork: crate::fork::AccountsDeps, // fork: accounts deps
     ) -> Self {
         Self {
-            ticket_cipher: Arc::new(crate::ticket_cipher::TicketCipher::new(ticket_dir)),
+            ticket_cipher: Arc::new(crate::ticket_cipher::TicketCipher::new(fork.ticket_dir)),
             accounts,
             account_runtime,
-            settings,
+            settings: fork.settings,
             providers,
             snapshot,
             probe,
-            proxies,
+            proxies: fork.proxies,
             hunts: super::turn_state_hunt::ActiveHunts::default(),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
             usage_cache: Arc::default(),
