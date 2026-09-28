@@ -39,9 +39,6 @@ flowchart TB
   Registry --> Plugins[Plugin Runtime / 插件进程]
   Builtin --> Upstream[上游服务]
   Plugins --> Upstream
-  Builtin --> TurnState[turn-state]
-  API --> TurnState
-  TurnState --> StateFiles[(runtime_data_dir/turn_state)]
   Core --> Store[gateway-store]
   Admin --> Store
   Builtin --> Store
@@ -70,7 +67,6 @@ flowchart TB
 | `gateway-plugin/runtime`（包名 `gateway-plugin-runtime`） | 插件包校验、能力适配、双向 RPC 与发布集合；通过 Host 管理子进程和受管 HTTP |
 | `providers/openai` | OpenAI OAuth、账号选择、目录、额度、Responses/Images/Search transport |
 | `providers/xai` | xAI OAuth session、账号选择、目录、额度和 Grok/Responses 转换 |
-| `turn-state` | Codex `X-Codex-Turn-State` 模板的桶存储（账号 × 模型，落运行数据目录）、Fernet 到期、注入决策、观测统计；纯逻辑 + 文件，不依赖其它 workspace crate，由 `providers/openai` 在请求前/响应后两处钩子调用，管理接口由 `gateway-api` 直接持有服务句柄 |
 | `frontend` | Vue 管理端与 Key 用量页，仅通过各自身份允许的控制面 API 访问状态 |
 | 独立仓库 `codex-proxy-ui` | 管理端与插件页面共用的 Vue 基础组件、纯主题算法和样式，不依赖宿主业务状态、路由或 API |
 | 独立仓库 `codex-proxy-plugins` | 官方维护综合示例，依赖公开 SDK，Rust 处理器和已构建页面合成一个可安装包，不随宿主构建发版 |
@@ -247,11 +243,8 @@ WS 路由提示属于握手，连接复用时不重发；档位变化不重建�
 各帧正文及计费仍使用本次请求的最终档位。
 
 `engine::observation` 统一维护单次响应的用量、费用、时间和响应 ID，并负责重试前清理；协调器继续
-独占发送、提交、重试和终结顺序。Provider 上报费用优先于本地估算作为既有结算金额；模型计算费用同时独立保留，不能冒充真实上游费用。
-Provider 本地估算按当前 attempt 实际发送的上游模型查价，响应声明的模型只作观测。
-父表 `model_requests` 持久化入口请求模型、路由模型与上游实际响应模型（`upstream_response_model`）；
-实际计价模型与本地计算费用存入子表 `model_request_billing`（fork 迁移 9001，避免 ALTER 巨表）。
-最终响应与计价观测在重试前一并清空，丢弃的 attempt 不得污染最终计量。
+独占发送、提交、重试和终结顺序。Provider 上报费用优先于本地估算，丢弃的 attempt 不得污染最终计量。
+Provider 本地估算按当前 attempt 实际发送的上游模型查价，响应声明的模型只作观测；费用明细复用同一口径。
 Client Key 费用账本独立累计各次 attempt 的实际费用，不能因请求重试而清空已产生的费用或未知计费状态。
 
 ## 4. 数据面请求生命周期
@@ -300,8 +293,7 @@ Client Key 鉴权完成后，API adapter 从有界请求头识别 Codex Desktop/
 核心不变量：
 
 - 一个客户端请求对应一条 `model_requests`；attempt 是请求内事实，不建立第二张权威表。
-- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、通用重试和 fallback 由 Core 决定。
-  OpenAI 密文恢复仅在该次执行内处理明确拒绝，受下述 Provider 恢复边界约束。
+- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、重试和 fallback 由 Core 决定。
 - `not_sent`、`sent`、`ambiguous` 是单调的上游发送边界；结果不明确时不能假定上游未收到请求。
 - downstream commit 是不可撤回的交付承诺。commit 后禁止换号、重试和 fallback。
 - API 在最终错误编码出口投影客户端恢复信号；该投影不修改 Provider 上游事实，也不改变 Core 的
@@ -367,13 +359,6 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 xAI Provider 负责 Codex custom 工具与 Grok function 工具的双向转换，保持工具类型、item ID 与
 `call_id` 配对；超限或转换失败终止流。默认 `store: false` 的续接由现有会话 owner 重放完整历史；
 原生续接按上游约束处理 `instructions` 与 `previous_response_id`，不把协议差异交给 Core。
-
-OpenAI Provider 对明确的 `invalid_encrypted_content` 拒绝提供一次同账号、同凭据、同模型恢复，
-仅在尚未交付客户端事件、未观察到输出或工具活动，且输入可自含重放时移除加密 reasoning 项。
-普通消息和配对工具历史保持原样；引用、compaction、孤儿工具结果及未知历史项继续要求客户端重放。
-正常请求保留密文。已拒绝项的摘要只在有界进程缓存中保存，按账号、凭据代际、模型、Client Key 与
-客户端会话隔离，供后续请求预清理；缺少客户端会话时只允许本次恢复。恢复不改变 Core 的结算合同，
-也不证明被拒绝的上游请求免费。
 
 ### 后台账号导入
 
@@ -621,7 +606,6 @@ PostgreSQL 周期对账才是正确性基础。
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | 对应 Provider 的上游 | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
-| OpenAI 实验 state 固定开关 / 候选 | PostgreSQL 凭据 JSON / Provider 进程内有界缓存 | 开关持久化；候选不落盘，最多 2048 条、固定一小时，按账号、令牌指纹、捕获代次、模型和客户端密钥隔离 |
 | Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
@@ -712,8 +696,7 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 - Core：`runtime` owner 的 RuntimeSnapshot 周期对账和 Redis change 订阅；
 - Admin：S3/R2 备份 daemon，负责调度、执行、删除收敛与保留清理；
   以及账号冻结恢复 worker（容量熔断的自适应并发下调与到期探测解冻）；
-- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查；
-  OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，默认关闭。
+- Provider：credential refresh、quota/catalog 健康和官方版本/etag 检查。
 
 账号容量熔断默认关闭。启用后，仅普通请求收到的明确容量拒绝（`server_is_overloaded`、`slow_down`
 或结构化错误中的明确过载提示）按滑动窗口计数，并把当时观测到的在途并发并入峰值证据；
