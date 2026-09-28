@@ -11,9 +11,13 @@ mod observability;
 mod plugin_update;
 mod plugins;
 mod proxies;
-mod public_import;
 mod settings;
 mod system;
+
+// fork: 以下为 fork 自有测试模块
+mod fork_accounts;
+mod fork_proxies;
+mod public_import;
 mod turn_state_hunt;
 
 use std::{

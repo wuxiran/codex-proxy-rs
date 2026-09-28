@@ -84,6 +84,7 @@ mod accounts;
 mod auth;
 mod client_keys;
 mod errors;
+mod fork_proxy_quality; // fork: proxy-quality
 mod observability;
 mod proxies;
 mod public_import;

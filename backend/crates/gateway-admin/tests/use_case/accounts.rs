@@ -78,8 +78,6 @@ pub(super) struct FakeProviderAdmin {
     retry_authorization_after_abort: Mutex<bool>,
     export_inputs: Mutex<Vec<ProviderExportCredentialInput>>,
     import_account_ids: Mutex<Vec<String>>,
-    import_authentication_kind: Mutex<String>,
-    import_documents: Mutex<Vec<serde_json::Value>>,
     quota_requests: Mutex<Vec<ProviderQuotaRequest>>,
     quota_started: tokio::sync::Notify,
     quota_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -90,12 +88,7 @@ pub(super) struct FakeProviderAdmin {
     profile_result: Mutex<Result<ProviderProfileStatistics, ProviderAdminErrorKind>>,
     subscription_result: Mutex<Result<Option<ProviderSubscription>, ProviderAdminErrorKind>>,
     personal_info_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
-    /// `Some` 时支持遍历代理找 state；值是当前凭据绑定，测试可中途改写模拟凭据刷新。
-    pub(super) hunt_binding: Mutex<Option<String>>,
-    /// 续期任务每个周期看到的到期账号。
-    pub(super) hunt_renewals: Mutex<Vec<gateway_admin::ports::provider::TurnStateRenewal>>,
-    /// 最近一次钉住 state 时传入的出口（外层 `None` = 还没钉过；内层 `None` = 直连）。
-    pub(super) hunt_pinned_egress: Mutex<Option<Option<String>>>,
+    pub(super) fork: super::fork_accounts::FakeProviderAdminFork, // fork: fake state
 }
 
 impl FakeProviderAdmin {
@@ -111,8 +104,6 @@ impl FakeProviderAdmin {
             retry_authorization_after_abort: Mutex::new(false),
             export_inputs: Mutex::new(Vec::new()),
             import_account_ids: Mutex::new(vec!["acct_prepared".to_owned()]),
-            import_authentication_kind: Mutex::new("oauth".to_owned()),
-            import_documents: Mutex::new(Vec::new()),
             quota_requests: Mutex::new(Vec::new()),
             quota_started: tokio::sync::Notify::new(),
             quota_gate: Mutex::new(None),
@@ -123,9 +114,7 @@ impl FakeProviderAdmin {
             profile_result: Mutex::new(Ok(empty_profile_statistics())),
             subscription_result: Mutex::new(Ok(None)),
             personal_info_barrier: Mutex::new(None),
-            hunt_binding: Mutex::new(None),
-            hunt_renewals: Mutex::new(Vec::new()),
-            hunt_pinned_egress: Mutex::new(None),
+            fork: Default::default(),
         })
     }
 
@@ -166,21 +155,6 @@ impl FakeProviderAdmin {
 
     pub(super) fn fail_next_quota(&self, kind: ProviderAdminErrorKind) {
         *self.quota_failure.lock().expect("provider quota failure") = Some(kind);
-    }
-
-    /// 依次返回 Provider 收到的导入文档，供断言入口改写后的内容。
-    pub(super) fn import_documents(&self) -> Vec<serde_json::Value> {
-        self.import_documents
-            .lock()
-            .expect("provider import documents")
-            .clone()
-    }
-
-    pub(super) fn set_import_authentication_kind(&self, kind: &str) {
-        *self
-            .import_authentication_kind
-            .lock()
-            .expect("import authentication kind") = kind.to_owned();
     }
 
     pub(super) fn set_import_account_ids(&self, account_ids: &[&str]) {
@@ -310,6 +284,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         upstream_model: &gateway_core::routing::UpstreamModelId,
     ) -> Result<gateway_admin::ports::provider::TurnStateHuntTicket, ProviderAdminError> {
         let binding = self
+            .fork
             .hunt_binding
             .lock()
             .unwrap()
@@ -328,7 +303,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         _: std::time::SystemTime,
         _: std::time::Duration,
     ) -> Vec<gateway_admin::ports::provider::TurnStateRenewal> {
-        self.hunt_renewals.lock().unwrap().clone()
+        self.fork.hunt_renewals.lock().unwrap().clone()
     }
 
     fn turn_state_hunt_inspect(
@@ -350,9 +325,9 @@ impl ProviderAdmin for FakeProviderAdmin {
         captured_at: std::time::SystemTime,
         egress: Option<&gateway_core::account::OutboundProxy>,
     ) -> Result<std::time::SystemTime, ProviderAdminError> {
-        *self.hunt_pinned_egress.lock().unwrap() =
+        *self.fork.hunt_pinned_egress.lock().unwrap() =
             Some(egress.map(gateway_core::account::OutboundProxy::endpoint));
-        if self.hunt_binding.lock().unwrap().as_deref() != Some(ticket.binding()) {
+        if self.fork.hunt_binding.lock().unwrap().as_deref() != Some(ticket.binding()) {
             return Err(ProviderAdminError::new(ProviderAdminErrorKind::Conflict));
         }
         self.record("provider.hunt_pin");
@@ -438,16 +413,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         command: PrepareCredentialImport,
     ) -> Result<PreparedCredentialImport, ProviderAdminError> {
         self.record("provider.prepare_import");
-        self.import_documents
-            .lock()
-            .expect("provider import documents")
-            .push(serde_json::Value::Object(
-                command
-                    .document
-                    .expose_to_provider()
-                    .expose_to_provider()
-                    .clone(),
-            ));
+        self.fork.record_import_document(&command); // fork: public import
         let gate = self.import_gate.lock().expect("import gate").clone();
         if let Some(gate) = gate {
             gate.acquire().await.expect("import permit").forget();
@@ -458,18 +424,17 @@ impl ProviderAdmin for FakeProviderAdmin {
             .lock()
             .expect("provider import account IDs")
             .clone();
-        let authentication_kind = self
-            .import_authentication_kind
-            .lock()
-            .expect("import authentication kind")
-            .clone();
         Ok(PreparedCredentialImport {
             provider_kind: self.kind.clone(),
             credentials: account_ids
                 .into_iter()
-                .map(|account_id| PreparedCredentialCreate {
-                    authentication_kind: authentication_kind.clone(),
-                    ..prepared_create_with_id(self.kind.clone(), &account_id, "prepared-import")
+                .map(|account_id| {
+                    self.fork
+                        .with_import_authentication_kind(prepared_create_with_id(
+                            self.kind.clone(),
+                            &account_id,
+                            "prepared-import",
+                        ))
                 })
                 .collect(),
         })
@@ -670,9 +635,7 @@ pub(super) struct FakeAccountStore {
     quota_forecast_history: Mutex<QuotaForecastHistory>,
     update_commands: Mutex<Vec<UpdateAccount>>,
     pub(super) lowered_limits: Mutex<Vec<(String, u32)>>,
-    /// 已保存代理 ID 到地址的解析表；批量更新选中其中之一时账号的出口随之改变。
-    pub(super) saved_proxies:
-        Mutex<std::collections::BTreeMap<String, gateway_core::account::OutboundProxy>>,
+    pub(super) fork: super::fork_accounts::FakeAccountStoreFork, // fork: fake state
 }
 
 impl FakeAccountStore {
@@ -694,7 +657,7 @@ impl FakeAccountStore {
             quota_forecast_history: Mutex::new(QuotaForecastHistory::default()),
             update_commands: Mutex::new(Vec::new()),
             lowered_limits: Mutex::new(Vec::new()),
-            saved_proxies: Mutex::new(std::collections::BTreeMap::new()),
+            fork: Default::default(),
         })
     }
 
@@ -730,7 +693,7 @@ impl FakeAccountStore {
         *self.quota_window_usage.lock().expect("quota window usage") = usage;
     }
 
-    fn quota_window_queries(&self) -> Vec<AccountUsageWindowQuery> {
+    pub(super) fn quota_window_queries(&self) -> Vec<AccountUsageWindowQuery> {
         self.quota_window_queries
             .lock()
             .expect("quota window queries")
@@ -1151,24 +1114,7 @@ impl AccountStore for FakeAccountStore {
         self.record("store.batch_update_accounts");
         self.record_context(context);
         self.require_commit()?;
-        if let Some(selection) = &command.outbound_proxy {
-            use gateway_admin::model::proxies::AccountProxySelection;
-            let proxy = match selection {
-                AccountProxySelection::Direct => None,
-                AccountProxySelection::Url(proxy) => Some(proxy.clone()),
-                AccountProxySelection::Saved(id) => {
-                    self.saved_proxies.lock().expect("proxies").get(id).cloned()
-                }
-            };
-            // 解析不到的已保存代理保持原绑定：模拟「提交看似成功、账号却没换到该出口」。
-            if !matches!(selection, AccountProxySelection::Saved(_)) || proxy.is_some() {
-                for account in self.accounts.lock().expect("accounts").iter_mut() {
-                    if command.account_ids.contains(&account.id) {
-                        account.outbound_proxy = proxy.clone();
-                    }
-                }
-            }
-        }
+        self.fork.apply_outbound_proxy(&command, &self.accounts); // fork: turn-state hunt
         if let Some(enabled) = command.enabled {
             for account in self.accounts.lock().expect("accounts").iter_mut() {
                 if command.account_ids.contains(&account.id) {
@@ -2653,58 +2599,6 @@ async fn api_key_list_and_detail_should_accumulate_local_usage_without_subscript
 }
 
 #[tokio::test]
-async fn unobserved_quota_should_preserve_local_cost_in_list_detail_and_refresh() {
-    let mut account = account_record("openai");
-    account.created_at = Utc::now() - TimeDelta::days(60);
-    let added_at = account.created_at;
-    let store = FakeAccountStore::with_account(account, events());
-    let account_id = ProviderAccountId::new("acct_test").unwrap();
-
-    // 金额未知、已知零和已有消费都不依赖上游额度；统计范围也不能缩为最近 24 小时。
-    // 列表的用量投影按 service 实例做短 TTL 缓存，每种金额用新实例，避免读到上一轮。
-    for amount in [None, Some("0"), Some("12.34")] {
-        let provider = FakeProviderAdmin::new("openai", events());
-        let services = accounts_service(provider, store.clone()).await;
-        let mut expected = quota_local_usage("acct_test", 4_330_000);
-        expected.costs = amount
-            .map(|value| gateway_admin::model::accounts::AccountCost {
-                currency: "USD".to_owned(),
-                amount: value.parse().unwrap(),
-            })
-            .into_iter()
-            .collect();
-        store.set_quota_window_usage(vec![AccountUsageWindowResult {
-            account_id: account_id.to_string(),
-            key: "account-lifetime".to_owned(),
-            usage: expected.clone(),
-        }]);
-        let page = services
-            .accounts()
-            .list(AccountListQuery {
-                page: 1,
-                page_size: gateway_admin::model::PageSize::new(20).unwrap(),
-                provider_kind: None,
-                group_filter: None,
-                search: None,
-                status: None,
-                sort: None,
-            })
-            .await
-            .unwrap();
-        let detail = services.accounts().quota(&account_id, false).await.unwrap();
-        let refreshed = services.accounts().quota(&account_id, true).await.unwrap();
-        for item in [&page.items[0], &detail, &refreshed] {
-            assert_eq!(item.usage.as_ref(), Some(&expected));
-            assert!(item.quota.windows.is_empty());
-        }
-        let queries = store.quota_window_queries();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].range.start, added_at);
-        assert!(queries[0].range.end > added_at + TimeDelta::days(59));
-    }
-}
-
-#[tokio::test]
 async fn accounts_list_should_attach_local_usage_to_quota_windows() {
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::hours(1);
@@ -3176,7 +3070,7 @@ fn empty_quota() -> ProviderQuota {
     }
 }
 
-fn quota_local_usage(account_id: &str, total_tokens: u64) -> AccountUsage {
+pub(super) fn quota_local_usage(account_id: &str, total_tokens: u64) -> AccountUsage {
     AccountUsage {
         billing: Default::default(),
         account_id: account_id.to_owned(),
@@ -3456,7 +3350,7 @@ async fn personal_info_should_discard_results_when_account_changes_during_query(
     }
 }
 
-async fn accounts_service(
+pub(super) async fn accounts_service(
     provider: Arc<FakeProviderAdmin>,
     store: Arc<FakeAccountStore>,
 ) -> AdminServices {

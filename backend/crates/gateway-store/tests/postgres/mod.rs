@@ -18,6 +18,8 @@ mod client_budgets;
 mod client_keys;
 mod execution;
 mod execution_buffer;
+mod fork_execution_billing; // fork: billing
+mod fork_proxy_quality; // fork: proxy-quality
 mod health;
 mod observability;
 mod ops_events;

@@ -1,4 +1,4 @@
-//! 使用真实 loopback HTTP/SSE/WS 验证恢复请求、交付边界与摘要缓存。
+//! fork：invalid_encrypted_content 恢复。使用真实 loopback HTTP/SSE/WS 验证恢复请求、交付边界与摘要缓存。
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::contract::{
+use super::{
     CAPTURE_COMPLETED_SSE, captured_request_body, context, context_with_state_owner,
     contract_account_scope, create_account, planned_request, planned_request_for_model,
     provider_with_base_url,

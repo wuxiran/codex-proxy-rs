@@ -52,12 +52,12 @@ use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FinalState {
+pub(super) struct FinalState {
     error_kind: Option<GatewayErrorKind>,
-    diagnostic_trace_json: Option<String>,
+    pub(super) diagnostic_trace_json: Option<String>,
     outcome: ExecutionOutcome,
     send_state: UpstreamSendState,
-    attempt_count: u32,
+    pub(super) attempt_count: u32,
     committed: bool,
     client_status_code: Option<u16>,
     total_tokens: Option<u64>,
@@ -85,28 +85,28 @@ struct FinalState {
     first_token_ms: Option<u64>,
     provider_processing_ms: Option<u64>,
     provider_metadata_json: Option<String>,
-    billing: gateway_core::metering::ModelBillingObservation,
-    cost_source: CostSource,
-    cost_ticks: Option<u128>,
+    pub(super) billing: gateway_core::metering::ModelBillingObservation, // fork: billing
+    pub(super) cost_source: CostSource,
+    pub(super) cost_ticks: Option<u128>,
 }
 
 #[derive(Default)]
-struct StoreState {
+pub(super) struct StoreState {
     created: usize,
-    attempts: Vec<AttemptRecord>,
+    pub(super) attempts: Vec<AttemptRecord>,
     send_states: Vec<UpstreamSendState>,
     commits: usize,
     committed_statuses: Vec<Option<u16>>,
     recorded_statuses: Vec<u16>,
-    intermediate_failures: usize,
+    pub(super) intermediate_failures: usize,
     intermediate_status_codes: Vec<Option<u16>>,
     intermediate_request_ids: Vec<Option<String>>,
-    finalizations: Vec<FinalState>,
+    pub(super) finalizations: Vec<FinalState>,
 }
 
 #[derive(Default)]
-struct FakeStore {
-    state: Mutex<StoreState>,
+pub(super) struct FakeStore {
+    pub(super) state: Mutex<StoreState>,
     failures: BTreeSet<StoreWriteFailure>,
     create_gate: Mutex<Option<oneshot::Receiver<()>>>,
     finalize_gate: Mutex<Option<oneshot::Receiver<()>>>,
@@ -253,7 +253,7 @@ impl ExecutionStore for FakeStore {
                 first_token_ms: finalization.timings.first_token_ms,
                 provider_processing_ms: finalization.timings.provider_processing_ms,
                 provider_metadata_json: finalization.provider_metadata_json,
-                billing: finalization.billing,
+                billing: finalization.billing, // fork: billing
                 cost_source: finalization.cost.source(),
                 cost_ticks: finalization
                     .cost
@@ -276,12 +276,7 @@ impl ExecutionStore for FakeStore {
     }
 }
 
-enum Script {
-    AttributedStream {
-        account_id: &'static str,
-        proxy: Option<&'static str>,
-        items: Vec<Result<GatewayEvent, ProviderError>>,
-    },
+pub(super) enum Script {
     Stream {
         account_id: &'static str,
         items: Vec<Result<GatewayEvent, ProviderError>>,
@@ -297,14 +292,20 @@ enum Script {
     },
     Error(ProviderError),
     Pending,
+    // fork: attribution —— 带账号出口的流，元数据见 fork_coordinator::attributed_metadata。
+    AttributedStream {
+        account_id: &'static str,
+        proxy: Option<&'static str>,
+        items: Vec<Result<GatewayEvent, ProviderError>>,
+    },
 }
 
-struct ScriptedProvider {
+pub(super) struct ScriptedProvider {
     profile_generation: AtomicUsize,
     default_profile_calls: AtomicUsize,
     default_profile: Mutex<Option<gateway_core::account::OpaqueProviderData>>,
     scripts: Mutex<VecDeque<Script>>,
-    contexts: Mutex<Vec<AttemptContext>>,
+    pub(super) contexts: Mutex<Vec<AttemptContext>>,
     operations: Mutex<Vec<Operation>>,
     released_leases: Arc<AtomicUsize>,
 }
@@ -385,29 +386,6 @@ impl Provider for ScriptedProvider {
             .pop_front()
             .expect("one script per provider call");
         match script {
-            Script::AttributedStream {
-                account_id,
-                proxy,
-                items,
-            } => {
-                let proxy =
-                    proxy.map(|url| gateway_core::account::OutboundProxy::parse(url).unwrap());
-                let candidate = request.candidate();
-                let metadata = ProviderCallMetadata::new(
-                    candidate.provider().clone(),
-                    candidate.upstream_model().cloned().unwrap(),
-                    ProviderAccountId::new(account_id).unwrap(),
-                    UpstreamTransport::new("http_sse").unwrap(),
-                )
-                .with_outbound_proxy(proxy.as_ref());
-                Ok(ProviderStream::new(
-                    metadata,
-                    Box::pin(futures::stream::iter(
-                        items.into_iter().map(canonical_provider_event),
-                    )),
-                    TrackedLease(Arc::clone(&self.released_leases)),
-                ))
-            }
             Script::Error(error) => Err(error),
             Script::Pending => futures::future::pending().await,
             Script::Stream { account_id, items } => {
@@ -467,11 +445,23 @@ impl Provider for ScriptedProvider {
                     (),
                 ))
             }
+            // fork: attribution
+            Script::AttributedStream {
+                account_id,
+                proxy,
+                items,
+            } => Ok(ProviderStream::new(
+                super::fork_coordinator::attributed_metadata(&request, account_id, proxy),
+                Box::pin(futures::stream::iter(
+                    items.into_iter().map(canonical_provider_event),
+                )),
+                TrackedLease(Arc::clone(&self.released_leases)),
+            )),
         }
     }
 }
 
-fn generate_operation() -> Operation {
+pub(super) fn generate_operation() -> Operation {
     let body = json!({
         "model": "gpt-5",
         "input": [{"type": "message", "role": "user", "content": "hello"}],
@@ -494,7 +484,9 @@ fn image_generate_operation() -> Operation {
     ))
 }
 
-fn complete_stream(total_tokens: Option<u64>) -> Vec<Result<GatewayEvent, ProviderError>> {
+pub(super) fn complete_stream(
+    total_tokens: Option<u64>,
+) -> Vec<Result<GatewayEvent, ProviderError>> {
     let mut events = vec![Ok(GatewayEvent::Started(ResponseMeta::new(
         "response-1",
         "gpt-5",
@@ -629,7 +621,7 @@ fn image_stream(image_output_tokens: Option<u64>) -> Vec<Result<GatewayEvent, Pr
     ]
 }
 
-fn plan(operation: &Operation) -> RoutingPlan {
+pub(super) fn plan(operation: &Operation) -> RoutingPlan {
     plan_with_policy(
         operation,
         AccountSelectionPolicy::new(
@@ -737,7 +729,7 @@ fn plan_with_profiles(
         .expect("routing plan")
 }
 
-fn model_request(operation: &Operation, deadline: SystemTime) -> NewModelRequest {
+pub(super) fn model_request(operation: &Operation, deadline: SystemTime) -> NewModelRequest {
     let client_key = ClientApiKeyId::new("key_client_1").expect("client key id");
     NewModelRequest {
         admission_decision_ms: None,
@@ -765,7 +757,7 @@ fn model_request(operation: &Operation, deadline: SystemTime) -> NewModelRequest
     }
 }
 
-fn coordinator(
+pub(super) fn coordinator(
     scripts: Vec<Script>,
 ) -> (
     AttemptCoordinator<FakeStore>,
@@ -2266,15 +2258,6 @@ fn calculated_cost_is_persisted_when_provider_does_not_report_cost() {
 
     assert_eq!(state.finalizations[0].cost_source, CostSource::Calculated);
     assert_eq!(state.finalizations[0].cost_ticks, Some(123));
-    assert_eq!(
-        state.finalizations[0]
-            .billing
-            .calculated_cost
-            .unwrap()
-            .amount()
-            .scaled(),
-        123
-    );
 }
 
 #[test]
@@ -2284,7 +2267,7 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
     let events = vec![
         Ok(GatewayEvent::Started(ResponseMeta::new(
             "reported-cost",
-            "gpt-5.6-luna",
+            "grok-4.5",
         ))),
         Ok(GatewayEvent::CalculatedCost(
             CalculatedCost::from_usd_ticks(10).expect("first calculated cost"),
@@ -2295,10 +2278,10 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
         Ok(GatewayEvent::CalculatedCost(
             CalculatedCost::from_usd_ticks(999).expect("later calculated cost"),
         )),
-        Ok(GatewayEvent::Completed(
-            ResponseMeta::new("reported-cost", "gpt-5.6-luna")
-                .with_billing_model(Some("gpt-5.6-luna".to_owned())),
-        )),
+        Ok(GatewayEvent::Completed(ResponseMeta::new(
+            "reported-cost",
+            "grok-4.5",
+        ))),
     ];
     let (coordinator, store, _) = coordinator(vec![Script::Stream {
         account_id: "acct_one",
@@ -2323,23 +2306,6 @@ fn provider_reported_cost_should_not_be_replaced_by_calculated_cost() {
             state.finalizations[0].cost_ticks
         ),
         (CostSource::ProviderReported, Some(25))
-    );
-    assert_eq!(
-        state.finalizations[0]
-            .billing
-            .calculated_cost
-            .unwrap()
-            .amount()
-            .scaled(),
-        999
-    );
-    assert_eq!(
-        state.finalizations[0].billing.response_model.as_deref(),
-        Some("gpt-5.6-luna")
-    );
-    assert_eq!(
-        state.finalizations[0].billing.billing_model.as_deref(),
-        Some("gpt-5.6-luna")
     );
 }
 
@@ -2386,8 +2352,6 @@ fn discarded_attempt_cost_never_leaks_into_retry_result() {
     let state = store.state.lock().expect("store lock");
     assert_eq!(state.finalizations[0].cost_source, CostSource::Unavailable);
     assert_eq!(state.finalizations[0].cost_ticks, None);
-    assert!(state.finalizations[0].billing.calculated_cost.is_none());
-    assert!(state.finalizations[0].billing.billing_model.is_none());
     assert_eq!(
         session.budget_charge().amount_usd.scaled(),
         999,
@@ -4748,288 +4712,6 @@ fn first_resolved_profile_is_frozen_across_account_retries() {
     let first = contexts[0].request_profile().unwrap();
     assert_eq!(first.expose_to_provider()["generation"], 1);
     assert_eq!(contexts[1].request_profile(), Some(first));
-}
-
-// fork 专属：路由归属与计价归属追踪测试（内联，遵守 tests 镜像 src 的架构约束）。
-fn attribution_trace(finalization: &FinalState) -> Value {
-    serde_json::from_str(finalization.diagnostic_trace_json.as_deref().unwrap()).unwrap()
-}
-
-#[test]
-fn attribution_keeps_last_valid_route_when_retry_has_no_current_or_eligible_account() {
-    let operation = generate_operation();
-    let route_plan = plan(&operation);
-    let (coordinator, store, provider) = coordinator(vec![
-        Script::AttributedStream {
-            account_id: "acct_first",
-            proxy: Some("http://synthetic-user:synthetic-password@proxy.example:8080"),
-            items: vec![Err(ProviderError::new(
-                ProviderErrorKind::Unavailable,
-                UpstreamSendState::Sent,
-            )
-            .with_replay_safe())],
-        },
-        Script::Error(ProviderError::new(
-            ProviderErrorKind::NoEligibleAccount,
-            UpstreamSendState::NotSent,
-        )),
-    ]);
-    let mut session = block_on(coordinator.start(
-        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
-        operation,
-        route_plan,
-        None,
-        None,
-        CancellationToken::new(),
-    ))
-    .unwrap();
-    assert!(block_on(session.collect_uncommitted()).is_err());
-    assert!(session.is_finalized());
-    assert_eq!(provider.contexts.lock().unwrap().len(), 2);
-    let state = store.state.lock().unwrap();
-    assert_eq!(state.intermediate_failures, 1);
-    assert_eq!(state.attempts.len(), 1);
-    assert_eq!(state.finalizations[0].attempt_count, 1);
-    let trace = attribution_trace(&state.finalizations[0]);
-    assert_eq!(
-        trace["request_attribution"],
-        json!({
-            "requested_model":"gpt-5", "route_model":"gpt-5", "response_model":null, "billing_model":null,
-            "provider_account_id":"acct_first", "outbound_proxy_endpoint":"http://proxy.example:8080/"
-        })
-    );
-    assert!(!trace.to_string().contains("synthetic"));
-}
-
-#[test]
-fn attribution_preserves_independent_response_and_billing_models_and_both_costs() {
-    for proxy in [
-        None,
-        Some("socks5h://synthetic-user:synthetic-secret@proxy.example:1080"),
-    ] {
-        let operation = generate_operation();
-        let (coordinator, store, _) = coordinator(vec![Script::AttributedStream {
-            account_id: "acct_one",
-            proxy,
-            items: vec![
-                Ok(GatewayEvent::Started(ResponseMeta::new(
-                    "resp_identity",
-                    "gpt-6-astra",
-                ))),
-                Ok(GatewayEvent::CalculatedCost(
-                    CalculatedCost::from_usd_ticks(100).unwrap(),
-                )),
-                Ok(GatewayEvent::ProviderCost(
-                    ProviderReportedCost::from_usd_ticks(0).unwrap(),
-                )),
-                Ok(GatewayEvent::Completed(
-                    ResponseMeta::new("resp_identity", "gpt-5.6-luna")
-                        .with_billing_model(Some("gpt-5.6-sol".to_owned())),
-                )),
-            ],
-        }]);
-        let mut session = block_on(coordinator.start(
-            model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
-            operation.clone(),
-            plan(&operation),
-            None,
-            None,
-            CancellationToken::new(),
-        ))
-        .unwrap();
-        block_on(session.collect_uncommitted()).unwrap();
-        block_on(session.commit_downstream(Some(200))).unwrap();
-        let state = store.state.lock().unwrap();
-        let finalization = &state.finalizations[0];
-        let trace = attribution_trace(finalization);
-        let expected_proxy = if proxy.is_some() {
-            "socks5h://proxy.example:1080"
-        } else {
-            "direct"
-        };
-        assert_eq!(
-            trace["request_attribution"],
-            json!({
-                "requested_model":"gpt-5", "route_model":"gpt-5", "response_model":"gpt-5.6-luna", "billing_model":"gpt-5.6-sol",
-                "provider_account_id":"acct_one", "outbound_proxy_endpoint":expected_proxy,
-            })
-        );
-        assert_eq!(
-            finalization.billing.response_model.as_deref(),
-            Some("gpt-5.6-luna")
-        );
-        assert_eq!(
-            finalization.billing.billing_model.as_deref(),
-            Some("gpt-5.6-sol")
-        );
-        assert_eq!(
-            finalization
-                .billing
-                .calculated_cost
-                .unwrap()
-                .amount()
-                .scaled(),
-            100
-        );
-        assert_eq!(finalization.cost_source, CostSource::ProviderReported);
-        assert_eq!(finalization.cost_ticks, Some(0));
-        assert!(!trace.to_string().contains("synthetic"));
-    }
-}
-
-#[test]
-fn attribution_retry_keeps_each_account_proxy_but_clears_discarded_billing() {
-    let operation = generate_operation();
-    let (coordinator, store, _) = coordinator(vec![
-        Script::AttributedStream {
-            account_id: "acct_first",
-            proxy: Some("http://synthetic-user:synthetic-secret@proxy.example:8080"),
-            items: vec![
-                Ok(GatewayEvent::Started(
-                    ResponseMeta::new("discarded", "gpt-5.6-luna")
-                        .with_billing_model(Some("gpt-5.6-luna".to_owned())),
-                )),
-                Ok(GatewayEvent::CalculatedCost(
-                    CalculatedCost::from_usd_ticks(100).unwrap(),
-                )),
-                Err(
-                    ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)
-                        .with_replay_safe(),
-                ),
-            ],
-        },
-        Script::AttributedStream {
-            account_id: "acct_second",
-            proxy: None,
-            items: vec![
-                Ok(GatewayEvent::Started(ResponseMeta::new(
-                    "winner",
-                    "gpt-6-astra",
-                ))),
-                Ok(GatewayEvent::ProviderCost(
-                    ProviderReportedCost::from_usd_ticks(0).unwrap(),
-                )),
-                Ok(GatewayEvent::Completed(ResponseMeta::new(
-                    "winner",
-                    "gpt-6-astra",
-                ))),
-            ],
-        },
-    ]);
-    let mut session = block_on(coordinator.start(
-        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
-        operation.clone(),
-        plan(&operation),
-        None,
-        None,
-        CancellationToken::new(),
-    ))
-    .unwrap();
-    block_on(session.collect_uncommitted()).unwrap();
-    block_on(session.commit_downstream(Some(200))).unwrap();
-    assert_eq!(session.budget_charge().amount_usd.scaled(), 100);
-    let state = store.state.lock().unwrap();
-    let finalization = &state.finalizations[0];
-    let trace = attribution_trace(finalization);
-    assert_eq!(
-        trace["request_attribution"]["provider_account_id"],
-        "acct_second"
-    );
-    assert_eq!(
-        trace["request_attribution"]["outbound_proxy_endpoint"],
-        "direct"
-    );
-    assert_eq!(
-        trace["request_attribution"]["response_model"],
-        "gpt-6-astra"
-    );
-    assert!(trace["request_attribution"]["billing_model"].is_null());
-    assert!(finalization.billing.billing_model.is_none());
-    assert!(finalization.billing.calculated_cost.is_none());
-    assert_eq!(finalization.cost_ticks, Some(0));
-    let attempts = trace["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|event| event["stage"] == "request.attempt_attribution")
-        .collect::<Vec<_>>();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0]["attemptIndex"], 1);
-    assert_eq!(attempts[1]["attemptIndex"], 2);
-    assert_eq!(attempts[0]["data"]["provider_account_id"], "acct_first");
-    assert_eq!(
-        attempts[0]["data"]["outbound_proxy_endpoint"],
-        "http://proxy.example:8080/"
-    );
-    assert_eq!(attempts[1]["data"]["provider_account_id"], "acct_second");
-    assert_eq!(attempts[1]["data"]["outbound_proxy_endpoint"], "direct");
-    assert!(!trace.to_string().contains("synthetic"));
-}
-
-#[test]
-fn attribution_does_not_fabricate_billing_from_provider_cost_or_fallback_response() {
-    let operation = generate_operation();
-    let (coordinator, store, _) = coordinator(vec![Script::Stream {
-        account_id: "acct_one",
-        items: vec![
-            Ok(GatewayEvent::Started(
-                ResponseMeta::new("unknown", "gpt-5").with_observed_model(None),
-            )),
-            Ok(GatewayEvent::ProviderCost(
-                ProviderReportedCost::from_usd_ticks(200).unwrap(),
-            )),
-            Ok(GatewayEvent::Completed(
-                ResponseMeta::new("unknown", "gpt-5").with_observed_model(None),
-            )),
-        ],
-    }]);
-    let mut session = block_on(coordinator.start(
-        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
-        operation.clone(),
-        plan(&operation),
-        None,
-        None,
-        CancellationToken::new(),
-    ))
-    .unwrap();
-    block_on(session.collect_uncommitted()).unwrap();
-    block_on(session.commit_downstream(Some(200))).unwrap();
-    let state = store.state.lock().unwrap();
-    let finalization = &state.finalizations[0];
-    let trace = attribution_trace(finalization);
-    assert!(trace["request_attribution"]["response_model"].is_null());
-    assert!(trace["request_attribution"]["billing_model"].is_null());
-    assert!(trace["request_attribution"]["outbound_proxy_endpoint"].is_null());
-    assert_eq!(finalization.cost_ticks, Some(200));
-}
-
-#[test]
-fn attribution_rejects_unvalidated_account_metadata_without_fabricating_an_attempt() {
-    let operation = generate_operation();
-    let (coordinator, store, _) = coordinator(vec![Script::AttributedStream {
-        account_id: "acct_out_of_scope",
-        proxy: None,
-        items: complete_stream(None),
-    }]);
-    let mut session = block_on(coordinator.start(
-        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
-        operation.clone(),
-        plan(&operation),
-        None,
-        None,
-        CancellationToken::new(),
-    ))
-    .unwrap();
-    assert!(matches!(
-        block_on(session.collect_uncommitted()),
-        Err(EngineError::AccountOutsideClientScope)
-    ));
-    let state = store.state.lock().unwrap();
-    let trace = attribution_trace(&state.finalizations[0]);
-    assert!(state.attempts.is_empty());
-    assert!(trace["request_attribution"]["provider_account_id"].is_null());
-    assert!(trace["request_attribution"]["route_model"].is_null());
-    assert!(trace["request_attribution"]["outbound_proxy_endpoint"].is_null());
 }
 
 #[test]

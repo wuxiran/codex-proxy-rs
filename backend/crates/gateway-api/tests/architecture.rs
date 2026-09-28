@@ -112,6 +112,8 @@ fn test_tree_should_match_frozen_rust_mirror() {
     actual.sort();
     let mut expected = vec![
         "tests/admin/account_groups.rs",
+        "tests/admin/accounts/fork_presenter.rs", // fork: billing
+        "tests/admin/accounts/fork_turn_state_wire.rs", // fork: turn-state
         "tests/admin/accounts/handlers.rs",
         "tests/admin/accounts/import_tasks.rs",
         "tests/admin/accounts/mod.rs",
@@ -119,6 +121,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/admin/auth.rs",
         "tests/admin/client_keys.rs",
         "tests/admin/errors.rs",
+        "tests/admin/fork_proxy_quality.rs", // fork: proxy-quality
         "tests/admin/mod.rs",
         "tests/admin/observability/mod.rs",
         "tests/admin/observability/query.rs",

@@ -3,6 +3,11 @@ mod capacity;
 mod precommit;
 mod response_interrupt;
 
+// fork: fork 专属契约测试
+mod fork_diagnostic_egress;
+mod fork_encrypted_content;
+mod fork_turn_state_pin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::num::NonZeroU32;
@@ -534,7 +539,7 @@ async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriti
         .unwrap()
         .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
     ));
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", operation),
             context("req_model", CancellationToken::new()),
@@ -689,7 +694,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
         let location = location.map(|value| serde_json::from_value::<RequestLocation>(value).unwrap());
         store.set_egress(account_id, Some(OutboundProxy::parse(&proxy.uri()).unwrap()), location);
         let mut stream = Arc::clone(&provider).execute(planned_request("openai", operation.clone()), context_with_state_owner_and_location(&format!("req_proxy_location_{index}"), account_id, global_enabled.then(global_request_location))).await.expect("prepare");
-        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some(format!("{}/", proxy.uri()).as_str()));
+        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some(format!("{}/", proxy.uri()).as_str())); // fork: 归因记录实际出口
         while let Some(event) = stream.next().await { event.expect("proxy response"); }
         let requests = proxy.received_requests().await.unwrap();
         let body = captured_request_body(requests.last().expect("request reached selected proxy"));
@@ -881,7 +886,7 @@ async fn capture_replay_compatibility_request(
             )])),
     ));
     let provider = provider_with_base_url(&store, base_url);
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", operation),
             context("req_replay_compatibility", CancellationToken::new()),
@@ -919,7 +924,7 @@ async fn capture_replay_compatibility_request(
     actual
 }
 
-pub(super) const CAPTURE_COMPLETED_SSE: &str = concat!(
+const CAPTURE_COMPLETED_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_scope_capture\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 );
@@ -1007,10 +1012,7 @@ fn provider_with_affinity(
     provider_with_affinity_and_base_url(store, session_affinity, OFFICIAL_CODEX_BASE_URL.to_owned())
 }
 
-pub(super) fn provider_with_base_url(
-    store: &Arc<MemoryAccountStore>,
-    base_url: String,
-) -> Arc<CodexProvider> {
+fn provider_with_base_url(store: &Arc<MemoryAccountStore>, base_url: String) -> Arc<CodexProvider> {
     provider_with_base_url_and_retry_budget(
         store,
         base_url,
@@ -1155,7 +1157,7 @@ fn provider_and_quota_with_runtime_ports(
     (Arc::new(provider), quota, websocket_pool)
 }
 
-pub(super) async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {
+async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {
     create_account_with_enabled(store, id, true).await;
 }
 
@@ -1238,11 +1240,11 @@ fn http_generate_operation() -> Operation {
     Operation::Generate(GenerateRequest::from_protocol_payload(payload))
 }
 
-pub(super) fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
+fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
     planned_request_for_model(provider_name, operation, "gpt-5.4")
 }
 
-pub(super) fn planned_request_for_model(
+fn planned_request_for_model(
     provider_name: &str,
     operation: Operation,
     model: &str,
@@ -1312,7 +1314,7 @@ fn planned_provider_endpoint_request(provider_name: &str, operation: Operation) 
     ProviderRequest::new(operation, plan.candidates()[0].clone())
 }
 
-pub(super) fn contract_account_scope() -> Arc<FrozenAccountScope> {
+fn contract_account_scope() -> Arc<FrozenAccountScope> {
     let provider = ProviderKind::new("openai").expect("provider");
     let accounts = [
         "acct_abrupt_disconnect",
@@ -1496,7 +1498,7 @@ fn context_with_middleware(
     )
 }
 
-pub(super) fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
+fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
     context_with_fast_policy(request_id, cancellation, false)
 }
 
@@ -1556,7 +1558,7 @@ fn diagnostic_context(request_id: &str, account_id: &str) -> AttemptContext {
     )
 }
 
-pub(super) fn context_with_state_owner(request_id: &str, owner_account_id: &str) -> AttemptContext {
+fn context_with_state_owner(request_id: &str, owner_account_id: &str) -> AttemptContext {
     context_with_state_owner_and_location(
         request_id,
         owner_account_id,
@@ -1835,7 +1837,7 @@ fn captured_header_values(request: &wiremock::Request, name: &str) -> Vec<Vec<u8
         .collect()
 }
 
-pub(super) fn captured_request_body(request: &wiremock::Request) -> serde_json::Value {
+fn captured_request_body(request: &wiremock::Request) -> serde_json::Value {
     let body = if request
         .headers
         .get("content-encoding")
@@ -2113,7 +2115,7 @@ async fn quota_snapshot_race_reloads_and_sends_the_request_once() {
         upstream.uri(),
         Arc::clone(&leases),
     );
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", http_generate_operation()),
             context("req_quota_snapshot_race", CancellationToken::new()),
@@ -2186,7 +2188,7 @@ async fn snapshot_retry_rechecks_account_availability_without_sending() {
             upstream.uri(),
             Arc::clone(&leases),
         );
-        let Err(error) = Arc::clone(&provider)
+        let Err(error) = provider
             .execute(
                 planned_request("openai", http_generate_operation()),
                 context("req_snapshot_unavailable", CancellationToken::new()),
@@ -2233,7 +2235,7 @@ async fn snapshot_retry_cannot_switch_a_disabled_native_continuation_account() {
         upstream.uri(),
         Arc::clone(&leases),
     );
-    let Err(error) = Arc::clone(&provider)
+    let Err(error) = provider
         .execute(
             planned_request("openai", http_generate_operation()),
             pinned_continuation_context(
@@ -2292,7 +2294,7 @@ async fn repeated_snapshot_conflicts_are_bounded_and_report_the_selection_stage(
         upstream.uri(),
         Arc::clone(&leases),
     );
-    let Err(error) = Arc::clone(&provider)
+    let Err(error) = provider
         .execute(
             planned_request("openai", http_generate_operation()),
             context("req_snapshot_conflicts", CancellationToken::new()),
@@ -2373,7 +2375,7 @@ async fn api_websocket_precheck_and_selection_share_the_snapshot_retry_budget() 
         )
         .expect("warmup"),
     ));
-    let Err(error) = Arc::clone(&provider)
+    let Err(error) = provider
         .execute(
             planned_request("openai", warmup),
             context("req_api_snapshot_conflicts", CancellationToken::new()),
@@ -2617,7 +2619,7 @@ async fn image_endpoints_bypass_only_the_text_catalog_and_preserve_the_current_c
             )
             .await
             .expect("prepare image provider stream");
-        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some("direct"));
+        assert_eq!(stream.metadata().outbound_proxy_endpoint(), Some("direct")); // fork: 归因记录实际出口
         let mut raw_response = None;
         let mut completed = false;
         let mut observed_http_json = false;
@@ -2942,7 +2944,7 @@ async fn image_metering_events_with_pricing(
     )
     .expect("image payload");
     let operation = Operation::GenerateImage(ImageRequest::from_raw_json(kind, payload));
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_provider_endpoint_request("openai", operation),
             context_with_pricing("req_image_usage", CancellationToken::new(), false, pricing),
@@ -3661,7 +3663,7 @@ async fn repeated_message_too_big_closes_keep_session_on_websocket() {
         SESSION_ID,
         "thread-after-closes",
     ));
-    let mut next_stream = Arc::clone(&provider)
+    let mut next_stream = provider
         .execute(
             planned_request("openai", second_operation),
             context("req_after_committed_close", CancellationToken::new()),
@@ -3847,7 +3849,7 @@ async fn websocket_fast_path_miss_uses_http_and_keeps_background_preconnect() {
         .await
         .expect("background WebSocket should become ready");
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let mut second = Arc::clone(&provider)
+    let mut second = provider
         .execute(
             planned_request("openai", operation("thread-websocket-reuse")),
             context("req_background_ws_reuse", CancellationToken::new()),
@@ -4018,7 +4020,7 @@ async fn websocket_midstream_error_frame_surfaces_upstream_message_after_deliver
     });
 
     let provider = provider_with_base_url(&store, base_url);
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", generate_operation()),
             context("req_ws_midstream_overload", CancellationToken::new()),
@@ -4204,7 +4206,7 @@ async fn websocket_pong_timeout_diagnosis_survives_ambiguous_send_wrapping() {
                 event.unwrap();
             }
         }
-        let mut stream = Arc::clone(&provider)
+        let mut stream = provider
             .execute(
                 planned_request("openai", operation),
                 context("req_pong_timeout", CancellationToken::new()),
@@ -4587,7 +4589,7 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
         )
         .expect("warmup payload"),
     ));
-    let warmup_stream = Arc::clone(&provider)
+    let warmup_stream = provider
         .execute(
             planned_request("openai", warmup_operation),
             context(
@@ -4828,7 +4830,7 @@ async fn websocket_upgrade_required_immediately_enables_session_http_fallback() 
         .expect("prepare unrelated session");
     assert_eq!(unrelated.metadata().transport().as_str(), "websocket");
     tokio::time::advance(Duration::from_secs(8 * 60 * 60)).await;
-    let expired = Arc::clone(&provider)
+    let expired = provider
         .execute(
             planned_request("openai", operation()),
             context("req_expired_http_session", CancellationToken::new()),
@@ -4903,7 +4905,7 @@ async fn oversized_http_new_chain_uses_http_without_disabling_session_websocket(
     assert_eq!(sent["tools"], tools);
     assert!(sent.get("previous_response_id").is_none());
 
-    let next = Arc::clone(&provider)
+    let next = provider
         .execute(
             planned_request(
                 "openai",
@@ -5360,7 +5362,7 @@ async fn oversized_websocket_http_response_continues_with_client_tool_history_re
     let input = body.get_mut("input").unwrap().as_array_mut().unwrap();
     input.extend(output.unwrap().as_array().unwrap().iter().cloned());
     input.push(tool_output);
-    let mut replay = Arc::clone(&provider)
+    let mut replay = provider
         .execute(
             planned_request("openai", ws_operation(body.clone(), "ws_reconnected", None)),
             context("req_large_ws_replay", CancellationToken::new()),
@@ -5559,7 +5561,7 @@ async fn websocket_opening_account_rejection_keeps_replay_safe_without_transport
     });
 
     let provider = provider_with_base_url(&store, base_url);
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", generate_operation()),
             context("req_ws_quota_rotation", CancellationToken::new()),
@@ -6988,7 +6990,7 @@ async fn affinity_quota_switch_should_clear_old_turn_state_without_a_provider_st
             json!("state-created-by-exhausted-account"),
         ),
     ]));
-    let mut second = Arc::clone(&provider)
+    let mut second = provider
         .execute(
             planned_request(
                 "openai",
@@ -8198,7 +8200,7 @@ async fn local_websocket_connection_cancellation_does_not_supply_capacity_eviden
     let (provider, pool) =
         provider_with_capacity_tracking(&store, base_url, Arc::clone(&cooldowns));
     let operation = capacity_websocket_operation();
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", operation),
             context("req_capacity_local", CancellationToken::new()),
@@ -8376,7 +8378,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
             };
             let (provider, pool) =
                 provider_with_capacity_tracking(&store, base_url, Arc::clone(&cooldowns));
-            let mut stream = Arc::clone(&provider)
+            let mut stream = provider
                 .execute(
                     planned_request("openai", operation),
                     context("req_capacity_stream", CancellationToken::new()),
@@ -9252,60 +9254,6 @@ async fn disabled_account_diagnostic_uses_upstream_without_persisting_account_st
     assert_eq!(affinity.binding_count(), 0);
 }
 
-/// 遍历代理时一个出口上的失败说明的是那个出口。即使上游回的是 401，也不能据此把
-/// 一个正在服务线上流量的账号标成凭据失效；不带临时出口的连接测试则照旧回写。
-#[tokio::test]
-async fn probe_through_a_temporary_egress_never_writes_back_account_state() {
-    for (through_temporary_egress, expected) in [
-        (true, CredentialState::Ready),
-        (false, CredentialState::Expired),
-    ] {
-        let store = Arc::new(MemoryAccountStore::default());
-        let account_id = "acct_egress_probe";
-        create_account(&store, account_id).await;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/codex/responses"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .insert_header("content-type", "application/json")
-                    .set_body_string(
-                        r#"{"error":{"message":"token expired","code":"token_expired"}}"#,
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        let mut context = diagnostic_context("req_egress_probe", account_id);
-        if through_temporary_egress {
-            context = context.with_diagnostic_egress(Some(
-                gateway_core::engine::DiagnosticEgress::new(None, None),
-            ));
-        }
-        let affinity = Arc::new(MemorySessionAffinity::default());
-        let result = provider_with_affinity_and_base_url(&store, affinity, server.uri())
-            .execute(
-                planned_request("openai", http_generate_operation()),
-                context,
-            )
-            .await;
-        if let Ok(mut stream) = result {
-            while let Some(event) = stream.next().await {
-                if event.is_err() {
-                    break;
-                }
-            }
-        }
-
-        let account = store.account(account_id).expect("account after probe");
-        assert_eq!(
-            account.credential_state(),
-            expected,
-            "through_temporary_egress={through_temporary_egress}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn quota_limited_account_diagnostic_uses_upstream() {
     let store = Arc::new(MemoryAccountStore::default());
@@ -9364,7 +9312,7 @@ async fn quota_limited_account_diagnostic_uses_upstream() {
         .prepare_scheduling(std::slice::from_ref(&account))
         .await;
 
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", http_generate_operation()),
             diagnostic_context("req_quota_limited_diagnostic", account_id),
@@ -9982,7 +9930,7 @@ async fn connection_limit_rejection_requests_one_provider_retry_and_reconnects_i
     let retry_context = context("req_rejected", CancellationToken::new()).with_transport(
         AttemptTransport::Retry(NonZeroU32::new(1).expect("retry index")),
     );
-    let mut retry = Arc::clone(&provider)
+    let mut retry = provider
         .execute(planned_request("openai", operation()), retry_context)
         .await
         .expect("prepare retry");
@@ -10054,7 +10002,7 @@ async fn assert_error_body_read_failure(image: bool) {
             } else {
                 planned_request("openai", http_generate_operation())
             };
-            let mut stream = Arc::clone(&provider)
+            let mut stream = provider
                 .execute(
                     request,
                     context("req_body_read_failure", CancellationToken::new()),
@@ -10223,7 +10171,7 @@ async fn assert_websocket_failure_headers(headers: Value, request_id: Option<&st
         .await
         .expect("bounded first request");
     }
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", operation()),
             context("req_ws_headers", CancellationToken::new()),
@@ -10312,7 +10260,7 @@ async fn connection_limit_payload_survives_exhausted_retry_budget() {
         );
     });
     let provider = provider_with_base_url_and_retry_budget(&store, base_url, 0);
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", generate_operation()),
             context("req_limit_final", CancellationToken::new()),
@@ -10510,7 +10458,7 @@ async fn api_key_responses_forward_lite_memgen_and_native_compaction_without_cat
                 ("memgen_request".to_owned(), json!("true")),
             ])),
     ));
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", operation),
             context("req_api_native_features", CancellationToken::new()),
@@ -10638,7 +10586,7 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
             catalog[0].content,
             gateway_core::routing::ProviderModelContent::Adapted(_)
         ));
-        let mut stream = Arc::clone(&provider)
+        let mut stream = provider
             .execute(
                 planned_request("openai", generate_with_downstream_headers()),
                 context("req_api_http", CancellationToken::new()),
@@ -10794,7 +10742,7 @@ async fn disabled_api_key_diagnostic_preserves_authentication_and_transport_cons
         .expect(1)
         .mount(&upstream)
         .await;
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_provider_endpoint_request("openai", search),
             diagnostic_context("req_disabled_api_search", account_id),
@@ -10845,7 +10793,7 @@ async fn api_key_http_account_is_rejected_before_websocket_warmup_or_old_revisio
     };
     let stale = generate.with_provider_session_state(ProviderSessionState::new("openai", json!({"account_id":"acct_provider_contract","conversation_id":"old","credential_revision":9,"continuation_scope":"persisted"}).as_object().unwrap().clone()).unwrap());
     assert!(
-        Arc::clone(&provider)
+        provider
             .execute(
                 planned_request("openai", Operation::Generate(stale)),
                 diagnostic_context("req_api_stale", "acct_provider_contract")
@@ -10903,7 +10851,7 @@ async fn api_key_websocket_uses_api_path_and_bearer_without_oauth_identity() {
         websocket.send(Message::Text(json!({"type":"response.completed","response":{"id":"resp_api_ws","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}).to_string().into())).await.unwrap();
     });
     let provider = provider(&store);
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", generate_with_downstream_headers()),
             diagnostic_context("req_api_ws", "acct_provider_contract"),
@@ -11335,7 +11283,7 @@ async fn quota_continuation_full_client_replay_selects_another_account() {
     let replay = Operation::Generate(GenerateRequest::from_protocol_payload(
         ProtocolPayload::json_object("openai", json!({"model":"gpt-5.4","session_id":"quota-replay","thread_id":"turn","input":full_input}).as_object().unwrap().clone()).unwrap(),
     ));
-    let mut stream = Arc::clone(&provider)
+    let mut stream = provider
         .execute(
             planned_request("openai", replay),
             context("req_quota_full", CancellationToken::new()),
@@ -11529,235 +11477,6 @@ async fn fast_policy_changes_preserve_the_websocket_continuation_and_meter_each_
         );
     }
     server.await.unwrap();
-}
-
-// fork 专属：turn-state 账号级 pin 契约测试（内联，遵守 tests 镜像 src 的架构约束）。
-#[tokio::test]
-async fn turn_state_pin_freezes_own_successful_candidate_and_reset_or_disable_stops_replay() {
-    let store = Arc::new(MemoryAccountStore::default());
-    let account = "acct_provider_contract";
-    create_account(&store, account).await;
-    store.set_turn_state_pin(account, true);
-    let server = MockServer::start().await;
-    let provider = provider_with_base_url(&store, server.uri());
-    let candidate = "a".repeat(292);
-    for (index, response_state) in [
-        candidate.clone(),
-        "b".repeat(312),
-        "c".repeat(292),
-        "d".repeat(312),
-        "e".repeat(312),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if index == 3 {
-            store.set_turn_state_pin(account, true);
-        }
-        if index == 4 {
-            store.set_turn_state_pin(account, false);
-        }
-        let mock = Mock::given(method("POST"))
-            .and(path("/codex/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .insert_header("x-codex-turn-state", response_state)
-                    .set_body_string(format!("data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_scope_capture\",\"model\":\"gpt-5.4\"}}}}\n\n{CAPTURE_COMPLETED_SSE}")),
-            )
-            .expect(1)
-            .mount_as_scoped(&server)
-            .await;
-        let mut stream = Arc::clone(&provider)
-            .execute(
-                planned_request("openai", http_generate_operation()),
-                context(&format!("req_pin_{index}"), CancellationToken::new()),
-            )
-            .await
-            .unwrap();
-        while let Some(event) = stream.next().await {
-            event.unwrap();
-        }
-        drop(mock);
-    }
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 5);
-    for index in [0, 3, 4] {
-        assert!(captured_header_values(&requests[index], "x-codex-turn-state").is_empty());
-    }
-    for index in [1, 2] {
-        assert_eq!(
-            captured_header_values(&requests[index], "x-codex-turn-state"),
-            vec![candidate.as_bytes().to_vec()]
-        );
-    }
-}
-
-#[tokio::test]
-async fn turn_state_pin_ignores_failed_responses_and_client_supplied_candidates() {
-    let store = Arc::new(MemoryAccountStore::default());
-    create_account(&store, "acct_provider_contract").await;
-    store.set_turn_state_pin("acct_provider_contract", true);
-    let server = MockServer::start().await;
-    let provider = provider_with_base_url(&store, server.uri());
-    let candidate = "a".repeat(292);
-    for index in 0..3 {
-        let body = if index == 0 {
-            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_pin_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"busy\"}}}\n\n"
-        } else {
-            CAPTURE_COMPLETED_SSE
-        };
-        let mock = Mock::given(method("POST"))
-            .and(path("/codex/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .insert_header(
-                        "x-codex-turn-state",
-                        if index == 0 {
-                            candidate.clone()
-                        } else {
-                            "b".repeat(312)
-                        },
-                    )
-                    .set_body_string(body),
-            )
-            .expect(1)
-            .mount_as_scoped(&server)
-            .await;
-        // 每轮输入不同：字符串 input 会展开成用户消息并派生会话亲和，同内容请求会命中
-        // 同账号而合法透传客户端 state，那就测不到"失败响应的 state 不得被钉住"。
-        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
-            ProtocolPayload::json_object(
-                "openai",
-                json!({"model":"gpt-5.4", "input": format!("test {index}")})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap()
-            .with_context(Map::from_iter([
-                ("use_websocket".to_owned(), json!(false)),
-                ("turn_state".to_owned(), json!(candidate)),
-            ])),
-        ));
-        let mut stream = Arc::clone(&provider)
-            .execute(
-                planned_request("openai", operation),
-                context(&format!("req_pin_failed_{index}"), CancellationToken::new()),
-            )
-            .await
-            .unwrap();
-        while let Some(event) = stream.next().await {
-            if index == 0 {
-                if event.is_err() {
-                    break;
-                }
-            } else {
-                event.unwrap();
-            }
-        }
-        drop(mock);
-    }
-    for request in server.received_requests().await.unwrap() {
-        assert!(captured_header_values(&request, "x-codex-turn-state").is_empty());
-    }
-}
-
-#[tokio::test]
-async fn turn_state_pin_websocket_metadata_is_replayed_in_next_turn_payload() {
-    for (plan, model, length) in [
-        ("pro", "gpt-5.4", 292),
-        ("pro", "gpt-5.6-terra", 292),
-        ("team", "gpt-5.5", 332),
-        ("team", "gpt-5.6-sol", 332),
-        ("team", "gpt-5.6-terra", 356),
-        ("team", "gpt-6-astra", 332),
-        ("business", "gpt-5.6-terra", 356),
-        ("self_serve_business_prolite", "gpt-5.6-terra", 356),
-        ("self_serve_business_usage_based", "gpt-6-astra", 332),
-        ("self_serve_business_prolite", "gpt-6-sol", 780),
-    ] {
-        let store = Arc::new(MemoryAccountStore::default());
-        let mut account_profile = profile("chatgpt-ws-pin");
-        account_profile.plan_type = Some(plan.to_owned());
-        store
-            .seed_oauth_credential(ImportCodexOAuthCredential {
-                account_id: "acct_websocket_turn_state".to_owned(),
-                name: "ws-pin".to_owned(),
-                secret: secret("ws-pin-test-token"),
-                verified_account: account_profile,
-                next_refresh_at: None,
-                enabled: true,
-            })
-            .await;
-        store.set_turn_state_pin("acct_websocket_turn_state", true);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let candidate = "w".repeat(length);
-        let expected = candidate.clone();
-        let server = tokio::spawn(async move {
-            let mut received = Vec::new();
-            for round in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut websocket = accept_codex_test_websocket(stream).await;
-                let request = websocket.next().await.unwrap().unwrap();
-                let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
-                received.push(request);
-                for event in [
-                    json!({"type":"response.created","response":{"id":format!("resp_pin_ws_{round}"),"model":model}}),
-                    json!({"type":"response.metadata","headers":{"x-codex-turn-state": if round==0 {candidate.clone()} else {"b".repeat(312)}}}),
-                    json!({"type":"response.completed","response":{"id":format!("resp_pin_ws_{round}"),"model":model,"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}),
-                ] {
-                    websocket
-                        .send(Message::Text(event.to_string().into()))
-                        .await
-                        .unwrap();
-                }
-                websocket.close(None).await.unwrap();
-            }
-            received
-        });
-        let provider = provider_with_base_url(&store, base_url);
-        for index in 0..2 {
-            let mut stream = Arc::clone(&provider)
-                .execute(
-                    planned_request_for_model(
-                        "openai",
-                        Operation::Generate(GenerateRequest::from_protocol_payload(
-                            ProtocolPayload::json_object(
-                                "openai",
-                                Map::from_iter([
-                                    ("model".to_owned(), json!(model)),
-                                    ("input".to_owned(), json!("hello")),
-                                ]),
-                            )
-                            .unwrap(),
-                        )),
-                        model,
-                    ),
-                    context(&format!("req_pin_ws_{index}"), CancellationToken::new()),
-                )
-                .await
-                .unwrap();
-            while let Some(event) = stream.next().await {
-                event.unwrap();
-            }
-        }
-        let requests = timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            requests[0]
-                .pointer("/client_metadata/x-codex-turn-state")
-                .is_none()
-        );
-        assert_eq!(
-            requests[1].pointer("/client_metadata/x-codex-turn-state"),
-            Some(&json!(expected))
-        );
-    }
 }
 
 #[tokio::test]

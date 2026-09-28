@@ -816,8 +816,8 @@ fn valid_compaction_summary(marker: &str) -> String {
     )
 }
 
-struct StubSelector {
-    proxy: Option<gateway_core::account::OutboundProxy>,
+pub(super) struct StubSelector {
+    pub(super) proxy: Option<gateway_core::account::OutboundProxy>, // fork: 归因出口
     calls: AtomicUsize,
     feedback: Mutex<Vec<GrokCredentialFailure>>,
     error: Mutex<Option<GrokSessionSelectorError>>,
@@ -826,7 +826,7 @@ struct StubSelector {
 }
 
 impl StubSelector {
-    fn success() -> Arc<Self> {
+    pub(super) fn success() -> Arc<Self> {
         Arc::new(Self {
             proxy: None,
             calls: AtomicUsize::new(0),
@@ -956,14 +956,14 @@ enum InferenceMode {
     StreamError(GrokInferenceTransportError),
 }
 
-struct StubInferenceTransport {
-    calls: AtomicUsize,
+pub(super) struct StubInferenceTransport {
+    pub(super) calls: AtomicUsize,
     requests: Mutex<Vec<GrokInferenceRequest>>,
     modes: Mutex<VecDeque<InferenceMode>>,
 }
 
 impl StubInferenceTransport {
-    fn success() -> Arc<Self> {
+    pub(super) fn success() -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
@@ -1124,7 +1124,7 @@ impl GrokCredentialRecovery for StubRecovery {
     }
 }
 
-async fn provider(
+pub(super) async fn provider(
     selector: Arc<StubSelector>,
     transport: Arc<StubInferenceTransport>,
 ) -> Arc<GrokBuildProvider> {
@@ -1437,7 +1437,7 @@ fn compaction_operation_with_state(state: ProviderSessionState) -> Operation {
     )
 }
 
-fn provider_request(provider_kind: &str) -> ProviderRequest {
+pub(super) fn provider_request(provider_kind: &str) -> ProviderRequest {
     provider_request_with_operation(provider_kind, operation())
 }
 
@@ -1631,7 +1631,7 @@ fn context_with_middleware_and_cancellation(
     )
 }
 
-fn context(
+pub(super) fn context(
     cancellation: CancellationToken,
     continuation: Option<ContinuationBinding>,
 ) -> AttemptContext {
@@ -4102,37 +4102,6 @@ async fn missing_catalog_feature_metadata_keeps_build_responses_routable() {
             )
             .is_some()
     );
-}
-
-#[tokio::test]
-async fn attribution_metadata_projects_selected_proxy_before_any_inference() {
-    for url in [
-        None,
-        Some("http://synthetic-user:synthetic-secret@proxy.example:8080"),
-    ] {
-        let mut selector = StubSelector::success();
-        Arc::get_mut(&mut selector).unwrap().proxy =
-            url.map(|url| gateway_core::account::OutboundProxy::parse(url).unwrap());
-        let transport = StubInferenceTransport::success();
-        let provider = provider(selector, transport.clone()).await;
-        let stream = provider
-            .execute(
-                provider_request("xai"),
-                context(CancellationToken::new(), None),
-            )
-            .await
-            .unwrap();
-        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            stream.metadata().outbound_proxy_endpoint(),
-            Some(if url.is_some() {
-                "http://proxy.example:8080/"
-            } else {
-                "direct"
-            })
-        );
-        assert!(!format!("{:?}", stream.metadata()).contains("synthetic"));
-    }
 }
 
 #[tokio::test]

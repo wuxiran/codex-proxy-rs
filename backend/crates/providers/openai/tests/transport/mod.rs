@@ -68,6 +68,10 @@ mod usage;
 mod websocket;
 mod websocket_pool;
 
+// fork: fork 专属传输测试
+mod fork_billing_identity;
+mod fork_ws_warm_pool;
+
 fn websocket_accept_config() -> WebSocketConfig {
     let mut extensions = ExtensionsConfig::default();
     extensions.permessage_deflate = Some(DeflateConfig::default());

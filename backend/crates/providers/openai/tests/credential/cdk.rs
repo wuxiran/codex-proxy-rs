@@ -155,3 +155,43 @@ async fn invalid_cdk_format_is_rejected_before_import() {
         .unwrap_err();
     assert!(format!("{error}").contains("CDK redeem failed"));
 }
+
+/// fork：sub2api 顶层导出带 `x_revive_manifest`（观澜 CDK 兑换产物）时照常导入。
+#[tokio::test]
+async fn sub2api_top_level_export_with_revive_manifest_imports() {
+    let service = CodexCredentialAdminService::new(
+        Arc::new(UnusedRefresher),
+        Arc::new(TestLeaseCoordinator::default()),
+        runtime_policy(),
+    );
+    let prepared = service
+        .prepare_import_document(serde_json::json!({
+            "exported_at": "2026-09-17T09:23:33.325693Z",
+            "proxies": [],
+            "x_revive_manifest": {
+                "signature": "test-signature",
+                "source": "cdk_redeem"
+            },
+            "accounts": [{
+                "name": "paezoastridj77+mj5@gmail.com",
+                "platform": "openai",
+                "type": "oauth",
+                "group_ids": [4],
+                "extra": {"source": "sub2api"},
+                "credentials": {
+                    "access_token": test_jwt("user-sub2api"),
+                    "refresh_token": "rt-sub2api",
+                    "email": "paezoastridj77+mj5@gmail.com",
+                    "plan_type": "self_serve_business_prolite"
+                }
+            }]
+        }))
+        .await
+        .unwrap();
+    assert_eq!(prepared.accounts().len(), 1);
+    assert_eq!(
+        prepared.accounts()[0].account.name(),
+        "paezoastridj77+mj5@gmail.com"
+    );
+    assert!(prepared.accounts()[0].account.outbound_proxy().is_none());
+}

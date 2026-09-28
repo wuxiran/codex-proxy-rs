@@ -6,6 +6,9 @@ use std::{
 
 mod admin_adapter;
 mod authorization;
+mod fork_billing; // fork: billing
+mod fork_expired_status; // fork: expired-status
+mod fork_turn_state; // fork: turn-state
 mod quota_forecast;
 mod timestamps;
 
@@ -14,9 +17,9 @@ use gateway_admin::{
     model::{
         MutationActor, MutationContext, PageSize,
         accounts::{
-            AccountListQuery, AccountListStatus, AccountRuntimeSnapshot, AccountSort,
-            AccountSortField, AccountStatus, AccountUsageWindowQuery, BatchUpdateAccounts,
-            DeleteAccounts, SortDirection, UpdateAccount,
+            AccountListQuery, AccountRuntimeSnapshot, AccountSort, AccountSortField, AccountStatus,
+            AccountUsageWindowQuery, BatchUpdateAccounts, DeleteAccounts, SortDirection,
+            UpdateAccount,
         },
         observability::TimeRange,
         provider_credentials::{
@@ -909,75 +912,6 @@ async fn terminal_admin_list_filters_and_sorts_before_pagination_with_retained_u
     assert_eq!(error_accounts.items.len(), 2);
     assert_eq!(error_accounts.items[0].account.id, "acct_beta");
     assert_eq!(error_accounts.items[1].account.id, "acct_invalid");
-
-    // fork：票据到点且已不能调度的账号归入「已过期」，默认目录与 total 都不含它；
-    // 票据到点但还能调度（alpha 正常）的照常显示；未到点的票据不影响状态。
-    sqlx::query(
-        "insert into account_tickets (provider_account_id, expires_at)
-         values ('acct_invalid', $1), ('acct_alpha', $1), ('acct_beta', $2)",
-    )
-    .bind(now - TimeDelta::minutes(1))
-    .bind(now + TimeDelta::days(1))
-    .execute(&database.pool)
-    .await
-    .expect("seed account tickets");
-    let default_page = store
-        .list_accounts(
-            AccountListQuery {
-                page: 1,
-                page_size: PageSize::new(10).expect("page size"),
-                provider_kind: None,
-                group_filter: None,
-                search: None,
-                status: None,
-                sort: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("hide expired accounts by default");
-    assert_eq!(default_page.total, 5);
-    assert!(
-        default_page
-            .items
-            .iter()
-            .all(|item| item.account.id != "acct_invalid")
-    );
-    assert!(
-        default_page
-            .items
-            .iter()
-            .any(|item| item.account.id == "acct_alpha")
-    );
-    assert_eq!(default_page.summary.total, 5);
-    assert_eq!(default_page.summary.expired, 1);
-    assert_eq!(default_page.summary.error, 1);
-    assert_eq!(default_page.summary.normal, 1);
-    assert_eq!(
-        default_page.summary.total,
-        default_page.summary.normal
-            + default_page.summary.quota_exhausted
-            + default_page.summary.rate_limited
-            + default_page.summary.disabled
-            + default_page.summary.error
-    );
-    let expired_accounts = store
-        .list_accounts(
-            AccountListQuery {
-                page: 1,
-                page_size: PageSize::new(10).expect("page size"),
-                provider_kind: None,
-                group_filter: None,
-                search: None,
-                status: Some(AccountListStatus::TicketExpired),
-                sort: None,
-            },
-            Default::default(),
-        )
-        .await
-        .expect("filter expired accounts");
-    assert_eq!(expired_accounts.total, 1);
-    assert_eq!(expired_accounts.items[0].account.id, "acct_invalid");
     database.close().await;
 }
 
@@ -3710,187 +3644,6 @@ async fn adaptive_concurrency_handles_unlimited_and_latest_locked_settings_witho
         audited_fields,
         vec![vec!["concurrency_limit".to_owned()]; 2]
     );
-    database.close().await;
-}
-
-#[tokio::test]
-async fn account_billing_groups_full_identity_and_never_uses_estimate_as_actual() {
-    let Some(database) = TestDatabase::create("account_billing_identity").await else {
-        return;
-    };
-    let repository = PgProviderAccountRepository::new(database.pool.clone());
-    repository
-        .insert_provider_account(account("acct_billing", "user-billing"))
-        .await
-        .unwrap();
-    let now = Utc::now();
-    for (id, model, calculated, actual) in [
-        ("req_astra", Some("gpt-6-astra"), "2.00", Some("1.50")),
-        ("req_luna", Some("gpt-5.6-luna"), "0.20", None),
-        ("req_luna_zero", Some("gpt-5.6-luna"), "0.20", Some("0")),
-        ("req_history", None, "0.10", None),
-    ] {
-        seed_model_request(
-            &database.pool,
-            ModelRequestSeed {
-                request_id: id,
-                account_id: "acct_billing",
-                provider_kind: "openai",
-                model: "gpt-6-astra",
-                total_tokens: 100,
-                cost_amount: "0",
-                started_at: now - TimeDelta::minutes(1),
-            },
-        )
-        .await
-        .unwrap();
-        // 计价身份/本地成本已迁子表 model_request_billing（fork 9001）；父表只留 cost_source/cost_amount。
-        sqlx::query(
-            "update model_requests set cost_source = $2, cost_amount = $3::numeric where id = $1",
-        )
-        .bind(id)
-        .bind(if actual.is_some() {
-            "provider_reported"
-        } else {
-            "calculated"
-        })
-        .bind(actual.unwrap_or(calculated))
-        .execute(&database.pool)
-        .await
-        .unwrap();
-        sqlx::query("insert into model_request_billing (model_request_id, response_model, billing_model, calculated_cost_amount, calculated_cost_currency) values ($1, $2, $2, $3::numeric, 'USD') on conflict (model_request_id) do update set response_model = excluded.response_model, billing_model = excluded.billing_model, calculated_cost_amount = excluded.calculated_cost_amount, calculated_cost_currency = excluded.calculated_cost_currency")
-            .bind(id).bind(model).bind(calculated)
-            .execute(&database.pool).await.unwrap();
-    }
-    let store = admin_account_store(&database.pool);
-    let range = TimeRange {
-        start: now - TimeDelta::hours(1),
-        end: now,
-    };
-    let window = store
-        .load_account_usage_by_windows(&[AccountUsageWindowQuery {
-            account_id: "acct_billing".to_owned(),
-            key: "test".to_owned(),
-            range,
-        }])
-        .await
-        .unwrap()
-        .remove(0)
-        .usage;
-    let rolling = store
-        .load_account_usage(range, &["acct_billing".to_owned()])
-        .await
-        .unwrap()
-        .remove(0);
-    for usage in [window, rolling] {
-        assert_eq!(usage.models.len(), 3);
-        assert_eq!(
-            usage.billing.model_price_usd.as_ref().unwrap().as_str(),
-            "2.5"
-        );
-        assert_eq!(
-            usage.billing.upstream_cost_usd.as_ref().unwrap().as_str(),
-            "1.5"
-        );
-        assert_eq!(
-            (
-                usage.billing.model_price_count,
-                usage.billing.upstream_cost_count
-            ),
-            (4, 2)
-        );
-        let luna = usage
-            .models
-            .iter()
-            .find(|row| row.identity.billing_model.as_deref() == Some("gpt-5.6-luna"))
-            .unwrap();
-        assert_eq!(luna.request_count, 2);
-        assert_eq!(
-            luna.identity.requested_model_id.as_deref(),
-            Some("gpt-6-astra")
-        );
-        assert_eq!(
-            luna.identity.upstream_model_id.as_deref(),
-            Some("gpt-6-astra")
-        );
-        assert_eq!(
-            luna.billing.model_price_usd.as_ref().unwrap().as_str(),
-            "0.4"
-        );
-        assert_eq!(
-            luna.billing.upstream_cost_usd.as_ref().unwrap().as_str(),
-            "0"
-        );
-        assert_eq!(luna.billing.upstream_cost_count, 1);
-        let history = usage
-            .models
-            .iter()
-            .find(|row| row.identity.billing_model.is_none())
-            .unwrap();
-        assert!(history.identity.response_model.is_none());
-        assert!(history.billing.upstream_cost_usd.is_none());
-    }
-    database.close().await;
-}
-
-#[tokio::test]
-async fn turn_state_configuration_rotation_preserves_credential_error_and_quota() {
-    let Some(database) = TestDatabase::create("turn_state_configuration_status").await else {
-        return;
-    };
-    let repository = PgProviderAccountRepository::new(database.pool.clone());
-    let id = "acct_pin_config";
-    repository
-        .import_provider_accounts(ImportProviderAccounts {
-            settings: None,
-            outbound_proxy: None,
-            scope: ProviderAccountAdminScope {
-                provider_kind: "openai".to_owned(),
-            },
-            accounts: vec![account(id, "pin-config-user")],
-            audit: audit("pin_config_import", "import", id),
-        })
-        .await
-        .unwrap();
-    sqlx::query("update provider_accounts set credential_state='banned', last_error_reason='account_banned', last_error_message='retained failure', updated_at=greatest(now(),updated_at), quota_access_state='exhausted', quota_evidence='provider_denied', quota_access_observed_at=now() where id=$1")
-        .bind(id).execute(&database.pool).await.unwrap();
-    let before = repository.load_provider_account(id).await.unwrap().unwrap();
-    let mut update = credential_update(id, 1, "same-secret-with-config");
-    update.preserve_profile = true;
-    update.preserve_credential_state = true;
-    repository
-        .rotate_provider_account(RotateProviderAccount {
-            settings: None,
-            scope: ProviderAccountAdminScope {
-                provider_kind: "openai".to_owned(),
-            },
-            profile: profile(id, "must-not-replace"),
-            replacement_identity: None,
-            credential: update,
-            audit: audit("pin_config_rotate", "rotate_credential", id),
-        })
-        .await
-        .unwrap();
-    let after = repository.load_provider_account(id).await.unwrap().unwrap();
-    assert_eq!(after.summary.credential_revision.get(), 2);
-    assert_eq!(
-        after.summary.credential_state,
-        before.summary.credential_state
-    );
-    assert_eq!(
-        after.summary.credential_observed_at,
-        before.summary.credential_observed_at
-    );
-    assert_eq!(
-        after.summary.last_error_reason,
-        before.summary.last_error_reason
-    );
-    assert_eq!(
-        after.summary.last_error_message,
-        before.summary.last_error_message
-    );
-    assert_eq!(after.summary.quota, before.summary.quota);
-    assert_eq!(after.summary.name, before.summary.name);
     database.close().await;
 }
 

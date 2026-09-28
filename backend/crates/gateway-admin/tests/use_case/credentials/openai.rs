@@ -43,51 +43,6 @@ async fn openai_delete_should_commit_then_release_provider_resources() {
 }
 
 #[tokio::test]
-async fn openai_new_accounts_import_should_ask_store_to_reject_existing_identities() {
-    let events = events();
-    let provider = FakeProviderAdmin::new("openai", events.clone());
-    let store = FakeAccountStore::new("openai", events.clone());
-    let services = service(provider.clone(), store.clone()).await;
-
-    services
-        .openai()
-        .import_new_accounts(ImportCredentials {
-            outbound_proxy_id: None,
-            settings: Some(super::super::accounts::import_settings()),
-            context: context("public-import"),
-            document: document(),
-        })
-        .await
-        .expect("import new account");
-
-    let recorded = recorded(&events);
-    assert!(recorded.contains(&"store.reject_existing"));
-}
-
-#[tokio::test]
-async fn openai_new_accounts_import_should_reject_non_oauth_credentials_before_commit() {
-    let events = events();
-    let provider = FakeProviderAdmin::new("openai", events.clone());
-    provider.set_import_authentication_kind("api_key");
-    let store = FakeAccountStore::new("openai", events.clone());
-    let services = service(provider.clone(), store.clone()).await;
-
-    let error = services
-        .openai()
-        .import_new_accounts(ImportCredentials {
-            outbound_proxy_id: None,
-            settings: Some(super::super::accounts::import_settings()),
-            context: context("public-import"),
-            document: document(),
-        })
-        .await
-        .expect_err("API key accounts must be rejected");
-
-    assert_eq!(error.message(), "此入口只接受 OAuth 账号");
-    assert!(!recorded(&events).contains(&"store.commit_import"));
-}
-
-#[tokio::test]
 async fn openai_import_should_prepare_before_atomic_store_commit() {
     let events = events();
     let provider = FakeProviderAdmin::new("openai", events.clone());
@@ -506,7 +461,10 @@ async fn openai_reauthorization_should_commit_after_credential_revision_advances
     assert_eq!(store.audit_requests(), ["oauth-complete-openai"]);
 }
 
-async fn service(provider: Arc<FakeProviderAdmin>, store: Arc<FakeAccountStore>) -> AdminServices {
+pub(super) async fn service(
+    provider: Arc<FakeProviderAdmin>,
+    store: Arc<FakeAccountStore>,
+) -> AdminServices {
     super::super::AdminHarness::new()
         .provider(provider)
         .accounts(store)
