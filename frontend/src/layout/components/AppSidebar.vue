@@ -3,12 +3,10 @@ import type { PluginManagementView } from '@/api'
 
 import { BaseIconButton, BaseMotionIcon, BaseScrollbar } from '@codex-proxy/ui'
 import {
-  Activity,
   ArrowUpCircle,
   Blocks,
   ChartNoAxesColumn,
   ChevronDown,
-  FlaskConical,
   FolderTree,
   Info,
   KeyRound,
@@ -21,11 +19,8 @@ import {
   PanelLeftOpen,
   PanelsTopLeft,
   Puzzle,
-  ScrollText,
   Settings,
   Sun,
-  TrendingUp,
-  Upload,
   Users,
 } from '@lucide/vue'
 import { usePreferredReducedMotion, useTimeoutFn } from '@vueuse/core'
@@ -40,6 +35,7 @@ import { usePluginViewsStore } from '@/stores/modules/plugin-views'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useThemeStore } from '@/stores/modules/theme'
 import { pluginPageLocation, shortPluginInstanceId } from '@/views/plugins/utils/navigation'
+import { insertForkNavItems } from './menu.fork' // fork: menu
 
 const props = withDefaults(
   defineProps<{
@@ -76,19 +72,15 @@ const pluginGroupExpanded = shallowRef(route.path.startsWith('/plugins'))
 const navItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
-  { label: '免登录导入', icon: Upload, path: '/public-import' },
   { label: '代理管理', icon: Network, path: '/proxies' },
   { label: '分组管理', icon: FolderTree, path: '/groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
-  { label: '经营日报', icon: TrendingUp, path: '/ops-report' },
-  { label: '请求日志', icon: ScrollText, path: '/logs' },
-  { label: '测智台', icon: FlaskConical, path: '/testbench' },
-  { label: 'state 观测', icon: Activity, path: '/turn-state' },
   { label: '插件', icon: Puzzle, path: '/plugins' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
 ]
+insertForkNavItems(navItems) // fork: menu
 const pluginNavIndex = navItems.findIndex(item => item.path === '/plugins')
 const pluginMenuVisible = computed(() => pluginGroupExpanded.value && !isCollapsed.value)
 const pluginViewNameCounts = computed(() => pluginPageViews.value.reduce((counts, view) => {

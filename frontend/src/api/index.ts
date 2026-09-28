@@ -1,3 +1,6 @@
+// fork: api modules
+export * from './index.fork'
+
 // 账号分组
 export * from './modules/account-groups'
 
@@ -16,8 +19,6 @@ export * from './modules/backups'
 // Dashboard 聚合
 export * from './modules/dashboard'
 
-// 观澜 CDK 兑换
-export * from './modules/guanlanCdk'
 // 插件管理
 export * from './modules/plugin-extensions'
 export * from './modules/plugins'
@@ -26,16 +27,12 @@ export * from './modules/plugins'
 export * from './modules/pricing'
 
 export * from './modules/proxies'
-export * from './modules/public-import'
 
 // 设置管理
 export * from './modules/settings'
 
 // 系统更新
 export * from './modules/system'
-
-// turn-state 模板/设置/观测
-export * from './modules/turn-state'
 
 // 使用记录
 export * from './modules/usage'
