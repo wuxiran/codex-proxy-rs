@@ -17,6 +17,9 @@ const USER_AGENT: &str = "cpr-cdk/1.0";
 const CLIENT_HEADER: &str = "X-Cdk-Client";
 const CLIENT_VERSION_HEADER: &str = "X-Cdk-Client-Version";
 const DOWNLOAD_TOKEN_HEADER: &str = "X-Cdk-Download-Token";
+const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+/// 观澜下载格式：`sub2api` = 已签名 JSON（导入与 401 复活都依赖它）；`cpa` 是 ZIP，不用。
+const DOWNLOAD_FORMAT: &str = "sub2api";
 const MAX_CDK_BATCH: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -84,7 +87,11 @@ impl CodexCdkClient {
         self.settings.enabled
     }
 
-    pub async fn redeem_export(&self, cdks: &[String]) -> Result<Value, CodexCdkError> {
+    /// 兑换（或找回）CDK，按空间逐个下载已签名的账号文件。
+    ///
+    /// 观澜 20260922 起一批 CDK 可能分属多个空间，每个空间一个独立签名的文件；
+    /// 这里按服务端顺序全部返回，调用方逐份归档、导入，不能合并成一份（合并会破坏签名）。
+    pub async fn redeem_export(&self, cdks: &[String]) -> Result<Vec<Value>, CodexCdkError> {
         if cdks.is_empty() || cdks.len() > MAX_CDK_BATCH {
             return Err(CodexCdkError::Rejected("请提供 1 到 200 个 CDK".to_owned()));
         }
@@ -100,7 +107,13 @@ impl CodexCdkClient {
             }
             Err(error) => return Err(error),
         };
-        self.download(&ticket).await
+        let mut documents = Vec::with_capacity(ticket.downloads.len());
+        for download in &ticket.downloads {
+            documents.push(self.download(download).await?);
+            // 回执只是告诉观澜「文件已送达」，失败不影响本次导入（观澜会在下次对账时补齐）。
+            self.acknowledge(&ticket.idempotency_key, download).await;
+        }
+        Ok(documents)
     }
 
     async fn redeem(&self, cdks: &[String], recover: bool) -> Result<RedeemTicket, CodexCdkError> {
@@ -112,6 +125,7 @@ impl CodexCdkClient {
         if recover {
             body["download"] = Value::Bool(true);
         }
+        let idempotency_key = Uuid::now_v7().to_string();
         let response = self
             .http
             .post(url)
@@ -119,7 +133,7 @@ impl CodexCdkClient {
             .header(header::ACCEPT, "application/json")
             .header(CLIENT_HEADER, &self.client_id)
             .header(CLIENT_VERSION_HEADER, &self.settings.client_version)
-            .header("Idempotency-Key", Uuid::now_v7().to_string())
+            .header(IDEMPOTENCY_HEADER, &idempotency_key)
             .json(&body)
             .send()
             .await
@@ -135,14 +149,15 @@ impl CodexCdkClient {
         if !payload.ok || !status.is_success() {
             return Err(map_redeem_failure(status, &payload));
         }
-        payload.into_ticket()
+        log_skipped_codes(&payload.details);
+        payload.into_ticket(idempotency_key)
     }
 
-    async fn download(&self, ticket: &RedeemTicket) -> Result<Value, CodexCdkError> {
+    async fn download(&self, download: &RedeemDownloadTicket) -> Result<Value, CodexCdkError> {
         let url = format!(
-            "{}/api/cdk/redemptions/{}/download",
+            "{}/api/cdk/redemptions/{}/download?format={DOWNLOAD_FORMAT}",
             self.settings.base_url.trim_end_matches('/'),
-            ticket.redemption_id
+            download.redemption_id
         );
         let response = self
             .http
@@ -150,7 +165,7 @@ impl CodexCdkClient {
             .header(header::ACCEPT, "application/json")
             .header(CLIENT_HEADER, &self.client_id)
             .header(CLIENT_VERSION_HEADER, &self.settings.client_version)
-            .header(DOWNLOAD_TOKEN_HEADER, &ticket.download_token)
+            .header(DOWNLOAD_TOKEN_HEADER, &download.download_token)
             .send()
             .await
             .map_err(|_| CodexCdkError::Transport)?;
@@ -163,10 +178,63 @@ impl CodexCdkClient {
             .json::<Value>()
             .await
             .map_err(|_| CodexCdkError::InvalidResponse)?;
-        if document.get("accounts").and_then(Value::as_array).is_none() {
+        // 与观澜兑换页一致：文件必须带非空账号数组，且不能是 `ok: false` 的错误体。
+        let has_accounts = document
+            .get("accounts")
+            .and_then(Value::as_array)
+            .is_some_and(|accounts| !accounts.is_empty());
+        if !has_accounts || document.get("ok").and_then(Value::as_bool) == Some(false) {
             return Err(CodexCdkError::InvalidResponse);
         }
         Ok(document)
+    }
+
+    /// 接收回执（观澜 `durable_delivery_receipts`）：与兑换请求同一 Idempotency-Key。
+    async fn acknowledge(&self, idempotency_key: &str, download: &RedeemDownloadTicket) {
+        let url = format!(
+            "{}/api/cdk/redemptions/{}/received",
+            self.settings.base_url.trim_end_matches('/'),
+            download.redemption_id
+        );
+        let result = self
+            .http
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .header(CLIENT_HEADER, &self.client_id)
+            .header(CLIENT_VERSION_HEADER, &self.settings.client_version)
+            .header(IDEMPOTENCY_HEADER, idempotency_key)
+            .body("{}")
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => tracing::warn!(
+                status = response.status().as_u16(),
+                redemption_id = %download.redemption_id,
+                "cdk delivery receipt was not accepted"
+            ),
+            Err(_) => tracing::warn!(
+                redemption_id = %download.redemption_id,
+                "cdk delivery receipt could not be sent"
+            ),
+        }
+    }
+}
+
+/// 部分 CDK 未生成（已撤销、不存在等）时只记状态分布，不落兑换码本身。
+fn log_skipped_codes(details: &[RedeemDetail]) {
+    let skipped: Vec<&str> = details
+        .iter()
+        .map(|detail| detail.status.as_str())
+        .filter(|status| !matches!(*status, "redeemed" | "recovered"))
+        .collect();
+    if !skipped.is_empty() {
+        tracing::warn!(
+            skipped = skipped.len(),
+            statuses = ?skipped,
+            "some cdks were not redeemed"
+        );
     }
 }
 
@@ -255,6 +323,19 @@ fn map_redeem_failure(status: StatusCode, payload: &RedeemResponse) -> CodexCdkE
     if status.as_u16() == 429 {
         return CodexCdkError::RateLimited;
     }
+    // 观澜兑换协议升级后，旧版本客户端会被 409 拒绝且「本次未执行兑换」。
+    // 协议只改版本号时可在配置里跟进；协议有变化时需要升级 cpr。
+    if payload.error_code.as_deref() == Some("client_update_required") {
+        let required = payload
+            .cdk_client_version
+            .as_deref()
+            .filter(|version| is_client_version(version))
+            .unwrap_or("未知");
+        return CodexCdkError::Rejected(format!(
+            "观澜 CDK 兑换接口已升级（要求客户端版本 {required}），本次未执行兑换；\
+             请升级 cpr，或确认协议兼容后把 openai.auth.cdk.client_version 改为该版本"
+        ));
+    }
     let message = match payload.error_code.as_deref() {
         Some("invalid_format") => "CDK 格式不正确",
         Some("not_found") => "CDK 不存在或无效",
@@ -271,12 +352,28 @@ fn map_redeem_failure(status: StatusCode, payload: &RedeemResponse) -> CodexCdkE
     CodexCdkError::Rejected(message.to_owned())
 }
 
+/// 观澜回传的版本号只在符合其兑换页同款格式时才展示给管理员。
+fn is_client_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// 兑换记录 ID 会拼进 URL 路径，只接受观澜兑换页同款的安全字符。
+fn is_redemption_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 #[derive(Debug, Deserialize)]
 struct RedeemResponse {
     #[serde(default)]
     ok: bool,
-    #[serde(default)]
-    status: String,
     #[serde(default)]
     redemption_id: Option<String>,
     #[serde(default)]
@@ -284,9 +381,13 @@ struct RedeemResponse {
     #[serde(default)]
     downloads: Vec<RedeemDownload>,
     #[serde(default)]
+    details: Vec<RedeemDetail>,
+    #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     error_code: Option<String>,
+    #[serde(default)]
+    cdk_client_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,32 +398,59 @@ struct RedeemDownload {
     download_token: Option<String>,
 }
 
-struct RedeemTicket {
+#[derive(Debug, Deserialize)]
+struct RedeemDetail {
+    #[serde(default)]
+    status: String,
+}
+
+struct RedeemDownloadTicket {
     redemption_id: String,
     download_token: String,
 }
 
+struct RedeemTicket {
+    idempotency_key: String,
+    downloads: Vec<RedeemDownloadTicket>,
+}
+
 impl RedeemResponse {
-    fn into_ticket(self) -> Result<RedeemTicket, CodexCdkError> {
-        if !matches!(self.status.as_str(), "redeemed" | "recovered") {
+    /// 与观澜兑换页一致：成功与否只看 `ok`，文件清单优先取 `downloads`（多空间），
+    /// 没有时退回顶层单文件字段；两者都没有完整下载信息即视为无效响应。
+    fn into_ticket(self, idempotency_key: String) -> Result<RedeemTicket, CodexCdkError> {
+        let mut downloads: Vec<RedeemDownloadTicket> = self
+            .downloads
+            .into_iter()
+            .filter_map(|item| ticket_from(item.redemption_id, item.download_token))
+            .collect();
+        if downloads.is_empty()
+            && let Some(single) = ticket_from(self.redemption_id, self.download_token)
+        {
+            downloads.push(single);
+        }
+        if downloads.is_empty() {
             return Err(CodexCdkError::InvalidResponse);
         }
-        let first = self.downloads.first();
-        let redemption_id = self
-            .redemption_id
-            .or_else(|| first.and_then(|item| item.redemption_id.clone()))
-            .filter(|value| !value.is_empty())
-            .ok_or(CodexCdkError::InvalidResponse)?;
-        let download_token = self
-            .download_token
-            .or_else(|| first.and_then(|item| item.download_token.clone()))
-            .filter(|value| !value.is_empty())
-            .ok_or(CodexCdkError::InvalidResponse)?;
         Ok(RedeemTicket {
-            redemption_id,
-            download_token,
+            idempotency_key,
+            downloads,
         })
     }
+}
+
+fn ticket_from(
+    redemption_id: Option<String>,
+    download_token: Option<String>,
+) -> Option<RedeemDownloadTicket> {
+    let redemption_id = redemption_id?.trim().to_owned();
+    let download_token = download_token?.trim().to_owned();
+    if !is_redemption_id(&redemption_id) || download_token.is_empty() {
+        return None;
+    }
+    Some(RedeemDownloadTicket {
+        redemption_id,
+        download_token,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]

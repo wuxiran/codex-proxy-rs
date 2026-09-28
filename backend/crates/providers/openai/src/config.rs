@@ -408,7 +408,8 @@ impl Default for CodexCdkSettings {
             enabled: true,
             base_url: "https://zzledu.kdns.fr".to_owned(),
             client_id: String::new(),
-            client_version: "20260907-receipt-capacity".to_owned(),
+            // 观澜兑换页 2026-09-22 起的协议版本（多空间下载 + 接收回执 + format 参数）。
+            client_version: "20260922-credentials".to_owned(),
         }
     }
 }
