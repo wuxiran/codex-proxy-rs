@@ -20,7 +20,7 @@ const forkNavItems: { after: string, items: NavItem[] }[] = [
       { label: '经营日报', icon: TrendingUp, path: '/ops-report' },
       { label: '请求日志', icon: ScrollText, path: '/logs' },
       { label: '测智台', icon: FlaskConical, path: '/testbench' },
-      { label: 'state 观测', icon: Activity, path: '/turn-state' },
+      { label: '票据管理', icon: Activity, path: '/turn-state' },
     ],
   },
 ]

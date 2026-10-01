@@ -188,6 +188,184 @@ async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_
     pool.shutdown().await;
 }
 
+#[tokio::test]
+async fn swapped_response_model_is_not_returned_to_the_websocket_pool() {
+    assert_mismatched_connection_is_discarded(false, false).await;
+}
+
+#[tokio::test]
+async fn a_matching_metadata_frame_cannot_hide_a_mismatched_handshake_model() {
+    assert_mismatched_connection_is_discarded(true, false).await;
+}
+
+#[tokio::test]
+async fn conflicting_model_headers_are_not_returned_to_the_websocket_pool() {
+    assert_mismatched_connection_is_discarded(true, true).await;
+    assert_mismatched_connection_is_discarded(false, true).await;
+}
+
+async fn assert_mismatched_connection_is_discarded(
+    handshake_mismatch: bool,
+    conflicting_headers: bool,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket_with(stream, |_, response| {
+            if handshake_mismatch {
+                response
+                    .headers_mut()
+                    .insert("openai-model", "gpt-other".parse().unwrap());
+                if conflicting_headers {
+                    response
+                        .headers_mut()
+                        .insert("x-openai-model", "gpt-test".parse().unwrap());
+                }
+            }
+        })
+        .await;
+        let _first = websocket.next().await.unwrap().unwrap();
+        if handshake_mismatch {
+            websocket.send(Message::Text(json!({"type":"codex.response.metadata", "headers":{"openai-model":"gpt-test"}}).to_string().into())).await.unwrap();
+        }
+        if conflicting_headers && !handshake_mismatch {
+            websocket.send(Message::Text(json!({"type":"codex.response.metadata", "headers":{"openai-model":["gpt-test", "gpt-other"]}}).to_string().into())).await.unwrap();
+        }
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_swapped",
+                        "object": "response",
+                        "model": if handshake_mismatch || conflicting_headers { "gpt-test" } else { "gpt-5.6-luna" },
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let next = timeout(Duration::from_secs(2), websocket.next()).await;
+        assert!(
+            next.is_err()
+                || matches!(
+                    next,
+                    Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_)))
+                ),
+            "swapped socket must not carry the next turn: {next:?}"
+        );
+    });
+    let pool = Arc::new(CodexWebSocketPool::default());
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::clone(&pool));
+    let mut request = new_chain_request("conversation-swapped-model");
+    request.discard_mismatched_connection = true;
+
+    let first = backend
+        .create_response(
+            &request,
+            request_context("req_swapped_seed", Some("chatgpt-account")),
+        )
+        .await
+        .expect("the swapped response is still delivered");
+    assert_eq!(first.transport, CodexBackendTransport::WebSocket);
+    assert!(first.body.contains("resp_swapped"));
+
+    request.set_previous_response_id(Some("resp_swapped".to_owned()));
+    request.previous_response_scope = Some(PreviousResponseScope::ConnectionLocal);
+    let second = backend
+        .create_response(
+            &request,
+            request_context("req_swapped_continuation", Some("chatgpt-account")),
+        )
+        .await;
+    let Err(CodexClientError::WebSocket(error)) = second else {
+        panic!("a swapped model must not leave its socket in the pool: {second:?}");
+    };
+    let CodexWebSocketExchangeError::ContinuationUnavailable { reason } = error else {
+        panic!("connection-local turn should be refused without that socket: {error}");
+    };
+    assert_eq!(
+        reason,
+        PreviousResponseUnavailableReason::FreshConnectionRequired
+    );
+    server.await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn observing_a_model_mismatch_can_leave_the_connection_reusable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        for id in ["resp_observe_first", "resp_observe_second"] {
+            let request = timeout(Duration::from_secs(3), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request, Message::Text(_)));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed", "response": {
+                            "id": id, "model": "gpt-other", "status": "completed", "output": [],
+                            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let pool = Arc::new(CodexWebSocketPool::default());
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::clone(&pool));
+    let mut request = new_chain_request("conversation-observe-model");
+    request.discard_mismatched_connection = false;
+    let first = backend
+        .create_response(
+            &request,
+            request_context("req_observe_first", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert!(first.body.contains("gpt-other"));
+    request.set_previous_response_id(Some("resp_observe_first".to_owned()));
+    request.previous_response_scope = Some(PreviousResponseScope::ConnectionLocal);
+    let second = backend
+        .create_response(
+            &request,
+            request_context("req_observe_second", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    assert!(
+        second
+            .websocket_pool_decision
+            .is_some_and(|decision| decision.is_reuse())
+    );
+    server.await.unwrap();
+    pool.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn external_continuation_should_wait_for_a_cold_websocket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

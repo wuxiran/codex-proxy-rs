@@ -5,6 +5,7 @@ mod fernet;
 mod fs_util;
 mod observe;
 mod record;
+mod served;
 mod service;
 mod settings;
 mod store;

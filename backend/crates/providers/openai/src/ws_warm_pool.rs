@@ -166,7 +166,7 @@ impl WarmPoolService {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.settings().enabled
+        self.settings().enabled && !self.pins.service().settings().dry_run
     }
 
     /// 请求侧：记下账号在用哪些模型、最近何时有流量（补齐/续探优先照顾活跃账号）。
@@ -229,6 +229,9 @@ impl WarmPoolService {
 
     /// 一轮保活：刷新业务复用开关、补齐/续探每个合格账号的保活连接。
     pub(crate) async fn run_cycle(self: &Arc<Self>) {
+        if self.pins.service().settings().dry_run {
+            return;
+        }
         let settings = self.settings();
         self.pool
             .set_warm_reuse(settings.enabled && settings.business_reuse);
@@ -511,7 +514,7 @@ impl WarmPoolService {
             settings.probe_prompt.as_str()
         };
         let mut body = Map::new();
-        body.insert("model".to_owned(), Value::String(model));
+        body.insert("model".to_owned(), Value::String(model.clone()));
         body.insert("instructions".to_owned(), Value::String(String::new()));
         body.insert(
             "input".to_owned(),
@@ -528,6 +531,7 @@ impl WarmPoolService {
         body.insert("store".to_owned(), Value::Bool(false));
         body.insert("stream".to_owned(), Value::Bool(true));
         let mut request = CodexResponsesRequest::from_body(body);
+        request.discard_mismatched_connection = !self.pins.service().settings().dry_run;
         // conversation 以保活前缀命名 → 连接落进保活 key；带下游标记 → 走 WebSocketNewChain
         // （无 fast-path 预算，强制真正建 WS 而非退回 HTTP）。
         request.local_conversation_id = Some(format!("{WARM_CONVERSATION_PREFIX}{slot}"));
@@ -558,7 +562,7 @@ impl WarmPoolService {
         // 在消费 body 前先取。
         let gateway = gateway_from_set_cookie(&response.set_cookie_headers);
         let verdict = self
-            .read_verdict(response, settings.probe_expect.as_str(), timeout)
+            .read_verdict(response, settings.probe_expect.as_str(), &model, timeout)
             .await?;
         Ok((verdict, gateway))
     }
@@ -570,13 +574,21 @@ impl WarmPoolService {
         &self,
         response: CodexBackendStreamingResponse,
         expect: &str,
+        probe_model: &str,
         timeout: Duration,
     ) -> Result<Verdict, String> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut header_model_seen = response.response_metadata.effective_model.clone();
+        let mut body_model_seen = None;
+        let metadata_updates = response.response_metadata_updates.clone();
+        let mut metadata_mismatch = header_model_seen
+            .as_deref()
+            .is_some_and(|model| !model.eq_ignore_ascii_case(probe_model));
         let mut body = response.body;
         let mut buf: Vec<u8> = Vec::new();
         let mut answer = String::new();
-        let mut served_model: Option<String> = None;
+        // 上游在 created 或终态里声明了别的模型：答对题也不算满血。
+        let mut swapped: Option<String> = None;
         let mut verdict: Option<Verdict> = None;
         loop {
             let next = match tokio::time::timeout_at(deadline, body.next()).await {
@@ -588,6 +600,13 @@ impl WarmPoolService {
                     break;
                 }
             };
+            if let Some(updates) = &metadata_updates {
+                let updates = updates.lock().await;
+                metadata_mismatch |= updates.served_mismatch;
+                if let Some(model) = &updates.reported_model {
+                    header_model_seen = Some(model.clone());
+                }
+            }
             // 判决已定：只排空剩余字节让连接归还，不再解析。
             if verdict.is_some() {
                 continue;
@@ -602,18 +621,38 @@ impl WarmPoolService {
                 let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
                     continue;
                 };
-                match event.get("type").and_then(Value::as_str) {
+                let event_type = event.get("type").and_then(Value::as_str);
+                let (header_model, body_model) = event_declared_models(&event);
+                if header_model.is_some() {
+                    header_model_seen.clone_from(&header_model);
+                }
+                if body_model.is_some() {
+                    body_model_seen.clone_from(&body_model);
+                }
+                if swapped.is_none()
+                    && let Some(declared) = disagreeing_model(
+                        header_model.as_deref(),
+                        body_model.as_deref(),
+                        probe_model,
+                    )
+                {
+                    swapped = Some(declared);
+                }
+                match event_type {
                     Some("response.output_text.delta") => {
                         if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                             answer.push_str(delta);
                         }
                     }
                     Some("response.completed") => {
-                        served_model = event
-                            .pointer("/response/model")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        verdict = Some(Self::judge(&answer, expect, served_model.take()));
+                        let served_model = body_model_seen
+                            .clone()
+                            .or_else(|| header_model_seen.clone());
+                        verdict = Some(if metadata_mismatch {
+                            Verdict::Degraded(served_model)
+                        } else {
+                            Self::judge(&answer, expect, probe_model, served_model, swapped.take())
+                        });
                         break;
                     }
                     Some("response.failed") | Some("error") => {
@@ -630,22 +669,37 @@ impl WarmPoolService {
                 }
             }
         }
+        // 没读到终态就断了：答案可能不完整，也没有终态的模型声明，不能据此判满血。
         Ok(verdict.unwrap_or_else(|| {
-            if answer.trim().is_empty() {
-                Verdict::Failed("no_answer".to_owned())
-            } else {
-                Self::judge(&answer, expect, served_model)
-            }
+            Verdict::Failed(
+                if answer.trim().is_empty() {
+                    "no_answer"
+                } else {
+                    "no_terminal"
+                }
+                .to_owned(),
+            )
         }))
     }
 
-    fn judge(answer: &str, expect: &str, served_model: Option<String>) -> Verdict {
-        let trimmed = answer.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
-        if trimmed.starts_with(expect) {
-            Verdict::Verified(served_model)
-        } else {
-            Verdict::Degraded(served_model)
+    fn judge(
+        answer: &str,
+        expect: &str,
+        probe_model: &str,
+        served_model: Option<String>,
+        swapped: Option<String>,
+    ) -> Verdict {
+        if swapped.is_some() {
+            return Verdict::Degraded(swapped);
         }
+        // 没看到声明，或声明和探针模型不是同一个，答对也不算满血。
+        let declared_matches = served_model
+            .as_deref()
+            .is_some_and(|model| model.eq_ignore_ascii_case(probe_model));
+        if !declared_matches || !answer_matches(answer, expect) {
+            return Verdict::Degraded(served_model);
+        }
+        Verdict::Verified(served_model)
     }
 
     fn probe_model(&self, settings: &WarmPoolSettings) -> String {
@@ -657,6 +711,56 @@ impl WarmPoolService {
         }
         DEFAULT_WARM_MODEL.to_owned()
     }
+}
+
+/// 响应头 `openai-model` / `x-openai-model` 与正文 `response.model` 分开取。
+fn event_declared_models(event: &Value) -> (Option<String>, Option<String>) {
+    let header = [event.pointer("/response/headers"), event.get("headers")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .find_map(|headers| {
+            headers.iter().find_map(|(name, value)| {
+                if !name.eq_ignore_ascii_case("openai-model")
+                    && !name.eq_ignore_ascii_case("x-openai-model")
+                {
+                    return None;
+                }
+                value
+                    .as_str()
+                    .or_else(|| value.as_array()?.first()?.as_str())
+                    .map(str::to_owned)
+            })
+        });
+    let body = event
+        .pointer("/response/model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (header, body)
+}
+
+/// 两处声明有一处和探针模型不一致就返回那一处。都没声明时返回 None，交给 judge 拒绝满血。
+fn disagreeing_model(
+    header: Option<&str>,
+    body: Option<&str>,
+    probe_model: &str,
+) -> Option<String> {
+    [header, body]
+        .into_iter()
+        .flatten()
+        .find(|model| !model.eq_ignore_ascii_case(probe_model))
+        .map(str::to_owned)
+}
+
+/// 期望答案之后必须是结尾或非数字。`210` 不能通过期望 `21`。
+fn answer_matches(answer: &str, expect: &str) -> bool {
+    let trimmed = answer.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
+    trimmed.strip_prefix(expect).is_some_and(|rest| {
+        !rest
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_digit())
+    })
 }
 
 /// 从上游回的 Set-Cookie 列表里找 __oailb，解出网关号（unified-N）。
@@ -686,4 +790,82 @@ fn gateway_from_oailb(oailb: &str) -> Option<String> {
         .take_while(char::is_ascii_digit)
         .collect();
     (!digits.is_empty()).then(|| format!("unified-{digits}"))
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::{Verdict, WarmPoolService};
+
+    #[test]
+    fn a_right_answer_from_a_swapped_model_is_not_verified() {
+        let swapped = Some("gpt-5.6-luna".to_owned());
+        assert!(matches!(
+            WarmPoolService::judge("21", "21", "gpt-6-astra", swapped.clone(), swapped),
+            Verdict::Degraded(Some(model)) if model == "gpt-5.6-luna"
+        ));
+        assert!(matches!(
+            WarmPoolService::judge(
+                "**21**",
+                "21",
+                "gpt-6-astra",
+                Some("gpt-6-astra".to_owned()),
+                None
+            ),
+            Verdict::Verified(_)
+        ));
+        assert!(matches!(
+            WarmPoolService::judge(
+                "21",
+                "21",
+                "gpt-6-astra",
+                Some("GPT-6-ASTRA".to_owned()),
+                None
+            ),
+            Verdict::Verified(_)
+        ));
+        assert!(matches!(
+            WarmPoolService::judge(
+                "20",
+                "21",
+                "gpt-6-astra",
+                Some("gpt-6-astra".to_owned()),
+                None
+            ),
+            Verdict::Degraded(_)
+        ));
+        assert!(matches!(
+            WarmPoolService::judge(
+                "210",
+                "21",
+                "gpt-6-astra",
+                Some("gpt-6-astra".to_owned()),
+                None
+            ),
+            Verdict::Degraded(_)
+        ));
+        assert!(matches!(
+            WarmPoolService::judge("21", "21", "gpt-6-astra", None, None),
+            Verdict::Degraded(None)
+        ));
+    }
+
+    #[test]
+    fn a_header_model_disagrees_even_when_the_body_matches() {
+        let event = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "model": "gpt-6-astra",
+                "headers": {"openai-model": "gpt-5.6-luna"}
+            }
+        });
+        let (header, body) = super::event_declared_models(&event);
+        assert_eq!(
+            super::disagreeing_model(header.as_deref(), body.as_deref(), "gpt-6-astra").as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        let header_only = serde_json::json!({"headers": {"x-openai-model": ["gpt-6-astra"]}});
+        let (header, body) = super::event_declared_models(&header_only);
+        assert_eq!(header.as_deref(), Some("gpt-6-astra"));
+        assert!(body.is_none());
+    }
 }

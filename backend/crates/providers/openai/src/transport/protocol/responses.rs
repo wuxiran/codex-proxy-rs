@@ -77,6 +77,10 @@ pub struct CodexResponsesRequest {
     pub parent_thread_id: Option<String>,
     /// 已知 previous response 的持久化范围，仅用于本地 transport 校验。
     pub previous_response_scope: Option<PreviousResponseScope>,
+    /// 换模型的业务连接不再复用，模拟运行必须关闭此控制。
+    pub discard_mismatched_connection: bool,
+    /// CPR 注入的云端票所需的路由指纹，不进入请求正文。
+    pub minted_turn_state_route: Option<String>,
 }
 
 impl fmt::Debug for CodexResponsesRequest {
@@ -525,6 +529,8 @@ impl CodexResponsesRequest {
             downstream_websocket_connection_id: None,
             parent_thread_id: None,
             previous_response_scope: None,
+            discard_mismatched_connection: false,
+            minted_turn_state_route: None,
         }
     }
 

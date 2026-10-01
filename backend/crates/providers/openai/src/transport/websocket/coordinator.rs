@@ -480,10 +480,16 @@ async fn connect_websocket_connection(
     let started_at = Instant::now();
     let (websocket, response) =
         connect_pumped_websocket(connection, keepalive, context, fast_path).await?;
+    let mut metadata = websocket_connection_metadata(&response);
+    // fork: served-mismatch
+    metadata.route_pair = crate::route_pair::RoutePairRef::handshake(
+        connection.headers(),
+        &metadata.set_cookie_headers,
+    );
     Ok((
         PooledWebSocketConnection {
             websocket,
-            metadata: websocket_connection_metadata(&response),
+            metadata,
             continuation: WebSocketContinuationState::default(),
             created_at: tokio::time::Instant::now(),
         },
@@ -597,6 +603,30 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         continuation,
         created_at,
     } = connection;
+    if request
+        .minted_turn_state_route
+        .as_ref()
+        .is_some_and(|expected| {
+            metadata
+                .route_pair
+                .as_ref()
+                .is_none_or(|actual| &actual.fingerprint != expected)
+        })
+    {
+        // 此时还没发送业务正文，拒绝把新票投到旧连接，保留既有的有界建连恢复。
+        let observation = websocket
+            .observation()
+            .with_exit_reason("mint_route_mismatch");
+        discard_connection(websocket, lease, observation.clone()).await;
+        return Err(CodexWebSocketExchangeError::Connect(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "minted ticket and websocket route do not match",
+            )
+            .into(),
+        )
+        .with_connection_observation(observation));
+    }
     trace.record("upstream.connection", serde_json::json!({
         "connectionId": websocket.connection_id().to_string(), "reused": reused,
         "pool": pool_decision.map_or("unpooled", WebSocketPoolDecision::kind),
@@ -620,7 +650,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
                 "reused": reused,
             }),
         );
-        discard_after_send(websocket, lease, observation.clone()).await;
+        discard_connection(websocket, lease, observation.clone()).await;
         return Err(post_send_ambiguous(
             error.with_connection_observation(observation),
         ));
@@ -640,13 +670,15 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         stream_idle_timeout,
         trace,
         response_control,
+        request.requested_model().to_owned(),
+        request.discard_mismatched_connection,
     );
     exchange.pool_decision = pool_decision;
     exchange.connection_local_continuation = connection_local_available;
     Ok(exchange)
 }
 
-async fn discard_after_send(
+async fn discard_connection(
     websocket: PumpedWebSocket,
     lease: Option<WebSocketPoolLease>,
     observation: super::pump::WebSocketConnectionObservation,

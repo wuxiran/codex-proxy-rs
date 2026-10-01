@@ -942,6 +942,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
         now: SystemTime,
         margin: std::time::Duration,
     ) -> Vec<TurnStateRenewal> {
+        // 专用打票启用后不再同时遍历业务代理补票，模拟运行也不触发旧的补票任务。
+        let turn_state_settings = self.turn_state_pins.service().settings();
+        if turn_state_settings.dry_run || turn_state_settings.cloud_mint.enabled {
+            return Vec::new();
+        }
         let Ok(provider) = ProviderKind::new(PROVIDER_NAME) else {
             return Vec::new();
         };
@@ -990,6 +995,15 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 .expected_length(&auto.model)
                 .is_none()
             {
+                continue;
+            }
+            // 票不定时续：只有最近有业务请求在这个桶上缺过票，才值得花一次真实请求去补。
+            if !self.turn_state_pins.service().demanded_within(
+                account.id().as_str(),
+                &auto.model,
+                now,
+                self.turn_state_pins.service().ttl(),
+            ) {
                 continue;
             }
             let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
@@ -1076,22 +1090,29 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 use crate::turn_state_mint::MintError;
                 let kind = match error {
                     MintError::Disabled => ProviderAdminErrorKind::Unsupported,
-                    MintError::NotEligible => ProviderAdminErrorKind::Invalid,
-                    MintError::Busy | MintError::CoolingDown => ProviderAdminErrorKind::Conflict,
+                    MintError::NotEligible | MintError::ProxyRequired | MintError::InvalidProxy => {
+                        ProviderAdminErrorKind::Invalid
+                    }
+                    MintError::Busy | MintError::CoolingDown | MintError::Stale => {
+                        ProviderAdminErrorKind::Conflict
+                    }
                     MintError::Unreachable
                     | MintError::Rejected
                     | MintError::InvalidResponse
                     | MintError::Store => ProviderAdminErrorKind::Unavailable,
                 };
                 provider_admin_error(kind).with_public_message(match error {
-                    MintError::Disabled => "云端打票未启用，请先在「state 观测」页配置",
+                    MintError::Disabled => "自动打票未启用或处于模拟运行，请先在票据管理页配置",
+                    MintError::ProxyRequired => "请先在票据管理页配置专用打票代理",
+                    MintError::InvalidProxy => "打票代理地址无效，请检查代理配置",
                     MintError::NotEligible => "只有已启用「固定自身 state」的 OAuth 账号能打票",
                     MintError::Busy => "该账号正在打票中",
                     MintError::CoolingDown => "上次打票失败，冷却中",
-                    MintError::Unreachable => "relay 不可达",
-                    MintError::Rejected => "relay 没有铸出符合条件的票",
-                    MintError::InvalidResponse => "relay 响应不合法",
+                    MintError::Unreachable => "打票代理或服务不可达",
+                    MintError::Rejected => "未取得符合条件的票据",
+                    MintError::InvalidResponse => "打票服务响应不合法",
                     MintError::Store => "凭据写入失败",
+                    MintError::Stale => "打票期间账号凭据或路由已更新，请重新打票",
                 })
             })?;
         Ok(mint_report_view(&report))

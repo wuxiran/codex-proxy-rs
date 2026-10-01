@@ -54,11 +54,15 @@ pub(crate) struct MemoryAccountStore {
     accounts: Mutex<BTreeMap<ProviderAccountId, StoredAccount>>,
     quota_reads: AtomicUsize,
     fail_provider_listing: AtomicBool,
+    fail_credential_writes: AtomicBool,
     credential_load_hook: Mutex<Option<Arc<CredentialLoadHook>>>,
     credential_loads: AtomicUsize,
 }
 
 impl MemoryAccountStore {
+    pub(crate) fn fail_credential_writes(&self) {
+        self.fail_credential_writes.store(true, Ordering::SeqCst);
+    }
     pub(crate) fn repository(self: &Arc<Self>) -> CodexCredentialRepository {
         CodexCredentialRepository::new(self.clone())
     }
@@ -350,6 +354,9 @@ impl ProviderAccountStore for MemoryAccountStore {
         &self,
         update: CredentialCasUpdate,
     ) -> Result<CredentialCasOutcome, StoreError> {
+        if self.fail_credential_writes.load(Ordering::SeqCst) {
+            return Err(store_error(StoreErrorKind::Unavailable));
+        }
         let CredentialCasUpdateParts {
             account_id,
             expected_revision,

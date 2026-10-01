@@ -940,16 +940,17 @@ async function mintTickets(req, res, cfg, entry, edgeIp) {
     transport, models: want.models, want_gateway: want.gateway || 'any', want_len: want.ticketLen,
   });
 
+  const freshPair = first(req.headers['x-mint-fresh-pair']) === '1';
   const lifetime = mintLifetime(res, cfg.mint);
   try {
-    await mintWithLifetime({ res, cfg, entry, edgeIp, want, creds, transport, lifetime, seed });
+    await mintWithLifetime({ res, cfg, entry, edgeIp, want, creds, transport, lifetime, seed, freshPair });
   } finally {
     if (lifetime.reason) entry.mint.stop_reason = lifetime.reason;
     lifetime.close();
   }
 }
 
-async function mintWithLifetime({ res, cfg, entry, edgeIp, want, creds, transport, lifetime, seed }) {
+async function mintWithLifetime({ res, cfg, entry, edgeIp, want, creds, transport, lifetime, seed, freshPair }) {
   // 握手取得的票可能具有协议相关语义,不同传输的票与 pair 保守隔离。
   const seedKey = seed ? crypto.createHash('sha256').update(JSON.stringify(seed.pairs)).digest('hex') : '';
   const gwKey = `${transport}|${want.gateway || 'any'}${seed ? `|seed:${seedKey}` : ''}`;
@@ -959,7 +960,10 @@ async function mintWithLifetime({ res, cfg, entry, edgeIp, want, creds, transpor
   let missing = [];
   const errors = {};    // model → {attempts, last:{status,len,gateway,served,reason,why}}
   const seen = { gateways: new Set() };
-  let pair = (want.ticketTtlS > 0 ? mintCacheGet(pairKey) : null) || seed;
+  // x-mint-fresh-pair 跳过并删掉 pair 缓存，从裸打开始，让后面的 !pairLive 循环铸一对新的。
+  // 显式带了 seed cookie 时仍用那对；票缓存不在这里清。
+  if (freshPair) mintCache.delete(pairKey);
+  let pair = seed || (freshPair || !(want.ticketTtlS > 0) ? null : mintCacheGet(pairKey));
   let attempts = 0;
   let last = null;
   const attemptLog = [];

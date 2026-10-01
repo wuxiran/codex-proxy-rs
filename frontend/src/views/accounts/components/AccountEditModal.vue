@@ -161,10 +161,10 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
               size="sm"
               :loading="minting"
               :disabled="saving || minting || !savedPinTurnState || !pinTurnState"
-              :title="savedPinTurnState ? '向 relay 铸票并钉住路由 cookie 对（需先在 state 观测页启用云端打票）' : '请先开启并保存「固定自身 state」'"
+              :title="savedPinTurnState ? '使用已配置的打票服务获取票据，需先在票据管理页启用' : '请先开启并保存「固定自身 state」'"
               @click="mintNow"
             >
-              云端打票
+              立即打票
             </BaseButton>
             <BaseButton variant="soft" size="sm" :disabled="saving" :aria-expanded="showStateHistory" :aria-controls="historyId" @click="showStateHistory = !showStateHistory">
               最近捕获
@@ -186,7 +186,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
             <span v-for="(length, model) in turnStateCaptureRule.modelLengths" :key="model">
               {{ model }}：{{ length }} 字节
             </span>
-            <span v-if="turnStateCaptureRule.defaultLength !== null">规则：≥200 字节可见 ASCII；正常/受限长度档在「state 观测」页配置。</span>
+            <span v-if="turnStateCaptureRule.defaultLength !== null">票据格式规则可在「票据管理」页调整，长度不代表模型能力</span>
             <span v-else>仅捕获上述模型，未列出的模型等待补充规则。</span>
           </div>
           <p v-else class="m-0 text-cp-xs text-cp-text-secondary">
@@ -206,11 +206,11 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
               <li v-for="(pin, index) in turnStatePins" :key="`${pin.model}-${pin.capturedAt}-${index}`">
                 {{ pin.model }} · {{ pin.length }} 字节 · 命中 {{ pin.hits }} 次 · {{ new Date(pin.expiresAt).toLocaleString() }} 到期
                 <span v-if="pin.scope === 'account'" class="text-cp-xs text-cp-text-secondary">· 全部客户端</span>
-                <span v-if="pin.source === 'mint'" class="text-cp-xs text-cp-text-secondary">· 云端打票{{ pin.gateway ? ` · ${pin.gateway}` : '' }}</span>
+                <span v-if="pin.source === 'mint'" class="text-cp-xs text-cp-text-secondary">· 打票{{ pin.gateway ? ` · ${pin.gateway}` : '' }}</span>
               </li>
             </ul>
             <p v-if="mintMessage" role="status" class="m-0 text-cp-sm text-cp-text-secondary">
-              云端打票：{{ mintMessage }}
+              打票结果：{{ mintMessage }}
             </p>
             <p v-if="turnStateAutoHunt" role="status" class="m-0 flex flex-wrap items-center gap-2 text-cp-sm text-cp-text">
               自动续期：{{ turnStateAutoHunt.modelId }} · 每个代理 {{ turnStateAutoHunt.attempts }} 次<template v-if="turnStateAutoHunt.includeDirect">

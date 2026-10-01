@@ -71,17 +71,21 @@ impl TurnStatePins {
         egress: &str,
         carried: Option<&str>,
         now: SystemTime,
+        route_fingerprint: Option<&str>,
     ) -> PinAttempt {
         let _ = expected_length; // 长度门已废弃：作用域不再含长度分量。
-        PinAttempt(self.0.begin_request(turn_state::RequestFacts {
-            account,
-            binding,
-            model,
-            client,
-            egress,
-            carried,
-            now,
-        }))
+        PinAttempt(self.0.begin_request_on_route(
+            turn_state::RequestFacts {
+                account,
+                binding,
+                model,
+                client,
+                egress,
+                carried,
+                now,
+            },
+            route_fingerprint,
+        ))
     }
 
     pub(crate) fn status(&self, account: &str, binding: &str, now: SystemTime) -> Vec<PinStatus> {
@@ -140,6 +144,9 @@ impl TurnStatePins {
 pub(crate) struct PinAttempt(turn_state::Attempt);
 
 impl PinAttempt {
+    pub(crate) fn injected_route(&self) -> Option<&str> {
+        self.0.injected_route()
+    }
     pub(crate) fn value(&self) -> Option<&str> {
         self.0.value()
     }
@@ -151,6 +158,11 @@ impl PinAttempt {
 
     pub(crate) fn completed(&mut self, now: SystemTime) {
         self.0.completed(now);
+    }
+
+    /// 上游这一轮换了模型：本轮的票不入库，正在复用的模板条件失效。
+    pub(crate) fn served_mismatch(&mut self, now: SystemTime) {
+        self.0.served_mismatch(now);
     }
 
     /// 桶里没有有效模板：账号此模型缺票。

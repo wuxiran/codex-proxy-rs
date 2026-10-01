@@ -4,6 +4,7 @@ mod admin;
 mod cf_cookie_pool;
 pub mod config;
 mod provider;
+mod route_pair;
 mod session_transport;
 mod turn_state_auto_hunt;
 mod turn_state_mint;

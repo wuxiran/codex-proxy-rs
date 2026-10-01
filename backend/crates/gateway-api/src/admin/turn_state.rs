@@ -14,8 +14,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use turn_state::{
-    BucketSummary, CloudMintSettings, InjectMode, ObservationSnapshot, Settings, TurnStateError,
-    TurnStateService, WarmPoolSettings,
+    BucketSummary, CloudMintSettings, InjectMode, ObservationSnapshot, ServedMismatchAction,
+    Settings, TurnStateError, TurnStateService, WarmPoolSettings,
 };
 
 use super::{AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse};
@@ -31,12 +31,38 @@ pub struct UpdateTurnStateSettingsRequest {
     log_decisions: bool,
     template_lengths: Vec<usize>,
     degraded_lengths: Vec<usize>,
+    /// 省略时保留现有的换模型处置。
+    #[serde(default)]
+    served_mismatch_action: Option<ServedMismatchAction>,
     /// 省略时保留现有云端打票设置；`relayKey` 为 `<set>` 占位时沿用磁盘上的密钥。
     #[serde(default)]
-    cloud_mint: Option<CloudMintSettings>,
+    cloud_mint: Option<CloudMintSettingsPatch>,
     /// 省略时保留现有 WS 保活设置。
     #[serde(default)]
     warm_pool: Option<WarmPoolSettings>,
+}
+
+/// 旧客户端省略专用代理时保留已保存值，显式空字符串才表示清除。
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CloudMintSettingsPatch {
+    #[serde(default)]
+    upstream_proxy_url: Option<String>,
+    #[serde(flatten)]
+    settings: CloudMintSettings,
+}
+
+impl std::fmt::Debug for CloudMintSettingsPatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudMintSettingsPatch")
+            .field(
+                "upstream_proxy_provided",
+                &self.upstream_proxy_url.is_some(),
+            )
+            .field("settings", &self.settings)
+            .finish()
+    }
 }
 
 impl UpdateTurnStateSettingsRequest {
@@ -49,8 +75,17 @@ impl UpdateTurnStateSettingsRequest {
             log_decisions: self.log_decisions,
             template_lengths: self.template_lengths,
             degraded_lengths: self.degraded_lengths,
+            served_mismatch_action: self
+                .served_mismatch_action
+                .unwrap_or(current.served_mismatch_action),
             cloud_mint: self
                 .cloud_mint
+                .map(|patch| CloudMintSettings {
+                    upstream_proxy_url: patch
+                        .upstream_proxy_url
+                        .unwrap_or_else(|| current.cloud_mint.upstream_proxy_url.clone()),
+                    ..patch.settings
+                })
                 .unwrap_or_else(|| current.cloud_mint.clone()),
             warm_pool: self.warm_pool.unwrap_or_else(|| current.warm_pool.clone()),
         }
@@ -157,8 +192,21 @@ where
 {
     let service = service(&state)?;
     let current = service.settings();
+    let requested = payload.into_settings(&current);
+    for proxy in [
+        &requested.cloud_mint.upstream_proxy_url,
+        &requested.cloud_mint.proxy_url,
+    ] {
+        if !proxy.trim().is_empty()
+            && gateway_core::account::OutboundProxy::parse(proxy.trim()).is_err()
+        {
+            return Err(AdminError::bad_request(
+                "代理地址格式不正确，请使用 HTTP、HTTPS 或 SOCKS5 地址",
+            ));
+        }
+    }
     let saved = service
-        .update_settings(payload.into_settings(&current))
+        .update_settings(requested)
         .map_err(map_error)?
         .redacted();
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(saved)))

@@ -55,6 +55,18 @@ pub struct RequestLogRecord {
     /// 与请求模型不同只是**事实陈述**，不由此判定猫腻/降智。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// 响应侧：上游声明的模型与发送模型的对照，`match` / `mismatch` / `unknown`
+    /// （上游没有声明）。响应头和正文任一处不一致即 `mismatch`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_match: Option<&'static str>,
+    /// 响应侧：路由 cookie 对里的节点标签（`unified-N`）。这是路由凭据自己的声明，
+    /// 不是对实际执行节点的独立验证。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// 节点标签的来源：`request`（请求带出的 pair）/ `response`（上游这次新发的 pair）/
+    /// `connection`（WebSocket 连接握手时用的 pair）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_source: Option<&'static str>,
     /// 响应侧：**未过滤**的全部 Set-Cookie 摘要（每项 `name@domain#值指纹`，非原文）。
     /// 用于实测上游到底下发了哪些 cookie（含 cpr 平时按白名单丢掉的），
     /// 好确认「网关节点信息是否藏在某张 cookie 里」。
@@ -76,6 +88,9 @@ pub struct ResponsePatch {
     pub ticket_len: Option<usize>,
     pub service_tier: Option<String>,
     pub served_model: Option<String>,
+    pub served_match: Option<&'static str>,
+    pub gateway: Option<String>,
+    pub gateway_source: Option<&'static str>,
     pub resp_cookies: Option<Vec<String>>,
     pub cfbm_ttl: Option<u32>,
 }
@@ -121,6 +136,13 @@ pub fn update_response(id: &str, patch: ResponsePatch) {
         }
         if patch.served_model.is_some() {
             rec.served_model = patch.served_model;
+        }
+        if patch.served_match.is_some() {
+            rec.served_match = patch.served_match;
+        }
+        if patch.gateway.is_some() {
+            rec.gateway = patch.gateway;
+            rec.gateway_source = patch.gateway_source;
         }
         if patch.resp_cookies.is_some() {
             rec.resp_cookies = patch.resp_cookies;
@@ -187,6 +209,9 @@ mod tests {
                 ticket_len: None,
                 service_tier: None,
                 served_model: None,
+                served_match: None,
+                gateway: None,
+                gateway_source: None,
                 resp_cookies: None,
                 cfbm_ttl: None,
             });
@@ -217,6 +242,9 @@ mod tests {
             ticket_len: None,
             service_tier: None,
             served_model: None,
+            served_match: None,
+            gateway: None,
+            gateway_source: None,
             resp_cookies: None,
             cfbm_ttl: None,
         });

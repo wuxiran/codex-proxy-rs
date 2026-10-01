@@ -31,6 +31,10 @@ pub struct CodexWebSocketRequest {
     pub(crate) connection: CodexWebSocketConnection,
     pub(super) payload_text: String,
     pub(super) continuation: WebSocketContinuationRequirement,
+    /// 这次 `response.create` 发出去的模型。转发任务用它在归还连接前对照上游声明。
+    pub(super) requested_model: String,
+    pub(super) discard_mismatched_connection: bool,
+    pub(super) minted_turn_state_route: Option<String>,
 }
 
 /// 当前 WebSocket 请求对 previous response 状态的要求。
@@ -111,6 +115,11 @@ impl CodexWebSocketRequest {
     /// 返回将要发送的首个文本帧。
     pub fn payload_text(&self) -> &str {
         &self.payload_text
+    }
+
+    /// 返回这次请求发出去的模型名。
+    pub(crate) fn requested_model(&self) -> &str {
+        &self.requested_model
     }
 
     /// 返回连接续接要求。

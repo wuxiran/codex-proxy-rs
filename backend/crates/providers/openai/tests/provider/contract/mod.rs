@@ -7,6 +7,7 @@ mod upstream_adapter;
 // fork: fork 专属契约测试
 mod fork_diagnostic_egress;
 mod fork_encrypted_content;
+mod fork_served_mismatch;
 mod fork_turn_state_pin;
 
 use std::collections::{BTreeMap, BTreeSet};

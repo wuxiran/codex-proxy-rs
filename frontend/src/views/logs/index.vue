@@ -20,6 +20,9 @@ interface BackendRecord {
   ticketLen?: number
   serviceTier?: string
   servedModel?: string
+  servedMatch?: 'match' | 'mismatch' | 'unknown'
+  gateway?: string
+  gatewaySource?: 'request' | 'response' | 'connection'
   respCookies?: string[]
   cfbmTtl?: number
 }
@@ -32,6 +35,9 @@ interface LogRow {
   egress: string
   model: string
   servedModel?: string
+  servedMatch?: 'match' | 'mismatch' | 'unknown'
+  gateway?: string
+  gatewaySource?: 'request' | 'response' | 'connection'
   tier?: string
   ticketIn?: string
   ticketOut?: string
@@ -46,6 +52,7 @@ const columns: BaseTableColumn<LogRow>[] = [
   { key: 'action', label: '决策', kind: 'custom', size: 'sm' },
   { key: 'unified', label: 'cf 指纹', kind: 'custom', size: 'sm' },
   { key: 'egress', label: '出口', kind: 'custom', size: 'sm' },
+  { key: 'gateway', label: '节点', kind: 'custom', size: 'sm' },
   { key: 'model', label: '请求模型', kind: 'custom' },
   { key: 'servedModel', label: '实际模型', kind: 'custom' },
   { key: 'tier', label: '档位', kind: 'custom', size: 'sm' },
@@ -95,6 +102,9 @@ function toRow(r: BackendRecord, i: number): LogRow {
     egress: r.egress,
     model: r.model,
     servedModel: r.servedModel,
+    servedMatch: r.servedMatch,
+    gateway: r.gateway,
+    gatewaySource: r.gatewaySource,
     tier: r.serviceTier,
     ticketIn: r.ticketIn,
     ticketOut: r.ticketOut,
@@ -147,7 +157,16 @@ function ttlClass(ttl?: number) {
   return ttl == null ? 'text-neutral-300 dark:text-neutral-600' : 'text-neutral-600 dark:text-neutral-300'
 }
 
-const isMole = (r: LogRow) => Boolean(r.servedModel && r.servedModel !== r.model)
+const gatewaySourceTitle: Record<NonNullable<LogRow['gatewaySource']>, string> = {
+  request: '请求带出的路由 cookie 对里的节点标签',
+  response: '上游这次新发的路由 cookie 对里的节点标签',
+  connection: 'WebSocket 连接握手时用的路由 cookie 对里的节点标签',
+}
+
+// 后端按最终发给上游的模型对照；`model` 列是客户端请求的名字，经过模型映射后两者本来就可能不同。
+function isMole(r: LogRow) {
+  return r.servedMatch ? r.servedMatch === 'mismatch' : Boolean(r.servedModel && r.servedModel !== r.model)
+}
 
 // —— 筛选下拉选项（来自当前数据） ——
 function distinct(getter: (r: LogRow) => string | undefined) {
@@ -194,7 +213,7 @@ const filtered = computed(() => {
     if (moleOnly.value && !isMole(r))
       return false
     if (kw) {
-      const hay = [r.unified, r.egress, r.ticketIn, r.ticketOut, r.servedModel, r.model, r.tier]
+      const hay = [r.unified, r.egress, r.gateway, r.ticketIn, r.ticketOut, r.servedModel, r.model, r.tier]
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
@@ -317,6 +336,16 @@ const stats = computed(() => {
         </template>
         <template #egress="{ row }">
           <span class="font-mono text-xs text-neutral-500">{{ (row as LogRow).egress }}</span>
+        </template>
+        <template #gateway="{ row }">
+          <span
+            v-if="(row as LogRow).gateway"
+            class="font-mono text-xs text-neutral-600 dark:text-neutral-300"
+            :title="gatewaySourceTitle[(row as LogRow).gatewaySource ?? 'request']"
+          >
+            {{ (row as LogRow).gateway }}
+          </span>
+          <span v-else class="text-neutral-300 dark:text-neutral-600" title="这次请求没有路由 cookie 对">—</span>
         </template>
         <template #model="{ row }">
           <span class="font-mono text-xs font-semibold">{{ (row as LogRow).model }}</span>

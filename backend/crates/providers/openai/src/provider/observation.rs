@@ -37,6 +37,8 @@ pub(super) struct OpenAiResponseObservationState {
     rate_limit_headers: Vec<(String, String)>,
     timings: ProviderResponseTimings,
     terminal: Option<OpenAiResponseTerminal>,
+    /// fork: served-mismatch。并入 Provider 元数据的附加事实（路由节点、模型对照结果）。
+    pub(super) fork_metadata: Map<String, Value>,
 }
 
 pub(super) struct OpenAiPassiveQuotaObservation {
@@ -87,6 +89,7 @@ impl OpenAiResponseObservationState {
                 &response.response_metadata,
             ),
             terminal: None,
+            fork_metadata: Map::new(),
         }
     }
 
@@ -288,6 +291,7 @@ impl OpenAiResponseObservationState {
         if let Some(status) = self.diagnostics.status_code {
             metadata.insert("upstreamStatus".to_owned(), json!(status));
         }
+        metadata.extend(self.fork_metadata.clone()); // fork: served-mismatch
         if let Some(decision) = self.metrics.decision {
             metadata.insert(
                 "transportDecision".to_owned(),

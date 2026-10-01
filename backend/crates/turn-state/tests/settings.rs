@@ -4,8 +4,12 @@ use turn_state::{InjectMode, Settings, SettingsError};
 #[test]
 fn defaults_reproduce_production_behaviour() {
     let settings = Settings::default();
-    assert_eq!(settings.ttl_seconds, 3600);
-    assert_eq!(settings.inject_mode, InjectMode::Always);
+    assert_eq!(settings.ttl_seconds, 240);
+    assert_eq!(settings.inject_mode, InjectMode::FillMissing);
+    assert_eq!(
+        settings.served_mismatch_action,
+        turn_state::ServedMismatchAction::Observe
+    );
     assert!(!settings.dry_run);
     assert!(settings.log_decisions);
     assert!(settings.template_lengths.is_empty());
@@ -48,10 +52,13 @@ fn json_uses_camel_case_and_kebab_case_modes() {
     })
     .expect("json");
     assert!(json.contains("\"injectMode\":\"replace-only\""));
-    assert!(json.contains("\"ttlSeconds\":3600"));
+    assert!(json.contains("\"ttlSeconds\":240"));
+    assert!(json.contains("\"servedMismatchAction\":\"observe\""));
     let partial: Settings = serde_json::from_str("{\"dryRun\":true}").expect("partial");
     assert!(partial.dry_run);
-    assert_eq!(partial.inject_mode, InjectMode::Always);
+    assert_eq!(partial.inject_mode, InjectMode::FillMissing);
+    let fill = serde_json::to_string(&Settings::default()).expect("json");
+    assert!(fill.contains("\"injectMode\":\"fill-missing\""));
 }
 
 #[test]
@@ -85,4 +92,45 @@ fn corrupt_file_keeps_last_good_settings() {
     std::fs::write(dir.path().join("settings.json"), b"{not json").expect("write");
     let store = SettingsStore::open(dir.path());
     assert_eq!(store.get(), Settings::default());
+}
+
+#[test]
+fn mint_proxy_secrets_are_redacted_and_survive_unchanged_form_submission() {
+    let mut current = Settings::default();
+    current.cloud_mint.upstream_proxy_url =
+        "socks5h://example-user:example-password@proxy.example:1080".to_owned();
+    current.cloud_mint.proxy_url = "http://relay-user:relay-password@proxy.example:8080".to_owned();
+    let view = current.redacted();
+    assert_eq!(view.cloud_mint.upstream_proxy_url, "<set>");
+    assert_eq!(view.cloud_mint.proxy_url, "<set>");
+    let json = serde_json::to_string(&view).unwrap();
+    assert!(!json.contains("example-password"));
+    assert!(!json.contains("relay-password"));
+    assert!(!format!("{current:?}").contains("example-password"));
+    assert!(!format!("{current:?}").contains("relay-password"));
+    assert_eq!(view.merge_secret_placeholders(&current), current);
+    let mut cleared = current.redacted();
+    cleared.cloud_mint.upstream_proxy_url.clear();
+    assert!(
+        cleared
+            .merge_secret_placeholders(&current)
+            .cloud_mint
+            .upstream_proxy_url
+            .is_empty()
+    );
+}
+
+#[test]
+fn old_drop_pair_settings_load_as_block_without_business_retry() {
+    let settings: Settings =
+        serde_json::from_str(r#"{"servedMismatchAction":"drop-pair"}"#).unwrap();
+    assert_eq!(
+        settings.served_mismatch_action,
+        turn_state::ServedMismatchAction::Block
+    );
+    assert!(
+        serde_json::to_string(&settings)
+            .unwrap()
+            .contains(r#""servedMismatchAction":"block""#)
+    );
 }

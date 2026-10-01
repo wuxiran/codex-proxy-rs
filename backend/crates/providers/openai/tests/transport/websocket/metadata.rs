@@ -1,5 +1,13 @@
 use super::*;
 
+fn metadata_round_model(round: usize) -> &'static str {
+    if round.is_multiple_of(2) {
+        "gpt-test"
+    } else {
+        "GPT-TEST"
+    }
+}
+
 #[tokio::test]
 async fn reused_websocket_should_keep_response_metadata_scoped_to_each_exchange() {
     const ROUNDS: usize = 40;
@@ -23,7 +31,8 @@ async fn reused_websocket_should_keep_response_metadata_scoped_to_each_exchange(
                         "type": "codex.response.metadata",
                         "headers": {
                             "x-models-etag": format!("etag-{round}"),
-                            "openai-model": format!("model-{round}"),
+                            // 与请求模型只差 ASCII 大小写，仍算同一个模型，连接可以回池。
+                            "openai-model": metadata_round_model(round),
                             "x-reasoning-included": "true",
                             "x-codex-safety-buffering-enabled": "true",
                             "x-codex-safety-buffering-faster-model": "faster-model",
@@ -78,7 +87,10 @@ async fn reused_websocket_should_keep_response_metadata_scoped_to_each_exchange(
         .expect("response within timeout")
         .expect("response should complete on the same socket");
         assert_eq!(response.response_metadata, expected, "exchange {round}");
-        assert_eq!(response.reported_model, Some(format!("model-{round}")));
+        assert_eq!(
+            response.reported_model.as_deref(),
+            Some(metadata_round_model(round))
+        );
         assert!(response.body.contains(&format!("etag-{round}")));
         assert_eq!(response.turn_state, Some(format!("turn-{round}")));
         if round > 0 {

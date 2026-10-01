@@ -307,7 +307,13 @@ impl CodexBackendClient {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
-        let connection_profile = websocket_connection_profile(&headers, &self.middleware_headers);
+        let mut connection_profile =
+            websocket_connection_profile(&headers, &self.middleware_headers);
+        if let Some(route) = &request.minted_turn_state_route {
+            // 云端票的新链不领养其他路由的连接；精确续链仍由连接实际路由复核。
+            connection_profile.push_str(":mint-route:");
+            connection_profile.push_str(route);
+        }
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
         let pool_log_context = pool_key.as_ref().map(WebSocketPoolLogContext::from_key);
