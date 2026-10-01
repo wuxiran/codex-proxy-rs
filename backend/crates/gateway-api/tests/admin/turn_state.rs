@@ -53,8 +53,9 @@ async fn settings_round_trip_and_validation() {
     let router = app(TurnStateTestState(fixture.services.clone(), service));
 
     let body = get_json(&router, "/api/admin/turn-state/settings").await;
-    assert_eq!(body["data"]["injectMode"], "always");
-    assert_eq!(body["data"]["ttlSeconds"], 3600);
+    assert_eq!(body["data"]["injectMode"], "fill-missing");
+    assert_eq!(body["data"]["ttlSeconds"], 240);
+    assert_eq!(body["data"]["servedMismatchAction"], "observe");
     assert_eq!(body["data"]["templateLengths"], serde_json::json!([]));
 
     let (status, body) = post_json(
@@ -71,6 +72,23 @@ async fn settings_round_trip_and_validation() {
     let body = get_json(&router, "/api/admin/turn-state/settings").await;
     assert_eq!(body["data"]["injectMode"], "replace-only");
     assert_eq!(body["data"]["dryRun"], true);
+
+    // 换模型处置可以单独改；旧前端不带这个字段时保留现值。
+    let (status, _) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        r#"{"ttlSeconds":240,"injectMode":"fill-missing","dryRun":false,"logDecisions":true,"templateLengths":[],"degradedLengths":[],"servedMismatchAction":"block"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        r#"{"ttlSeconds":30,"injectMode":"always","dryRun":false,"logDecisions":true,"templateLengths":[],"degradedLengths":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["servedMismatchAction"], "block");
 
     let (status, _) = post_json(
         &router,
@@ -127,6 +145,67 @@ async fn buckets_list_filter_clear_and_observations() {
     assert_eq!(body["data"]["cleared"], 1);
     let body = get_json(&router, "/api/admin/turn-state/buckets").await;
     assert_eq!(body["data"]["buckets"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn dedicated_mint_proxy_is_validated_masked_and_preserved() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let service = TurnStateService::in_memory();
+    let state_service = service.clone();
+    let router = app(TurnStateTestState(fixture.services.clone(), service));
+    let mut settings = serde_json::to_value(::turn_state::Settings::default()).unwrap();
+    settings["cloudMint"]["upstreamProxyUrl"] =
+        serde_json::json!("http://example-user:example-password@proxy.example:8080");
+    let (status, body) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["cloudMint"]["upstreamProxyUrl"], "<set>");
+    assert!(!body.to_string().contains("example-password"));
+    let read = get_json(&router, "/api/admin/turn-state/settings").await;
+    let (status, _) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        &read["data"].to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state_service.settings().cloud_mint.upstream_proxy_url,
+        "http://example-user:example-password@proxy.example:8080"
+    );
+    let mut legacy = read["data"].clone();
+    legacy["cloudMint"]
+        .as_object_mut()
+        .unwrap()
+        .remove("upstreamProxyUrl");
+    let (status, _) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        &legacy.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state_service.settings().cloud_mint.upstream_proxy_url,
+        "http://example-user:example-password@proxy.example:8080"
+    );
+    settings["cloudMint"]["upstreamProxyUrl"] = serde_json::json!("http://proxy.example:0");
+    let (status, _) = post_json(
+        &router,
+        "/api/admin/turn-state/settings/update",
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        state_service.settings().cloud_mint.upstream_proxy_url,
+        "http://example-user:example-password@proxy.example:8080"
+    );
 }
 
 #[tokio::test]

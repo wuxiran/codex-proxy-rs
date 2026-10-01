@@ -86,9 +86,48 @@ pub struct BucketRecord {
     pub gateway: Option<String>,
 }
 
+/// 当前设置给票定的寿命上限。记录里的 `expires_at` 是写入时算好的绝对时刻，缩短设置后
+/// 不会跟着变，所以读取时再按「签发时刻 + 当前上限」封顶；调大设置不会延长已写入的票。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtlCaps {
+    /// hunt、续期和被动捕获的票。
+    pub template: Duration,
+    /// 云端打票的票。
+    pub mint: Duration,
+}
+
+impl TtlCaps {
+    /// 不封顶：只按记录自带的到期时刻。
+    pub const UNBOUNDED: Self = Self {
+        template: Duration::MAX,
+        mint: Duration::MAX,
+    };
+}
+
 impl BucketRecord {
     pub fn active(&self, now: SystemTime) -> bool {
         now < self.expires_at
+    }
+
+    /// 按当前设置封顶后的到期时刻。
+    pub fn expires_under(&self, caps: TtlCaps) -> SystemTime {
+        let cap = match self.source {
+            Source::Mint => caps.mint,
+            Source::Hunt | Source::Passive | Source::Renewal => caps.template,
+        };
+        self.issued_at
+            .checked_add(cap)
+            .map_or(self.expires_at, |capped| capped.min(self.expires_at))
+    }
+
+    pub fn active_under(&self, now: SystemTime, caps: TtlCaps) -> bool {
+        now < self.expires_under(caps)
+    }
+
+    /// 把 `expires_at` 换成封顶后的值，供展示和续期判断用。
+    pub(crate) fn capped(mut self, caps: TtlCaps) -> Self {
+        self.expires_at = self.expires_under(caps);
+        self
     }
 
     pub fn account_wide(&self) -> bool {

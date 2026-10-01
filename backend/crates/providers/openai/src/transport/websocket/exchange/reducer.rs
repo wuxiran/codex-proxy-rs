@@ -35,12 +35,16 @@ pub(super) struct ReducedWebSocketEvent {
     pub(super) action: ExchangeAction,
     pub(super) diagnostic_event_type: Option<String>,
     pub(super) turn_state_update: Option<String>,
+    /// 正文 `response.model`。响应头里的模型在 metadata.effective_model，两处分开比。
+    pub(super) body_model: Option<String>,
+    pub(super) header_model_mismatch: bool,
 }
 
 pub(super) fn reduce_websocket_event(
     raw: &str,
     metadata: &mut CodexWebSocketConnectionMetadata,
     continuation: &mut WebSocketContinuationState,
+    requested_model: &str,
 ) -> Result<ReducedWebSocketEvent, CodexWebSocketExchangeError> {
     // 每帧只解析一次 JSON，后续提取全部复用同一 Value；
     // 不可解析的帧不承载可路由的事件类型，忽略。
@@ -50,6 +54,8 @@ pub(super) fn reduce_websocket_event(
             action: ExchangeAction::Ignore,
             diagnostic_event_type: None,
             turn_state_update: None,
+            body_model: None,
+            header_model_mismatch: false,
         });
     };
     let diagnostic_event_type = diagnostic_event_type(websocket_event_type(&value));
@@ -61,6 +67,8 @@ pub(super) fn reduce_websocket_event(
             created_response_id: None,
             diagnostic_event_type,
             turn_state_update: None,
+            body_model: None,
+            header_model_mismatch: false,
         });
     }
 
@@ -105,6 +113,12 @@ pub(super) fn reduce_websocket_event(
         action,
         diagnostic_event_type,
         turn_state_update,
+        header_model_mismatch: response_meta::event_has_model_mismatch(requested_model, &value),
+        body_model: value
+            .pointer("/response/model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned),
     })
 }
 

@@ -38,7 +38,7 @@
 | `apps/gateway/src/bootstrap.rs` | B | `ForkRuntimePorts::under(host.runtime_data_dir())` 一行（要在 `host` 被 `initialize` 消费之前）；`fork: fork_ports` 字段；`gateway_api::initialize` 的 `turn_state` 实参 | `gateway-admin/src/fork.rs` | 取上游，补回 3 行 |
 | `gateway-store/src/bundle.rs` | B | `AdminStorePorts::new(..)` 之后链一个 `.with_ops_report(..)` | `gateway-store/src/postgres/ops_report.rs` | 取上游，补回链式调用 |
 | `gateway-api/src/lib.rs` | B | `mod public_import;`（fork 块）；`initialize` 的 `turn_state` 形参；`ApiState.turn_state` 字段及初始化；`.merge(public_import::router())`；`SessionState::turn_state` 实现 | `gateway-api/src/public_import.rs`、`admin/turn_state.rs` | 取上游，补回 12 行 |
-| `gateway-api/src/auth.rs` | B | `SessionState::turn_state()` 默认方法（返回 `None`） | — | 取上游，补回该方法 |
+| `gateway-api/src/auth.rs` | B | `SessionState::turn_state()` 默认方法（返回 `None`） | — | 取上游，补回声明读取与累积观测 |
 | `gateway-api/src/admin/mod.rs` | B | fork 模块声明块（`fork_routes`、`ops_report`、`public_import`、`request_log`、`turn_state`）；`.merge(fork_routes::router())` 一行 | `admin/fork_routes.rs`（汇总全部 fork 管理路由） | 取上游，补回声明块和 1 行 merge |
 | `gateway-api/src/admin/accounts/mod.rs` | B | fork 块：`mod fork_credentials;`、`mod fork_handlers;`、两行 `pub use`、`AccountListStatus` 导入 | `accounts/fork_handlers.rs`（票据、rotate、turn-state 打票与遍历、测智台）、`accounts/fork_credentials.rs`（rotate 请求体与校验） | 取上游，补回 fork 块 |
 | `gateway-api/src/admin/accounts/handlers.rs`、`credentials.rs` | — | 无，与上游一致 | 同上 | 直接取上游 |
@@ -73,7 +73,7 @@
 | 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
 | --- | --- | --- | --- | --- |
 | `openai/tests/provider/contract/mod.rs` | D | fork `mod` 声明组；上游用例里 2 处带标记的 `outbound_proxy_endpoint` 断言 | `contract/fork_encrypted_content.rs`、`fork_diagnostic_egress.rs`、`fork_turn_state_pin.rs` | 取上游，补声明组和 2 处断言 |
-| `openai/tests/admin.rs` | D+C | worker 数断言为 11（上游 8 + fork 的复活、云端打票、WS warmer）；`oauth_transport_settings…` 只断言 `transport` 字段（fork 的 OAuth 文档多出字段）；7 处 `pub(crate)` | `tests/turn_state_pin.rs` 的 `admin_rotation` 模块 | 取上游，worker 数改成「上游数 + 3」，补断言收窄和可见性 |
+| `openai/tests/admin.rs` | D+C | worker 数断言为 11（上游 8 + fork 的复活、云端打票、WS warmer）；`oauth_transport_settings…` 只断言 `transport` 字段（fork 的 OAuth 文档多出字段）；7 处 `pub(crate)`、`mod mint_publication;` | `tests/turn_state_pin.rs` 的 `admin_rotation` 模块、`tests/admin/mint_publication.rs` | 取上游，worker 数改成「上游数 + 3」，补断言收窄和可见性 |
 | `openai/tests/transport/websocket_pool.rs`、`transport/canonical.rs`、`credential/admin.rs`、`credential/cookie.rs`、`provider/mod.rs` | — | 无，与上游一致 | `transport/fork_ws_warm_pool.rs`、`transport/fork_billing_identity.rs`、`credential/cdk.rs`、`credential/fork_cookie.rs` | 直接取上游 |
 | `openai/tests/credential/mod.rs`、`transport/mod.rs` | D | fork `mod` 声明组 | — | 取上游，补声明组 |
 | `openai/tests/support.rs`、`credential/types.rs`、`config.rs`、`main.rs` | D | `set_turn_state_pin`（要访问 store 私有字段）、1 个夹具字段、4 处复活配置断言、`mod turn_state_pin;` | 原文件 | 取上游后补回 |
@@ -95,5 +95,22 @@
 | `gateway-api/tests/admin/accounts/handlers.rs` | C | 上游的「rotate 路由不存在」用例改成 `fork_rotation_route_stays_exposed_and_validates_its_material` | 原文件 | 取上游后把该用例改回 fork 版本（fork 保留 `/accounts/rotate`） |
 | `gateway-api/tests/architecture.rs` | D | 源码清单、测试清单之后各一个 `expected.extend([..])` 块，登记 fork 自有文件（清单运行时排序，上游列表保持原样） | — | 取上游，补回两个 `extend` 块；新增 fork 文件时在块里登记 |
 | `gateway-api/tests/admin/mod.rs`、`admin/accounts/mod.rs` | D | fork `mod` 行；夹具字段 | — | 取上游，补回 |
+
+## Provider 执行路径
+
+| 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
+| --- | --- | --- | --- | --- |
+| `providers/openai/src/provider/mod.rs` | B | `mod fork_served;` | `provider/fork_served.rs` | 取上游，补 1 行 |
+| `providers/openai/src/provider/execution.rs` | A | 9 行带 `fork: served-mismatch` 标记的调用：建 `served_watch`、`routed`、两处 `observe` + `annotate`、建好 `observation_state` 后的一处 `annotate`、两处 `completed`、两处 `log_patch` 包住请求日志补丁 | `provider/fork_served.rs`、`route_pair.rs`；注票时传递当前 route 指纹、初始化 HTTP 全部模型头判定 | 取上游后补回。`observe` 要在本块的 metadata 合并之后、`attach_openai_session_update` 之前；`completed` 与 `pin.completed` 同条件 |
+| `providers/openai/src/provider/observation.rs` | B | `fork_metadata` 字段及其初始化；`provider_metadata` 里一行 `metadata.extend(..)` | `provider/fork_served.rs` 的 `annotate` | 取上游，补 3 处 |
+| `providers/openai/src/transport/canonical.rs` | B | `declared_models()`、初始 HTTP 头及逐事件累积的 mismatch 事实 | — | 取上游，补回声明读取与累积观测 |
+| `providers/openai/src/credential/selector.rs` | A | `drop_route_pair` 方法；`capture_response_cookies` 里 `captured_expiry(..)` 一处 | `route_pair.rs` | 取上游，补回 2 处 |
+| `providers/openai/src/transport/websocket/pool/state.rs`、`handshake.rs` | B | `CodexWebSocketConnectionMetadata.route_pair` 字段及其 `None` 初始化 | `route_pair.rs` | 取上游，补字段 |
+| `providers/openai/src/transport/response_meta.rs` | B | `has_model_mismatch`、`event_has_model_mismatch`：所有模型头及多值分别对照 | canonical decoder、WS reducer/stream | 取上游，补回累积检查，不能只用展示用的 effective_model |
+| `providers/openai/src/transport/protocol/responses.rs`、`websocket/model.rs`、`websocket/handshake.rs`、`client_sse.rs` | B | 本地 `minted_turn_state_route` 字段及传递；云端票新链按路由隔离池 profile | `turn_state_pin.rs`、`websocket/coordinator.rs` | 取上游，补回控制字段与池键，不写入上游正文 |
+| `providers/openai/src/transport/websocket/coordinator.rs` | A | 握手后给 `metadata.route_pair` 赋值；发送正文前核对云端票路由，不符则 discard | `route_pair.rs` 的 `RoutePairRef::handshake` | 取上游，补回 |
+| `providers/openai/src/transport/websocket/exchange/mod.rs` | B | `CodexWebSocketResponseMetadataUpdate` 的 `route_pair`、`discard_connection`、`served_mismatch` 字段 | — | 取上游，补字段 |
+| `providers/openai/src/transport/websocket/exchange/stream.rs` | A+B | 上述两个字段的初始化；`ServedModelMismatch` 丢弃原因；终态归还前的模型对照与丢弃分支，请求侧显式传入是否允许丢连接，模拟运行关闭 | — | 取上游，补回 4 处。守卫分支要排在正常的 `Completed \| Interrupted` 分支之前 |
+| `providers/openai/tests/provider/contract/mod.rs`、`tests/credential/contract/mod.rs` | D | `mod fork_served_mismatch;`、`mod fork_route_pair;` | 同名测试文件 | 取上游，补声明 |
 
 <!-- 后端接线、数据结构、热点文件的登记随各阶段补充 -->

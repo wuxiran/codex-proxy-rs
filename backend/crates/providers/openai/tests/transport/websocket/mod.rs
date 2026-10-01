@@ -7,6 +7,7 @@ use provider_openai::transport::{
 mod diagnostics;
 mod fingerprint;
 mod metadata;
+mod mint_route;
 
 fn rate_limit_event(used_percent: u64) -> String {
     json!({
@@ -1053,7 +1054,7 @@ async fn reused_websocket_should_not_leak_turn_state_into_the_next_response() {
             .send(Message::Text(
                 json!({
                     "type": "codex.response.metadata",
-                    "headers": {"x-codex-turn-state": "turn-from-first-response", "openai-model": "first-response-model"}
+                    "headers": {"x-codex-turn-state": "turn-from-first-response", "openai-model": "GPT-TEST"}
                 })
                 .to_string()
                 .into(),
@@ -1109,10 +1110,7 @@ async fn reused_websocket_should_not_leak_turn_state_into_the_next_response() {
             .websocket_pool_decision
             .is_some_and(WebSocketPoolDecision::is_reuse)
     );
-    assert_eq!(
-        first.reported_model.as_deref(),
-        Some("first-response-model")
-    );
+    assert_eq!(first.reported_model.as_deref(), Some("GPT-TEST"));
     assert_eq!(second.reported_model, None);
     assert_eq!(second.turn_state, None);
     assert!(

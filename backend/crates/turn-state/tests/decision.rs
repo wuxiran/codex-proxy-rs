@@ -28,10 +28,14 @@ fn identical_value_is_already_current() {
 #[test]
 fn always_mode_adds_or_replaces() {
     let live = "t".repeat(292);
-    let added = decide(Some(&live), None, &Settings::default());
+    let always = Settings {
+        inject_mode: InjectMode::Always,
+        ..Settings::default()
+    };
+    let added = decide(Some(&live), None, &always);
     assert_eq!(added.decision, Decision::Inject);
     assert_eq!(added.replacement.as_deref(), Some(live.as_str()));
-    let replaced = decide(Some(&live), Some(&"c".repeat(780)), &Settings::default());
+    let replaced = decide(Some(&live), Some(&"c".repeat(780)), &always);
     assert_eq!(replaced.decision, Decision::Inject);
     assert_eq!(replaced.replacement.as_deref(), Some(live.as_str()));
 }
@@ -49,4 +53,16 @@ fn replace_only_touches_only_degraded_lengths() {
     let none = decide(Some(&live), None, &settings);
     assert_eq!(none.decision, Decision::Pass);
     assert!(none.replacement.is_none());
+}
+
+#[test]
+fn fill_missing_is_the_default_and_never_replaces_a_carried_state() {
+    let live = "t".repeat(780);
+    let added = decide(Some(&live), None, &Settings::default());
+    assert_eq!(added.decision, Decision::Inject);
+    assert_eq!(added.replacement.as_deref(), Some(live.as_str()));
+    // 同一轮的后续请求带着这一轮自己的票：不换。
+    let kept = decide(Some(&live), Some(&"c".repeat(780)), &Settings::default());
+    assert_eq!(kept.decision, Decision::Pass);
+    assert!(kept.replacement.is_none());
 }

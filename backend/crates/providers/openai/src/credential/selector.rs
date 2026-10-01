@@ -897,6 +897,9 @@ impl CodexCredentialSelector {
                                     ticket_len: None,
                                     service_tier: None,
                                     served_model: None,
+                                    served_match: None,
+                                    gateway: None,
+                                    gateway_source: None,
                                     resp_cookies: None,
                                     cfbm_ttl: None,
                                 },
@@ -1367,6 +1370,11 @@ impl CodexCredentialSelector {
             .ok_or(CredentialSelectionError::InvalidCredential)
     }
 
+    /// fork: served-mismatch。凭据里现存的路由 pair 仍是 `fingerprint` 那一对时删除它。
+    pub async fn drop_route_pair(&self, account: &ProviderAccount, fingerprint: &str) -> bool {
+        crate::route_pair::drop_if_current(&self.repository, account, fingerprint).await
+    }
+
     pub async fn capture_response_cookies(
         &self,
         account: &ProviderAccount,
@@ -1429,6 +1437,12 @@ impl CodexCredentialSelector {
                     && cookie.path == input.path)
             });
             if !input.delete {
+                // fork: served-mismatch。__oailb 的期限取它自己 JWT 里的 exp。
+                let expires_at = crate::route_pair::captured_expiry(
+                    &input.name,
+                    input.value.expose_secret(),
+                    input.expires_at,
+                );
                 cookies.push(CodexCookie {
                     name: input.name,
                     value: input.value.expose_secret().to_owned(),
@@ -1436,7 +1450,7 @@ impl CodexCredentialSelector {
                     path: input.path,
                     host_only: scope.host_only,
                     secure: input.secure,
-                    expires_at: input.expires_at,
+                    expires_at,
                 });
             }
         }

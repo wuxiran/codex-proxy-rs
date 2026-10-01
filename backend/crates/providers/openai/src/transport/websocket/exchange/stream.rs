@@ -42,6 +42,7 @@ enum StreamWebSocketDiscardReason {
     PoolShutdown,
     UpstreamClosed,
     UpstreamReceiveFailed,
+    ServedModelMismatch, // fork: served-mismatch
 }
 
 impl StreamWebSocketDiscardReason {
@@ -55,10 +56,15 @@ impl StreamWebSocketDiscardReason {
             Self::PoolShutdown => "pool_shutdown",
             Self::UpstreamClosed => "upstream_closed",
             Self::UpstreamReceiveFailed => "upstream_receive_failed",
+            Self::ServedModelMismatch => "served_model_mismatch",
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "转发启动分别接管连接、池租约、响应控制和请求模型策略"
+)]
 pub(in crate::transport::websocket) fn stream_websocket_response(
     websocket: PumpedWebSocket,
     metadata: CodexWebSocketConnectionMetadata,
@@ -67,14 +73,28 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
     stream_idle_timeout: Option<Duration>,
     trace: TraceContext,
     response_control: Option<ResponseControl>,
+    requested_model: String,
+    discard_mismatched_connection: bool,
 ) -> CodexWebSocketStreamingExchange {
     let websocket_connection_id = websocket.connection_id();
     let response_metadata = metadata.clone();
     let rate_limit_updates = Arc::new(Mutex::new(Vec::new()));
     let rate_limit_updates_for_task = Arc::clone(&rate_limit_updates);
+    // 握手声明也属于本轮事实，不能等后续 metadata 把它覆盖后才开始比较。
+    let served_mismatch = turn_state::served::compare(
+        &requested_model,
+        metadata.response_metadata.effective_model.as_deref(),
+        None,
+    ) == turn_state::ServedMatch::Mismatch
+        || metadata
+            .response_metadata
+            .has_model_mismatch(&requested_model);
     let response_metadata_updates = Arc::new(Mutex::new(CodexWebSocketResponseMetadataUpdate {
         turn_state: metadata.turn_state.clone(),
         reported_model: None,
+        route_pair: metadata.route_pair.clone(), // fork: served-mismatch
+        discard_connection: discard_mismatched_connection && served_mismatch,
+        served_mismatch,
     }));
     let response_metadata_updates_for_task = Arc::clone(&response_metadata_updates);
     let (tx, rx) = mpsc::channel(WEBSOCKET_STREAM_BUFFER);
@@ -97,6 +117,8 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
             shutdown,
             rate_limit_updates: rate_limit_updates_for_task,
             response_metadata_updates: response_metadata_updates_for_task,
+            requested_model,
+            discard_mismatched_connection,
             tx,
         })
         .await;
@@ -137,6 +159,8 @@ struct WebSocketStreamForwardState {
     shutdown: CancellationToken,
     rate_limit_updates: CodexWebSocketRateLimitUpdates,
     response_metadata_updates: CodexWebSocketResponseMetadataUpdates,
+    requested_model: String,
+    discard_mismatched_connection: bool,
     tx: mpsc::Sender<Result<Bytes, CodexWebSocketExchangeError>>,
 }
 
@@ -152,6 +176,8 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         shutdown,
         rate_limit_updates,
         response_metadata_updates,
+        requested_model,
+        discard_mismatched_connection,
         tx,
     } = state;
     let mut pool_return = pool_return;
@@ -307,7 +333,12 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
             _ => continue,
         };
         trace.capture("upstream.event", raw.as_bytes());
-        let reduced = match reduce_websocket_event(&raw, &mut metadata, &mut continuation) {
+        let reduced = match reduce_websocket_event(
+            &raw,
+            &mut metadata,
+            &mut continuation,
+            &requested_model,
+        ) {
             Ok(reduced) => reduced,
             Err(error) => {
                 drop(active_interrupt.take());
@@ -362,8 +393,20 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                 pending.turn_state = Some(turn_state);
             }
         }
-        if let Some(model) = metadata.response_metadata.effective_model.as_ref() {
-            response_metadata_updates.lock().await.reported_model = Some(model.clone());
+        {
+            let mut updates = response_metadata_updates.lock().await;
+            updates.served_mismatch |= reduced.header_model_mismatch;
+            if let Some(model) = metadata.response_metadata.effective_model.as_ref() {
+                updates.reported_model = Some(model.clone());
+            }
+            // 转发任务自己对照。短响应可能在消费方 observe 之前就终态，不能等那边写这个标记。
+            note_served_model(
+                &requested_model,
+                metadata.response_metadata.effective_model.as_deref(),
+                reduced.body_model.as_deref(),
+                &mut updates.served_mismatch,
+            );
+            updates.discard_connection |= discard_mismatched_connection && updates.served_mismatch;
         }
         let (frame, terminal) = match reduced.action {
             ExchangeAction::RateLimits(rate_limits) => {
@@ -396,13 +439,23 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                 "upstream.terminal",
                 json!({"kind": format!("{terminal:?}")}),
             );
-            match terminal {
-                WebSocketTerminalKind::Completed | WebSocketTerminalKind::Interrupted => {
+            let discard_connection = response_metadata_updates.lock().await.discard_connection;
+            match terminal_release(terminal, discard_connection) {
+                // fork: served-mismatch。换了模型的连接留在原节点上，不能再给下一个请求用。
+                TerminalRelease::DiscardMismatch => {
+                    discard_stream_websocket(
+                        websocket,
+                        pool_return,
+                        StreamWebSocketDiscardReason::ServedModelMismatch,
+                    )
+                    .await;
+                }
+                TerminalRelease::ReturnToPool => {
                     metadata.response_metadata = opening_response_metadata;
                     finish_stream_websocket(websocket, metadata, continuation, pool_return.take())
                         .await;
                 }
-                WebSocketTerminalKind::Incomplete => {
+                TerminalRelease::DiscardIncomplete => {
                     discard_stream_websocket(
                         websocket,
                         pool_return,
@@ -410,7 +463,7 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                     )
                     .await;
                 }
-                WebSocketTerminalKind::Failed => {
+                TerminalRelease::DiscardFailed => {
                     discard_stream_websocket(
                         websocket,
                         pool_return,
@@ -471,6 +524,46 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         error
     };
     let _ = tx.send(Err(error)).await;
+}
+
+/// 请求模型与上游声明不一致时，终态连接不回池。只置位，不把已经记下的不一致清掉。
+fn note_served_model(
+    requested_model: &str,
+    header_model: Option<&str>,
+    body_model: Option<&str>,
+    discard_connection: &mut bool,
+) {
+    if requested_model.is_empty() || *discard_connection {
+        return;
+    }
+    if turn_state::served::compare(requested_model, header_model, body_model)
+        == turn_state::ServedMatch::Mismatch
+    {
+        *discard_connection = true;
+    }
+}
+
+enum TerminalRelease {
+    DiscardMismatch,
+    ReturnToPool,
+    DiscardIncomplete,
+    DiscardFailed,
+}
+
+/// 终态怎么处理连接。`discard_connection` 在本帧归约时已经写好，不依赖消费方。
+fn terminal_release(kind: WebSocketTerminalKind, discard_connection: bool) -> TerminalRelease {
+    match kind {
+        WebSocketTerminalKind::Completed | WebSocketTerminalKind::Interrupted
+            if discard_connection =>
+        {
+            TerminalRelease::DiscardMismatch
+        }
+        WebSocketTerminalKind::Completed | WebSocketTerminalKind::Interrupted => {
+            TerminalRelease::ReturnToPool
+        }
+        WebSocketTerminalKind::Incomplete => TerminalRelease::DiscardIncomplete,
+        WebSocketTerminalKind::Failed => TerminalRelease::DiscardFailed,
+    }
 }
 
 async fn finish_stream_websocket(
@@ -560,5 +653,72 @@ fn exchange_exit_reason(error: &CodexWebSocketExchangeError) -> &'static str {
         CodexWebSocketExchangeError::ReceiveIdleTimeout { .. } => "receive_idle_timeout",
         CodexWebSocketExchangeError::UnexpectedBinaryEvent => "unexpected_binary_event",
         _ => "exchange_failure",
+    }
+}
+
+#[cfg(test)]
+mod served_model_release {
+    use super::super::reducer::WebSocketTerminalKind;
+    use super::{TerminalRelease, note_served_model, terminal_release};
+
+    #[test]
+    fn a_mismatch_on_the_terminal_frame_discards_without_a_consumer_write() {
+        let mut discard = false;
+        note_served_model(
+            "gpt-6-astra",
+            Some("gpt-6-astra"),
+            Some("gpt-5.6-luna"),
+            &mut discard,
+        );
+        assert!(discard);
+        assert!(matches!(
+            terminal_release(WebSocketTerminalKind::Completed, discard),
+            TerminalRelease::DiscardMismatch
+        ));
+    }
+
+    #[test]
+    fn a_header_mismatch_discards_even_when_the_body_matches() {
+        let mut discard = false;
+        note_served_model(
+            "gpt-6-astra",
+            Some("gpt-5.6-luna"),
+            Some("gpt-6-astra"),
+            &mut discard,
+        );
+        assert!(matches!(
+            terminal_release(WebSocketTerminalKind::Interrupted, discard),
+            TerminalRelease::DiscardMismatch
+        ));
+    }
+
+    #[test]
+    fn a_matching_declaration_returns_the_connection() {
+        let mut discard = false;
+        note_served_model(
+            "gpt-6-astra",
+            Some("GPT-6-ASTRA"),
+            Some("gpt-6-astra"),
+            &mut discard,
+        );
+        assert!(!discard);
+        assert!(matches!(
+            terminal_release(WebSocketTerminalKind::Completed, discard),
+            TerminalRelease::ReturnToPool
+        ));
+    }
+
+    #[test]
+    fn a_missing_declaration_does_not_discard() {
+        let mut discard = false;
+        note_served_model("gpt-6-astra", None, None, &mut discard);
+        assert!(matches!(
+            terminal_release(WebSocketTerminalKind::Completed, discard),
+            TerminalRelease::ReturnToPool
+        ));
+        assert!(matches!(
+            terminal_release(WebSocketTerminalKind::Failed, true),
+            TerminalRelease::DiscardFailed
+        ));
     }
 }

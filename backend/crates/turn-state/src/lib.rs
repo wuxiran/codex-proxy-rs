@@ -11,6 +11,7 @@ pub mod fernet;
 pub mod fs_util;
 pub mod observe;
 pub mod record;
+pub mod served;
 pub mod service;
 pub mod settings;
 pub mod store;
@@ -20,7 +21,8 @@ pub use classify::{LengthClass, MIN_TURN_STATE_LEN};
 pub use decision::Decision;
 pub use fernet::IssuedAtSource;
 pub use observe::{BucketTally, ObservationEvent, ObservationSnapshot};
-pub use record::{BucketRecord, Source};
+pub use record::{BucketRecord, Source, TtlCaps};
+pub use served::{ServedMatch, ServedMismatchAction};
 pub use service::{
     AccountWidePin, Attempt, BucketSummary, PinRejected, PinStatus, RequestFacts, TurnStateError,
     TurnStateService,

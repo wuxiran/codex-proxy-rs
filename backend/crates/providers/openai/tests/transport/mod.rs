@@ -388,12 +388,13 @@ fn completed_websocket_response(
     input_tokens: u64,
     output_tokens: u64,
 ) -> String {
+    // 不写 response.model。这些夹具测连接复用，不测换模型。
+    // 两处都没声明时不会把连接丢出池；声明不一致才丢，见 stream::note_served_model。
     json!({
         "type": "response.completed",
         "response": {
             "id": response_id,
             "object": "response",
-            "model": "gpt-test",
             "status": "completed",
             "output": [],
             "usage": {

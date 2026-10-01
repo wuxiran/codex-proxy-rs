@@ -15,7 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{classify::LengthClass, decision::Decision, record::unix_seconds};
+use crate::{classify::LengthClass, decision::Decision, record::unix_seconds, served::ServedMatch};
 
 const OBSERVATIONS_FILE: &str = "observations.json";
 const SNAPSHOT_VERSION: u32 = 1;
@@ -57,10 +57,33 @@ pub struct BucketTally {
     pub last_issued_len: Option<usize>,
     pub last_issued_at: u64,
     pub lengths: BTreeMap<usize, u64>,
+    /// 上游声明的模型与发送模型一致 / 不一致 / 没有声明的请求数。
+    pub served_match: u64,
+    pub served_mismatch: u64,
+    pub served_unknown: u64,
+    pub last_served_mismatch_at: u64,
 }
 
 impl BucketTally {
+    fn record_served(&mut self, served: ServedMatch, at: u64) {
+        self.last_seen_at = self.last_seen_at.max(at);
+        match served {
+            ServedMatch::Match => self.served_match += 1,
+            ServedMatch::Mismatch => {
+                self.served_mismatch += 1;
+                self.last_served_mismatch_at = self.last_served_mismatch_at.max(at);
+            }
+            ServedMatch::Unknown => self.served_unknown += 1,
+        }
+    }
+
     fn add(&mut self, other: &Self) {
+        self.served_match += other.served_match;
+        self.served_mismatch += other.served_mismatch;
+        self.served_unknown += other.served_unknown;
+        self.last_served_mismatch_at = self
+            .last_served_mismatch_at
+            .max(other.last_served_mismatch_at);
         self.normal += other.normal;
         self.degraded += other.degraded;
         self.unknown += other.unknown;
@@ -256,6 +279,13 @@ impl Delta {
         self.buckets.is_empty() && self.events.is_empty()
     }
 
+    fn record_served(&mut self, account: &str, model: &str, served: ServedMatch, at: SystemTime) {
+        self.buckets
+            .entry(format!("{account}/{model}"))
+            .or_default()
+            .record_served(served, unix_seconds(at));
+    }
+
     fn record(&mut self, input: &ObservationInput) {
         let key = format!("{}/{}", input.account, input.model);
         self.buckets.entry(key).or_default().record(input);
@@ -325,6 +355,17 @@ impl Observations {
         inner.delta.record(input);
         if inner.last_flush.elapsed() >= SNAPSHOT_INTERVAL {
             self.flush_locked(&mut inner, input.at);
+        }
+    }
+
+    /// 模型对照结果按桶计数；不依赖账号是否启用了固定 state。
+    pub fn record_served(&self, account: &str, model: &str, served: ServedMatch, at: SystemTime) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.delta.record_served(account, model, served, at);
+        if inner.last_flush.elapsed() >= SNAPSHOT_INTERVAL {
+            self.flush_locked(&mut inner, at);
         }
     }
 

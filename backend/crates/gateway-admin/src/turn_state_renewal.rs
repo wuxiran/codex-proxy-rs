@@ -1,7 +1,9 @@
-//! 账号级 state 的到期前自动续期：对临近到期（或本进程内缺失）的账号重新遍历代理。
+//! 账号级 state 的按需补票：最近有业务请求缺过票、且当前没有有效 state 的账号，重新遍历代理。
 //!
-//! 续期复用管理端的遍历用例：账号当前绑定的出口排最前，续不上就继续打其它出口。
-//! state 只存在于进程内存，所以本任务不加跨实例租约——每个实例各自维护自己的 state。
+//! 票只能回放约 240 秒，不在到期前定时续：闲置账号的票过期就过期，下一个业务请求会不带票
+//! 发出并留下缺票记录，本任务在下一个周期补上。候选名单由 Provider 给出。
+//! 补票复用管理端的遍历用例：账号当前绑定的出口排最前，补不上就继续打其它出口。
+//! 缺票记录只在进程内存，所以本任务不加跨实例租约——每个实例各自照顾自己收到的流量。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -15,19 +17,18 @@ use crate::model::accounts::{TurnStateHuntCommand, TurnStateHuntEvent};
 use crate::model::{MutationActor, MutationContext};
 use crate::use_case::accounts::AccountsService;
 
-pub const TURN_STATE_RENEWAL_INTERVAL: Duration = Duration::from_secs(60);
+pub const TURN_STATE_RENEWAL_INTERVAL: Duration = Duration::from_secs(20);
 pub const TURN_STATE_RENEWAL_WORKER_OWNER: &str = "turn-state-renewal";
 pub const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
-/// 到期前这么久开始续；留出一整轮遍历的时间，旧 state 在新 state 钉住前继续生效。
-pub const RENEWAL_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// 不提前续：state 过期之后、且有请求缺过票才补。
+pub const RENEWAL_MARGIN: Duration = Duration::ZERO;
 /// 一整轮遍历都没续上后的等待：每轮最多「出口数 × 次数」个真实请求，不能每分钟重来。
 const MISS_BACKOFF: Duration = Duration::from_secs(5 * 60);
-/// 上游无容量是瞬时过载：退避必须远短于 [`RENEWAL_MARGIN`]，否则一次抖动就把到期前
-/// 唯一的续期机会用掉，state 会在下一次重试之前过期。
-const CAPACITY_BACKOFF: Duration = Duration::from_secs(60);
+/// 上游无容量是瞬时过载：短退避后再试。
+const CAPACITY_BACKOFF: Duration = Duration::from_secs(30);
 /// 上游拒绝账号（401/429 等）后的等待；换出口也不会好。
-const REJECTED_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const REJECTED_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const SYSTEM_REQUEST_ID: &str = "turn-state-renewal";
 
 pub struct TurnStateRenewalTask {

@@ -1,14 +1,14 @@
 //! 云端打票：账号缺票时铸票，把每模型的票钉成账号级模板、把路由 cookie 对
 //! （`__cflb`/`__oailb`，内嵌目标网关 `unified-N`）写进凭据，让后续业务请求带着 pair 和票
-//! 钉在目标网关上；票只有 ~240s，到期前由后台续打。
+//! 钉在目标网关上；票约 240s 可用，按业务需求补充。
 //!
 //! 两种后端：
-//! - `native`（默认）：cpr 自己经**账号绑定的代理**向上游发 codex ping 铸票，验收票长、
+//! - `native`（默认）：cpr 自己经**专用动态代理**向上游发 codex ping 铸票，验收票长、
 //!   网关、模型声明（照 `deploy/cloud-mint/index.js` 的 `mintAttemptAccepted`）。
 //! - `relay`：交给 `deploy/cloud-mint` 的 relay（阿里 FC 或 89 上的容器），出口是 relay 的。
 //!
 //! 触发：请求侧钩子发现桶里没票（`PinAttempt::needs_template`）→ 异步预热一次；
-//! 续打：worker 每 20s 扫最近有流量的账号，票剩余不足一分钟就重打。
+//! 后台每 20s 检查活跃账号的路由对是否需要更新，票据按需补充。
 //! 账号级去重：同一账号同一时刻只有一次打票在途，失败后冷却 `cooldown_seconds`。
 //! 票值、cookie 值、relay 密钥永不进日志。
 
@@ -30,23 +30,30 @@ use crate::credential::{
     CODEX_AUTHENTICATION_KIND_OAUTH, CodexCookie, CodexCredentialRepository,
     CodexRuntimeAuthentication, CredentialRepositoryError,
 };
+use crate::route_pair::RoutePairRef;
 use crate::transport::profile::CodexWireProfileState;
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(150);
 const MAX_RELAY_RESPONSE_BYTES: usize = 512 * 1024;
 /// 最近有请求的账号才续打；闲置账号不烧配额。
 const ACTIVE_WINDOW: Duration = Duration::from_secs(600);
-/// 票剩余不足这么久就续打。
-const RENEW_MARGIN: Duration = Duration::from_secs(60);
+/// 路由 pair 剩余不足这么久就续。票不定时续：过期后由下一个业务请求按需打。
+const PAIR_RENEW_MARGIN: Duration = Duration::from_secs(120);
 /// 原生打票：只扫响应体前 16 KiB 找 `response.created` 的模型声明，拿到判决就拆流。
 const NATIVE_BODY_SCAN_BYTES: usize = 16 * 1024;
 const NATIVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const NATIVE_MAX_TOTAL_ATTEMPTS: u64 = 24;
+const NATIVE_TOTAL_TIMEOUT: Duration = Duration::from_secs(75);
 const NATIVE_ATTEMPT_GAP: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum MintError {
     #[error("cloud mint is disabled")]
     Disabled,
+    #[error("a dedicated mint proxy is required")]
+    ProxyRequired,
+    #[error("dedicated mint proxy is invalid")]
+    InvalidProxy,
     #[error("account is not eligible for cloud mint")]
     NotEligible,
     #[error("a mint for this account is already in flight")]
@@ -61,6 +68,8 @@ pub(crate) enum MintError {
     InvalidResponse,
     #[error("credential store is unavailable")]
     Store,
+    #[error("account credentials or route changed while minting")]
+    Stale,
 }
 
 /// 一次打票的结果摘要；不含票值和 cookie 值。
@@ -84,10 +93,10 @@ pub(crate) struct MintedTicket {
     pub(crate) expires_at: SystemTime,
 }
 
-/// 两种后端归一化后的产出：票 + （可能新签发的）pair。
+/// 两种后端归一化后的产出：票与签发它们的完整 pair。
 struct MintOutcome {
     gateway: Option<String>,
-    /// 新签发的 pair；`None` = 本次沿用既有 pair（或没有 pair）。
+    /// 包括沿用的 seed pair；缺少完整 pair 的票不能发布。
     pair: Option<RoutePair>,
     attempts: u64,
     tickets: Vec<RawTicket>,
@@ -200,7 +209,7 @@ impl CloudMintService {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.settings().enabled
+        self.settings().enabled && !self.pins.service().settings().dry_run
     }
 
     /// 请求侧：记下这个账号在用哪些模型，续打只照顾最近活跃的账号。
@@ -246,10 +255,11 @@ impl CloudMintService {
             .and_then(|state| state.last.get(account_id).cloned())
     }
 
-    /// 后台续打：最近有流量的账号，票缺失或剩余不足一分钟就重打。
+    /// 后台续 pair：最近有流量的账号，路由 pair 缺失或剩余不足两分钟时裸打一次换一对新的
+    /// （顺带得到的票照常钉住）。票本身不在这里续。
     pub(crate) async fn renew_cycle(&self) -> usize {
         let settings = self.settings();
-        if !settings.enabled {
+        if !self.enabled() {
             return 0;
         }
         let due: Vec<(String, Vec<String>)> = {
@@ -271,40 +281,30 @@ impl CloudMintService {
         };
         let mut minted = 0;
         for (account_id, models) in due {
-            let missing = match self.models_needing_ticket(&account_id, &models).await {
-                Ok(missing) => missing,
-                Err(_) => continue,
-            };
-            if missing.is_empty() {
+            if models.is_empty() || !self.pair_needs_renewal(&account_id, &settings).await {
                 continue;
             }
-            if self.mint_account(&account_id, missing).await.is_ok() {
+            if self.mint(&account_id, models, true).await.is_ok() {
                 minted += 1;
             }
         }
         minted
     }
 
-    async fn models_needing_ticket(
-        &self,
-        account_id: &str,
-        models: &[String],
-    ) -> Result<Vec<String>, MintError> {
-        let (account, binding) = self.load_binding(account_id).await?;
-        let egress = crate::turn_state_pin::egress_fingerprint(
-            account.outbound_proxy().map(|proxy| proxy.expose_url()),
-        );
-        let now = SystemTime::now();
-        Ok(models
-            .iter()
-            .filter(|model| {
-                !self
-                    .pins
-                    .account_wide_expires_at(account.id().as_str(), &binding, model, &egress, now)
-                    .is_some_and(|expires_at| expires_at > now + RENEW_MARGIN)
+    /// 凭据里没有目标网关上的 pair，或它将在 [`PAIR_RENEW_MARGIN`] 内到期。
+    async fn pair_needs_renewal(&self, account_id: &str, settings: &CloudMintSettings) -> bool {
+        let Ok((account, _)) = self.load_binding(account_id).await else {
+            return false;
+        };
+        self.stored_pair(&account, settings)
+            .await
+            .is_none_or(|pair| {
+                pair.expires_at.is_some_and(|expires| {
+                    expires
+                        <= Utc::now()
+                            + chrono::Duration::from_std(PAIR_RENEW_MARGIN).unwrap_or_default()
+                })
             })
-            .cloned()
-            .collect())
     }
 
     async fn load_account(&self, account_id: &str) -> Result<ProviderAccount, MintError> {
@@ -375,8 +375,19 @@ impl CloudMintService {
         account_id: &str,
         models: Vec<String>,
     ) -> Result<MintReport, MintError> {
+        self.mint(account_id, models, false).await
+    }
+
+    /// `fresh_pair`：不带既有 pair 裸打，让边缘重新分配节点并签发一对新的（续 pair 用）。
+    /// relay 侧的 pair 缓存在 relay 进程里，靠 `x-mint-fresh-pair: 1` 跳过并删掉那条缓存。
+    async fn mint(
+        &self,
+        account_id: &str,
+        models: Vec<String>,
+        fresh_pair: bool,
+    ) -> Result<MintReport, MintError> {
         let settings = self.settings();
-        if !settings.enabled {
+        if !self.enabled() {
             return Err(MintError::Disabled);
         }
         let models: Vec<String> = if settings.models.is_empty() {
@@ -388,7 +399,9 @@ impl CloudMintService {
             return Err(MintError::NotEligible);
         }
         let _guard = InFlight::acquire(self, account_id)?;
-        let outcome = self.mint_inner(account_id, &models, &settings).await;
+        let outcome = self
+            .mint_inner(account_id, &models, &settings, fresh_pair)
+            .await;
         let report = match &outcome {
             Ok(report) => report.clone(),
             Err(error) => MintReport {
@@ -418,8 +431,15 @@ impl CloudMintService {
         account_id: &str,
         models: &[String],
         settings: &CloudMintSettings,
+        fresh_pair: bool,
     ) -> Result<MintReport, MintError> {
         let (account, binding) = self.load_binding(account_id).await?;
+        let original_data = self
+            .repository
+            .load_complete_data(&account)
+            .await
+            .map_err(|_| MintError::Store)?;
+        let original_route = RoutePairRef::stored(original_data.cookies());
         let credential = self
             .repository
             .load_runtime_credential(&account)
@@ -431,11 +451,21 @@ impl CloudMintService {
             .map_err(|_| MintError::NotEligible)?;
         let outcome = match settings.mode {
             MintMode::Relay => {
-                self.mint_via_relay(&account, authorization.expose_secret(), models, settings)
-                    .await?
+                self.mint_via_relay(
+                    &account,
+                    authorization.expose_secret(),
+                    models,
+                    settings,
+                    fresh_pair,
+                )
+                .await?
             }
             MintMode::Native => {
-                let seed = self.stored_pair(&account, settings).await;
+                let seed = if fresh_pair {
+                    None
+                } else {
+                    self.stored_pair(&account, settings).await
+                };
                 self.mint_native(
                     &account,
                     authorization.expose_secret(),
@@ -450,13 +480,31 @@ impl CloudMintService {
             .gateway
             .clone()
             .or_else(|| outcome.pair.as_ref().and_then(|pair| pair.gateway.clone()));
+        let pair = outcome.pair.as_ref().ok_or(MintError::InvalidResponse)?;
+        if outcome.tickets.is_empty() || !pair.live(mint_target(&settings.gateway).as_deref()) {
+            return Err(MintError::Rejected);
+        }
+        let route = RoutePairRef::of(&pair.cflb, &pair.oailb).ok_or(MintError::InvalidResponse)?;
+        let now = SystemTime::now();
+        let current_settings = self.pins.service().settings();
+        let observe_only = settings.observe_only
+            || current_settings.cloud_mint.observe_only
+            || current_settings.dry_run
+            || !current_settings.cloud_mint.enabled;
+        // 先条件提交路由，再发布绑定该路由的票。并发请求握着旧凭据快照时不能读到新路由票。
+        let (account, pair_written) = if observe_only {
+            (account, false)
+        } else {
+            self.write_route_pair(&account, &binding, original_route.as_ref(), pair)
+                .await?
+        };
+        // 专用打票代理不修改账号的业务出口绑定。
         let egress = crate::turn_state_pin::egress_fingerprint(
             account.outbound_proxy().map(|proxy| proxy.expose_url()),
         );
-        let now = SystemTime::now();
         let mut tickets = Vec::new();
         for ticket in &outcome.tickets {
-            if settings.observe_only {
+            if observe_only {
                 tickets.push(MintedTicket {
                     model: ticket.model.clone(),
                     length: ticket.value.len(),
@@ -465,10 +513,8 @@ impl CloudMintService {
                 });
                 continue;
             }
-            match self
-                .pins
-                .service()
-                .pin_account_wide(turn_state::AccountWidePin {
+            match self.pins.service().pin_minted_account_wide(
+                turn_state::AccountWidePin {
                     account: account.id().as_str(),
                     binding: binding.clone(),
                     model: &ticket.model,
@@ -479,12 +525,14 @@ impl CloudMintService {
                     source: turn_state::Source::Mint,
                     ttl: Some(ticket.ttl),
                     gateway: gateway.clone(),
-                }) {
-                Ok(expires_at) => tickets.push(MintedTicket {
+                },
+                &route.fingerprint,
+            ) {
+                Ok(effective) => tickets.push(MintedTicket {
                     model: ticket.model.clone(),
-                    length: ticket.value.len(),
+                    length: effective.length,
                     served_model: ticket.served_model.clone(),
-                    expires_at,
+                    expires_at: effective.expires_at,
                 }),
                 Err(rejected) => tracing::info!(
                     target: "turn_state",
@@ -496,16 +544,10 @@ impl CloudMintService {
                 ),
             }
         }
-        let mut pair_written = false;
-        if !settings.observe_only
-            && let Some(pair) = outcome.pair.as_ref()
-        {
-            pair_written = self.write_route_pair(&account, pair).await?;
-        }
         let report = MintReport {
             at: now,
             ok: !tickets.is_empty(),
-            observe_only: settings.observe_only,
+            observe_only,
             gateway: gateway.clone(),
             attempts: outcome.attempts,
             tickets,
@@ -520,7 +562,7 @@ impl CloudMintService {
             tickets = report.tickets.len(),
             attempts = report.attempts,
             pair_written,
-            observe_only = settings.observe_only,
+            observe_only = observe_only,
             "[turn-state] mint"
         );
         if report.ok {
@@ -538,6 +580,7 @@ impl CloudMintService {
         authorization: &str,
         models: &[String],
         settings: &CloudMintSettings,
+        fresh_pair: bool,
     ) -> Result<MintOutcome, MintError> {
         let client = self.relay_client(&settings.proxy_url)?;
         let mut request = client
@@ -549,6 +592,10 @@ impl CloudMintService {
             .header("x-mint-ttl", settings.ticket_ttl_seconds.to_string())
             .header("x-mint-transport", settings.transport.as_str())
             .header("authorization", authorization);
+        if fresh_pair {
+            // relay 自己的 pair 缓存不看调用方是否还握着旧 pair。带上这个头才会裸打。
+            request = request.header("x-mint-fresh-pair", "1");
+        }
         if !settings.gateway.trim().is_empty() {
             request = request.header("x-mint-gateway", settings.gateway.trim());
         }
@@ -590,8 +637,13 @@ impl CloudMintService {
         let tickets = parsed
             .tickets
             .iter()
-            .filter(|(_, ticket)| {
-                settings.ticket_len == 0 || ticket.turn_state.len() == settings.ticket_len
+            .filter(|(model, ticket)| {
+                models.contains(model)
+                    && ticket
+                        .served_model
+                        .as_deref()
+                        .is_some_and(|served| served.eq_ignore_ascii_case(model))
+                    && (settings.ticket_len == 0 || ticket.turn_state.len() == settings.ticket_len)
             })
             .map(|(model, ticket)| {
                 let issued_at = ticket
@@ -623,7 +675,7 @@ impl CloudMintService {
         })
     }
 
-    // ---- 原生后端：经账号代理直打上游 ------------------------------------------
+    // ---- 原生后端：经专用动态代理打票 ------------------------------------------
 
     /// 凭据里已有的、未过期且在目标网关上的 pair；用作定向打的种子。
     async fn stored_pair(
@@ -652,24 +704,32 @@ impl CloudMintService {
         settings: &CloudMintSettings,
         seed: Option<RoutePair>,
     ) -> Result<MintOutcome, MintError> {
-        let client = crate::transport::client::build_account_http_client(
-            account.id().as_str(),
-            account.outbound_proxy(),
-        )
-        .map_err(|_| MintError::Unreachable)?;
+        // 打票与业务出口隔离，缺配置或代理失败时绝不回退直连或账号代理。
+        let proxy = mint_proxy(&settings.upstream_proxy_url)?;
+        let deadline = tokio::time::Instant::now() + NATIVE_TOTAL_TIMEOUT;
         let url = crate::transport::endpoints::endpoint_url(
             &self.base_url,
             crate::transport::endpoints::CODEX_RESPONSES_PATH,
         );
         let target = mint_target(&settings.gateway);
         let mut pair = seed;
-        let mut new_pair: Option<RoutePair> = None;
         let mut tickets = Vec::new();
+        let mut ticket_pair: Option<RoutePair> = None;
         let mut attempts = 0u64;
         for model in models {
             for _ in 0..settings.max_attempts {
-                if attempts > 0 {
-                    tokio::time::sleep(NATIVE_ATTEMPT_GAP).await;
+                if !self.enabled()
+                    || attempts >= NATIVE_MAX_TOTAL_ATTEMPTS
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                if attempts > 0
+                    && tokio::time::timeout_at(deadline, tokio::time::sleep(NATIVE_ATTEMPT_GAP))
+                        .await
+                        .is_err()
+                {
+                    break;
                 }
                 attempts += 1;
                 // 有活的目标 pair 就定向打（票铸在该节点上）；没有就裸打让边缘重新分配。
@@ -677,16 +737,24 @@ impl CloudMintService {
                     .as_ref()
                     .filter(|pair| pair.live(target.as_deref()))
                     .cloned();
-                let attempt = self
-                    .native_attempt(
+                // 每次尝试新建客户端，不复用上一次的 TCP 连接，动态出口由代理服务分配。
+                let client = mint_http_client(&proxy)?;
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    self.native_attempt(
                         &client,
                         &url,
                         authorization,
                         account,
                         model,
                         steered.as_ref(),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
+                let attempt = match attempt {
+                    Ok(attempt) => attempt,
+                    Err(_) => break,
+                };
                 let attempt = match attempt {
                     Ok(attempt) => attempt,
                     Err(MintError::Unreachable) => continue,
@@ -704,7 +772,6 @@ impl CloudMintService {
                 if let Some(issued) = attempt.pair.clone() {
                     // 上游新签了 pair：在目标上就采纳并定向；不在目标上不入库，下一发回裸打。
                     if issued.live(target.as_deref()) {
-                        new_pair = Some(issued.clone());
                         pair = Some(issued);
                     } else {
                         pair = None;
@@ -719,12 +786,20 @@ impl CloudMintService {
                     steered.as_ref().and_then(|p| p.gateway.clone())
                 };
                 let accepted = attempt.status == 200
+                    && attempt
+                        .pair
+                        .as_ref()
+                        .or(steered.as_ref())
+                        .is_some_and(|pair| pair.live(target.as_deref()))
                     && !attempt.ticket.is_empty()
                     && (settings.ticket_len == 0 || attempt.ticket.len() == settings.ticket_len)
                     && target
                         .as_deref()
                         .is_none_or(|wanted| node.as_deref() == Some(wanted))
-                    && attempt.served.as_deref() == Some(model.as_str());
+                    && attempt
+                        .served
+                        .as_deref()
+                        .is_some_and(|served| served.eq_ignore_ascii_case(model));
                 tracing::info!(
                     target: "turn_state",
                     account_id = account.id().as_str(),
@@ -737,7 +812,17 @@ impl CloudMintService {
                     accepted,
                     "[turn-state] mint attempt"
                 );
+                if !accepted && tickets.is_empty() {
+                    pair = None;
+                }
                 if accepted {
+                    let route = attempt.pair.as_ref().or(steered.as_ref()).cloned();
+                    // 一批返回的票必须随同一对路由使用，动态出口换到新 pair 后不发布旧 pair 的票。
+                    if !tickets.is_empty() && !same_mint_route(route.as_ref(), ticket_pair.as_ref())
+                    {
+                        tickets.clear();
+                    }
+                    ticket_pair = route;
                     let issued_at =
                         turn_state::fernet::issued_at(&attempt.ticket).unwrap_or(attempt.started);
                     tickets.push(RawTicket {
@@ -751,13 +836,13 @@ impl CloudMintService {
                 }
             }
         }
-        let gateway = pair
+        let gateway = ticket_pair
             .as_ref()
             .filter(|pair| pair.live(target.as_deref()))
             .and_then(|pair| pair.gateway.clone());
         Ok(MintOutcome {
             gateway,
-            pair: new_pair,
+            pair: ticket_pair,
             attempts,
             tickets,
         })
@@ -858,28 +943,44 @@ impl CloudMintService {
         })
     }
 
-    /// 把 pair 写进凭据；CAS 冲突重读一次再试。
+    /// 只在凭据绑定及原路由仍匹配时发布；CAS 冲突重读一次并重新检查。
     async fn write_route_pair(
         &self,
         account: &ProviderAccount,
+        expected_binding: &str,
+        original_route: Option<&RoutePairRef>,
         pair: &RoutePair,
-    ) -> Result<bool, MintError> {
+    ) -> Result<(ProviderAccount, bool), MintError> {
+        let desired =
+            RoutePairRef::of(&pair.cflb, &pair.oailb).ok_or(MintError::InvalidResponse)?;
         let values = [("__cflb", &pair.cflb), ("__oailb", &pair.oailb)];
         for (_, value) in &values {
             if value.len() > 4096 || !value.bytes().all(|b| b.is_ascii_graphic() && b != b';') {
                 return Err(MintError::InvalidResponse);
             }
         }
-        let mut current = account.clone();
         for attempt in 0..2 {
-            let mut data = self
-                .repository
-                .load_complete_data(&current)
-                .await
-                .map_err(|_| MintError::Store)?;
-            let Some(stored) = data.cookies_mut() else {
-                return Ok(false);
+            let current = self.load_account(account.id().as_str()).await?;
+            let mut data = match self.repository.load_complete_data(&current).await {
+                Ok(data) => data,
+                Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => continue,
+                Err(_) => return Err(MintError::Store),
             };
+            let oauth = data.oauth().ok_or(MintError::NotEligible)?;
+            let generation = oauth.turn_state_pin.as_deref().ok_or(MintError::Stale)?;
+            if crate::turn_state_pin::credential_binding(generation, &oauth.access_token)
+                != expected_binding
+            {
+                return Err(MintError::Stale);
+            }
+            let current_route = RoutePairRef::stored(data.cookies());
+            if current_route.as_ref() == Some(&desired) {
+                return Ok((current, false));
+            }
+            if current_route.as_ref() != original_route {
+                return Err(MintError::Stale);
+            }
+            let stored = data.cookies_mut().ok_or(MintError::NotEligible)?;
             for (name, value) in &values {
                 stored.retain(|cookie| !(cookie.name == *name && cookie.path == "/"));
                 stored.push(CodexCookie {
@@ -893,10 +994,8 @@ impl CloudMintService {
                 });
             }
             match self.repository.compare_and_swap_data(&current, data).await {
-                Ok(_) => return Ok(true),
-                Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => {
-                    current = self.load_account(current.id().as_str()).await?;
-                }
+                Ok(_) => return Ok((current, true)),
+                Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => {}
                 Err(_) => return Err(MintError::Store),
             }
         }
@@ -972,7 +1071,7 @@ fn mint_target(raw: &str) -> Option<String> {
     Some(value)
 }
 
-fn jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+pub(crate) fn jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let payload = token.split('.').nth(1)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
@@ -984,7 +1083,7 @@ fn jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>>
 }
 
 /// pair 的节点名：先查 `__oailb` 的 JWT 载荷，再退到两个值的明文；规范化成 `unified-N`。
-fn gateway_label(cflb: &str, oailb: &str) -> Option<String> {
+pub(crate) fn gateway_label(cflb: &str, oailb: &str) -> Option<String> {
     let payload = jwt_claims(oailb)
         .map(|claims| serde_json::Value::Object(claims).to_string())
         .unwrap_or_default();
@@ -1148,4 +1247,116 @@ fn parse_chrono(value: &str) -> Option<DateTime<Utc>> {
 
 fn parse_time(value: &str) -> Option<SystemTime> {
     parse_chrono(value).map(SystemTime::from)
+}
+
+/// 同一批票只能附带签发它们的路由对，失败探测的新 cookie 不能替换成功票的路由。
+fn same_mint_route(left: Option<&RoutePair>, right: Option<&RoutePair>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cflb == right.cflb && left.oailb == right.oailb,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// 只认显式配置的专用出口，账号业务代理和环境代理都不能代替它。
+fn mint_proxy(value: &str) -> Result<gateway_core::account::OutboundProxy, MintError> {
+    if value.trim().is_empty() {
+        return Err(MintError::ProxyRequired);
+    }
+    gateway_core::account::OutboundProxy::parse(value.trim()).map_err(|_| MintError::InvalidProxy)
+}
+
+fn mint_http_client(
+    proxy: &gateway_core::account::OutboundProxy,
+) -> Result<reqwest::Client, MintError> {
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| MintError::InvalidProxy)?)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .connect_timeout(Duration::from_secs(15));
+    crate::transport::tls::build_reqwest_client_with_custom_ca(builder)
+        .map_err(|_| MintError::Unreachable)
+}
+
+#[cfg(test)]
+mod dedicated_proxy_tests {
+    use super::{MintError, mint_http_client, mint_proxy};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn a_missing_or_invalid_mint_proxy_cannot_select_a_business_exit() {
+        assert_eq!(mint_proxy("").unwrap_err(), MintError::ProxyRequired);
+        assert_eq!(
+            mint_proxy("file:///tmp/proxy").unwrap_err(),
+            MintError::InvalidProxy
+        );
+        assert_eq!(
+            mint_proxy("http://user:pass@localhost:0").unwrap_err(),
+            MintError::InvalidProxy
+        );
+        assert!(mint_proxy("socks5h://example-user:example-password@proxy.example:1080").is_ok());
+    }
+
+    #[tokio::test]
+    async fn consecutive_mint_attempts_open_new_connections_to_the_dedicated_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = mint_proxy(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut part = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let n = socket.read(&mut part).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&part[..n]);
+                }
+                assert!(
+                    request.starts_with(b"POST http://mint.invalid/codex/responses HTTP/1.1\r\n")
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK",
+                    )
+                    .await
+                    .unwrap();
+                connections.push(socket);
+            }
+            connections.len()
+        });
+        for _ in 0..2 {
+            let response = mint_http_client(&proxy)
+                .unwrap()
+                .post("http://mint.invalid/codex/responses")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "OK");
+        }
+        assert_eq!(server.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_dedicated_proxy_does_not_fall_back_to_direct() {
+        let upstream = wiremock::MockServer::start().await;
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = mint_proxy(&format!("http://{}", unavailable.local_addr().unwrap())).unwrap();
+        drop(unavailable);
+        let result = mint_http_client(&proxy)
+            .unwrap()
+            .post(upstream.uri())
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 }

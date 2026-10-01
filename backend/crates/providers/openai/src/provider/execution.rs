@@ -333,6 +333,16 @@ pub(super) fn same_client_turn(previous: Option<&str>, current: Option<&str>) ->
         .is_some_and(|(previous, current)| !previous.is_empty() && previous == current)
 }
 
+/// 阻断只结束当前响应，不授予 Core 重放业务请求的许可。
+pub(super) fn served_mismatch_error() -> ProviderError {
+    provider_error(ProviderErrorKind::Protocol, UpstreamSendState::Sent)
+        .with_client_visible_upstream_error(gateway_core::error::ClientVisibleUpstreamError::new(
+            "Upstream served a different model than requested",
+            Some("degraded_model_blocked".to_owned()),
+            Some("gateway_error".to_owned()),
+        ))
+}
+
 /// 组装请求日志的响应侧回填补丁：Set-Cookie(__cf_bm) 有无、上游票短指纹与票长、service_tier、
 /// 上游实际服务模型（用于「实际模型≠请求模型」的猫腻分叉判断）。
 /// 票优先取本回合捕获（含流内轮转）的 turn_state，退回 handshake 票；只存短指纹/长度/模型名，绝不存原文。
@@ -858,6 +868,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         };
         let mut active_account = lease.account().clone();
         let cookie_header = build_cookie_header(lease.cookies())?;
+        let sent_route = crate::route_pair::RoutePairRef::sent(lease.cookies());
         let authorization = lease
             .authentication()
             .authorization_header()
@@ -875,6 +886,8 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 .expected_length(upstream_model.as_str())
         {
             let binding = crate::turn_state_pin::credential_binding(generation, oauth.access_token.expose_secret());
+            // 出口指纹仍参与 pin 分桶。同一账号带着活的 __cflb/__oailb 时，票可以换 IP，
+            // 这里不因此解开出口绑定。
             let egress = crate::turn_state_pin::egress_fingerprint(
                 active_account.outbound_proxy().map(|proxy| proxy.expose_url()),
             );
@@ -883,8 +896,10 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 active_account.id().as_str(), binding, upstream_model.as_str(),
                 context.client_api_key_ref().as_str(), expected_length, &egress,
                 request.turn_state.as_deref(), SystemTime::now(),
+                sent_route.as_ref().map(|route| route.fingerprint.as_str()),
             ))
         } else { None };
+        request.minted_turn_state_route = pin_attempt.as_ref().and_then(crate::turn_state_pin::PinAttempt::injected_route).map(str::to_owned);
         if let Some(value) = pin_attempt.as_ref().and_then(crate::turn_state_pin::PinAttempt::value) {
             request.turn_state = Some(value.to_owned());
             request.passthrough_headers.remove("x-codex-turn-state");
@@ -906,6 +921,14 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         }
         let request_id = context.request_id().as_str().to_owned();
         let capture_request_log = context.should_capture_request_log();
+        // 模拟运行只观测，不改变 WebSocket 的回池与续接能力。
+        request.discard_mismatched_connection = !turn_state_pins.service().settings().dry_run;
+        // fork: served-mismatch
+        let mut served_watch = super::fork_served::ServedWatch::new(
+            &turn_state_pins, active_account.id().as_str(), upstream_model.as_str(),
+            request.generate() && !context.is_diagnostic_required_account()
+                && allows_account_state_mutation,
+        );
         // 回填 ticket_in = **实际发送**给上游的 turn-state 指纹（pin 值或客户透传值，未发=None）；
         // 不是请求侧 runtime.turn_state_pin(那是 pin 的 uuid 代次标识、非真票)。
         // 门控用请求开始冻结的同一决定；关闭/非测试来源不做任何指纹构造。
@@ -1005,6 +1028,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         if let Some(pin) = pin_attempt.as_mut() {
             pin.observe(response.turn_state.as_deref());
         }
+        served_watch.routed(lease.cookies(), &response.set_cookie_headers, response.response_metadata_updates.as_ref()).await; // fork: served-mismatch
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {
                 OpenAiContinuationScope::Persisted
@@ -1033,6 +1057,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             &response,
             &request,
         );
+        served_watch.annotate(&mut observation_state); // fork: served-mismatch
         if let Some(observation) = observation_state.observation(None) {
             yield ProviderEvent::observation(observation);
         }
@@ -1083,6 +1108,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
+        if response.response_metadata.has_model_mismatch(upstream_model.as_str()) {
+            decoder.note_served_mismatch();
+        }
         let mut pre_commit_events = PreCommitClientEvents::new(trace);
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
@@ -1231,6 +1259,30 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 .observe_upstream_response_model(decoder.response_model());
             let service_tier_changed = observation_state
                 .observe_upstream_service_tier(decoder.response_service_tier());
+            served_watch.observe(&decoder, pin_attempt.as_mut(), &mut session_capture, &selector, &active_account).await; // fork: served-mismatch
+            served_watch.annotate(&mut observation_state); // fork: served-mismatch
+            // 阻断当前响应，不标记 replay-safe，不给 Core 同账号或换号重放的许可。
+            if served_watch.block_response() {
+                if let Some(observation) = observation_state.observation(None) {
+                    yield ProviderEvent::observation(observation);
+                }
+                if capture_request_log {
+                    gateway_core::request_log::update_response(
+                        &request_id,
+                        served_watch.log_patch(codex_response_log_patch(
+                            resp_has_cfbm,
+                            session_capture.as_ref(),
+                            resp_handshake_turn_state.as_deref(),
+                            decoder.response_service_tier(),
+                            decoder.response_model(),
+                            &resp_cookie_summary,
+                            resp_cfbm_ttl,
+                        )),
+                    );
+                }
+                Err(served_mismatch_error())?;
+                return;
+            }
             let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
                 log_canonical_upstream_error(
                     UpstreamErrorLogContext::new(
@@ -1286,6 +1338,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             if completed && terminal_failure.is_none() && !terminal_response_is_incomplete(&events)
                 && let Some(pin) = pin_attempt.as_mut()
             { pin.completed(SystemTime::now()); }
+            if completed && terminal_failure.is_none() { served_watch.completed(); } // fork: served-mismatch
             attach_openai_session_update(&mut events, &mut session_capture);
             if allows_account_state_mutation && completed && terminal_failure.is_none() {
                 // 完成事件一旦交给下游，Core 可以立刻停止轮询 Provider stream；
@@ -1342,7 +1395,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 if capture_request_log {
                     gateway_core::request_log::update_response(
                         &request_id,
-                        codex_response_log_patch(
+                        served_watch.log_patch(codex_response_log_patch( // fork: served-mismatch
                             resp_has_cfbm,
                             session_capture.as_ref(),
                             resp_handshake_turn_state.as_deref(),
@@ -1350,7 +1403,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                             decoder.response_model(),
                             &resp_cookie_summary,
                             resp_cfbm_ttl,
-                        ),
+                        )),
                     );
                 }
                 return;
@@ -1422,11 +1475,35 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         )
         .await
         .unwrap_or(false);
+        served_watch.observe(&decoder, pin_attempt.as_mut(), &mut session_capture, &selector, &active_account).await; // fork: served-mismatch
+        served_watch.annotate(&mut observation_state); // fork: served-mismatch
+        if served_watch.block_response() {
+            if let Some(observation) = observation_state.observation(None) {
+                yield ProviderEvent::observation(observation);
+            }
+            if capture_request_log {
+                gateway_core::request_log::update_response(
+                    &request_id,
+                    served_watch.log_patch(codex_response_log_patch(
+                        resp_has_cfbm,
+                        session_capture.as_ref(),
+                        resp_handshake_turn_state.as_deref(),
+                        decoder.response_service_tier(),
+                        decoder.response_model(),
+                        &resp_cookie_summary,
+                        resp_cfbm_ttl,
+                    )),
+                );
+            }
+            Err(served_mismatch_error())?;
+            return;
+        }
         attach_openai_session_update(&mut events, &mut session_capture);
         let completed = events
             .iter()
             .flat_map(ProviderEvent::canonical_facts)
             .any(|event| matches!(event, GatewayEvent::Completed(_)));
+        if completed && terminal_failure.is_none() { served_watch.completed(); } // fork: served-mismatch
         if completed && terminal_failure.is_none() && !terminal_response_is_incomplete(&events)
             && let Some(pin) = pin_attempt.as_mut()
         { pin.completed(SystemTime::now()); }
@@ -1487,7 +1564,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         if capture_request_log {
             gateway_core::request_log::update_response(
                 &request_id,
-                codex_response_log_patch(
+                served_watch.log_patch(codex_response_log_patch( // fork: served-mismatch
                     resp_has_cfbm,
                     session_capture.as_ref(),
                     resp_handshake_turn_state.as_deref(),
@@ -1495,7 +1572,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                     decoder.response_model(),
                     &resp_cookie_summary,
                     resp_cfbm_ttl,
-                ),
+                )),
             );
         }
         let events = pre_commit_events.finish(events, timing_signals, completed);
@@ -1514,6 +1591,9 @@ async fn merge_response_metadata_updates(
 ) -> Option<bool> {
     let updates = updates?;
     let mut pending = updates.lock().await;
+    if pending.served_mismatch {
+        decoder.note_served_mismatch();
+    }
     let turn_state = pending.turn_state.take();
     let reported_model = pending.reported_model.clone();
     drop(pending);

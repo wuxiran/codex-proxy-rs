@@ -10,10 +10,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs_util;
+use crate::{fs_util, served::ServedMismatchAction};
 
-pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
-const MIN_TTL_SECONDS: u64 = 600;
+/// 票实测只能回放约 240 秒，远短于它自己签名里的一小时。
+pub const DEFAULT_TTL: Duration = Duration::from_secs(240);
+const MIN_TTL_SECONDS: u64 = 30;
 const MAX_TTL_SECONDS: u64 = 86_400;
 const SETTINGS_FILE: &str = "settings.json";
 /// 两次 stat 之间的最短间隔：请求路径上不能每次都碰磁盘。
@@ -23,8 +24,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InjectMode {
-    /// 桶内有有效模板就注入：请求没带 state 则补上，带了不同的就替换（现网既有行为）。
+    /// 只给没带 state 的请求补上模板；客户端自带的 state 原样放行。同一轮的后续请求
+    /// 要回放这一轮自己的首张票，换掉它会打断续接。
     #[default]
+    FillMissing,
+    /// 桶内有有效模板就注入：请求没带 state 则补上，带了不同的就替换。
     Always,
     /// 只替换长度属于受限档的 state；没带 state 或长度不属于受限档的请求原样放行。
     ReplaceOnly,
@@ -33,6 +37,7 @@ pub enum InjectMode {
 impl InjectMode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::FillMissing => "fill-missing",
             Self::Always => "always",
             Self::ReplaceOnly => "replace-only",
         }
@@ -53,6 +58,8 @@ pub struct Settings {
     pub template_lengths: Vec<usize>,
     /// 受限/降级档长度；永不入库。
     pub degraded_lengths: Vec<usize>,
+    /// 业务请求上游换了模型时的处置；`dry_run` 下一律只记录。
+    pub served_mismatch_action: ServedMismatchAction,
     /// 云端打票：账号缺票时向 relay 铸票并钉住路由 cookie 对。
     pub cloud_mint: CloudMintSettings,
     /// WS 保活：在乐观窗口内为账号预建并挂住上游 WebSocket，用 canary 验满血。
@@ -177,7 +184,7 @@ impl WarmPoolSettings {
 }
 
 /// 云端打票设置。relay 即 `deploy/cloud-mint/index.js`（阿里 FC 或 89 上的容器）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct CloudMintSettings {
     pub enabled: bool,
@@ -191,6 +198,8 @@ pub struct CloudMintSettings {
     pub relay_key: String,
     /// 插件 → relay 之间的前置代理；空 = 直连。
     pub proxy_url: String,
+    /// 原生打票专用的动态代理，独立于账号业务出口，密钥不回显。
+    pub upstream_proxy_url: String,
     /// 目标网关（`unified-95`）；空 = 任意。
     pub gateway: String,
     /// 预期票长；0 = 不查。
@@ -205,6 +214,23 @@ pub struct CloudMintSettings {
     pub cooldown_seconds: u64,
     /// 原生打票每个模型最多发几次（每发都是一次真实上游请求，烧配额）。
     pub max_attempts: u32,
+}
+
+impl std::fmt::Debug for CloudMintSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudMintSettings")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("observe_only", &self.observe_only)
+            .field(
+                "upstream_proxy_configured",
+                &!self.upstream_proxy_url.is_empty(),
+            )
+            .field("relay_proxy_configured", &!self.proxy_url.is_empty())
+            .field("relay_key_configured", &!self.relay_key.is_empty())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -224,6 +250,7 @@ impl Default for CloudMintSettings {
             relay_url: String::new(),
             relay_key: String::new(),
             proxy_url: String::new(),
+            upstream_proxy_url: String::new(),
             // 空 = 任意网关：哪个节点不降智没有证据，先观测再定，不默认钉某个节点。
             gateway: String::new(),
             ticket_len: 780,
@@ -253,6 +280,16 @@ impl CloudMintSettings {
             } else {
                 "<set>".to_owned()
             },
+            upstream_proxy_url: if self.upstream_proxy_url.is_empty() {
+                String::new()
+            } else {
+                "<set>".to_owned()
+            },
+            proxy_url: if self.proxy_url.is_empty() {
+                String::new()
+            } else {
+                "<set>".to_owned()
+            },
             ..self.clone()
         }
     }
@@ -267,13 +304,16 @@ impl CloudMintSettings {
                 return Err(SettingsError::RelayKey);
             }
         }
-        if !self.proxy_url.is_empty()
-            && !(self.proxy_url.starts_with("http://")
-                || self.proxy_url.starts_with("https://")
-                || self.proxy_url.starts_with("socks5://")
-                || self.proxy_url.starts_with("socks5h://"))
-        {
-            return Err(SettingsError::ProxyUrl);
+        for proxy in [&self.proxy_url, &self.upstream_proxy_url] {
+            if !proxy.is_empty()
+                && (proxy.len() > 4096
+                    || proxy.chars().any(char::is_whitespace)
+                    || !["http://", "https://", "socks5://", "socks5h://"]
+                        .iter()
+                        .any(|scheme| proxy.starts_with(scheme)))
+            {
+                return Err(SettingsError::ProxyUrl);
+            }
         }
         if !(30..=86_400).contains(&self.ticket_ttl_seconds) {
             return Err(SettingsError::Ttl);
@@ -295,11 +335,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             ttl_seconds: DEFAULT_TTL.as_secs(),
-            inject_mode: InjectMode::Always,
+            inject_mode: InjectMode::default(),
             dry_run: false,
             log_decisions: true,
             template_lengths: Vec::new(),
             degraded_lengths: Vec::new(),
+            served_mismatch_action: ServedMismatchAction::default(),
             cloud_mint: CloudMintSettings::default(),
             warm_pool: WarmPoolSettings::default(),
         }
@@ -349,6 +390,8 @@ impl Settings {
 
     /// 排序去重后校验；写盘前必须经过这里。
     pub fn normalized(mut self) -> Result<Self, SettingsError> {
+        self.cloud_mint.upstream_proxy_url = self.cloud_mint.upstream_proxy_url.trim().to_owned();
+        self.cloud_mint.proxy_url = self.cloud_mint.proxy_url.trim().to_owned();
         self.template_lengths.sort_unstable();
         self.template_lengths.dedup();
         self.degraded_lengths.sort_unstable();
@@ -390,6 +433,12 @@ impl Settings {
 
     /// 前端整体提交时密钥字段可能是 `<set>` 占位：沿用磁盘上的旧值。
     pub fn merge_secret_placeholders(mut self, current: &Self) -> Self {
+        if self.cloud_mint.upstream_proxy_url == "<set>" {
+            self.cloud_mint.upstream_proxy_url = current.cloud_mint.upstream_proxy_url.clone();
+        }
+        if self.cloud_mint.proxy_url == "<set>" {
+            self.cloud_mint.proxy_url = current.cloud_mint.proxy_url.clone();
+        }
         if self.cloud_mint.relay_key == "<set>" {
             self.cloud_mint.relay_key = current.cloud_mint.relay_key.clone();
         }
@@ -444,6 +493,7 @@ impl SettingsStore {
     /// 校验后原子写盘，并立即更新缓存。
     pub fn set(&self, settings: Settings) -> Result<Settings, SetSettingsError> {
         let settings = settings.normalized().map_err(SetSettingsError::Invalid)?;
+        warn_about_length_rules(&settings);
         if let Some(dir) = &self.dir {
             let _guard = fs_util::lock(dir).map_err(|_| SetSettingsError::Io)?;
             let bytes = serde_json::to_vec_pretty(&settings).map_err(|_| SetSettingsError::Io)?;
@@ -498,6 +548,7 @@ impl SettingsStore {
             .and_then(|settings| settings.normalized().ok())
         {
             Some(settings) => {
+                warn_about_length_rules(&settings);
                 cache.settings = settings;
                 cache.mtime = mtime;
             }
@@ -511,6 +562,20 @@ impl SettingsStore {
             }
         }
     }
+}
+
+/// 上游统一票的格式之后，长度不再区分正常与受限。受限长度表非空时，`always` 和
+/// `replace-only` 仍会按票长换掉客户端的票、拒收这些长度的新票，所以每次读到都提醒清空。
+fn warn_about_length_rules(settings: &Settings) {
+    if settings.degraded_lengths.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "turn_state",
+        degraded_lengths = ?settings.degraded_lengths,
+        inject_mode = settings.inject_mode.as_str(),
+        "[turn-state] degradedLengths is not empty: state length is no longer a degradation signal; clear it on the state page"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

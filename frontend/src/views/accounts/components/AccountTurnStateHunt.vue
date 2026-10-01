@@ -255,7 +255,7 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
         <BaseCheckbox v-model="includeDirect" label="同时尝试直连" show-label :disabled="busy || single" />
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
-        <BaseCheckbox v-model="autoRenew" label="到期前自动续期" show-label :disabled="busy" />
+        <BaseCheckbox v-model="autoRenew" label="过期后按需补票" show-label :disabled="busy" />
       </div>
       <div class="flex gap-2 pb-1">
         <BaseButton variant="primary" size="sm" :disabled="!canStart" @click="start">

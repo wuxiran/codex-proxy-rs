@@ -1,7 +1,8 @@
 import type { RequestOptions } from '../request'
 import request from '../request'
 
-export type TurnStateInjectMode = 'always' | 'replace-only'
+export type TurnStateInjectMode = 'fill-missing' | 'always' | 'replace-only'
+export type TurnStateServedMismatchAction = 'observe' | 'block'
 
 /** turn-state 运行设置；整体替换，字段全部必填。 */
 export interface TurnStateSettings {
@@ -13,6 +14,8 @@ export interface TurnStateSettings {
   templateLengths: number[]
   /** 受限/降级档长度；永不入库，replace-only 只替换这些。 */
   degradedLengths: number[]
+  /** 业务请求上游换了模型时的处置；模拟运行下一律只记录。 */
+  servedMismatchAction: TurnStateServedMismatchAction
   /** 云端打票：账号缺票时向 relay 铸票并钉住路由 cookie 对。 */
   cloudMint: TurnStateCloudMintSettings
   /** WS 保活：为已绑定 state 的账号预建并挂住满血 WebSocket，业务复用。 */
@@ -56,7 +59,7 @@ export type TurnStateMintMode = 'native' | 'relay'
 
 export interface TurnStateCloudMintSettings {
   enabled: boolean
-  /** native：cpr 经账号代理直打上游；relay：交给 deploy/cloud-mint 的 relay。 */
+  /** native：经专用动态代理打票；relay：交给 deploy/cloud-mint 的 relay。 */
   mode: TurnStateMintMode
   /** 只观测不注入：照常打票、记录，但不把 pair/票写进业务请求。 */
   observeOnly: boolean
@@ -64,6 +67,8 @@ export interface TurnStateCloudMintSettings {
   /** 读取时为 `<set>` 占位或空；提交 `<set>` 表示沿用已保存的密钥。 */
   relayKey: string
   proxyUrl: string
+  /** 专用动态打票代理，读取时脱敏为 <set> */
+  upstreamProxyUrl: string
   gateway: string
   ticketLen: number
   ticketTtlSeconds: number
@@ -115,6 +120,11 @@ export interface TurnStateBucketTally {
   lastIssuedLen: number | null
   lastIssuedAt: number
   lengths: Record<string, number>
+  /** 上游声明的模型与发送模型一致 / 不一致 / 没有声明的请求数。 */
+  servedMatch: number
+  servedMismatch: number
+  servedUnknown: number
+  lastServedMismatchAt: number
 }
 
 export interface TurnStateHourTally {

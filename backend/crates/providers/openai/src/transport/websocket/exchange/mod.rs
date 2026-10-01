@@ -61,6 +61,12 @@ pub struct CodexWebSocketResponseMetadataUpdate {
     pub turn_state: Option<String>,
     /// 当前响应最新的服务端模型报告。
     pub reported_model: Option<String>,
+    /// fork: served-mismatch。承载这次响应的连接握手时用的路由 cookie 对。
+    pub(crate) route_pair: Option<crate::route_pair::RoutePairRef>,
+    /// fork: served-mismatch。Provider 判定这次响应换了模型且要求换节点：终态后连接不回池。
+    pub(crate) discard_connection: bool,
+    /// 本轮曾出现不一致声明，与是否实际丢弃连接分开记录。
+    pub(crate) served_mismatch: bool,
 }
 
 pub type CodexWebSocketResponseMetadataUpdates = Arc<Mutex<CodexWebSocketResponseMetadataUpdate>>;

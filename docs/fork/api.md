@@ -14,7 +14,7 @@
 | `GET` | `/api/admin/accounts/ticket` | `accountId` | 读取账号成本、到期与票据摘要（票据只回打码邮箱） |
 | `POST` | `/api/admin/accounts/ticket` | `{ accountId, purchaseAmount?, purchaseCurrency?, purchasedAt?, expiresAt?, ticket? }` | 保存成本、到期与票据；`ticket` 省略表示保留原票据 |
 | `POST` | `/api/admin/accounts/ticket/restore` | `{ accountId }` | 用已存票据登录换回令牌并恢复账号 |
-| `POST` | `/api/admin/accounts/rotate` | 见下文「固定自身 state」「观澜复活」「自动续期」 | fork 保留的凭据轮换入口（上游已移除；普通连接编辑走 `/accounts/update`） |
+| `POST` | `/api/admin/accounts/rotate` | 见下文「固定自身 state」「观澜复活」「按需补票」 | fork 保留的凭据轮换入口（上游已移除；普通连接编辑走 `/accounts/update`） |
 
 账号列表额外支持 `status=expired`：票据 `expiresAt` 已到且账号已不能调度（五态不是正常 / 限流）的账号归入
 「已过期」，默认列表与 `summary.total` 不含它们，`summary.expired` 单独计数。
@@ -155,7 +155,7 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 356 字节；其它模型暂不捕获。Pro 和其它套餐保留原有 292 字节规则。长度按原始 ASCII state 字节计算，
 不解码或截断；缓存摘要 `length` 返回实际字节数，管理端以服务端规则展示筛选说明。
 固定期内覆盖发往上游的 state，后续返回值不覆盖已固定值；失败、不完整响应、预热和连接测试不捕获。
-默认关闭。单个候选的本地最长保留时间为 3600 秒，不随命中续期；这不是已验证的上游有效期。
+默认关闭。单个候选的本地最长保留时间为 240 秒（自票内嵌的签发时刻起算，可在 turn-state 设置里调），不随命中续期。
 到期、访问令牌改变、重新捕获或服务重启后等待新的候选，尚无候选时保持原有透传行为。
 此功能偏离常规同轮粘性路由合同，state 长度不构成模型质量判断，也不保证减少 overload。
 
@@ -172,7 +172,7 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 钉为账号级 state。**账号级 state 只对经同一出口发出的请求生效**：账号之后被改绑到别的出口（包括绑定与钉住之间
 的并发改绑）就不再使用，续期会在新出口上重新找。绑定以回读到的账号出口为准：代理在探测后被修改（`egress_changed`）或账号最终没有落在
 探测过的出口上（`bind_mismatch`）时不钉。账号级 state 对该账号该模型的全部客户端密钥生效，并**替换**该模型已有的全部固定（旧值来自换绑前的出口）；
-被动捕获仍然永不覆盖。`turnStatePins` 摘要以 `scope: "account" | "client"` 区分二者，寿命同为 3600 秒且不续期。
+被动捕获仍然永不覆盖。`turnStatePins` 摘要以 `scope: "account" | "client"` 区分二者，寿命同为 `ttlSeconds`（默认 240 秒）且不续期。
 提交边界是 `hit` 事件进入发送队列：此后绑定与钉住在服务端独立完成，不受页面断开影响；此前连接已断开的，
 即使在途请求随后命中，账号也不被改动。SSE 无法确认事件是否已经送达浏览器，所以「取消」与「命中」几乎同时发生时
 服务端可能已经提交；管理端在取消后会按服务端的实际状态刷新，以它为准。
@@ -189,19 +189,21 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 是按分类给出的固定文案，不含上游原文；`requests` 只统计真正发往上游的请求。
 账号被线上流量占用而未发出的尝试不计次数，连续五次后中止。
 
-**自动续期。** `POST /api/admin/accounts/rotate` 接受 `turnStateAutoHunt: { enabled, modelId, attempts, includeDirect }`
+**按需补票。** `POST /api/admin/accounts/rotate` 接受 `turnStateAutoHunt: { enabled, modelId, attempts, includeDirect }`
 （`enabled: false` 关闭；不要同时提交 `pinTurnState`，重新提交开关会更换代次并作废已钉住的 state）。参数保存在运行数据目录
 `turn_state/auto_hunt.json`（各实例共享），**不进账号凭据**——凭据 schema 拒绝未知字段，写进去会让回滚后的旧版本读不了该账号。
 参数在凭据提交成功之后才写入（提交失败则不生效），读写在跨进程文件锁内完成；文件损坏时拒绝覆盖并停止续期，不会当成空表。
 开启续期要求固定已开启，关闭「固定自身 state」时一并清除；详情的 `credentialConfiguration.turnStateAutoHunt` 返回当前参数或 null。
-开启后服务端每 60 秒检查一次：该账号该模型的账号级 state 在本进程内缺失（含服务重启后）或将在 5 分钟内到期时，
-以系统身份重新撞：**代理池里存在轮换代理模板（用户名含 `_area-` 的 smartproxy 式地址）时，续期走「自动撞」**——
+票不在到期前定时续。开启后服务端每 20 秒检查一次：该账号该模型最近一个 `ttlSeconds` 内有业务请求缺过票
+（请求来时没有可用的 state），且账号级 state 此刻缺失或已过期时，以系统身份重新撞；闲置账号的票过期后不补，
+下一个业务请求会不带票发出并留下缺票记录，随后的周期补上。缺票记录只在进程内存，重启后由下一个缺票的请求重新记上。
+补票时：**代理池里存在轮换代理模板（用户名含 `_area-` 的 smartproxy 式地址）时，续期走「自动撞」**——
 从模板即时生成 US/JP/DE/PH 随机的临时出口（每轮最多 60 个 IP、每个打 1 次），命中后改绑到账号数最少的静态出口；
 没有轮换模板时回退到遍历已存代理（当前绑定的出口排最前，续不上就继续打其它出口）。命中后照常换绑并替换旧 state。
-整轮都未命中则 5 分钟后重试，上游拒绝账号则 15 分钟后重试，因上游无容量中止则 60 秒后重试（必须远短于 5 分钟的续期提前量，否则一次过载就会让 state 在下次重试前过期）。停用或凭据失效的账号不续期：轮到它时会按当时的事实和参数重新确认，
+整轮都未命中则 5 分钟后重试，上游拒绝账号则 10 分钟后重试，因上游无容量中止则 30 秒后重试。停用或凭据失效的账号不补票：轮到它时会按当时的事实和参数重新确认，
 续期途中被停用会在下一个请求前停手（`account_unschedulable`，不计退避，重新启用后立即恢复）。
 续期途中才关闭续期开关的，本轮（最多「出口数 × 次数」个请求）仍会走完。
-state 只存在于进程内存，续期任务不加跨实例租约，每个实例各自维护。
+补票任务不加跨实例租约，每个实例各自照顾自己收到的流量。
 
 ## turn-state 模板与观测
 
@@ -209,11 +211,39 @@ state 只存在于进程内存，续期任务不加跨实例租约，每个实�
 
 | 方法 | 路径 | 请求 | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/admin/turn-state/settings` | 无 | 运行设置；`cloudMint.relayKey` 只回 `<set>`/空 |
+| `GET` | `/api/admin/turn-state/settings` | 无 | 运行设置；`cloudMint.relayKey`、`proxyUrl` 与 `upstreamProxyUrl` 只回 `<set>`/空 |
 | `POST` | `/api/admin/turn-state/settings/update` | 全部字段 + 可选 `cloudMint` | 整体替换并热生效；`cloudMint` 省略时保留现值，`relayKey` 为 `<set>` 时沿用已保存密钥；模板/受限长度表不能重叠 |
-| `GET` | `/api/admin/turn-state/observations` | 无 | 按桶的正常/受限/未知/沉默与注入盲区计数、48 小时分时、长度直方图、最近 100 条事件 |
+| `GET` | `/api/admin/turn-state/observations` | 无 | 按桶的正常/受限/未知/沉默与注入盲区计数、模型对照计数（`servedMatch` / `servedMismatch` / `servedUnknown`）、48 小时分时、长度直方图、最近 100 条事件 |
 | `GET` | `/api/admin/turn-state/buckets` | `account?`、`model?` | 有效模板摘要（范围、长度、签发/到期、来源、网关、命中），不含值 |
 | `POST` | `/api/admin/turn-state/buckets/clear` | `{ account, model? }` | 清除模板（内存与磁盘） |
 
-设置字段：`ttlSeconds`（600–86400）、`injectMode`（`always` 有模板就注入；`replace-only` 只替换受限档长度的 state）、`dryRun`、`logDecisions`、`templateLengths`、`degradedLengths`（空表 = ≥200 字节可见 ASCII 下限规则）、`cloudMint { enabled, mode, observeOnly, relayUrl, relayKey, proxyUrl, gateway, ticketLen, ticketTtlSeconds, models, transport, cooldownSeconds, maxAttempts }`。
-`mode=native`（默认）由 cpr 经账号绑定的代理直接向上游铸票（出口 = 该代理 IP），验收票长、`__oailb` 内嵌网关名与 `response.created` 的模型声明；`mode=relay` 交给 `deploy/cloud-mint/` 的 relay（出口 = relay 所在机器）；账号缺票时请求侧异步预热一次，后台每 20 秒对最近 10 分钟有流量的账号在票剩余不足 60 秒时续打。
+设置字段：`ttlSeconds`（30–86400，默认 240）、`injectMode`（默认 `fill-missing` 只给没带 state 的请求补上；`always` 有模板就注入，会换掉请求自带的 state；`replace-only` 只替换受限档长度的 state）、`dryRun`、`logDecisions`、`templateLengths`、`degradedLengths`（空表 = ≥200 字节可见 ASCII 下限规则）、`servedMismatchAction`（见下文「换模型」，省略时保留现值）、`cloudMint { enabled, mode, observeOnly, relayUrl, relayKey, proxyUrl, upstreamProxyUrl, gateway, ticketLen, ticketTtlSeconds, models, transport, cooldownSeconds, maxAttempts }`。
+`mode=native`（默认）由 cpr 经 `upstreamProxyUrl` 指定的专用代理打票，每次尝试重新建立连接以支持动态出口 IP，缺配置或连接失败不回退到账号业务代理或直连，验收票长、`__oailb` 内嵌网关名与 `response.created` 的模型声明；`mode=relay` 交给 `deploy/cloud-mint/` 的 relay，中继到上游的出口由中继配置，`proxyUrl` 只控制 cpr 到中继的一跳；账号缺票时请求侧异步预热一次；票不定时续。后台每 20 秒检查最近 10 分钟有流量的账号：凭据里的路由 cookie 对缺失或剩余不足 120 秒时，不带既有 pair 裸打一次换一对新的。`mode=relay` 时 pair 缓存在 relay 进程里，续 pair 会带 `x-mint-fresh-pair: 1`，relay 删掉这条 pair 缓存并不带 cookie 重打；票缓存仍可复用。调用方显式带了 seed cookie 时仍用那对。
+
+启用专用打票后，旧的遍历业务代理自动补票任务不再同时运行。专用代理在「票据管理」页填写，读取接口与 Debug 均不回显地址或认证信息，提交 `<set>` 保留已有值，提交空字符串清除。打票不修改账号业务代理绑定，票据仍属于同一账号与模型，并随有效路由对使用。原生打票整次调用最多 24 次尝试、75 秒，单次最多 60 秒，失败后进入配置的冷却期。
+
+云端票必须有匹配的服务模型声明和完整路由对。发布时先核对账号凭据与原路由未被并发更新，再保存路由并发布绑定该路由的票；路由写入失败不会留下新票。业务请求只使用与其凭据快照路由一致的云端票，WebSocket 发送正文前还会核对连接的实际路由。旧版本保存的未绑定路由云端票不再注入，下次缺票会重新打票；被动捕获和手动遍历的模板维持原有作用域。
+
+`ttlSeconds` 调短对已写入的票同样生效：读取时按「签发时刻 + 当前 `ttlSeconds`」封顶（云端打票的票按 `cloudMint.ticketTtlSeconds`），调大不会延长已写入的票。
+
+已经保存过的 `settings.json` 不会跟着代码默认值改。文件里如果还是 `injectMode: always`、`ttlSeconds: 3600`，或 `degradedLengths` 里有 `292` / `312`，行为保持旧值，直到在状态页改完保存。`degradedLengths` 不再表示降级：非空时 `always` 和 `replace-only` 仍会按这些长度换掉客户端的票，服务启动读到非空表会打一条警告。新装、或从未保存过设置的实例直接用当前默认（`ttlSeconds` 240、`fill-missing`、空的 `degradedLengths`）。
+
+### 换模型
+
+每个业务响应都把上游声明的模型与实际发送的模型对照一次。上游有两处声明：响应头 `openai-model`（WebSocket 上是 metadata 帧里的同名头）和正文 `response.created` / 终态事件的 `response.model`；任一处不一致即判为换模型。比较只忽略大小写，带日期的快照名与裸名不算同一个模型；两处都没有声明记为未知，不当作一致。诊断请求和经临时出口的探测不计入。
+
+判为换模型的这一轮，在非模拟运行下，新签发的 state 不进固定也不进会话，正在复用的那张固定按值条件失效（期间已被换成新值则不动）。这一条与 `servedMismatchAction` 无关。`servedMismatchAction` 决定额外的处置：
+
+- `observe`（默认）：只计数，响应照常交付。
+- `block`：中止本次响应并返回 `degraded_model_blocked`，不重放业务请求，不切换账号。已交付的部分不能撤回。按 pair 指纹清除本次失效路由，期间已换成另一对则保留。旧配置 `drop-pair` 可继续读取，读取后按 `block` 执行，保存时写成 `block`。
+- `dryRun`：换模型只记日志和计数，不阻断、不改 pin、会话、pair 或连接，也不启动自动或手动打票。
+
+非模拟运行的业务 WebSocket 在归还连接前自行对照模型，换模型的连接不再回池，避免消费方处理较慢时被提前复用。打票与业务请求分开：打票构造独立的 `store:false`、`stream:true` 正文，不携带业务续接 ID 或档位；业务正文保留原有 store、service_tier、previous_response_id 与 reasoning.context，共享 encoder 仍仅补缺省值。
+
+同一账号的票仍按出口指纹分桶。实测中票可以跟着还活着的 `__cflb` / `__oailb` 换 IP，出口绑定保持原样。
+
+对照结果和路由节点随请求记录落库，写在 `model_requests.provider_observation_json` 里：`servedMatch`（`match` / `mismatch`，未知时不写）、`upstreamGateway`（路由 cookie 对里的 `unified-N`）、`upstreamGatewaySource`（`request` 请求带出的 pair / `response` 上游这次新发的 pair / `connection` WebSocket 连接握手时用的 pair）。节点标签是路由凭据自己的声明，不是对实际执行节点的独立验证。请求日志（`/api/admin/logs/recent`）的 `servedMatch`、`gateway`、`gatewaySource` 是同一组事实。
+
+被动捕获的 `__oailb` 按它自己 JWT 里的 `exp` 存，不按 Set-Cookie 声明的期限。
+
+WS 保活的探针除了核对答案，还核对上游声明的模型：声明了别的模型、或没读到终态就断开的连接不算满血。

@@ -79,13 +79,13 @@ fn account_wide_pin_persists_expires_from_fernet_time_and_is_egress_bound() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("epoch")
         .as_secs()
-        - 600;
+        - 100;
     let token = fernet_token(issued_secs, 292);
     let binding = credential_binding("gen", "token");
     let expires = service
         .pin_account_wide(pin(&binding, &token, now))
         .expect("pinned");
-    let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(issued_secs + 3600);
+    let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(issued_secs + 240);
     assert_eq!(expires, expected);
     assert_eq!(
         service.account_wide_expires_at("acct", &binding, "gpt-6-astra", EGRESS, now),
@@ -219,24 +219,28 @@ fn mint_pins_use_their_own_ttl_and_carry_the_gateway() {
     let binding = credential_binding("gen", "token");
     let value = plain_token(780);
     let expires = service
-        .pin_account_wide(AccountWidePin {
-            account: "acct",
-            binding: binding.clone(),
-            model: "gpt-6-astra",
-            egress: EGRESS.to_owned(),
-            value: &value,
-            captured_at: now,
-            now,
-            source: Source::Mint,
-            ttl: Some(Duration::from_secs(240)),
-            gateway: Some("unified-95".to_owned()),
-        })
+        .pin_minted_account_wide(
+            AccountWidePin {
+                account: "acct",
+                binding: binding.clone(),
+                model: "gpt-6-astra",
+                egress: EGRESS.to_owned(),
+                value: &value,
+                captured_at: now,
+                now,
+                source: Source::Mint,
+                ttl: Some(Duration::from_secs(240)),
+                gateway: Some("unified-95".to_owned()),
+            },
+            "route-a",
+        )
         .expect("pinned");
-    assert_eq!(expires, now + Duration::from_secs(240));
+    assert_eq!(expires.expires_at, now + Duration::from_secs(240));
     let status = service.status("acct", &binding, now);
     assert_eq!(status[0].source, Source::Mint);
     assert_eq!(status[0].gateway.as_deref(), Some("unified-95"));
-    let attempt = service.begin_request(facts(&binding, "cli", None, now));
+    let attempt =
+        service.begin_request_on_route(facts(&binding, "cli", None, now), Some("route-a"));
     assert!(!attempt.needs_template());
     let missing = service.begin_request(facts("other", "cli", None, now));
     assert!(missing.needs_template());

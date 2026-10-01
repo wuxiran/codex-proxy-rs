@@ -191,6 +191,8 @@ pub(crate) struct CodexWebSocketConnectionMetadata {
     pub(crate) rate_limit_headers: Vec<(String, String)>,
     pub(crate) response_metadata: CodexResponseMetadata,
     pub(crate) diagnostics: CodexUpstreamDiagnostics,
+    /// fork: served-mismatch。握手实际用的路由 cookie 对，随连接存在。
+    pub(crate) route_pair: Option<crate::route_pair::RoutePairRef>,
 }
 
 pub(crate) struct PooledWebSocketConnection {

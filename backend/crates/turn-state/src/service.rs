@@ -2,8 +2,9 @@
 //! 响应侧两个（[`Attempt::observe`] / [`Attempt::completed`]），其余是管理端读写。
 
 use std::{
+    collections::BTreeMap,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -14,13 +15,16 @@ use crate::{
     decision::{self, Decision},
     fernet::{self, IssuedAtSource},
     observe::{ObservationInput, ObservationSnapshot, Observations},
-    record::{BucketRecord, Source, unix_seconds},
+    record::{BucketRecord, Source, TtlCaps, unix_seconds},
+    served::ServedMatch,
     settings::{SetSettingsError, Settings, SettingsStore},
     store::{PinStore, Scope, StoreError},
 };
 
 /// 容忍的时钟偏差：票据签发时间超过 `now + skew` 视为伪造。
 const FUTURE_SKEW: Duration = Duration::from_secs(120);
+/// 缺票记录的条数上限；满了先丢最旧的。
+const MAX_DEMANDS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TurnStateError {
@@ -107,6 +111,9 @@ struct ServiceInner {
     store: PinStore,
     settings: SettingsStore,
     observations: Observations,
+    /// 「账号 × 模型」最近一次业务请求来了却没有可用模板的时刻。只在本进程内存里：
+    /// 票不定时续，过期后由这条记录触发按需补票；重启后由下一个缺票的请求重新记上。
+    demands: Mutex<BTreeMap<(String, String), SystemTime>>,
 }
 
 /// 可廉价克隆的服务句柄；不实现 Debug。
@@ -120,6 +127,7 @@ impl TurnStateService {
             store: PinStore::in_memory(),
             settings: SettingsStore::in_memory(),
             observations: Observations::in_memory(),
+            demands: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -130,6 +138,7 @@ impl TurnStateService {
             store: PinStore::open(dir).map_err(|_| TurnStateError::Io)?,
             settings: SettingsStore::open(dir),
             observations: Observations::open(dir),
+            demands: Mutex::new(BTreeMap::new()),
         })))
     }
 
@@ -148,8 +157,51 @@ impl TurnStateService {
         self.settings().ttl()
     }
 
+    fn caps(&self) -> TtlCaps {
+        caps_of(&self.settings())
+    }
+
+    fn note_demand(&self, account: &str, model: &str, now: SystemTime) {
+        let Ok(mut demands) = self.0.demands.lock() else {
+            return;
+        };
+        if demands.len() >= MAX_DEMANDS
+            && let Some(oldest) = demands
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+        {
+            demands.remove(&oldest);
+        }
+        demands.insert((account.to_owned(), model.to_owned()), now);
+    }
+
+    /// `window` 之内是否有业务请求在这个桶上缺过票。按需补票据此判断，闲置账号不补。
+    pub fn demanded_within(
+        &self,
+        account: &str,
+        model: &str,
+        now: SystemTime,
+        window: Duration,
+    ) -> bool {
+        self.0.demands.lock().is_ok_and(|demands| {
+            demands
+                .get(&(account.to_owned(), model.to_owned()))
+                .is_some_and(|at| now.duration_since(*at).is_ok_and(|age| age <= window))
+        })
+    }
+
     /// 请求侧钩子：查桶、做决策、打一行日志。返回的 [`Attempt`] 要活到响应结束。
     pub fn begin_request(&self, facts: RequestFacts<'_>) -> Attempt {
+        self.begin_request_on_route(facts, None)
+    }
+
+    /// 路由来自本次请求的凭据快照，不能在查票后再改成另一个账号版本。
+    pub fn begin_request_on_route(
+        &self,
+        facts: RequestFacts<'_>,
+        route_fingerprint: Option<&str>,
+    ) -> Attempt {
         let settings = self.settings();
         let scope = Scope {
             account: facts.account.to_owned(),
@@ -157,7 +209,13 @@ impl TurnStateService {
             model: facts.model.to_owned(),
             client: Some(facts.client.to_owned()),
         };
-        let found = self.0.store.lookup(&scope, facts.egress, facts.now);
+        let found = self.0.store.lookup_on_route(
+            &scope,
+            facts.egress,
+            facts.now,
+            caps_of(&settings),
+            route_fingerprint,
+        );
         let verdict = decision::decide(
             found.as_ref().map(|(value, _)| value.as_str()),
             facts.carried,
@@ -181,8 +239,22 @@ impl TurnStateService {
             facts.carried.map(str::len),
             verdict.reason,
         );
+        let injected_route = value
+            .as_ref()
+            .and(found.as_ref())
+            .filter(|(_, found_scope)| found_scope.binding != scope.binding)
+            .and(route_fingerprint)
+            .map(str::to_owned);
         let reused = value.is_some();
         let had_template = found.is_some();
+        if !had_template {
+            self.note_demand(facts.account, facts.model, facts.now);
+        }
+        // 「改没改请求」和「这次请求用的是不是桶里这张模板」是两回事：客户端自带的 state
+        // 恰好就是桶里这张时不必改写请求，但换模型时要作废的仍是它。
+        let used = found
+            .filter(|(template, _)| reused || facts.carried == Some(template.as_str()))
+            .map(|(template, scope)| (scope, template));
         Attempt {
             service: self.clone(),
             settings,
@@ -191,7 +263,10 @@ impl TurnStateService {
             decision: verdict.decision,
             value,
             had_template,
+            injected_route,
             reused,
+            used,
+            rejected: false,
             candidate: None,
             upstream_len: None,
             observed: false,
@@ -202,7 +277,7 @@ impl TurnStateService {
     pub fn status(&self, account: &str, binding: &str, now: SystemTime) -> Vec<PinStatus> {
         self.0
             .store
-            .status(account, binding, now)
+            .status(account, binding, now, self.caps())
             .into_iter()
             .map(|record| PinStatus {
                 model: record.model,
@@ -249,11 +324,30 @@ impl TurnStateService {
         };
         self.0
             .store
-            .pin_account_wide(record, pin.now)
+            .pin_account_wide(record, pin.now, caps_of(&settings))
             .map_err(|error| match error {
                 StoreError::Full => PinRejected::Full,
                 StoreError::Io | StoreError::Path => PinRejected::Io,
             })
+    }
+
+    /// 云端票与签发路由共同构成模板身份，防止同一秒的新路由误保留旧路由的票。
+    /// 返回实际生效模板的摘要，不能把保留的更新模板谎报为本次新票。
+    pub fn pin_minted_account_wide(
+        &self,
+        mut pin: AccountWidePin<'_>,
+        route_fingerprint: &str,
+    ) -> Result<PinStatus, PinRejected> {
+        if route_fingerprint.is_empty() {
+            return Err(PinRejected::Io);
+        }
+        let binding = crate::binding::mint_binding(&pin.binding, route_fingerprint);
+        let (account, model, now, egress) = (pin.account, pin.model, pin.now, pin.egress.clone());
+        pin.binding = binding.clone();
+        pin.source = Source::Mint;
+        self.pin_account_wide(pin)?;
+        self.account_wide(account, &binding, model, &egress, now)
+            .ok_or(PinRejected::Io)
     }
 
     /// 当前出口上的账号级模板状态（不含值）。
@@ -267,7 +361,7 @@ impl TurnStateService {
     ) -> Option<PinStatus> {
         self.0
             .store
-            .account_wide_record(account, binding, model, egress, now)
+            .account_wide_record(account, binding, model, egress, now, self.caps())
             .map(|record| PinStatus {
                 model: record.model,
                 length: record.len,
@@ -293,7 +387,7 @@ impl TurnStateService {
     ) -> Option<SystemTime> {
         self.0
             .store
-            .account_wide_record(account, binding, model, egress, now)
+            .account_wide_record(account, binding, model, egress, now, self.caps())
             .map(|record| record.expires_at)
     }
 
@@ -308,7 +402,7 @@ impl TurnStateService {
     pub fn buckets(&self, now: SystemTime) -> Vec<BucketSummary> {
         self.0
             .store
-            .records(now)
+            .records(now, self.caps())
             .into_iter()
             .map(|record| BucketSummary {
                 scope: if record.client.is_none() {
@@ -337,6 +431,20 @@ impl TurnStateService {
     pub fn observations(&self, now: SystemTime) -> ObservationSnapshot {
         self.0.observations.snapshot(now)
     }
+
+    /// 记一次业务请求的模型对照结果；与账号是否启用固定 state 无关。
+    pub fn record_served(&self, account: &str, model: &str, served: ServedMatch, at: SystemTime) {
+        self.0
+            .observations
+            .record_served(account, model, served, at);
+    }
+}
+
+fn caps_of(settings: &Settings) -> TtlCaps {
+    TtlCaps {
+        template: settings.ttl(),
+        mint: settings.cloud_mint.ticket_ttl(),
+    }
 }
 
 /// 一次请求的 turn-state 生命周期：注入值、上游响应观测、完成后的被动捕获。
@@ -349,8 +457,14 @@ pub struct Attempt {
     value: Option<String>,
     /// 查桶时有没有有效模板；没有就是「缺票」，宿主据此触发云端打票预热。
     had_template: bool,
+    injected_route: Option<String>,
     /// 本请求复用了一个模板（含账号级回退）：完成后不再另立客户端级 pin。
     reused: bool,
+    /// 这次请求实际带出去的桶内模板（作用域与值）：注入的，或客户端自带且与桶内相同的。
+    /// 换模型时据此条件失效那一张。
+    used: Option<(Scope, String)>,
+    /// 上游这一轮换了模型：签发的票不入库。
+    rejected: bool,
     candidate: Option<String>,
     upstream_len: Option<usize>,
     observed: bool,
@@ -358,6 +472,11 @@ pub struct Attempt {
 }
 
 impl Attempt {
+    /// 只有本次确实注入云端票时才返回其路由约束。
+    pub fn injected_route(&self) -> Option<&str> {
+        self.injected_route.as_deref()
+    }
+
     pub const fn decision(&self) -> Decision {
         self.decision
     }
@@ -382,15 +501,45 @@ impl Attempt {
         self.observed = true;
         if let Some(value) = upstream {
             self.upstream_len = Some(value.len());
-            if self.candidate.is_none() && classify::storable(value, &self.settings) {
+            if !self.rejected
+                && self.candidate.is_none()
+                && classify::storable(value, &self.settings)
+            {
                 self.candidate = Some(value.to_owned());
             }
         }
     }
 
+    /// 上游这一轮声明的模型与发送的不一致：本轮签发的票不再入库，正在复用的那张模板
+    /// 也不能继续用。失效是条件的，桶里已经换成别的值时不动。可重复调用，只生效一次。
+    /// 模拟运行（`dry_run`）下不动桶里已有的模板，只是不收这一轮的新票。
+    pub fn served_mismatch(&mut self, now: SystemTime) {
+        if self.rejected {
+            return;
+        }
+        self.rejected = true;
+        self.candidate = None;
+        if self.service.settings().dry_run {
+            return;
+        }
+        let Some((scope, value)) = self.used.as_ref() else {
+            return;
+        };
+        if self.service.0.store.invalidate(scope, value, now) {
+            decision::log(
+                &self.settings,
+                Decision::Pass,
+                &self.scope.account,
+                &self.scope.model,
+                Some(value.len()),
+                "template dropped (served model mismatch)",
+            );
+        }
+    }
+
     /// 请求完整成功后调用：把首个可入库候选立为该客户端的 pin。
     pub fn completed(&mut self, now: SystemTime) {
-        if self.reused {
+        if self.reused || self.rejected {
             return;
         }
         let Some(value) = self.candidate.take() else {
@@ -401,7 +550,9 @@ impl Attempt {
         else {
             return;
         };
-        let expires_at = issued.at + self.settings.ttl();
+        // 寿命按完成这一刻的设置算：长请求进行中设置被调短时，不沿用开始时的旧值。
+        let current = self.service.settings();
+        let expires_at = issued.at + current.ttl();
         if expires_at <= now {
             return;
         }
@@ -426,7 +577,7 @@ impl Attempt {
             .service
             .0
             .store
-            .insert_passive(record, &self.egress, now)
+            .insert_passive(record, &self.egress, now, caps_of(&current))
         {
             decision::log(
                 &self.settings,

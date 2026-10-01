@@ -78,6 +78,14 @@ pub fn decide(live: Option<&str>, carried: Option<&str>, settings: &Settings) ->
             },
             replacement: Some(live.to_owned()),
         },
+        InjectMode::FillMissing => match carried {
+            None => Verdict {
+                decision: Decision::Inject,
+                reason: "added (request carried no state)",
+                replacement: Some(live.to_owned()),
+            },
+            Some(_) => Verdict::keep(Decision::Pass, "request carried its own state"),
+        },
         InjectMode::ReplaceOnly => match carried {
             Some(value) if settings.degraded_lengths.contains(&value.len()) => Verdict {
                 decision: Decision::Substitute,

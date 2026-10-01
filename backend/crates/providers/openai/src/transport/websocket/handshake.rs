@@ -102,6 +102,9 @@ impl CodexWebSocketConnection {
             connection,
             payload_text: websocket_response_create_payload_text(request)?,
             continuation: WebSocketContinuationRequirement::from_request(request),
+            requested_model: request.model().to_owned(),
+            discard_mismatched_connection: request.discard_mismatched_connection,
+            minted_turn_state_route: request.minted_turn_state_route.clone(),
         })
     }
 }
@@ -155,6 +158,7 @@ pub(super) fn websocket_connection_metadata(
             Some(response.status().as_u16()),
             response.headers(),
         ),
+        route_pair: None, // fork: served-mismatch，由 coordinator 按握手请求补上
     }
 }
 

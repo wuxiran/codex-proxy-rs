@@ -33,6 +33,41 @@ impl fmt::Debug for CodexResponseMetadata {
     }
 }
 
+impl CodexResponseMetadata {
+    /// 所有模型头都参与校验，不能让另一个同名头或别名头掩盖换模型。
+    pub(crate) fn has_model_mismatch(&self, requested: &str) -> bool {
+        self.client_headers.iter().any(|(name, value)| {
+            is_model_header(name)
+                && std::str::from_utf8(value).is_ok_and(|value| model_mismatches(requested, value))
+        })
+    }
+}
+
+fn is_model_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+}
+
+fn model_mismatches(requested: &str, declared: &str) -> bool {
+    !declared.is_empty() && !declared.eq_ignore_ascii_case(requested)
+}
+
+pub(super) fn event_has_model_mismatch(requested: &str, value: &serde_json::Value) -> bool {
+    [value.pointer("/response/headers"), value.get("headers")]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+        .flat_map(|headers| headers.iter())
+        .filter(|(name, _)| is_model_header(name))
+        .any(|(_, value)| match value {
+            serde_json::Value::String(model) => model_mismatches(requested, model),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|model| model_mismatches(requested, model)),
+            _ => false,
+        })
+}
+
 pub(super) fn diagnostics(
     status_code: Option<u16>,
     headers: &HeaderMap,

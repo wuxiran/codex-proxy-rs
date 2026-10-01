@@ -51,6 +51,7 @@ pub struct CodexCanonicalDecoder {
     response_service_tier: Option<String>,
     response_model: ResponseModelObservation,
     reported_model: Option<String>,
+    served_mismatch: bool,
     web_search_pricing: Option<WebSearchPricing>,
     timing_signals: ResponseEventSignals,
     raw_sse_passthrough: bool,
@@ -160,6 +161,7 @@ impl CodexCanonicalDecoder {
             response_service_tier: None,
             response_model: ResponseModelObservation::default(),
             reported_model: None,
+            served_mismatch: false,
             web_search_pricing: None,
             pricing: None,
             timing_signals: ResponseEventSignals::default(),
@@ -244,12 +246,14 @@ impl CodexCanonicalDecoder {
     /// 真实 HTTP 响应头提供初始报告；流内请求级报告可覆盖它。
     #[must_use]
     pub fn with_reported_model(mut self, model: Option<&str>) -> Self {
+        self.observe_served_declarations(model, None);
         self.reported_model = model.and_then(observed_model_name).map(str::to_owned);
         self
     }
 
     /// 接收 transport 已解析的内部 metadata 报告，内部帧无需交付客户端。
     pub(crate) fn observe_reported_model(&mut self, model: &str) {
+        self.observe_served_declarations(Some(model), None);
         if let Some(model) = observed_model_name(model) {
             self.reported_model = Some(model.to_owned());
         }
@@ -261,6 +265,28 @@ impl CodexCanonicalDecoder {
         self.reported_model
             .as_deref()
             .or_else(|| self.response_model.model())
+    }
+
+    /// 换模型是累积事实，不能被同一数据块内后到的匹配声明覆盖。
+    fn observe_served_declarations(&mut self, header: Option<&str>, body: Option<&str>) {
+        self.served_mismatch |= turn_state::served::compare(
+            &self.upstream_model,
+            header.filter(|model| !model.is_empty()),
+            body.filter(|model| !model.is_empty()),
+        ) == turn_state::ServedMatch::Mismatch;
+    }
+
+    pub(crate) const fn served_mismatch(&self) -> bool {
+        self.served_mismatch
+    }
+
+    pub(crate) fn note_served_mismatch(&mut self) {
+        self.served_mismatch = true;
+    }
+
+    /// fork: served-mismatch。响应头报告与正文声明分开返回，换模型可能只体现在其中一处。
+    pub(crate) fn declared_models(&self) -> (Option<&str>, Option<&str>) {
+        (self.reported_model.as_deref(), self.response_model.model())
     }
 
     fn decode(&mut self, events: Vec<SseEvent>) -> CodexCanonicalOutcome {
@@ -328,6 +354,12 @@ impl CodexCanonicalDecoder {
             return Ok(());
         }
         self.observe_response_service_tier(&value);
+        self.served_mismatch |=
+            super::response_meta::event_has_model_mismatch(&self.upstream_model, &value);
+        self.observe_served_declarations(
+            super::response_meta::reported_model_from_event(&value),
+            value.pointer("/response/model").and_then(Value::as_str),
+        );
         self.response_model.observe(event_type, &value);
         if let Some(model) = super::response_meta::reported_model_from_event(&value) {
             self.reported_model = Some(model.to_owned());
