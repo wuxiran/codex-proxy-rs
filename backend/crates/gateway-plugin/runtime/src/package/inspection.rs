@@ -35,28 +35,6 @@ impl PackageInspector {
 
 #[async_trait]
 impl PluginPackageInspector for PackageInspector {
-    fn permission_descriptions(
-        &self,
-        permissions: &[String],
-    ) -> Vec<gateway_admin::model::plugins::PluginPermissionDescription> {
-        permissions
-            .iter()
-            .map(|identifier| {
-                let permission = serde_json::from_value::<gateway_plugin_sdk::Permission>(
-                    serde_json::Value::String(identifier.clone()),
-                )
-                .ok();
-                gateway_admin::model::plugins::PluginPermissionDescription {
-                    permission: identifier.clone(),
-                    label: permission
-                        .map_or(identifier.as_str(), |value| value.label())
-                        .into(),
-                    description: permission.map_or("", |value| value.description()).into(),
-                }
-            })
-            .collect()
-    }
-
     async fn inspect(
         &self,
         archive: Arc<[u8]>,
@@ -73,6 +51,9 @@ impl PluginPackageInspector for PackageInspector {
             let package = ValidatedPackage::read(archive, expected_sha256.as_deref(), limits)
                 .map_err(inspection_error)?;
             let manifest = package.manifest();
+            if !super::compatibility::supports(manifest)? {
+                return Err(AdminError::invalid("插件能力与当前宿主不兼容"));
+            }
             let target = manifest
                 .package_for(&host_version, std::env::consts::OS, std::env::consts::ARCH)
                 .map_err(|_| AdminError::invalid("插件不支持当前网关版本或平台"))?;
@@ -122,11 +103,6 @@ impl PluginPackageInspector for PackageInspector {
                             },
                         ))
                     })
-                    .collect::<Result<_, _>>()?,
-                requested_permissions: manifest
-                    .permissions
-                    .iter()
-                    .map(identifier)
                     .collect::<Result<_, _>>()?,
                 configuration_schema: manifest.configuration_schema.clone(),
                 secret_fields: manifest.secret_fields.iter().cloned().collect(),

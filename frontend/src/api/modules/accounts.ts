@@ -248,10 +248,6 @@ export interface AccountQuotaForecast {
   estimatedTokensDisplay: string
   estimatedUsd: number | null
   estimatedUsdDisplay: string
-  remainingTokens: number | null
-  remainingTokensDisplay: string
-  remainingUsd: number | null
-  remainingUsdDisplay: string
   windowStartAt: string | null
   curve: AccountQuotaCurvePoint[]
   burnPercentPerHour: number | null

@@ -30,9 +30,6 @@ pub struct AccountQuotaForecast {
     pub incomplete_tokens: bool,
     pub estimated_tokens: Option<u64>,
     pub estimated_usd: Option<f64>,
-    /// 剩余估算始终属于源窗口，不随目标周期折算。
-    pub remaining_tokens: Option<u64>,
-    pub remaining_usd: Option<f64>,
     /// 源窗口起点，供消耗曲线确定横轴；窗口边界无效时为空。
     pub window_start_at: Option<DateTime<Utc>>,
     /// 源窗口内已观测的已用比例；与能否预测无关，样本不足时仍可展示。
@@ -99,8 +96,6 @@ pub fn account_quota_forecasts(
             incomplete_tokens: false,
             estimated_tokens: None,
             estimated_usd: None,
-            remaining_tokens: None,
-            remaining_usd: None,
             window_start_at: None,
             curve: Vec::new(),
             burn_percent_per_hour: None,
@@ -225,14 +220,13 @@ impl AccountQuotaForecast {
         let remaining_tokens = Some(sample.usage.tokens)
             .filter(|tokens| *tokens > 0)
             .and_then(|value| estimate(value as f64, remaining_factor));
-        self.remaining_tokens = remaining_tokens.and_then(|value| estimate_tokens(value, 1.0));
         self.estimated_tokens = remaining_tokens
             .and_then(|remaining| estimate_tokens(usage.tokens as f64 + remaining, factor));
-        self.remaining_usd = Some(&sample.usage)
+        let remaining_usd = Some(&sample.usage)
             .filter(|usage| usage.known_cost_count > 0 && usage.usd.is_finite() && usage.usd >= 0.0)
             .and_then(|usage| estimate(usage.usd, remaining_factor));
         self.estimated_usd = usd
-            .zip(self.remaining_usd)
+            .zip(remaining_usd)
             .and_then(|(used, remaining)| estimate(used + remaining, factor));
         self.unavailable_reason = if self.estimated_tokens.is_none() && self.estimated_usd.is_none()
         {

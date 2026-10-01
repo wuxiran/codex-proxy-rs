@@ -30,8 +30,6 @@ fn fork_quota_forecast_projection_exposes_curve_burn_and_exhaustion() {
         incomplete_tokens: false,
         estimated_tokens: Some(1_000_000),
         estimated_usd: None,
-        remaining_tokens: Some(0),
-        remaining_usd: None,
         window_start_at: Some(now),
         curve: vec![QuotaForecastCurvePoint {
             observed_at: now,

@@ -23,7 +23,9 @@ use crate::engine::middleware::{
     MiddlewareHeader, MiddlewareNext, MiddlewareRequest, MiddlewareResponse,
 };
 use crate::error::{PreDeliveryRetry, ProviderError, ProviderErrorKind};
-use crate::event::{EventSequenceValidator, GatewayEvent, ProtocolWireEvent, ProviderEvent};
+use crate::event::{
+    EventSequenceError, EventSequenceValidator, GatewayEvent, ProtocolWireEvent, ProviderEvent,
+};
 use crate::identity::ProviderKind;
 use crate::operation::Operation;
 use crate::policy::ClientApiKeyId;
@@ -233,7 +235,7 @@ pub struct ProviderStream {
     _lease: Box<dyn ResourceLease>,
     native_response_translator: Option<Box<dyn NativeResponseTranslator>>,
     account_feedback: Option<ProviderStreamAccountFeedback>,
-    validator: EventSequenceValidator,
+    validator: Result<EventSequenceValidator, EventSequenceError>,
     strict_canonical_seen: bool,
     terminated: bool,
 }
@@ -340,7 +342,7 @@ impl ProviderStream {
             _lease: Box::new(lease),
             native_response_translator: None,
             account_feedback: None,
-            validator: EventSequenceValidator::new(),
+            validator: Ok(EventSequenceValidator::new()),
             strict_canonical_seen: false,
             terminated: false,
         }
@@ -372,12 +374,6 @@ impl ProviderStream {
     ) -> Self {
         self.native_response_translator = Some(Box::new(translator));
         self
-    }
-
-    /// 返回本次 stream 是否需要原生响应转换。
-    #[must_use]
-    pub const fn has_native_response_translator(&self) -> bool {
-        self.native_response_translator.is_some()
     }
 
     /// 在 Core 已记录原始事实且完成 `BeforeTranslation` 后执行原生转换。
@@ -483,29 +479,22 @@ const MAX_ATTEMPT_HEADER_NAME_BYTES: usize = 128;
 const MAX_ATTEMPT_HEADER_VALUE_BYTES: usize = 16 * 1024;
 const MAX_ATTEMPT_HEADER_TOTAL_BYTES: usize = 64 * 1024;
 
-struct ProviderMiddlewareNext {
+fn provider_middleware_next(
     operation: Operation,
     transport: ClientTransport,
-    terminal: Option<ProviderMiddlewareTerminal>,
-}
-
-impl MiddlewareNext for ProviderMiddlewareNext {
-    fn run(
-        mut self: Box<Self>,
-        request: MiddlewareRequest,
-    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+    terminal: ProviderMiddlewareTerminal,
+) -> MiddlewareNext {
+    crate::middleware::compose(Vec::new(), move |request| {
         Box::pin(async move {
-            let fallback_protocol = self.operation.protocol().to_owned();
+            let fallback_protocol = operation.protocol().to_owned();
             if request.has_capability_declaration() {
                 return Err(MiddlewareError::InvalidState);
             }
             let (protocol, headers, body) = request.into_parts();
             validate_attempt_headers(&headers)?;
-            let operation = self
-                .operation
+            let operation = operation
                 .replace_middleware_wire(protocol, body)
                 .map_err(|_| MiddlewareError::InvalidState)?;
-            let terminal = self.terminal.take().ok_or(MiddlewareError::InvalidState)?;
             let stream = terminal(operation, headers)
                 .await
                 .map_err(MiddlewareError::Provider)?;
@@ -514,14 +503,14 @@ impl MiddlewareNext for ProviderMiddlewareNext {
             let body = ProviderMiddlewareBody {
                 stream,
                 pending: VecDeque::new(),
-                transport: self.transport,
+                transport,
             };
             Ok(
                 MiddlewareResponse::new(protocol, 200, Vec::new(), Box::new(body))
                     .with_provider_metadata(metadata),
             )
         })
-    }
+    })
 }
 
 fn validate_attempt_headers(headers: &[MiddlewareHeader]) -> Result<(), MiddlewareError> {
@@ -531,7 +520,6 @@ fn validate_attempt_headers(headers: &[MiddlewareHeader]) -> Result<(), Middlewa
     let mut total = 0_usize;
     for header in headers {
         let name = header.name();
-        let normalized = name.to_ascii_lowercase();
         if name.is_empty()
             || name.len() > MAX_ATTEMPT_HEADER_NAME_BYTES
             || !name
@@ -542,7 +530,6 @@ fn validate_attempt_headers(headers: &[MiddlewareHeader]) -> Result<(), Middlewa
                 .value()
                 .iter()
                 .any(|byte| *byte != b'\t' && (*byte < b' ' || *byte == 0x7f))
-            || attempt_header_is_protected(&normalized)
         {
             return Err(MiddlewareError::InvalidState);
         }
@@ -555,48 +542,6 @@ fn validate_attempt_headers(headers: &[MiddlewareHeader]) -> Result<(), Middlewa
         }
     }
     Ok(())
-}
-
-fn attempt_header_is_protected(name: &str) -> bool {
-    name.contains("auth")
-        || name.contains("credential")
-        || name.contains("secret")
-        || name.contains("token")
-        || name.contains("cookie")
-        || name.contains("session")
-        || name.contains("conversation")
-        || name.contains("thread")
-        || name.contains("account")
-        || name.contains("organization")
-        || name.contains("project")
-        || name.contains("tenant")
-        || name.contains("principal")
-        || name.contains("identity")
-        || name.contains("user-id")
-        || name.ends_with("-key")
-        || name.ends_with("_key")
-        || name.starts_with("sec-websocket-")
-        || matches!(
-            name,
-            "connection"
-                | "keep-alive"
-                | "proxy-connection"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-                | "host"
-                | "content-length"
-                | "content-type"
-                | "content-encoding"
-                | "accept"
-                | "accept-encoding"
-                | "user-agent"
-                | "x-request-id"
-                | "x-gateway-request-id"
-        )
 }
 
 struct ProviderMiddlewareBody {
@@ -728,11 +673,7 @@ pub async fn execute_attempt_middleware(
         .handle(
             context,
             request,
-            Box::new(ProviderMiddlewareNext {
-                operation,
-                transport,
-                terminal: Some(terminal),
-            }),
+            provider_middleware_next(operation, transport, terminal),
         )
         .await
         .map_err(middleware_prepare_error)?;
@@ -821,11 +762,14 @@ fn middleware_frame_to_provider_event(
 fn middleware_prepare_error(error: MiddlewareError) -> ProviderError {
     match error {
         MiddlewareError::Provider(error) => error,
-        MiddlewareError::Rejected => ProviderError::new(
-            ProviderErrorKind::RequestPolicyDenied,
-            UpstreamSendState::NotSent,
-        ),
+        MiddlewareError::Rejected | MiddlewareError::Remote { rejected: true, .. } => {
+            ProviderError::new(
+                ProviderErrorKind::RequestPolicyDenied,
+                UpstreamSendState::NotSent,
+            )
+        }
         MiddlewareError::Fault
+        | MiddlewareError::Remote { .. }
         | MiddlewareError::InvalidState
         | MiddlewareError::Gateway(_)
         | MiddlewareError::Engine(_) => middleware_protocol_error(UpstreamSendState::NotSent),
@@ -835,11 +779,14 @@ fn middleware_prepare_error(error: MiddlewareError) -> ProviderError {
 fn middleware_body_error(error: MiddlewareError) -> ProviderError {
     match error {
         MiddlewareError::Provider(error) => error,
-        MiddlewareError::Rejected => ProviderError::new(
-            ProviderErrorKind::RequestPolicyDenied,
-            UpstreamSendState::Ambiguous,
-        ),
+        MiddlewareError::Rejected | MiddlewareError::Remote { rejected: true, .. } => {
+            ProviderError::new(
+                ProviderErrorKind::RequestPolicyDenied,
+                UpstreamSendState::Ambiguous,
+            )
+        }
         MiddlewareError::Fault
+        | MiddlewareError::Remote { .. }
         | MiddlewareError::InvalidState
         | MiddlewareError::Gateway(_)
         | MiddlewareError::Engine(_) => middleware_protocol_error(UpstreamSendState::Ambiguous),
@@ -874,23 +821,25 @@ impl Stream for ProviderStream {
         match this.events.as_mut().poll_next(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(event))) => {
-                // 带 wire 的 canonical facts 只是旁路观测：wire 才是客户端协议的
-                // 权威表达。只有 canonical-only Provider 输出需要以状态机作为交付条件。
-                if event.wire_event().is_none() && !event.canonical_facts().is_empty() {
-                    this.strict_canonical_seen = true;
-                    for fact in event.canonical_facts() {
-                        if this.validator.observe(fact).is_err() {
-                            this.terminated = true;
-                            let error = ProviderError::new(
-                                ProviderErrorKind::Protocol,
-                                UpstreamSendState::Sent,
-                            );
-                            if let Some(feedback) = this.account_feedback.as_mut() {
-                                feedback.report_failure(&error);
-                            }
-                            return Poll::Ready(Some(Err(error)));
-                        }
+                // 纯 wire 流的 facts 仍只是旁路观测；一旦交付 canonical-only
+                // 事件，就必须校验完整事实序列，不能漏掉带 wire 的开始或终态。
+                this.strict_canonical_seen |=
+                    event.wire_event().is_none() && !event.canonical_facts().is_empty();
+                for fact in event.canonical_facts() {
+                    if let Ok(validator) = &mut this.validator
+                        && let Err(error) = validator.observe(fact)
+                    {
+                        this.validator = Err(error);
                     }
+                }
+                if this.strict_canonical_seen && this.validator.is_err() {
+                    this.terminated = true;
+                    let error =
+                        ProviderError::new(ProviderErrorKind::Protocol, UpstreamSendState::Sent);
+                    if let Some(feedback) = this.account_feedback.as_mut() {
+                        feedback.report_failure(&error);
+                    }
+                    return Poll::Ready(Some(Err(error)));
                 }
                 if let Some(feedback) = this.account_feedback.as_mut() {
                     feedback.observe(&event);
@@ -907,7 +856,10 @@ impl Stream for ProviderStream {
             Poll::Ready(None) => {
                 this.terminated = true;
                 let validation = if this.strict_canonical_seen {
-                    this.validator.finish()
+                    this.validator
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(EventSequenceValidator::finish)
                 } else {
                     Ok(())
                 };

@@ -20,6 +20,7 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
+pub mod service;
 mod use_case;
 pub use use_case::plugins::{PluginDistributionPorts, PluginManagementService, PluginsService};
 
@@ -195,6 +196,7 @@ pub enum AdminConfigError {
 /// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块。
 #[derive(Clone)]
 pub struct AdminServices {
+    public_services: Arc<service::Registry>,
     plugins: Arc<PluginsService>,
     plugin_management: Arc<PluginManagementService>,
     proxies: Arc<dyn ProxiesService>,
@@ -215,6 +217,10 @@ pub struct AdminServices {
 }
 
 impl AdminServices {
+    pub fn public_services(&self) -> Arc<service::Registry> {
+        self.public_services.clone()
+    }
+
     #[must_use]
     pub fn plugin_management(&self) -> &PluginManagementService {
         &self.plugin_management
@@ -276,7 +282,6 @@ impl AdminServices {
         self.observability.as_ref()
     }
 
-    #[must_use]
     pub fn settings(&self) -> &dyn SettingsService {
         self.settings.as_ref()
     }
@@ -323,6 +328,7 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
 pub struct AdminRuntimePorts {
+    pub service_middleware: service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,
     pub plugin_management: Arc<dyn ports::plugin_management::PluginManagement>,
     pub published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle,
@@ -372,6 +378,7 @@ async fn initialize_inner(
     plugin_accounts: Option<Arc<dyn PluginAccountAccess>>,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        service_middleware,
         plugin_preparation,
         plugin_management,
         published_snapshot,
@@ -428,6 +435,7 @@ async fn initialize_inner(
     let system_preflight = Arc::new(use_case::plugin_update::PluginSystemUpdatePreflight::new(
         store.plugins(),
         plugin_inspector.clone(),
+        snapshot.clone(),
     ));
     let system = Arc::new(DefaultSystemService::new(system, system_preflight));
     let key_usage = Arc::new(use_case::key_usage::DefaultKeyUsageService::new(
@@ -448,8 +456,17 @@ async fn initialize_inner(
     });
     let import_tasks = use_case::import_tasks::DefaultImportTasksService::new(credentials.clone());
     let import_task = use_case::import_tasks::ImportTaskWorker(import_tasks.clone());
+    let settings = initialize_settings(
+        store.settings(),
+        snapshot.clone(),
+        registry.clone(),
+        pricing_source,
+    );
+    let mut public_services = service::Registry::new(service_middleware);
+    public_services.register_settings(&settings)?;
     let services = AdminServices {
         fork: fork::ForkServices::default(), // fork: services
+        public_services: Arc::new(public_services),
         plugin_management: Arc::new(PluginManagementService::new(
             plugin_management,
             store.plugins(),
@@ -490,12 +507,7 @@ async fn initialize_inner(
             store.settings(),
             registry.clone(),
         )),
-        settings: Arc::new(DefaultSettingsService::new(
-            store.settings(),
-            snapshot.clone(),
-            registry,
-            pricing_source,
-        )),
+        settings,
         system,
         credentials,
         plugin_accounts,
@@ -612,4 +624,19 @@ fn freeze_recovery_worker_contribution(
     )
     .map_err(|_| AdminError::internal("冻结恢复 Worker 注册信息不合法"))?;
     Ok(vec![WorkerContribution::Registration(registration)])
+}
+
+/// 设置服务不依赖 Web 管理会话，CLI 与服务器通过同一用例执行事务和发布。
+pub fn initialize_settings(
+    store: Arc<dyn ports::store::SettingsStore>,
+    snapshot: Arc<dyn SnapshotControl>,
+    providers: ProviderAdminRegistry,
+    pricing_source: Arc<dyn ports::pricing::PricingSource>,
+) -> Arc<dyn SettingsService> {
+    Arc::new(DefaultSettingsService::new(
+        store,
+        snapshot,
+        providers,
+        pricing_source,
+    ))
 }

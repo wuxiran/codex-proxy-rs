@@ -52,15 +52,18 @@ const exhaustion = computed(() => {
   }
 })
 
-// 「刷新额度」由父级执行；结束后重新取样，让曲线末点跟上新的已用比例。
-watch(() => props.refreshing, (refreshing, wasRefreshing) => {
-  if (wasRefreshing && !refreshing)
-    void load()
-})
+// 面板和预测弹窗都能刷新额度；账号快照变化后统一取样，避免曲线停留在旧值。
+watch(
+  [() => props.refreshing, () => props.account.quota],
+  ([refreshing, quota], [wasRefreshing, previousQuota]) => {
+    if (!refreshing && (wasRefreshing || quota !== previousQuota))
+      void load()
+  },
+)
 </script>
 
 <template>
-  <div class="mt-4 grid min-h-0 flex-1 content-start gap-3 border-t border-cp-split pt-3">
+  <div class="mt-4 grid min-h-0 min-w-0 flex-1 grid-cols-1 content-start gap-3 border-t border-cp-split pt-3">
     <dl class="m-0 flex flex-wrap items-baseline gap-x-5 gap-y-1 text-cp-xs">
       <div class="flex items-baseline gap-1.5">
         <dt class="font-emphasis text-cp-text-secondary">
@@ -94,7 +97,7 @@ watch(() => props.refreshing, (refreshing, wasRefreshing) => {
       </div>
     </dl>
 
-    <div aria-live="polite" :aria-busy="loading">
+    <div class="min-w-0" aria-live="polite" :aria-busy="loading">
       <BaseSkeleton v-if="loading && !forecast" class="h-28 w-full" />
       <div v-else-if="error && !forecast" class="grid h-28 place-items-center gap-2 text-center">
         <p class="m-0 text-cp-xs text-cp-text-tertiary">
@@ -104,7 +107,7 @@ watch(() => props.refreshing, (refreshing, wasRefreshing) => {
           重新加载
         </BaseButton>
       </div>
-      <figure v-else-if="option" class="m-0">
+      <figure v-else-if="option" class="m-0 min-w-0">
         <figcaption class="mb-1 flex items-baseline justify-between gap-2 text-cp-xs">
           <span class="font-emphasis text-cp-text-secondary">{{ forecast?.source?.label ?? '额度' }}消耗曲线</span>
           <span v-if="forecast?.lowSample" class="text-cp-text-quaternary">样本较少，仅供参考</span>

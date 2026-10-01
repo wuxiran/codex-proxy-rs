@@ -19,14 +19,11 @@ use gateway_core::{
 use serde_json::{Value, json};
 use tokio::{sync::Notify, time::timeout};
 
-use crate::support::{
-    environment::{Environment, account_grant},
-    native,
-};
+use crate::support::{environment::Environment, native};
 
 #[tokio::test]
 async fn plugin_process_manages_native_budget_through_client_key_service() {
-    for granted in [false, true] {
+    {
         let Some(environment) = Environment::create().await else {
             eprintln!("SKIP: plugin integration environment absent");
             return;
@@ -56,7 +53,7 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
                 {"method":"host.keys.update_budget_limits","query":{"client_key_id":"key_budget","max_concurrency":1}},
                 {"method":"host.keys.get_budget","query":{"client_key_id":"key_budget","instance_id":"forged"}}
             ]
-        }), if granted { vec![account_grant("key_budgets")] } else { vec![] }).await;
+        })).await;
         let (runtime, core) = environment.runtime().await;
         let access = gateway_admin::initialize_plugin_client_keys(
             native::admin_registry(),
@@ -74,6 +71,7 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
             .handle(
                 &view.target,
                 PluginManagementRequest {
+                    headers: Vec::new(),
                     method: "POST".into(),
                     path: "reset".into(),
                     query: String::new(),
@@ -87,7 +85,7 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
         let results: Vec<Value> = serde_json::from_slice(&reply.body).unwrap();
         let after = store.get_client_key(&key).await.unwrap().unwrap();
         let audits = environment.audit_requests("reset_budget").await;
-        if granted {
+        {
             assert_eq!(
                 results[0],
                 json!({"keys":[{"id":"key_budget","name":"fixture key_budget","enabled":true}],"next_cursor":null})
@@ -108,7 +106,7 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
                 "client_key_id":"key_budget", "daily_limit_usd":"10", "weekly_limit_usd":"20",
                 "daily_used_usd":"3", "weekly_used_usd":"0",
                 "daily_resets_at_ms":before.budget.daily_resets_at.map(|time| chrono::DateTime::<chrono::Utc>::from(time).timestamp_millis()),
-                "weekly_resets_at_ms":before.budget.weekly_resets_at.map(|time| chrono::DateTime::<chrono::Utc>::from(time).timestamp_millis()),
+                "weekly_resets_at_ms":null,
             });
             assert_eq!(results[6], expected);
             assert_eq!(results[7], json!({"client_key_id":"key_budget"}));
@@ -128,20 +126,9 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
                 1
             );
             assert_eq!(after.budget.daily_resets_at, before.budget.daily_resets_at);
-            assert_eq!(
-                after.budget.weekly_resets_at,
-                before.budget.weekly_resets_at
-            );
+            assert_eq!(after.budget.weekly_resets_at, None);
             assert_eq!(audits.len(), 1);
             assert!(audits[0].starts_with(&format!("plugin:{}:scope:", view.target.instance_id)));
-        } else {
-            assert!(
-                results
-                    .iter()
-                    .all(|value| value == &json!({"error":"permission_denied"}))
-            );
-            assert_eq!(after.budget, before.budget);
-            assert!(audits.is_empty());
         }
         assert_eq!(
             store
@@ -203,13 +190,10 @@ async fn command_plane_resets_budget_with_only_budget_permission() {
     };
     let key = seed_budget(&environment).await;
     environment
-        .install_plugin(
-            json!({
-                "command_registration":{"commands":[{"name":"reset","description":"预算接口测试"}]},
-                "data_queries":reset_queries()
-            }),
-            vec![account_grant("key_budgets")],
-        )
+        .install_plugin(json!({
+            "command_registration":{"commands":[{"name":"reset","description":"预算接口测试"}]},
+            "data_queries":reset_queries()
+        }))
         .await;
     let (runtime, core) = environment.command_plane().await;
     let store = environment.store.admin_ports().client_keys();
@@ -265,14 +249,11 @@ async fn published_maintenance_resets_budget_with_only_budget_permission() {
         .path()
         .join("budget-maintenance.jsonl");
     environment
-        .install_plugin(
-            json!({
-                "maintenance_fixture":true,
-                "maintenance_marker":marker,
-                "data_queries":reset_queries()
-            }),
-            vec![account_grant("key_budgets")],
-        )
+        .install_plugin(json!({
+            "maintenance_fixture":true,
+            "maintenance_marker":marker,
+            "data_queries":reset_queries()
+        }))
         .await;
     let (runtime, core) = environment.runtime().await;
     let store = environment.store.admin_ports().client_keys();
@@ -393,7 +374,7 @@ async fn losing_callback_reply_after_commit_keeps_budget_and_audit_without_repla
                 "startup_marker":startups,
                 "exit_after_ready_signals":[disconnect]
             }),
-            vec![account_grant("key_budgets")],
+
         )
         .await;
     let (runtime, core) = environment.runtime().await;
@@ -419,6 +400,7 @@ async fn losing_callback_reply_after_commit_keeps_budget_and_audit_without_repla
             .handle(
                 &view.target,
                 PluginManagementRequest {
+                    headers: Vec::new(),
                     method: "POST".into(),
                     path: "reset".into(),
                     query: String::new(),

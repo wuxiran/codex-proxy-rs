@@ -28,7 +28,7 @@ use gateway_core::runtime::extensions::ExtensionSetReference;
 
 /// Admin 准备完整候选并保活到提交后的发布结束；进程状态不能代替持久启用状态。
 #[async_trait]
-pub trait PluginPreparation: Send + Sync {
+pub trait PluginPreparation: PluginRuntimeDiagnostics + PluginStateLifecycle {
     /// 静态判断业务配置是否完整，不启动进程；不完整的安装保留为待配置。
     async fn configuration_ready(
         &self,
@@ -44,36 +44,33 @@ pub trait PluginPreparation: Send + Sync {
         &self,
         snapshot: PluginInstanceSnapshot,
     ) -> Result<ExtensionSetReference, AdminError>;
-    /// 返回当前进程的只读运行事实；缺省实现让不托管插件进程的组合保持兼容。
+}
+
+/// 运行诊断独立于发布准备；没有进程事实时显式返回 None。
+#[async_trait]
+pub trait PluginRuntimeDiagnostics: Send + Sync {
     async fn runtime_diagnostics(
         &self,
-        _snapshot: &PluginInstanceSnapshot,
-        _published_revision: Option<u64>,
-        _published: Option<&ExtensionSetReference>,
-    ) -> Option<BTreeMap<String, PluginInstanceRuntime>> {
-        None
-    }
+        snapshot: &PluginInstanceSnapshot,
+        published_revision: Option<u64>,
+        published: Option<&ExtensionSetReference>,
+    ) -> Option<BTreeMap<String, PluginInstanceRuntime>>;
+}
+
+/// 发布实现必须显式承担状态激活、排空和迁移，不能以缺省成功跳过生命周期。
+#[async_trait]
+pub trait PluginStateLifecycle: Send + Sync {
     async fn activate_state(
         &self,
-        _prepared: &ExtensionSetReference,
-        _instance: &PluginInstance,
-    ) -> Result<(), AdminError> {
-        Ok(())
-    }
-    async fn quiesce_instance(
-        &self,
-        _instance_id: &str,
-        _artifact_sha256: &str,
-        _revision: Revision,
-    ) {
-    }
+        prepared: &ExtensionSetReference,
+        instance: &PluginInstance,
+    ) -> Result<(), AdminError>;
+    async fn quiesce_instance(&self, instance_id: &str, artifact_sha256: &str, revision: Revision);
     async fn migrate_state(
         &self,
-        _prepared: &ExtensionSetReference,
-        _transition: PluginStateTransition,
-    ) -> Result<(), AdminError> {
-        Err(AdminError::unavailable("插件状态迁移运行时不可用"))
-    }
+        prepared: &ExtensionSetReference,
+        transition: PluginStateTransition,
+    ) -> Result<(), AdminError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,23 +173,6 @@ pub trait PluginDistribution: Send + Sync {
 /// Runtime 只解释插件包格式；安装事务与来源选择归 Admin。
 #[async_trait]
 pub trait PluginPackageInspector: Send + Sync {
-    /// 当前宿主对权限标识的说明，供展示投影使用，不属于不可变制品元数据。
-    fn permission_descriptions(
-        &self,
-        permissions: &[String],
-    ) -> Vec<crate::model::plugins::PluginPermissionDescription> {
-        permissions
-            .iter()
-            .map(
-                |permission| crate::model::plugins::PluginPermissionDescription {
-                    permission: permission.clone(),
-                    label: permission.clone(),
-                    description: String::new(),
-                },
-            )
-            .collect()
-    }
-
     async fn inspect(
         &self,
         archive: Arc<[u8]>,
@@ -238,6 +218,19 @@ pub trait PluginStore: Send + Sync {
     /// 只返回有可恢复配置的制品摘要，不读取敏感值。
     async fn configuration_versions(&self, _id: &str) -> AdminStoreResult<Vec<String>> {
         Ok(Vec::new())
+    }
+    /// 在单个事务中停用确认快照中的实例，保留配置、密钥及私有状态。
+    async fn disable_instances(
+        &self,
+        _ids: &[String],
+        _expected_revision: Revision,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(super::store::AdminStoreError::new(
+            super::store::AdminStoreErrorKind::Unavailable,
+            "plugin",
+            "atomic plugin disable is unavailable",
+        ))
     }
     async fn save_instance(
         &self,
@@ -314,7 +307,7 @@ pub trait PluginStore: Send + Sync {
         source: PluginSource,
         context: &MutationContext,
     ) -> AdminStoreResult<PluginArtifactMutation>;
-    /// 接受不可变制品声明的全部能力域；接受事实不随实例设置变化。
+    /// 确认信任并安装精确摘要的制品；安装事实不随实例设置变化。
     async fn accept_artifact(
         &self,
         digest: &str,

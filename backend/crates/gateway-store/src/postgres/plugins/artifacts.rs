@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use gateway_admin::model::audit::MutationAuditOperation;
 use gateway_admin::model::plugins::distribution::{SourceCredential, SourceCredentialInfo};
 use gateway_admin::{
     model::{
@@ -54,13 +55,9 @@ pub(super) fn not_found() -> AdminStoreError {
 pub(super) fn decode_metadata(
     row: &sqlx::postgres::PgRow,
 ) -> AdminStoreResult<PluginArtifactMetadata> {
-    let mut metadata: serde_json::Value =
+    let metadata: sqlx::types::Json<PluginArtifactMetadata> =
         row.try_get("metadata_json").map_err(|_| unavailable())?;
-    // 兼容开发期已写入的展示说明；忽略这一旧字段，其他未知字段仍严格拒绝。
-    if let Some(metadata) = metadata.as_object_mut() {
-        metadata.remove("permissionDescriptions");
-    }
-    serde_json::from_value(metadata).map_err(|_| unavailable())
+    Ok(metadata.0)
 }
 
 fn decode(row: &sqlx::postgres::PgRow) -> AdminStoreResult<InstalledPluginArtifact> {
@@ -98,6 +95,14 @@ impl PluginStore for PgPluginStore {
     }
     async fn configuration_versions(&self, id: &str) -> AdminStoreResult<Vec<String>> {
         super::instances::configuration_versions(&self.pool, id).await
+    }
+    async fn disable_instances(
+        &self,
+        ids: &[String],
+        expected: Revision,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        super::instances::disable(&self.pool, ids, expected, context).await
     }
     async fn save_instance(
         &self,
@@ -272,8 +277,7 @@ impl PluginStore for PgPluginStore {
             &mut transaction,
             mutation_audit(
                 context,
-                "install",
-                "plugin_artifact",
+                MutationAuditOperation::PluginArtifactInstall,
                 &metadata.plugin_id,
                 vec!["artifact".into(), "source".into()],
             ),
@@ -319,10 +323,9 @@ impl PluginStore for PgPluginStore {
                 &mut transaction,
                 mutation_audit(
                     context,
-                    "accept",
-                    "plugin_artifact",
+                    MutationAuditOperation::PluginArtifactAccept,
                     digest,
-                    vec!["permissions".into()],
+                    vec!["acceptedAt".into()],
                 ),
                 revision,
             )
@@ -377,8 +380,7 @@ impl PluginStore for PgPluginStore {
             &mut transaction,
             mutation_audit(
                 context,
-                "delete",
-                "plugin_artifact",
+                MutationAuditOperation::PluginArtifactDelete,
                 &id,
                 vec!["artifact".into()],
             ),

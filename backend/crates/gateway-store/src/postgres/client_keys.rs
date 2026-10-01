@@ -1,5 +1,6 @@
 //! 明文 `client_api_keys` 的 PostgreSQL owner。
 
+use gateway_admin::model::audit::MutationAuditOperation;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -724,8 +725,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 .await
                 .map_err(|_| map_error(postgres_unavailable("begin budget limits update")))?,
             ClientKeyBudgetMutationOrigin::Plugin(owner) => {
-                super::plugins::begin_authorized_mutation(&self.keys.pool, owner, "key_budgets")
-                    .await?
+                super::plugins::begin_plugin_mutation(&self.keys.pool, owner).await?
             }
         };
         // 保持与完整 Key 编辑相同的锁顺序；绝不读出整份配置再覆盖写回。
@@ -784,8 +784,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
             &mut tx,
             mutation_audit(
                 context,
-                "update_budget_limits",
-                "client_api_key",
+                MutationAuditOperation::ClientApiKeyUpdateBudgetLimits,
                 command.id.as_str(),
                 fields,
             ),
@@ -885,8 +884,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 },
                 mutation_audit(
                     context,
-                    "create",
-                    "client_api_key",
+                    MutationAuditOperation::ClientApiKeyCreate,
                     id.as_str(),
                     [
                         "name",
@@ -936,8 +934,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 },
                 mutation_audit(
                     context,
-                    "update",
-                    "client_api_key",
+                    MutationAuditOperation::ClientApiKeyUpdate,
                     id.as_str(),
                     [
                         "name",
@@ -972,8 +969,9 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 command.enabled,
                 mutation_audit(
                     context,
-                    if command.enabled { "enable" } else { "disable" },
-                    "client_api_key",
+                    MutationAuditOperation::ClientApiKeyEnabled {
+                        enabled: command.enabled,
+                    },
                     id.as_str(),
                     vec!["enabled".to_owned()],
                 ),
@@ -993,8 +991,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 command.id.as_str(),
                 mutation_audit(
                     context,
-                    "delete",
-                    "client_api_key",
+                    MutationAuditOperation::ClientApiKeyDelete,
                     command.id.as_str(),
                     Vec::new(),
                 ),

@@ -15,6 +15,7 @@ pub mod policy;
 pub mod probe;
 pub mod provider;
 pub mod response_control;
+pub mod upstream_adapter;
 
 pub use coordinator::{AttemptCoordinator, ResponseExecutionSession};
 
@@ -33,9 +34,7 @@ use crate::account::{
     OutboundProxy, ProviderAccountId, RequestLocation,
 };
 use crate::engine::continuation::{ContinuationBinding, NativeContinuationPin};
-use crate::error::{
-    GatewayError, ProviderConnectionObservation, ProviderError, ProviderErrorKind, StoreError,
-};
+use crate::error::{GatewayError, ProviderConnectionObservation, ProviderError, StoreError};
 use crate::event::ProviderEvent;
 use crate::identity::ProviderKind;
 use crate::lifecycle::CancellationToken;
@@ -118,39 +117,6 @@ impl AttemptTrigger {
         match self {
             Self::Initial => "initial",
             Self::AccountRetry => "account_retry",
-        }
-    }
-}
-
-/// 一次实际上游调用的诊断结果。
-///
-/// 该事实只描述调用结果，不参与跨请求的路由屏蔽。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderAttemptOutcome {
-    /// 上游流自然完成且通过 canonical event 序列校验。
-    Succeeded { provider_kind: ProviderKind },
-    /// 上游打开或流式阶段返回了稳定 Provider 错误。
-    Failed {
-        provider_kind: ProviderKind,
-        error_kind: ProviderErrorKind,
-    },
-}
-
-impl ProviderAttemptOutcome {
-    /// 返回本次调用实际归属的 Provider。
-    #[must_use]
-    pub const fn provider_kind(&self) -> &ProviderKind {
-        match self {
-            Self::Succeeded { provider_kind } | Self::Failed { provider_kind, .. } => provider_kind,
-        }
-    }
-
-    /// 成功返回 `None`，失败返回稳定 Provider 错误分类。
-    #[must_use]
-    pub const fn error_kind(&self) -> Option<ProviderErrorKind> {
-        match self {
-            Self::Succeeded { .. } => None,
-            Self::Failed { error_kind, .. } => Some(*error_kind),
         }
     }
 }
@@ -381,6 +347,8 @@ pub struct RequestAttemptContext {
     request_policy: Option<policy::RequestPolicyContext>,
     execution_effects: Option<Arc<nested::ExecutionEffects>>,
     middleware: Option<middleware::FrozenMiddlewarePlan>,
+    upstream_adapters: Option<upstream_adapter::FrozenUpstreamAdapterPlan>,
+    requested_model: Option<PublicModelId>,
     account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
     endpoint: String,
     client_transport: execution::ClientTransport,
@@ -388,6 +356,21 @@ pub struct RequestAttemptContext {
 }
 
 impl RequestAttemptContext {
+    #[must_use]
+    pub fn with_requested_model(mut self, model: Option<PublicModelId>) -> Self {
+        self.requested_model = model;
+        self
+    }
+
+    #[must_use]
+    pub fn with_upstream_adapters(
+        mut self,
+        plan: Option<upstream_adapter::FrozenUpstreamAdapterPlan>,
+    ) -> Self {
+        self.upstream_adapters = plan;
+        self
+    }
+
     #[must_use]
     pub fn with_response_control(
         mut self,
@@ -453,6 +436,8 @@ impl RequestAttemptContext {
             request_policy: None,
             execution_effects: None,
             middleware: None,
+            upstream_adapters: None,
+            requested_model: None,
             account_group_ids: Arc::from([]),
             endpoint: String::new(),
             client_transport: execution::ClientTransport::InternalProbe,
@@ -591,6 +576,38 @@ pub struct AttemptContext {
 }
 
 impl AttemptContext {
+    #[must_use]
+    pub fn execution_effects(&self) -> Option<Arc<nested::ExecutionEffects>> {
+        self.request.execution_effects.as_ref().map(Arc::clone)
+    }
+
+    #[must_use]
+    pub const fn requested_model(&self) -> Option<&PublicModelId> {
+        self.request.requested_model.as_ref()
+    }
+
+    /// 从本次请求冻结的发布代次选择上游适配器；不建立连接、不重新选号。
+    pub fn upstream_adapter(
+        &self,
+        provider: &ProviderKind,
+        model: &UpstreamModelId,
+    ) -> Result<Option<Arc<dyn upstream_adapter::UpstreamAdapter>>, ProviderError> {
+        self.request
+            .upstream_adapters
+            .as_ref()
+            .map_or(Ok(None), |plan| plan.select(self, provider, model))
+    }
+
+    #[must_use]
+    pub fn account_group_ids(&self) -> &[crate::account::scope::AccountGroupId] {
+        &self.request.account_group_ids
+    }
+
+    #[must_use]
+    pub const fn client_transport(&self) -> execution::ClientTransport {
+        self.request.client_transport
+    }
+
     #[must_use]
     pub fn response_control(&self) -> Option<&response_control::ResponseControl> {
         self.request.response_control.as_ref()

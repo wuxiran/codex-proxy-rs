@@ -160,7 +160,7 @@ async fn usage_page_should_always_return_total() {
 }
 
 #[tokio::test]
-async fn usage_list_should_resolve_current_notes_by_account_id() {
+async fn usage_list_and_diagnostics_should_resolve_current_account_metadata_by_id() {
     let Some(database) = TestDatabase::create("usage_account_notes").await else {
         return;
     };
@@ -197,12 +197,20 @@ async fn usage_list_should_resolve_current_notes_by_account_id() {
             .expect("admin observability range");
     let store = admin_observability_store(&database.pool);
 
-    for notes in [None, Some("个人主号"), Some("个人备用号"), None] {
-        sqlx::query("update provider_accounts set notes = $1 where id = 'acct_observe'")
-            .bind(notes)
-            .execute(&database.pool)
-            .await
-            .expect("update current account notes");
+    for (notes, plan) in [
+        (None, Some("pro")),
+        (Some("个人主号"), Some("plus")),
+        (Some("个人备用号"), Some("pro")),
+        (None, None),
+    ] {
+        sqlx::query(
+            "update provider_accounts set notes = $1, plan_type = $2 where id = 'acct_observe'",
+        )
+        .bind(notes)
+        .bind(plan)
+        .execute(&database.pool)
+        .await
+        .expect("update current account notes");
         let page = store
             .list_usage_records(admin_observability::UsageQuery {
                 range,
@@ -230,6 +238,36 @@ async fn usage_list_should_resolve_current_notes_by_account_id() {
         );
         assert_eq!(personal.provider_account_email, team.provider_account_email);
         assert_eq!(personal.provider_account_notes.as_deref(), notes);
+        assert_eq!(personal.provider_account_plan_type.as_deref(), plan);
+        assert_eq!(team.provider_account_plan_type.as_deref(), Some("team"));
+        let diagnostics = store
+            .usage_diagnostics(
+                range,
+                admin_observability::UsageFilter::default(),
+                admin_observability::DiagnosticDimension::Account,
+            )
+            .await
+            .expect("account plans");
+        assert_eq!(
+            diagnostics
+                .items
+                .iter()
+                .find(|item| item.key == "acct_observe")
+                .expect("personal diagnostics")
+                .account_plan_type
+                .as_deref(),
+            plan
+        );
+        assert_eq!(
+            diagnostics
+                .items
+                .iter()
+                .find(|item| item.key == "acct_team")
+                .expect("team diagnostics")
+                .account_plan_type
+                .as_deref(),
+            Some("team")
+        );
         assert_eq!(team.provider_account_notes.as_deref(), Some("团队工作区"));
     }
 
@@ -274,6 +312,19 @@ async fn usage_list_should_resolve_current_notes_by_account_id() {
         Some("account@example.invalid")
     );
     assert_eq!(page.items[0].provider_account_notes, None);
+    assert_eq!(page.items[0].provider_account_plan_type, None);
+    let diagnostics = store
+        .usage_diagnostics(
+            range,
+            admin_observability::UsageFilter {
+                provider_account_ref: Some("acct_team".to_owned()),
+                ..Default::default()
+            },
+            admin_observability::DiagnosticDimension::Account,
+        )
+        .await
+        .expect("deleted account diagnostics");
+    assert_eq!(diagnostics.items[0].account_plan_type, None);
     database.close().await;
 }
 
@@ -603,6 +654,114 @@ async fn ops_search_should_treat_sql_wildcards_as_literals() {
 }
 
 #[tokio::test]
+async fn ops_errors_should_use_each_event_accounts_current_subscription() {
+    let Some(database) = TestDatabase::create("ops_account_subscription").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now)
+        .await
+        .expect("seed observability facts");
+    sqlx::query(
+        "insert into provider_accounts (
+           id, provider_kind, name, email, upstream_user_id, upstream_account_id,
+           plan_type, authentication_kind, provider_credentials_json,
+           credential_revision, credential_observed_at, has_refresh_token,
+           created_at, updated_at
+         ) select 'acct_retry', provider_kind, name, email, upstream_user_id,
+                  'retry-workspace', 'team', authentication_kind,
+                  provider_credentials_json, credential_revision, credential_observed_at,
+                  has_refresh_token, created_at, updated_at
+           from provider_accounts where id = 'acct_observe'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("seed same-email retry account");
+    sqlx::query(
+        "update ops_events set provider_account_id = 'acct_retry',
+                               provider_account_ref = 'acct_retry'
+         where id = 'ops_observe_retry'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("assign retry event to its own account");
+    let query = admin_observability::OpsErrorQuery {
+        range: admin_observability::TimeRange::new(
+            now - TimeDelta::hours(1),
+            now + TimeDelta::hours(1),
+        )
+        .expect("ops range"),
+        filter: admin_observability::OpsErrorFilter::default(),
+        current_page: 1,
+        page_size: PageSize::new(10).expect("page size"),
+    };
+    let store = admin_observability_store(&database.pool);
+    for plan in [Some("pro"), Some("plus"), None] {
+        sqlx::query("update provider_accounts set plan_type = $1 where id = 'acct_observe'")
+            .bind(plan)
+            .execute(&database.pool)
+            .await
+            .expect("update current subscription");
+        let page = store
+            .list_ops_errors(query.clone())
+            .await
+            .expect("ops page");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+        let request = page
+            .items
+            .iter()
+            .find(|error| error.source == "model_request")
+            .expect("request error");
+        let event = page
+            .items
+            .iter()
+            .find(|error| error.source == "ops_event")
+            .expect("retry event");
+        assert_eq!(request.provider_account_email, event.provider_account_email);
+        assert_eq!(request.provider_account_plan_type.as_deref(), plan);
+        assert_eq!(event.provider_account_plan_type.as_deref(), Some("team"));
+    }
+    sqlx::query(
+        "update ops_events set model_request_id = null, attempt_index = null
+         where id = 'ops_observe_retry'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("detach event from request");
+    let page = store
+        .list_ops_errors(query.clone())
+        .await
+        .expect("ops page");
+    assert_eq!(
+        page.items
+            .iter()
+            .find(|error| error.source == "ops_event")
+            .expect("standalone event")
+            .provider_account_plan_type
+            .as_deref(),
+        Some("team")
+    );
+    sqlx::query("delete from provider_accounts where id = 'acct_retry'")
+        .execute(&database.pool)
+        .await
+        .expect("delete retry account");
+    let page = store
+        .list_ops_errors(query)
+        .await
+        .expect("deleted account history");
+    assert_eq!(page.total, 2);
+    let event = page
+        .items
+        .iter()
+        .find(|error| error.source == "ops_event")
+        .expect("deleted account event");
+    assert_eq!(event.provider_account_ref.as_deref(), Some("acct_retry"));
+    assert_eq!(event.provider_account_plan_type, None);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn ops_should_include_incomplete_upstream_errors() {
     let Some(database) = TestDatabase::create("ops_incomplete_error").await else {
         return;
@@ -765,7 +924,8 @@ async fn recovered_continuation_failure_should_be_visible_in_ops_but_hidden_from
             DiagnosticDimension::Account,
         )
         .await
-        .expect("diagnostics without recovered intermediates");
+        .expect("diagnostics without recovered intermediates")
+        .items;
     assert_eq!(diagnostics[0].request_count, 2);
     assert_eq!(diagnostics[0].failure_count, 0);
 
@@ -1358,7 +1518,8 @@ async fn admin_observability_adapter_preserves_utc_queries_metrics_costs_and_det
             admin_observability::DiagnosticDimension::Account,
         )
         .await
-        .expect("admin diagnostics");
+        .expect("admin diagnostics")
+        .items;
     assert_eq!(diagnostics[0].key, "acct_observe");
     assert_eq!(diagnostics[0].name, "account@example.invalid");
     assert_eq!(diagnostics[0].cost_coverage.provider_reported_count, 1);
@@ -1775,7 +1936,8 @@ async fn observability_queries_preserve_request_account_cost_and_diagnostic_fact
             DiagnosticDimension::Account,
         )
         .await
-        .expect("usage diagnostics");
+        .expect("usage diagnostics")
+        .items;
     assert_eq!(diagnostics[0].key, "acct_observe");
     assert_eq!(diagnostics[0].name, "account@example.invalid");
     assert_eq!(diagnostics[0].request_count, 3);

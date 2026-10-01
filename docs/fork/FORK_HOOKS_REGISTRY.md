@@ -1,6 +1,6 @@
 # Fork 钩子登记表
 
-上游基线：zyycn/codex-proxy-rs `3915aa25`（v3.17.0）。度量：`python3 tools/fork_divergence.py`。
+上游基线：zyycn/codex-proxy-rs `9c106767`（v3.18.3）。度量：`python3 tools/fork_divergence.py --base 9c106767`。
 
 约定：fork 逻辑放 fork 自有文件（Rust `fork_<主题>.rs`，前端 `*.fork.ts` / `*.fork.vue`，文档 `docs/fork/`）；
 上游文件只留一行调用或接线，并带 `fork: <主题>` 标记。
@@ -28,11 +28,18 @@
 | `frontend/src/router/routes.ts` | B | import 一行；`...forkPublicRoutes`、`...forkAdminRoutes` 各一行 | `router/routes.fork.ts` | 取上游，补回 3 行 |
 | `frontend/src/layout/components/AppSidebar.vue` | A | import 一行；`insertForkNavItems(navItems)` 一行（在 `navItems` 定义之后） | `layout/components/menu.fork.ts`（菜单项与锚点） | 取上游，补回 2 行；上游改了 `/accounts`、`/usage` 的路径时同步 `menu.fork.ts` 的锚点 |
 | `frontend/src/api/index.ts` | B | 文件开头 `export * from './index.fork'`（lint 要求全文件按字母序） | `api/index.fork.ts` | 取上游，开头补回 |
+| `frontend/src/views/accounts/components/AccountQuotaPanel/index.vue` | B | 消耗曲线组件及账号更新事件 | `AccountQuotaPanel/BurnChart.vue` | 保留上游额度预测入口，补回曲线，避免重复绑定事件 |
+| `frontend/src/views/accounts/components/AccountQuotaSummaryCell/index.vue` | C | 模型计价、真实上游费用及近似额度 | 账号 `usage.billing` 投影 | 延续上游容量对齐与 Token 摘要，保留两种费用来源的区分 |
 
 ## 后端接线
 
 | 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
 | --- | --- | --- | --- | --- |
+| `gateway-core/src/settings/values.rs`、`routing/snapshot.rs` | B | 请求日志开关、测试 Key、默认值、设置构造方法、快照访问器与 RoutingPlan 投影 | 统一的 `SettingsValues` owner | 保留上游设置编译路径，再补日志字段；不得恢复独立的旧设置事实结构 |
+| `gateway-admin/src/model/settings.rs` | B | `RuntimeSettings` 转换成替换命令时携带日志字段 | `ReplaceRuntimeSettings::from` | 取上游转换逻辑，补两个字段 |
+| `gateway-admin/src/model/audit.rs` | B | `OutboundProxyQualityCheck` 审计分类 | `MutationAuditOperation` | 保留 `quality_check / outbound_proxy` 分类 |
+| `gateway-plugin/sdk/src/call/services/settings.rs` | B | 生成的设置合同包含 fork 日志字段 | `gateway-admin/tests/use_case/service_contract.rs` | 修改宿主类型后用 `CPR_UPDATE_SERVICE_CONTRACT=1` 的生成流程同步，不手工改生成结果 |
+| `gateway-store/src/postgres/runtime_settings.rs` | C | 日志字段的查询、绑定与持久化 | 同文件的设置 Repository | SQL 占位符与 bind 顺序整体核对，保留上游管理员 Key 的独立更新路径 |
 | `gateway-admin/src/lib.rs` | B+A | fork 模块声明块（`mod fork;`、`ops_report`、`ticket_cipher`、`ticket_revive`、`turn_state_renewal` 及两行 `pub use`）；`AdminServices.fork`、`AdminRuntimePorts.fork` 字段及其解构、初始化；`fork::AccountsDeps::new(..)` 一个实参；`fork::attach(..)` 一行 | `gateway-admin/src/fork.rs`（fork 服务、运行目录、3 个 worker 注册、访问器 `ops_report()` / `public_import()` / `openai()`） | 取上游，补回 16 行。`attach` 要放在上游 worker 登记之后、`AdminBundle` 构造之前；它从 `services` 里取上游已建好的 proxies、account_groups、accounts、credentials |
 | `gateway-admin/src/use_case/accounts.rs` 的 `new` | B | 构造函数末尾一个 `fork: crate::fork::AccountsDeps` 形参 | `fork.rs` 的 `AccountsDeps` | 上游改构造函数签名时，保留末尾这个形参 |
 | `apps/gateway/src/bootstrap.rs` | B | `ForkRuntimePorts::under(host.runtime_data_dir())` 一行（要在 `host` 被 `initialize` 消费之前）；`fork: fork_ports` 字段；`gateway_api::initialize` 的 `turn_state` 实参 | `gateway-admin/src/fork.rs` | 取上游，补回 3 行 |
@@ -52,6 +59,7 @@
 
 | 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
 | --- | --- | --- | --- | --- |
+| `gateway-core/tests/settings/mod.rs` | D | `mod fork_request_log` | `settings/fork_request_log.rs` | 取上游，补模块声明；验证设置重编译与 rebase 的日志门控 |
 | `gateway-core/tests/engine/coordinator.rs` | D+B | 测试夹具的 `pub(super)`；`billing` 字段及其赋值（`// fork: billing`）；`Script::AttributedStream` 变体及其分支（`// fork: attribution`） | `tests/engine/fork_coordinator.rs`（归因与计费用例） | 取上游，补可见性、`billing` 字段和 `AttributedStream` 变体 |
 | `gateway-core/tests/engine/provider.rs` | — | 无，与上游一致 | `tests/engine/fork_provider.rs` | 直接取上游 |
 | `gateway-core/tests/engine/mod.rs` | D | `mod fork_coordinator;`、`mod fork_provider;` | — | 取上游，补 2 行 |
@@ -85,6 +93,8 @@
 
 | 文件 | 类型 | fork 留下了什么 | 实现在哪 | 合并策略 |
 | --- | --- | --- | --- | --- |
+| `gateway-store/tests/postgres/mod.rs`、`runtime_settings.rs` | D | 日志设置测试模块及共用夹具可见性 | `postgres/fork_request_log_settings.rs` | 保留日志字段数据库回归与已有 9xxx 后补跑上游迁移的升级验证 |
+| `gateway-api/tests/openai/mod.rs`、`auth.rs`、`responses/websocket/connection/` | D | API 组合入口的可选 turn-state 参数 | 测试初始化调用 | 取上游测试逻辑，补 fork 参数 |
 | `gateway-store/tests/postgres/provider_accounts/mod.rs` | D | 3 行 `mod fork_*`；3 处状态筛选的 `.into()`；`exit_geo: None` | `provider_accounts/fork_billing.rs`、`fork_expired_status.rs`、`fork_turn_state.rs` | 取上游，补声明和适配 |
 | `gateway-store/tests/postgres/proxies.rs` | D | `exit_geo: None`；`context()`、`success()` 的 `pub(super)` | `postgres/fork_proxy_quality.rs` | 取上游，补字段和可见性 |
 | `gateway-store/tests/postgres/execution.rs` | D | 2 处 `billing: Default::default()`；2 个辅助函数 `pub(super)` | `postgres/fork_execution_billing.rs` | 取上游，补字段和可见性 |

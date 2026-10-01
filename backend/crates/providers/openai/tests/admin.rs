@@ -357,7 +357,14 @@ async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
         .await
         .unwrap();
     let prices = bundle.admin_provider().pricing_catalog();
-    for model in ["gpt-4", "gpt-4o", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+    for model in [
+        "gpt-4",
+        "gpt-4o",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+    ] {
         let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
         let inherited = openai_billing_breakdown(model, usage, None).unwrap();
         let copied =
@@ -1501,7 +1508,7 @@ fn initialized_provider_request(operation: Operation, account_id: &str) -> Provi
     let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        account_policy(),
+        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider,

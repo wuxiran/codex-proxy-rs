@@ -1,5 +1,6 @@
 //! 命名代理持有认证信息，账号保留解析后的 URL 供 Provider 传输使用。
 
+use gateway_admin::model::audit::MutationAuditOperation;
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
@@ -524,7 +525,7 @@ pub(crate) async fn resolve_proxy_selection(
 async fn audit(
     transaction: &mut Transaction<'_, Postgres>,
     context: &MutationContext,
-    action: &str,
+    action: MutationAuditOperation,
     id: &str,
     fields: &[&str],
     revision: Revision,
@@ -534,7 +535,6 @@ async fn audit(
         mutation_audit(
             context,
             action,
-            "outbound_proxy",
             id,
             fields.iter().map(|value| (*value).to_owned()).collect(),
         ),
@@ -578,8 +578,7 @@ impl ProxyStore for PgProxyRepository {
             &mut transaction,
             mutation_audit(
                 context,
-                "update",
-                "provider_account",
+                MutationAuditOperation::ProviderAccountUpdate,
                 account_id.as_str(),
                 vec!["outbound_proxy".to_owned()],
             ),
@@ -839,7 +838,7 @@ impl ProxyStore for PgProxyRepository {
         audit(
             &mut transaction,
             context,
-            "create",
+            MutationAuditOperation::OutboundProxyCreate,
             &id,
             &["name", "proxy_url", "location", "auto_location"],
             revision,
@@ -940,7 +939,7 @@ impl ProxyStore for PgProxyRepository {
         audit(
             &mut transaction,
             context,
-            "update",
+            MutationAuditOperation::OutboundProxyUpdate,
             &command.id,
             &["name", "proxy_url", "location", "auto_location"],
             revision,
@@ -995,7 +994,7 @@ impl ProxyStore for PgProxyRepository {
         audit(
             &mut transaction,
             context,
-            "delete",
+            MutationAuditOperation::OutboundProxyDelete,
             id,
             &[],
             config_revision,
@@ -1088,7 +1087,7 @@ impl ProxyStore for PgProxyRepository {
         audit(
             &mut transaction,
             context,
-            "test",
+            MutationAuditOperation::OutboundProxyTest,
             id,
             &["last_test", "detected_location"],
             revision,
@@ -1200,7 +1199,7 @@ impl ProxyStore for PgProxyRepository {
         audit(
             &mut transaction,
             context,
-            "quality_check",
+            MutationAuditOperation::OutboundProxyQualityCheck,
             id,
             &["last_test", "quality"],
             current,

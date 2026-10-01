@@ -105,19 +105,19 @@ onMounted(() => {
         <!-- 参数行 -->
         <div class="flex flex-wrap items-end gap-3">
           <div class="w-48">
-            <label class="block text-xs text-neutral-500">分组</label>
+            <span class="block text-xs text-neutral-500">分组</span>
             <BaseSelect v-model="groupId" :options="groupOptions()" class="mt-1" @update:model-value="store.loadAccounts()" />
           </div>
           <div class="w-48">
-            <label class="block text-xs text-neutral-500">模型</label>
+            <span class="block text-xs text-neutral-500">模型</span>
             <BaseSelect v-model="model" :options="modelOptions" class="mt-1" />
           </div>
           <div class="w-40">
-            <label class="block text-xs text-neutral-500">思考强度</label>
+            <span class="block text-xs text-neutral-500">思考强度</span>
             <BaseSelect v-model="effort" :options="effortOptions" class="mt-1" />
           </div>
           <div class="w-32">
-            <label class="block text-xs text-neutral-500">并发上限</label>
+            <span class="block text-xs text-neutral-500">并发上限</span>
             <BaseNumberInput v-model="concurrency" label="并发上限" :min="1" :max="8" class="mt-1" />
           </div>
           <BaseButton :loading="running" :disabled="running || selected.length === 0" @click="store.runBatch()">
@@ -130,18 +130,18 @@ onMounted(() => {
 
         <!-- prompt -->
         <div>
-          <label class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</label>
-          <BaseTextarea v-model="prompt" :rows="3" class="mt-1" placeholder="输入测试 prompt" />
+          <span class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</span>
+          <BaseTextarea v-model="prompt" label="测试 Prompt" :rows="3" class="mt-1" placeholder="输入测试 prompt" />
         </div>
 
         <!-- 账号选择 -->
         <div>
           <div class="mb-2 flex items-center gap-3">
-            <label class="text-xs text-neutral-500">
+            <span class="text-xs text-neutral-500">
               账号
               <span v-if="accountsLoading" class="ml-1 text-amber-500">加载中…</span>
               <span v-else class="ml-1 text-neutral-400">（{{ filteredAccounts.length }} 个，已选 {{ selected.length }}）</span>
-            </label>
+            </span>
             <BaseInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-56 text-xs" />
             <BaseCheckbox
               :model-value="allVisibleSelected" label="全选可见" show-label
@@ -231,6 +231,7 @@ onMounted(() => {
           </div>
           <div v-if="run.output" class="flex flex-col gap-2">
             <iframe
+              title="模型输出预览"
               :srcdoc="previewSrcdoc(run.output)"
               sandbox=""
               class="h-80 w-full rounded-md border border-neutral-200 bg-white dark:border-neutral-800"

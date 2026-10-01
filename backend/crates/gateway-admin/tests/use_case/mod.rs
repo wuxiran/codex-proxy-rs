@@ -50,7 +50,7 @@ use gateway_admin::{
         observability::{
             DashboardDesktopRelease, DashboardObservation, DashboardWireAttribute,
             DashboardWireProfile, DashboardWireTarget, DesktopReleaseStatus, DiagnosticDimension,
-            DiagnosticObservation, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
+            DiagnosticsObservation, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
             UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
         },
         provider_credentials::{
@@ -112,6 +112,7 @@ pub(super) struct AdminHarness {
     plugin_store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
     plugin_inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
+    service_middleware: gateway_admin::service::PlanSource,
 }
 
 impl AdminHarness {
@@ -140,6 +141,7 @@ impl AdminHarness {
             plugin_store: Arc::new(plugins::TestPluginPorts),
             plugin_inspector: Arc::new(plugins::TestPluginPorts),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
+            service_middleware: Arc::new(|| None),
         }
     }
 
@@ -195,6 +197,11 @@ impl AdminHarness {
 
     pub(super) fn settings(mut self, store: Arc<dyn SettingsStore>) -> Self {
         self.settings = store;
+        self
+    }
+
+    pub(super) fn service_middleware(mut self, source: gateway_admin::service::PlanSource) -> Self {
+        self.service_middleware = source;
         self
     }
 
@@ -277,6 +284,7 @@ impl AdminHarness {
                 Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
                 plugin_management: Arc::new(plugins::TestPluginPorts),
                 published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle::default(),
@@ -782,7 +790,7 @@ impl ObservabilityStore for UnavailableStore {
         _: TimeRange,
         _: UsageFilter,
         _: DiagnosticDimension,
-    ) -> AdminStoreResult<Vec<DiagnosticObservation>> {
+    ) -> AdminStoreResult<DiagnosticsObservation> {
         Err(unavailable("usage diagnostics"))
     }
 
@@ -1098,7 +1106,10 @@ impl SystemOperations for UnavailableSystem {
         Err(unavailable_system())
     }
 
-    async fn restart(&self) -> Result<SystemOperationAccepted, SystemOperationError> {
+    async fn restart(
+        &self,
+        _preflight: Arc<dyn gateway_admin::ports::system::SystemRestartPreflight>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
 }
@@ -1121,3 +1132,4 @@ fn unavailable_system() -> SystemOperationError {
         "unavailable in this test",
     )
 }
+mod service_contract;

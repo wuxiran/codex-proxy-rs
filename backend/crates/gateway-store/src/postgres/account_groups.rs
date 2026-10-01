@@ -1,5 +1,6 @@
 //! PostgreSQL owner for provider-neutral account groups and memberships.
 
+use gateway_admin::model::audit::MutationAuditOperation;
 use std::{
     collections::BTreeMap,
     str::FromStr as _,
@@ -245,8 +246,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
         let id = command.id.clone();
         let audit = mutation_audit(
             context,
-            "create",
-            "account_group",
+            MutationAuditOperation::AccountGroupCreate,
             id.as_str(),
             vec![
                 "name".to_owned(),
@@ -278,8 +278,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
         let id = command.id.clone();
         let audit = mutation_audit(
             context,
-            "update",
-            "account_group",
+            MutationAuditOperation::AccountGroupUpdate,
             id.as_str(),
             vec![
                 "name".to_owned(),
@@ -322,8 +321,9 @@ impl AccountGroupStore for PgAccountGroupRepository {
         let id = command.id.clone();
         let audit = mutation_audit(
             context,
-            if command.enabled { "enable" } else { "disable" },
-            "account_group",
+            MutationAuditOperation::AccountGroupEnabled {
+                enabled: command.enabled,
+            },
             id.as_str(),
             vec!["enabled".to_owned()],
         );
@@ -355,7 +355,12 @@ impl AccountGroupStore for PgAccountGroupRepository {
         context: &MutationContext,
     ) -> AdminStoreResult<AccountGroupMutation> {
         let id = command.id.clone();
-        let audit = mutation_audit(context, "delete", "account_group", id.as_str(), Vec::new());
+        let audit = mutation_audit(
+            context,
+            MutationAuditOperation::AccountGroupDelete,
+            id.as_str(),
+            Vec::new(),
+        );
         let revision = self
             .mutate(audit, |transaction| {
                 Box::pin(async move {
