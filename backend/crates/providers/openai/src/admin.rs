@@ -1,0 +1,2551 @@
+//! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
+
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt as _;
+use gateway_admin::model::Revision;
+use gateway_admin::model::accounts::AccountRecord;
+use gateway_admin::model::observability::{
+    CalculatedBillingBreakdown, CurrencyCost, DashboardDesktopRelease, DashboardWireAttribute,
+    DashboardWireProfile, DashboardWireTarget, DecimalAmount, DesktopReleaseStatus,
+    ProviderBillingInput,
+};
+use gateway_admin::model::provider_credentials::{
+    AuthorizationMutationTarget, AuthorizationOwnerBinding, AuthorizationStarted,
+    CompleteAuthorization, ConsumeProviderResetCredit, CredentialCommitGuard,
+    PendingAuthorizationMutation, PrepareCredentialImport, PrepareCredentialRefresh,
+    PrepareCredentialRotation, PreparedAuthorizationCommit, PreparedAuthorizationCredential,
+    PreparedCredentialCreate, PreparedCredentialImport, PreparedCredentialRotation,
+    PreparedCredentialRotationFacts, ProviderDocument, ProviderExport,
+    ProviderExportCredentialInput, ProviderModel, ProviderModels, ProviderProfileActivityInsights,
+    ProviderProfileAvatar, ProviderProfileAvatarStreamError, ProviderProfileDailyUsage,
+    ProviderProfileInvocation, ProviderProfileStatistics, ProviderProfileStatisticsSummary,
+    ProviderQuota, ProviderQuotaRequest, ProviderQuotaWindow, ProviderQuotaWindowRole,
+    ProviderResetCredit, ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription,
+    QuotaLocalUsageAttribution,
+};
+use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
+use gateway_admin::ports::provider::{
+    ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind, TurnStateHuntObservation,
+    TurnStateHuntTicket, TurnStateRenewal,
+};
+use gateway_core::account::{
+    CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
+    OpaqueProviderData, PlaintextCredential, ProviderAccount, ProviderAccountId,
+    ProviderAccountStore,
+};
+use gateway_core::error::StoreErrorKind;
+use gateway_core::event::ProviderResponseHeader;
+use gateway_core::metering::Money;
+use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload};
+use gateway_core::provider_ports::{
+    NewOAuthPendingFlow, OAuthPendingBinding, OAuthPendingClaimOutcome, OAuthPendingConsumeOutcome,
+    OAuthPendingFlowPort, OAuthPendingPutOutcome, OAuthPendingReleaseOutcome, ProviderStoreError,
+    ProviderStoreErrorKind,
+};
+use gateway_core::routing::{ProviderKind, UpstreamModelId};
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::Deserialize;
+use serde_json::{Map, Number, Value};
+
+use crate::credential::{
+    CodexAccountQuotaSnapshot, CodexCredentialAdmin, CodexCredentialAdminError,
+    CodexCredentialAdminService, CodexCredentialCatalogError, CodexCredentialCatalogService,
+    CodexCredentialProfileService, CodexCredentialQuotaError, CodexCredentialQuotaService,
+    CodexOAuthAdmin, CodexOAuthAdminError, CodexOAuthPendingClaimOutcome, CodexOAuthPendingStore,
+    CodexOAuthPendingStoreError, CodexPendingAuthorization, CodexProfileAvatarError,
+    CodexProfileStatisticsError, CodexQuotaWindow, CodexQuotaWindowKind, CodexQuotaWindowRole,
+    CodexResetCreditsError, CompleteCodexOAuthAuthorization, CompletedCodexOAuthCredential,
+    ExportManagedCodexCredential, StartCodexOAuthAuthorization, StoredCodexPendingAuthorization,
+};
+use crate::credential::{
+    CodexCredentialCodec, CodexOAuthSecret, oauth_owner_ref, parse_access_token_expiration,
+};
+use crate::transport::CodexWebSocketPool;
+use crate::transport::profile::{
+    CodexDesktopReleaseSnapshot, CodexDesktopReleaseStatus, CodexWireProfile, CodexWireProfileState,
+};
+use crate::transport::{
+    CodexProfileAvatar, CodexProfileStatistics, OpenAiBillingUsage, openai_billing_breakdown,
+};
+
+const PROVIDER_NAME: &str = "openai";
+const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
+
+/// OpenAI 对终态 Admin port 的唯一实现。
+pub(crate) struct OpenAiAdminProvider {
+    turn_state_pins: crate::turn_state_pin::TurnStatePins,
+    auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore,
+    provider_kind: ProviderKind,
+    profile: CodexWireProfileState,
+    accounts: Arc<dyn ProviderAccountStore>,
+    credentials: Arc<CodexCredentialAdminService>,
+    oauth: Arc<dyn CodexOAuthAdmin>,
+    profile_statistics: Arc<CodexCredentialProfileService>,
+    quota: Arc<CodexCredentialQuotaService>,
+    catalog: Arc<CodexCredentialCatalogService>,
+    websocket_pool: Arc<CodexWebSocketPool>,
+    desktop_release: CodexDesktopReleaseStatus,
+    ticket_login: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
+}
+
+pub(crate) struct OpenAiAdminServices {
+    pub(crate) credentials: Arc<CodexCredentialAdminService>,
+    pub(crate) oauth: Arc<dyn CodexOAuthAdmin>,
+    pub(crate) profile_statistics: Arc<CodexCredentialProfileService>,
+    pub(crate) quota: Arc<CodexCredentialQuotaService>,
+    pub(crate) catalog: Arc<CodexCredentialCatalogService>,
+}
+
+impl OpenAiAdminProvider {
+    #[must_use]
+    pub(crate) fn new(
+        provider_kind: ProviderKind,
+        profile: CodexWireProfileState,
+        accounts: Arc<dyn ProviderAccountStore>,
+        services: OpenAiAdminServices,
+        websocket_pool: Arc<CodexWebSocketPool>,
+        desktop_release: CodexDesktopReleaseStatus,
+    ) -> Self {
+        Self {
+            provider_kind,
+            turn_state_pins: crate::turn_state_pin::TurnStatePins::default(),
+            auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore::default(),
+            profile,
+            accounts,
+            credentials: services.credentials,
+            oauth: services.oauth,
+            profile_statistics: services.profile_statistics,
+            quota: services.quota,
+            catalog: services.catalog,
+            websocket_pool,
+            desktop_release,
+            ticket_login: None,
+        }
+    }
+
+    pub(crate) fn with_ticket_login(
+        mut self,
+        client: Option<Arc<crate::credential::ticket_login::TicketLoginClient>>,
+    ) -> Self {
+        self.ticket_login = client;
+        self
+    }
+
+    pub(crate) fn with_turn_state_pins(
+        mut self,
+        pins: crate::turn_state_pin::TurnStatePins,
+    ) -> Self {
+        self.turn_state_pins = pins;
+        self
+    }
+
+    pub(crate) fn with_auto_hunt_store(
+        mut self,
+        store: crate::turn_state_auto_hunt::AutoHuntStore,
+    ) -> Self {
+        self.auto_hunt = store;
+        self
+    }
+
+    /// 经 sidecar 用票据登录；失败只给固定文案，票据与上游原文不进日志。
+    async fn login_with_ticket(
+        &self,
+        email: &str,
+        password: &str,
+        totp_secret: &str,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<crate::credential::ticket_login::TicketLoginTokens, ProviderAdminError> {
+        let client = self.ticket_login.as_ref().ok_or_else(|| {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                .with_public_message("票据登录服务未配置")
+        })?;
+        client
+            .login(crate::credential::ticket_login::TicketLoginRequest {
+                email,
+                password,
+                totp_secret,
+                proxy_url: proxy.map(|proxy| proxy.expose_url()),
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "ticket login failed");
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message(error.public_message())
+            })
+    }
+
+    /// 用票据（邮箱/密码/2FA）经 sidecar 重新登录，换回令牌后写回原账号。
+    ///
+    /// 登录走账号绑定的出口；新令牌必须属于同一个 ChatGPT 用户与工作区，否则拒绝写入，
+    /// 防止录错票据把别的账号写进来。
+    async fn prepare_ticket_restore(
+        &self,
+        current: LoadedCredential,
+        material: ProviderDocument,
+        provider_kind: ProviderKind,
+    ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+        let material = material.into_provider_data().into_inner();
+        let ticket = match (material.len(), material.get("ticket_restore")) {
+            (1, Some(Value::Object(ticket))) => ticket,
+            _ => return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)),
+        };
+        let field = |name: &str| {
+            ticket
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Invalid))
+        };
+        if current.account.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
+                .with_public_message("只有 OAuth 账号可以用票据恢复"));
+        }
+        let tokens = self
+            .login_with_ticket(
+                field("email")?,
+                field("password")?,
+                field("totp_secret")?,
+                current.account.outbound_proxy(),
+            )
+            .await?;
+        let claims =
+            crate::credential::parse_chatgpt_jwt_claims(tokens.access_token.expose_secret())
+                .map_err(|_| {
+                    provider_admin_error(ProviderAdminErrorKind::Invalid)
+                        .with_public_message("票据登录返回的令牌无法解析")
+                })?;
+        let same_user = claims.chatgpt_user_id.as_deref() == current.account.upstream_user_id();
+        let same_workspace =
+            claims.chatgpt_account_id.as_deref() == current.account.upstream_account_id();
+        if !same_user || !same_workspace {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("票据登录到的不是这个账号（用户或工作区不一致），未写入"));
+        }
+        let secret = CodexOAuthSecret {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            id_token: tokens.id_token,
+        };
+        let expires_at = parse_access_token_expiration(secret.access_token.expose_secret());
+        let prepared = CodexCredentialAdmin
+            .prepare_refreshed_oauth_rotation(current, secret, expires_at, None)
+            .map_err(map_credential_admin_error)?;
+        tracing::info!(target: "account_ticket", account_id = %prepared.profile.account_id, "ticket restore prepared");
+        prepared_rotation(prepared, provider_kind)
+    }
+
+    async fn account(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderAccount, ProviderAdminError> {
+        self.accounts
+            .get_account(account_id)
+            .await
+            .map_err(map_store_error)?
+            .filter(|account| account.provider() == &self.provider_kind)
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::NotFound))
+    }
+
+    async fn preserve_existing_installation_id(
+        &self,
+        mut incoming: NewProviderAccount,
+    ) -> Result<NewProviderAccount, ProviderAdminError> {
+        let Some(existing) = self
+            .accounts
+            .get_account(incoming.account.id())
+            .await
+            .map_err(map_store_error)?
+        else {
+            return Ok(incoming);
+        };
+        if existing.provider() != incoming.account.provider()
+            || existing.upstream_user_id() != incoming.account.upstream_user_id()
+            || existing.upstream_account_id() != incoming.account.upstream_account_id()
+        {
+            return Ok(incoming);
+        }
+        let current = self
+            .accounts
+            .load_current_credential(existing.id())
+            .await
+            .map_err(map_store_error)?;
+        incoming.credential = CodexCredentialCodec::preserve_installation_id(
+            &incoming.credential,
+            &current.credential,
+        )
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        Ok(incoming)
+    }
+}
+
+#[async_trait]
+impl ProviderAdmin for OpenAiAdminProvider {
+    fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
+        crate::transport::usage::pricing_catalog()
+    }
+
+    fn client_profile_options(
+        &self,
+    ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
+        self.profile
+            .selection_options()
+            .map_err(map_client_profile_error)
+    }
+
+    fn preview_client_profile(
+        &self,
+        configuration: &gateway_core::account::OpaqueProviderData,
+    ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
+        self.profile
+            .preview_selection(configuration)
+            .map_err(map_client_profile_error)
+    }
+
+    fn provider_kind(&self) -> &ProviderKind {
+        &self.provider_kind
+    }
+
+    fn plan_type_display(&self, plan_type: &str) -> String {
+        // 与官方 Desktop 的套餐名称映射一致；原始子类型继续由 plan_type 保留。
+        match plan_type.to_ascii_lowercase().as_str() {
+            "free" | "free_workspace" | "guest" => "Free",
+            "go" => "Go",
+            "plus" => "Plus",
+            "pro" | "prolite" => "Pro",
+            "team" | "self_serve_business_prolite" | "self_serve_business_usage_based" => {
+                "Business"
+            }
+            "business"
+            | "ent26"
+            | "enterprise_cbp_automation"
+            | "enterprise_cbp_usage_based"
+            | "enterprise"
+            | "hc" => "Enterprise",
+            "edu" | "education" => "Edu",
+            "edu_plus" => "Edu Plus",
+            "edu_pro" => "Edu Pro",
+            _ => plan_type,
+        }
+        .to_owned()
+    }
+
+    async fn account_unavailable(&self, account_id: &ProviderAccountId) {
+        self.turn_state_pins.clear(account_id.as_str());
+        self.websocket_pool.evict_account(account_id.as_str()).await;
+    }
+
+    async fn account_facts_changed(&self, account_ids: &[ProviderAccountId]) {
+        if account_ids.is_empty() {
+            return;
+        }
+        self.quota.invalidate_scheduling(account_ids);
+        if let Err(error) = self.catalog.invalidate() {
+            tracing::warn!(
+                account_count = account_ids.len(),
+                error = %error,
+                "OpenAI model catalog invalidation failed after account commit"
+            );
+        }
+    }
+
+    fn connection_test_operation(
+        &self,
+        upstream_model: &UpstreamModelId,
+        input_text: &str,
+    ) -> Result<Operation, ProviderAdminError> {
+        build_connection_test_operation(upstream_model, input_text)
+    }
+
+    fn test_bench_operation(
+        &self,
+        upstream_model: &UpstreamModelId,
+        input_text: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Operation, ProviderAdminError> {
+        build_test_bench_operation(upstream_model, input_text, reasoning_effort)
+    }
+
+    fn dashboard_wire_profile(&self) -> Option<DashboardWireProfile> {
+        let profile = self.profile.snapshot();
+        let release = self.desktop_release.snapshot();
+        let user_agent = profile.user_agent();
+        let client_identity = format!("{}; {}", profile.originator, profile.desktop_version);
+        let release = dashboard_desktop_release(&profile, release);
+        Some(DashboardWireProfile {
+            provider: self.provider_kind.as_str().to_owned(),
+            product: profile.originator,
+            version: profile.codex_version,
+            build: None,
+            target: DashboardWireTarget {
+                os_type: profile.os_type,
+                os_version: profile.os_version,
+                arch: profile.arch,
+                terminal: profile.terminal,
+            },
+            user_agent,
+            attributes: vec![DashboardWireAttribute {
+                label: "客户端标识".to_owned(),
+                value: client_identity,
+            }],
+            verified_at: Some(profile.verified_at),
+            release: Some(release),
+        })
+    }
+
+    fn configured_wire_profile(
+        &self,
+        configuration: &OpaqueProviderData,
+    ) -> Option<DashboardWireProfile> {
+        use crate::transport::profile::selection::{
+            ClientKind, ClientPlatform, ClientProfileSelection, VersionMode,
+        };
+        let selection = ClientProfileSelection::parse(configuration).ok()?;
+        let profile = selection.resolve(&self.profile).ok()?;
+        let custom = selection.version_mode == VersionMode::Fixed;
+        let (checked_at, error) = self.profile.client_release_status(
+            selection.client,
+            selection.platform,
+            selection.architecture(),
+        );
+        let release = if custom {
+            None
+        } else if selection.client == ClientKind::Desktop
+            && selection.platform == ClientPlatform::Macos
+        {
+            Some(dashboard_desktop_release(
+                &profile,
+                self.desktop_release.snapshot(),
+            ))
+        } else {
+            Some(DashboardDesktopRelease {
+                status: if error.is_some() {
+                    DesktopReleaseStatus::Failed
+                } else if checked_at.is_some() {
+                    DesktopReleaseStatus::Current
+                } else {
+                    DesktopReleaseStatus::Unchecked
+                },
+                checked_at,
+                latest_version: Some(profile.codex_version.clone()),
+                latest_build: None,
+                published_at: None,
+                minimum_system_version: None,
+                hardware_requirements: None,
+                download_url: None,
+                download_size: None,
+                signature_present: None,
+                error,
+            })
+        };
+        Some(DashboardWireProfile {
+            provider: self.provider_kind.as_str().to_owned(),
+            product: profile.originator.clone(),
+            version: profile.codex_version.clone(),
+            build: None,
+            user_agent: profile.user_agent(),
+            target: DashboardWireTarget {
+                os_type: profile.os_type,
+                os_version: profile.os_version,
+                arch: profile.arch,
+                terminal: profile.terminal,
+            },
+            attributes: vec![
+                DashboardWireAttribute {
+                    label: "客户端标识".to_owned(),
+                    value: if selection.client == ClientKind::Desktop {
+                        format!("{}; {}", profile.originator, profile.desktop_version)
+                    } else {
+                        profile.originator
+                    },
+                },
+                DashboardWireAttribute {
+                    label: "版本策略".to_owned(),
+                    value: if custom {
+                        "固定自定义"
+                    } else {
+                        "自动最新"
+                    }
+                    .to_owned(),
+                },
+            ],
+            verified_at: (!custom).then_some(profile.verified_at),
+            release,
+        })
+    }
+
+    fn calculated_billing(
+        &self,
+        input: &ProviderBillingInput,
+    ) -> Result<Option<CalculatedBillingBreakdown>, ProviderAdminError> {
+        let (Some(input_tokens), Some(output_tokens)) = (input.input_tokens, input.output_tokens)
+        else {
+            return Ok(None);
+        };
+        let Some(breakdown) = openai_billing_breakdown(
+            &input.upstream_model_id,
+            OpenAiBillingUsage::new(
+                input_tokens,
+                output_tokens,
+                input.cached_tokens.unwrap_or_default(),
+                input.cache_write_tokens.unwrap_or_default(),
+            ),
+            input.service_tier.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let total_amount = currency_cost(breakdown.total_amount())?;
+        if total_amount != input.total {
+            return Ok(None);
+        }
+        Ok(Some(CalculatedBillingBreakdown {
+            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记。
+            long_context_billing_applied: false,
+            image: None,
+            custom_multiplier_bps: breakdown.custom_multiplier_bps(),
+            input_amount: currency_cost(breakdown.input_amount())?,
+            output_amount: currency_cost(breakdown.output_amount())?,
+            cache_read_amount: currency_cost(breakdown.cache_read_amount())?,
+            cache_write_amount: currency_cost(breakdown.cache_write_amount())?,
+            standard_amount: currency_cost(breakdown.standard_amount())?,
+            total_amount,
+            input_price_per_million: currency_cost(breakdown.input_price_per_million())?,
+            output_price_per_million: currency_cost(breakdown.output_price_per_million())?,
+            cache_read_price_per_million: currency_cost(breakdown.cache_read_price_per_million())?,
+            cache_write_price_per_million: currency_cost(
+                breakdown.cache_write_price_per_million(),
+            )?,
+            service_tier: breakdown.service_tier().map(str::to_owned),
+            multiplier_percent: breakdown.multiplier_percent(),
+        }))
+    }
+
+    async fn prepare_import(
+        &self,
+        command: PrepareCredentialImport,
+    ) -> Result<PreparedCredentialImport, ProviderAdminError> {
+        let prepared = self
+            .credentials
+            .prepare_import_document_with_proxy(
+                Value::Object(command.document.into_provider_data().into_inner()),
+                command.default_outbound_proxy.as_ref(),
+            )
+            .await
+            .inspect_err(|error| {
+                log_import_failure("prepare_document", credential_admin_error_code(error));
+            })
+            .map_err(map_credential_admin_error)?;
+        let observed_at = Utc::now();
+        let mut credentials = Vec::with_capacity(prepared.accounts().len());
+        for account in prepared.into_accounts() {
+            let account = self
+                .preserve_existing_installation_id(account)
+                .await
+                .inspect_err(|error| {
+                    log_import_failure(
+                        "preserve_installation_id",
+                        provider_admin_error_code(error.kind()),
+                    );
+                })?;
+            credentials.push(prepared_create(account, observed_at)?);
+        }
+        Ok(PreparedCredentialImport {
+            provider_kind: self.provider_kind.clone(),
+            credentials,
+        })
+    }
+
+    async fn start_authorization(
+        &self,
+        pending: PendingAuthorizationMutation,
+    ) -> Result<AuthorizationStarted, ProviderAdminError> {
+        if pending.provider_kind() != &self.provider_kind {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        if let gateway_admin::model::provider_credentials::AuthorizationMutationTarget::Reauthorize { account_id } = pending.target()
+            && self.account(account_id).await?.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        let started = self
+            .oauth
+            .start_authorization(StartCodexOAuthAuthorization { mutation: pending })
+            .await
+            .map_err(map_oauth_error)?;
+        Ok(AuthorizationStarted {
+            flow_id: started.flow_id,
+            authorization_url: started.authorization_url,
+            expires_at: started.expires_at,
+        })
+    }
+
+    async fn complete_authorization(
+        &self,
+        command: CompleteAuthorization,
+    ) -> Result<PreparedAuthorizationCommit, ProviderAdminError> {
+        let request_id = command.context.request_id.clone();
+        let binding = AuthorizationOwnerBinding::from_context(&command.context);
+        let completed = self
+            .oauth
+            .complete_authorization(CompleteCodexOAuthAuthorization {
+                owner_ref: oauth_owner_ref(binding.owner()),
+                flow_id: command.flow_id,
+                callback_url: SecretString::from(command.callback_url),
+            })
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    request_id = %request_id,
+                    oauth_stage = "complete_authorization",
+                    oauth_error = oauth_error_code(error),
+                    "OpenAI OAuth authorization completion failed"
+                );
+            })
+            .map_err(map_oauth_error)?;
+        let (mutation, completed_credential, authorization_guard) = completed.into_parts();
+        let credential = match (mutation.target(), completed_credential) {
+            (
+                AuthorizationMutationTarget::Create { .. },
+                CompletedCodexOAuthCredential::Create(credential),
+            ) => {
+                prepared_create(credential, Utc::now()).map(PreparedAuthorizationCredential::Create)
+            }
+            (
+                AuthorizationMutationTarget::Reauthorize { .. },
+                CompletedCodexOAuthCredential::Reauthorize(credential),
+            ) => prepared_rotation(credential, mutation.provider_kind().clone())
+                .map(PreparedAuthorizationCredential::Reauthorize),
+            _ => Err(provider_admin_error(ProviderAdminErrorKind::Internal)),
+        };
+        let credential = match credential {
+            Ok(credential) => credential,
+            Err(error) => {
+                if let Err(settlement_error) = authorization_guard.abort().await {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        settlement_error = %settlement_error,
+                        "OpenAI OAuth claim release failed after credential preparation"
+                    );
+                    return Err(provider_admin_error(ProviderAdminErrorKind::Unavailable));
+                }
+                return Err(error);
+            }
+        };
+        Ok(PreparedAuthorizationCommit::new(mutation, credential)
+            .with_authorization_guard(authorization_guard))
+    }
+
+    async fn ticket_login(
+        &self,
+        ticket: &gateway_admin::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, ProviderAdminError> {
+        let tokens = self
+            .login_with_ticket(
+                &ticket.email,
+                ticket.password.expose_secret(),
+                ticket.totp_secret.expose_secret(),
+                proxy,
+            )
+            .await?;
+        let mut account = serde_json::Map::new();
+        account.insert("email".to_owned(), Value::String(ticket.email.clone()));
+        account.insert("name".to_owned(), Value::String(ticket.email.clone()));
+        account.insert(
+            "access_token".to_owned(),
+            Value::String(tokens.access_token.expose_secret().to_owned()),
+        );
+        for (key, token) in [
+            ("refresh_token", &tokens.refresh_token),
+            ("id_token", &tokens.id_token),
+        ] {
+            if let Some(token) = token {
+                account.insert(
+                    key.to_owned(),
+                    Value::String(token.expose_secret().to_owned()),
+                );
+            }
+        }
+        let mut document = serde_json::Map::new();
+        document.insert(
+            "accounts".to_owned(),
+            Value::Array(vec![Value::Object(account)]),
+        );
+        Ok(ProviderDocument::new(OpaqueProviderData::new(document)))
+    }
+
+    async fn prepare_rotation(
+        &self,
+        command: PrepareCredentialRotation,
+    ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+        validate_account_record(&command.account, &self.provider_kind)?;
+        let account_id = ProviderAccountId::new(command.account.id.clone())
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let current = self
+            .accounts
+            .load_current_credential(&account_id)
+            .await
+            .map_err(map_store_error)?;
+        if !account_matches_record(&current.account, &command.account) {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("账号凭据已被更新，请刷新账号列表后重试"));
+        }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("guanlan_revive")
+        {
+            let material = command
+                .provider_material
+                .expose_to_provider()
+                .expose_to_provider();
+            if material.len() != 1 || material.get("guanlan_revive") != Some(&Value::Bool(true)) {
+                return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+            }
+            let revive = self.credentials.revive_service().ok_or_else(|| {
+                provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                    .with_public_message("观澜复活服务未配置")
+            })?;
+            let (mut secret, guard) = revive
+                .prepare_manual_revival(&current.account)
+                .await
+                .map_err(map_revive_error)?;
+            let runtime = CodexCredentialCodec::decode(&current.credential)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            if let Some(oauth) = runtime.authentication.oauth() {
+                secret.refresh_token = secret.refresh_token.or_else(|| oauth.refresh_token.clone());
+                secret.id_token = secret.id_token.or_else(|| oauth.id_token.clone());
+            }
+            let expires_at = parse_access_token_expiration(secret.access_token.expose_secret());
+            let prepared = CodexCredentialAdmin
+                .prepare_refreshed_oauth_rotation(current, secret, expires_at, None)
+                .map_err(map_credential_admin_error)?;
+            let (facts, credential_guard) =
+                prepared_rotation(prepared, command.account.provider_kind)?.into_parts();
+            return Ok(PreparedCredentialRotation::new(
+                facts,
+                Box::new(GuanlanReviveCommitGuard {
+                    _operation: guard,
+                    _credential: credential_guard,
+                }),
+            ));
+        }
+        if command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .contains_key("ticket_restore")
+        {
+            return self
+                .prepare_ticket_restore(
+                    current,
+                    command.provider_material,
+                    command.account.provider_kind,
+                )
+                .await;
+        }
+        let settings_material = command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        if settings_material.contains_key("pin_turn_state")
+            || settings_material.contains_key("turn_state_auto_hunt")
+        {
+            return prepare_turn_state_pin_rotation(
+                &self.auto_hunt,
+                current,
+                command.provider_material,
+                command.account.provider_kind,
+            );
+        }
+        if current.account.authentication_kind()
+            == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY
+        {
+            let prepared = CodexCredentialAdmin
+                .prepare_api_key_rotation(
+                    current,
+                    Value::Object(command.provider_material.into_provider_data().into_inner()),
+                )
+                .map_err(map_credential_admin_error)?;
+            return prepared_rotation(prepared, command.account.provider_kind);
+        }
+        let mut secret = rotation_secret(command.provider_material)?;
+        if secret.id_token.is_none() {
+            let runtime = CodexCredentialCodec::decode(&current.credential)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            secret.id_token = runtime
+                .authentication
+                .oauth()
+                .and_then(|oauth| oauth.id_token.clone());
+        }
+        let access_token_expires_at =
+            parse_access_token_expiration(secret.access_token.expose_secret());
+        let prepared = CodexCredentialAdmin
+            .prepare_refreshed_oauth_rotation(current, secret, access_token_expires_at, None)
+            .map_err(map_credential_admin_error)?;
+        prepared_rotation(prepared, command.account.provider_kind)
+    }
+
+    async fn prepare_refresh(
+        &self,
+        command: PrepareCredentialRefresh,
+    ) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+        if command.account.authentication_kind != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        validate_account_record(&command.account, &self.provider_kind)?;
+        let account_id = ProviderAccountId::new(command.account.id.clone())
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let current = self
+            .accounts
+            .load_current_credential(&account_id)
+            .await
+            .map_err(map_store_error)?;
+        if !account_matches_record(&current.account, &command.account) {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("账号凭据已被更新，请刷新账号列表后重试"));
+        }
+        let prepared = self
+            .credentials
+            .manual_refresh(current)
+            .await
+            .map_err(map_credential_admin_error)?;
+        prepared_rotation(prepared, command.account.provider_kind)
+    }
+
+    async fn turn_state_hunt_prepare(
+        &self,
+        account_id: &ProviderAccountId,
+        upstream_model: &UpstreamModelId,
+    ) -> Result<TurnStateHuntTicket, ProviderAdminError> {
+        self.account(account_id).await?;
+        let current = self
+            .accounts
+            .load_current_credential(account_id)
+            .await
+            .map_err(map_store_error)?;
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let crate::credential::CodexCredentialData::OAuth(data) = data else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported)
+                .with_public_message("只有 OAuth 账号支持遍历代理找 state"));
+        };
+        let Some(generation) = data.turn_state_pin.as_ref() else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("请先开启并保存「固定自身 state」"));
+        };
+        let Some(expected_length) =
+            crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                .expected_length(upstream_model.as_str())
+        else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("该模型没有 state 长度规则，无法判断是否正确"));
+        };
+        Ok(TurnStateHuntTicket::new(
+            account_id.clone(),
+            upstream_model.clone(),
+            expected_length,
+            crate::turn_state_pin::credential_binding(generation, &data.access_token),
+        ))
+    }
+
+    fn turn_state_hunt_inspect(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+    ) -> TurnStateHuntObservation {
+        let _ = ticket; // 长度门已废弃：命中判据改为下限+ASCII，不再精确匹配长度。
+        let length = hunted_turn_state(response_headers).map(str::len);
+        TurnStateHuntObservation {
+            length,
+            matched: length.is_some_and(|l| l >= crate::turn_state_pin::MIN_TURN_STATE_LEN)
+                && hunted_turn_state(response_headers)
+                    .is_some_and(|value| value.bytes().all(|b| b.is_ascii_graphic())),
+        }
+    }
+
+    async fn turn_state_hunt_renewals(
+        &self,
+        now: SystemTime,
+        margin: std::time::Duration,
+    ) -> Vec<TurnStateRenewal> {
+        let Ok(provider) = ProviderKind::new(PROVIDER_NAME) else {
+            return Vec::new();
+        };
+        let Ok(accounts) = self.accounts.list_for_provider(&provider).await else {
+            return Vec::new();
+        };
+        let settings = match self.auto_hunt.all() {
+            Ok(settings) if settings.is_empty() => return Vec::new(),
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(
+                    target: "turn_state_hunt",
+                    error = %error,
+                    "state 自动续期的参数文件读不出来，本周期不续期"
+                );
+                return Vec::new();
+            }
+        };
+        let mut due = Vec::new();
+        for account in accounts {
+            // 停用或凭据失效的账号发不出请求，续期只会白白失败。
+            if !account.enabled()
+                || account.authentication_kind() != "oauth"
+                || account.credential_state() != gateway_core::account::CredentialState::Ready
+            {
+                continue;
+            }
+            let Ok(current) = self.accounts.load_current_credential(account.id()).await else {
+                continue;
+            };
+            let Ok(crate::credential::CodexCredentialData::OAuth(data)) =
+                CodexCredentialCodec::decode_complete(&current.credential)
+            else {
+                continue;
+            };
+            let (Some(auto), Some(generation)) =
+                (settings.get(account.id().as_str()), &data.turn_state_pin)
+            else {
+                continue;
+            };
+            let Ok(upstream_model) = UpstreamModelId::new(auto.model.clone()) else {
+                continue;
+            };
+            // 套餐规则里没有这个模型时，遍历本身就会被拒绝，不必进续期队列。
+            let Some(expected_length) =
+                crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type())
+                    .expected_length(&auto.model)
+            else {
+                continue;
+            };
+            let binding = crate::turn_state_pin::credential_binding(generation, &data.access_token);
+            let fresh = self
+                .turn_state_pins
+                .account_wide_captured_at(
+                    account.id().as_str(),
+                    &binding,
+                    &auto.model,
+                    expected_length,
+                    // 账号改绑到别的出口后，旧出口上的 state 不再生效，要在新出口上重新找。
+                    &crate::turn_state_pin::egress_fingerprint(
+                        account.outbound_proxy().map(|proxy| proxy.expose_url()),
+                    ),
+                    now,
+                )
+                .is_some_and(|captured_at| {
+                    captured_at + crate::turn_state_pin::MAX_PIN_AGE > now + margin
+                });
+            if !fresh {
+                due.push(TurnStateRenewal {
+                    account_id: account.id().clone(),
+                    upstream_model,
+                    attempts: auto.attempts,
+                    include_direct: auto.include_direct,
+                });
+            }
+        }
+        due
+    }
+
+    async fn turn_state_hunt_pin(
+        &self,
+        ticket: &TurnStateHuntTicket,
+        response_headers: &[ProviderResponseHeader],
+        captured_at: SystemTime,
+        egress: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<SystemTime, ProviderAdminError> {
+        // 钉之前重新派生绑定：遍历期间凭据被刷新或重新捕获时，旧观测不再有资格复用。
+        let current = self
+            .turn_state_hunt_prepare(ticket.account_id(), ticket.upstream_model())
+            .await?;
+        if &current != ticket {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("凭据在遍历期间已变化，请重新遍历"));
+        }
+        let value = hunted_turn_state(response_headers)
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        self.turn_state_pins
+            .pin_account_wide(
+                ticket.account_id().as_str(),
+                ticket.binding().to_owned(),
+                ticket.upstream_model().as_str(),
+                ticket.expected_length(),
+                crate::turn_state_pin::egress_fingerprint(egress.map(|proxy| proxy.expose_url())),
+                value,
+                captured_at,
+                SystemTime::now(),
+            )
+            .map_err(|rejected| {
+                provider_admin_error(match rejected {
+                    crate::turn_state_pin::PinRejected::Full => ProviderAdminErrorKind::Unavailable,
+                    crate::turn_state_pin::PinRejected::Length
+                    | crate::turn_state_pin::PinRejected::Expired => {
+                        ProviderAdminErrorKind::Invalid
+                    }
+                })
+            })?;
+        Ok(captured_at + crate::turn_state_pin::MAX_PIN_AGE)
+    }
+
+    async fn account_configuration(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderDocument>, ProviderAdminError> {
+        self.account(account_id).await?;
+        let current = self
+            .accounts
+            .load_current_credential(account_id)
+            .await
+            .map_err(map_store_error)?;
+        let data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        let data = match data {
+            crate::credential::CodexCredentialData::OAuth(data) => {
+                let now = std::time::SystemTime::now();
+                let rule =
+                    crate::turn_state_pin::CaptureRule::for_plan(current.account.plan_type());
+                let pins = data
+                    .turn_state_pin
+                    .as_ref()
+                    .map(|generation| {
+                        let binding = crate::turn_state_pin::credential_binding(
+                            generation,
+                            &data.access_token,
+                        );
+                        self.turn_state_pins
+                            .status(account_id.as_str(), &binding, now)
+                    })
+                    .unwrap_or_default();
+                // 长度门已废弃：展示判据改为下限，不再按写死长度过滤（rule 仍用于 turnStateCaptureRule 展示）。
+                let pins = pins.into_iter()
+                    .filter(|pin| pin.length >= crate::turn_state_pin::MIN_TURN_STATE_LEN)
+                    .map(|pin| serde_json::json!({
+                    "model": pin.model,
+                    "length": pin.length,
+                    "capturedAt": DateTime::<Utc>::from(pin.captured_at),
+                    "expiresAt": DateTime::<Utc>::from(pin.captured_at + crate::turn_state_pin::MAX_PIN_AGE),
+                    "hits": pin.hits,
+                    "scope": if pin.account_wide { "account" } else { "client" },
+                })).collect::<Vec<_>>();
+                let guanlan_revive_available = self.credentials.revive_service()
+                    .map(|service| service.supports_account(&current.account))
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "Guanlan revival availability could not be read");
+                        None
+                    }).unwrap_or(false);
+                let value = serde_json::json!({
+                    "guanlanReviveAvailable": guanlan_revive_available,
+                    "pinTurnState": data.turn_state_pin.is_some(),
+                    // 续期只对开启中的固定有意义；固定关着时即便文件里有残留也不展示、不续期。
+                    "turnStateAutoHunt": data.turn_state_pin.as_ref().and_then(|_| self.auto_hunt.get(account_id.as_str())).map(|auto| serde_json::json!({
+                        "modelId": auto.model,
+                        "attempts": auto.attempts,
+                        "includeDirect": auto.include_direct,
+                    })),
+                    "turnStatePins": pins,
+                    "turnStateCaptureRule": rule,
+                    "maxAgeSeconds": crate::turn_state_pin::MAX_PIN_AGE.as_secs(),
+                });
+                return Ok(Some(ProviderDocument::new(OpaqueProviderData::new(
+                    value
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+                ))));
+            }
+            crate::credential::CodexCredentialData::ApiKey(data) => data,
+        };
+        let value = serde_json::to_value(data.configuration())
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        let object = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        Ok(Some(ProviderDocument::new(
+            gateway_core::account::OpaqueProviderData::new(object),
+        )))
+    }
+
+    async fn quota(
+        &self,
+        request: ProviderQuotaRequest,
+    ) -> Result<ProviderQuota, ProviderAdminError> {
+        let ProviderQuotaRequest {
+            account_id,
+            refresh,
+            rolling_usage: _,
+        } = request;
+        let mut account = self.account(&account_id).await?;
+        if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
+            if refresh {
+                return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+            }
+            return Ok(project_quota(None, &account));
+        }
+        let snapshot = if refresh {
+            let snapshot = Some(
+                self.quota
+                    .refresh_account(&account_id)
+                    .await
+                    .map_err(map_quota_error)?,
+            );
+            account = self.account(&account_id).await?;
+            snapshot
+        } else {
+            self.quota
+                .read_account(&account_id)
+                .await
+                .map_err(map_quota_error)?
+        };
+        Ok(project_quota(snapshot, &account))
+    }
+
+    fn quota_forecast_observation(
+        &self,
+        document: &ProviderDocument,
+        window: &ProviderQuotaWindow,
+    ) -> Option<QuotaForecastObservation> {
+        use gateway_protocol::openai::events::parse_rate_limit_headers;
+
+        if window.local_usage_attribution != QuotaLocalUsageAttribution::AccountWide {
+            return None;
+        }
+        let value = document
+            .expose_to_provider()
+            .expose_to_provider()
+            .get("rateLimitHeaders")?;
+        let headers: Vec<(String, String)> = serde_json::from_value(value.clone()).ok()?;
+        let parsed = parse_rate_limit_headers(&headers)?;
+        let limit = parsed.limits.get(window.limit_id.as_deref()?)?;
+        let observed = match window.role? {
+            ProviderQuotaWindowRole::Primary => limit.primary?,
+            ProviderQuotaWindowRole::Secondary => limit.secondary?,
+            ProviderQuotaWindowRole::Monthly => return None,
+        };
+        if observed.window_minutes?.checked_mul(60)? != window.window_seconds? {
+            return None;
+        }
+        Some(QuotaForecastObservation {
+            used_percent: observed.used_percent,
+            reset_at: DateTime::<Utc>::from_timestamp(observed.reset_at?, 0)?,
+            plan_type: parsed.plan_type,
+        })
+    }
+
+    async fn subscription(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderSubscription>, ProviderAdminError> {
+        if self.account(account_id).await?.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        self.profile_statistics
+            .subscription(account_id)
+            .await
+            .map(|subscription| {
+                subscription.map(|subscription| ProviderSubscription {
+                    starts_at: subscription.starts_at,
+                    expires_at: subscription.expires_at,
+                    will_renew: subscription.will_renew,
+                    billing_period: subscription.billing_period,
+                    billing_currency: subscription.billing_currency,
+                    observed_at: subscription.observed_at,
+                })
+            })
+            .map_err(map_profile_statistics_error)
+    }
+
+    async fn profile_statistics(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderProfileStatistics, ProviderAdminError> {
+        if self.account(account_id).await?.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        let statistics = self
+            .profile_statistics
+            .profile_statistics(account_id)
+            .await
+            .map_err(map_profile_statistics_error)?;
+        Ok(project_profile_statistics(statistics))
+    }
+
+    async fn profile_avatar(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderProfileAvatar, ProviderAdminError> {
+        if self.account(account_id).await?.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        self.profile_statistics
+            .profile_avatar(account_id)
+            .await
+            .map(project_profile_avatar)
+            .map_err(map_profile_avatar_error)
+    }
+
+    async fn reset_credits(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<ProviderResetCredits, ProviderAdminError> {
+        if self.account(account_id).await?.authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        self.quota
+            .list_reset_credits(account_id)
+            .await
+            .map(project_reset_credits)
+            .map_err(map_reset_credits_error)
+    }
+
+    async fn consume_reset_credit(
+        &self,
+        command: ConsumeProviderResetCredit,
+    ) -> Result<ProviderResetCreditResult, ProviderAdminError> {
+        if self
+            .account(&command.account_id)
+            .await?
+            .authentication_kind()
+            != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        self.quota
+            .consume_reset_credit(
+                &command.account_id,
+                command.credit_id.as_deref(),
+                command.redeem_request_id,
+            )
+            .await
+            .map(|result| ProviderResetCreditResult {
+                code: result.code,
+                credit: result.credit.map(project_reset_credit),
+            })
+            .map_err(map_reset_credits_error)
+    }
+
+    async fn models(
+        &self,
+        account_id: &ProviderAccountId,
+        refresh: bool,
+    ) -> Result<ProviderModels, ProviderAdminError> {
+        let account = self.account(account_id).await?;
+        let catalog = if refresh {
+            self.catalog
+                .refresh_account_catalog(account_id)
+                .await
+                .map_err(map_catalog_error)?
+        } else {
+            self.catalog
+                .cached_or_refresh_account_catalog(&account)
+                .await
+                .map_err(map_catalog_error)?
+        };
+        let models = catalog
+            .models()
+            .iter()
+            .cloned()
+            .map(|model| {
+                let id = UpstreamModelId::new(model.clone())
+                    .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+                Ok(ProviderModel { id, name: model })
+            })
+            .collect::<Result<Vec<_>, ProviderAdminError>>()?;
+        Ok(ProviderModels {
+            models,
+            observed_at: Some(catalog.observed_at()),
+        })
+    }
+
+    async fn export_credentials(
+        &self,
+        credentials: Vec<ProviderExportCredentialInput>,
+    ) -> Result<ProviderExport, ProviderAdminError> {
+        let mut account_ids = Vec::with_capacity(credentials.len());
+        let mut items = Vec::with_capacity(credentials.len());
+        for input in credentials {
+            validate_account_record(&input.account, &self.provider_kind)?;
+            let current = LoadedCredential {
+                account: account_from_record(&input.account)?,
+                credential: PlaintextCredential::new(
+                    input.provider_material.into_provider_data().into_inner(),
+                ),
+            };
+            account_ids.push(current.account.id().clone());
+            items.push(ExportManagedCodexCredential {
+                current,
+                added_at: input.account.created_at,
+                updated_at: input.account.updated_at,
+            });
+        }
+        let document = CodexCredentialAdmin
+            .format_cpr_export(items)
+            .and_then(|document| document.into_json())
+            .map_err(map_credential_admin_error)?;
+        let Value::Object(document) = document else {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Internal));
+        };
+        Ok(ProviderExport {
+            provider_kind: self.provider_kind.clone(),
+            account_ids,
+            document: ProviderDocument::new(OpaqueProviderData::new(document)),
+        })
+    }
+}
+
+struct OpenAiCredentialCommitGuard {
+    _guard: crate::credential::PreparedCodexCredentialRotationGuard,
+}
+
+impl CredentialCommitGuard for OpenAiCredentialCommitGuard {
+    fn finish(self: Box<Self>) {}
+}
+
+fn prepared_create(
+    prepared: NewProviderAccount,
+    observed_at: DateTime<Utc>,
+) -> Result<PreparedCredentialCreate, ProviderAdminError> {
+    let NewProviderAccount {
+        account,
+        model_access,
+        credential,
+    } = prepared;
+    Ok(PreparedCredentialCreate {
+        model_access,
+        outbound_proxy: account.outbound_proxy().cloned(),
+        account_id: account.id().clone(),
+        provider_kind: account.provider().clone(),
+        name: account.name().to_owned(),
+        email: account.email().map(str::to_owned),
+        upstream_user_id: account.upstream_user_id().map(str::to_owned),
+        upstream_account_id: account.upstream_account_id().map(str::to_owned),
+        plan_type: account.plan_type().map(str::to_owned),
+        authentication_kind: account.authentication_kind().to_owned(),
+        provider_material: ProviderDocument::new(OpaqueProviderData::new(credential.into_inner())),
+        has_refresh_token: account.has_refresh_token(),
+        access_token_expires_at: account.access_token_expires_at().map(DateTime::<Utc>::from),
+        next_refresh_at: account.next_refresh_at().map(DateTime::<Utc>::from),
+        enabled: account.enabled(),
+        credential_state: account.credential_state(),
+        credential_observed_at: observed_at,
+    })
+}
+
+struct GuanlanReviveCommitGuard {
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    _credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for GuanlanReviveCommitGuard {
+    fn finish(self: Box<Self>) {
+        self._credential.finish();
+    }
+}
+
+fn map_revive_error(error: crate::credential::CodexReviveError) -> ProviderAdminError {
+    use crate::credential::CodexReviveError;
+    let (kind, message) = match error {
+        CodexReviveError::Unsupported => (
+            ProviderAdminErrorKind::Invalid,
+            "该账号没有可用的观澜签名导入记录",
+        ),
+        CodexReviveError::Busy => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活任务正在执行，请稍后重试",
+        ),
+        CodexReviveError::Cooldown => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜复活失败冷却中，请稍后重试",
+        ),
+        CodexReviveError::NoRecovery => (
+            ProviderAdminErrorKind::Conflict,
+            "观澜未返回该账号的恢复凭据，账号可能无需复活或暂不可恢复",
+        ),
+        _ => (
+            ProviderAdminErrorKind::Unavailable,
+            "观澜复活失败，请稍后重试",
+        ),
+    };
+    provider_admin_error(kind).with_public_message(message)
+}
+
+fn prepared_rotation(
+    prepared: crate::credential::PreparedCodexCredentialRotation,
+    provider_kind: ProviderKind,
+) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+    let (profile, credential, replacement_identity, guard) = prepared.into_parts();
+    let CredentialCasUpdateParts {
+        account_id,
+        expected_revision,
+        profile: credential_profile,
+        preserve_profile,
+        credential,
+        has_refresh_token,
+        access_token_expires_at,
+        next_refresh_at,
+        account_state: _account_state,
+    } = credential.into_parts();
+    if profile != credential_profile || profile.account_id != account_id {
+        return Err(provider_admin_error(ProviderAdminErrorKind::Internal));
+    }
+    let expected_credential_revision = Revision::new(expected_revision.get())
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+    Ok(PreparedCredentialRotation::new(
+        PreparedCredentialRotationFacts {
+            account_id,
+            provider_kind,
+            expected_credential_revision,
+            replacement_identity,
+            name: profile.name,
+            email: profile.email,
+            plan_type: profile.plan_type,
+            preserve_profile,
+            preserve_credential_state: false,
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                credential.into_inner(),
+            )),
+            has_refresh_token,
+            access_token_expires_at: access_token_expires_at.map(DateTime::<Utc>::from),
+            next_refresh_at: next_refresh_at.map(DateTime::<Utc>::from),
+        },
+        Box::new(OpenAiCredentialCommitGuard { _guard: guard }),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStatePinDocument {
+    pin_turn_state: Option<bool>,
+    turn_state_auto_hunt: Option<TurnStateAutoHuntDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStateAutoHuntDocument {
+    enabled: bool,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    attempts: u8,
+    #[serde(default)]
+    include_direct: bool,
+}
+
+impl TurnStateAutoHuntDocument {
+    fn into_setting(
+        self,
+    ) -> Result<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>, ProviderAdminError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if UpstreamModelId::new(self.model.clone()).is_err() || !(1..=20).contains(&self.attempts) {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        Ok(Some(crate::turn_state_auto_hunt::TurnStateAutoHunt {
+            model: self.model,
+            attempts: self.attempts,
+            include_direct: self.include_direct,
+        }))
+    }
+}
+
+fn prepare_turn_state_pin_rotation(
+    auto_hunt: &crate::turn_state_auto_hunt::AutoHuntStore,
+    current: LoadedCredential,
+    document: ProviderDocument,
+    provider_kind: ProviderKind,
+) -> Result<PreparedCredentialRotation, ProviderAdminError> {
+    let document: TurnStatePinDocument =
+        serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    let account_id = current.account.id().as_str().to_owned();
+    let setting = document
+        .turn_state_auto_hunt
+        .map(TurnStateAutoHuntDocument::into_setting)
+        .transpose()?;
+    let pinned_now = CodexCredentialCodec::decode_complete(&current.credential)
+        .ok()
+        .and_then(|data| data.oauth().map(|oauth| oauth.turn_state_pin.is_some()))
+        .unwrap_or(false);
+    let pinned_after = document.pin_turn_state.unwrap_or(pinned_now);
+    if matches!(setting, Some(Some(_))) && !pinned_after {
+        return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+            .with_public_message("请先开启并保存「固定自身 state」再开启自动续期"));
+    }
+    // 只改续期参数时凭据原样重编码（不换代次），仍走既有的 CAS 与审计。
+    let prepared = CodexCredentialAdmin
+        .prepare_turn_state_pin_rotation(current, document.pin_turn_state)
+        .map_err(map_credential_admin_error)?;
+    // 续期参数不进凭据：旧版本的凭据 schema 拒绝未知字段，写进去会让回滚后的实例读不了该账号。
+    let stored = if pinned_after { setting } else { Some(None) };
+    let (facts, credential) = prepared_rotation(prepared, provider_kind)?
+        .preserving_credential_state()
+        .into_parts();
+    Ok(PreparedCredentialRotation::new(
+        facts,
+        Box::new(AutoHuntCommitGuard {
+            store: auto_hunt.clone(),
+            account_id,
+            setting: stored,
+            credential,
+        }),
+    ))
+}
+
+/// 续期参数只在凭据提交成功之后才落盘：准备阶段就写的话，CAS 冲突或数据库失败时
+/// 接口报了失败，后台却已经按新参数开始发真实请求（或已经把续期删掉）。
+struct AutoHuntCommitGuard {
+    store: crate::turn_state_auto_hunt::AutoHuntStore,
+    account_id: String,
+    setting: Option<Option<crate::turn_state_auto_hunt::TurnStateAutoHunt>>,
+    credential: Box<dyn CredentialCommitGuard>,
+}
+
+impl CredentialCommitGuard for AutoHuntCommitGuard {
+    fn finish(self: Box<Self>) {
+        let this = *self;
+        if let Some(setting) = this.setting
+            && let Err(error) = this.store.set(&this.account_id, setting)
+        {
+            // 凭据已经提交，这里无法再让接口失败；留下能定位的日志，管理员重新保存即可。
+            tracing::warn!(
+                target: "turn_state_hunt",
+                account_id = this.account_id.as_str(),
+                error = %error,
+                "state 自动续期参数保存失败，请重新保存"
+            );
+        }
+        this.credential.finish();
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationDocument {
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+}
+
+fn rotation_secret(document: ProviderDocument) -> Result<CodexOAuthSecret, ProviderAdminError> {
+    let document: RotationDocument =
+        serde_json::from_value(Value::Object(document.into_provider_data().into_inner()))
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(CodexOAuthSecret {
+        access_token: SecretString::from(document.access_token),
+        refresh_token: document.refresh_token.map(SecretString::from),
+        id_token: document.id_token.map(SecretString::from),
+    })
+}
+
+fn validate_account_record(
+    account: &AccountRecord,
+    provider_kind: &ProviderKind,
+) -> Result<(), ProviderAdminError> {
+    if &account.provider_kind != provider_kind || provider_kind.as_str() != PROVIDER_NAME {
+        return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+    }
+    ProviderAccountId::new(account.id.clone())
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(())
+}
+
+fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, ProviderAdminError> {
+    let account_id = ProviderAccountId::new(account.id.clone())
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    let revision = CredentialRevision::new(account.credential_revision.get())
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(ProviderAccount::new(
+        account_id,
+        account.provider_kind.clone(),
+        account.name.clone(),
+        account.upstream_user_id.clone(),
+        account.authentication_kind.clone(),
+        revision,
+        account.access_token_expires_at.map(SystemTime::from),
+    )
+    .with_outbound_proxy(account.outbound_proxy.clone())
+    .with_profile(
+        account.email.clone(),
+        account.upstream_account_id.clone(),
+        account.plan_type.clone(),
+    )
+    .with_account_facts(
+        account.enabled,
+        account.credential_state,
+        account.quota,
+        account.last_error_reason,
+        account.last_error_message.clone(),
+    )
+    .with_model_access(account.model_access.clone())
+    .with_refresh_schedule(
+        account.has_refresh_token,
+        account.next_refresh_at.map(SystemTime::from),
+    ))
+}
+
+fn dashboard_desktop_release(
+    profile: &CodexWireProfile,
+    snapshot: CodexDesktopReleaseSnapshot,
+) -> DashboardDesktopRelease {
+    let status = if snapshot.checked_at.is_none() {
+        DesktopReleaseStatus::Unchecked
+    } else if snapshot.last_error.is_some() {
+        DesktopReleaseStatus::Failed
+    } else if snapshot.latest.as_ref().is_some_and(|latest| {
+        latest.version == profile.desktop_version && latest.build == profile.desktop_build
+    }) {
+        DesktopReleaseStatus::Current
+    } else if snapshot.latest.is_some() {
+        DesktopReleaseStatus::UpdateAvailable
+    } else {
+        DesktopReleaseStatus::Failed
+    };
+    let latest = snapshot.latest;
+    DashboardDesktopRelease {
+        status,
+        checked_at: snapshot.checked_at,
+        latest_version: latest.as_ref().map(|release| release.version.clone()),
+        latest_build: latest.as_ref().map(|release| release.build.clone()),
+        published_at: latest.as_ref().and_then(|release| release.published_at),
+        minimum_system_version: latest
+            .as_ref()
+            .and_then(|release| release.minimum_system_version.clone()),
+        hardware_requirements: latest
+            .as_ref()
+            .and_then(|release| release.hardware_requirements.clone()),
+        download_url: latest
+            .as_ref()
+            .and_then(|release| release.download_url.clone()),
+        download_size: latest.as_ref().and_then(|release| release.download_size),
+        signature_present: latest.as_ref().map(|release| release.signature_present),
+        error: snapshot.last_error,
+    }
+}
+
+fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> bool {
+    account.id().as_str() == record.id
+        && account.provider() == &record.provider_kind
+        && account.upstream_user_id() == record.upstream_user_id.as_deref()
+        && account.upstream_account_id() == record.upstream_account_id.as_deref()
+        && account.authentication_kind() == record.authentication_kind
+}
+
+fn empty_quota() -> ProviderQuota {
+    ProviderQuota {
+        plan_type: None,
+        observed_at: None,
+        refresh_token_expires_at: None,
+        windows: Vec::new(),
+        limit_reached: false,
+        provider_data: None,
+    }
+}
+
+fn project_quota(
+    snapshot: Option<CodexAccountQuotaSnapshot>,
+    account: &ProviderAccount,
+) -> ProviderQuota {
+    let mut quota = snapshot
+        .map(project_quota_snapshot)
+        .unwrap_or_else(empty_quota);
+    quota.limit_reached = account.quota().is_exhausted();
+    quota
+}
+
+fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota {
+    let mut provider_data = Map::new();
+    provider_data.insert(
+        "remaining_percent".to_owned(),
+        snapshot
+            .fact()
+            .remaining_percent()
+            .map_or(Value::Null, |value| Value::Number(Number::from(value))),
+    );
+    provider_data.insert(
+        "exhausted".to_owned(),
+        Value::Bool(snapshot.quota().is_exhausted()),
+    );
+    let windows: Vec<ProviderQuotaWindow> = snapshot
+        .windows()
+        .iter()
+        .filter(|window| should_project_quota_window(window))
+        .map(|window| ProviderQuotaWindow {
+            key: window.key().to_owned(),
+            group: quota_group(window.kind()).to_owned(),
+            label: codex_quota_window_label(window.kind(), window.role(), window.window_seconds()),
+            limit_id: Some(window.source().to_owned()),
+            limit_name: window.limit_name().map(str::to_owned),
+            role: Some(quota_role(window.role())),
+            local_usage_attribution: if window.is_account_wide() {
+                QuotaLocalUsageAttribution::AccountWide
+            } else {
+                QuotaLocalUsageAttribution::Unavailable
+            },
+            window_seconds: window.window_seconds(),
+            used_percent: window.used_percent(),
+            reset_at: window.reset_at(),
+            limit_reached: window.limit_reached(),
+            local_usage: None,
+            provider_data: None,
+        })
+        .collect();
+    // 快照级 limit_reached 只看滚动后的窗口触顶：顶层标记是观测事实，不能
+    // 在窗口全部过期后继续维持限流。
+    let limit_reached = quota_windows_limit_reached(&windows);
+    ProviderQuota {
+        plan_type: snapshot.plan_type().map(str::to_owned),
+        observed_at: Some(DateTime::<Utc>::from(snapshot.observed_at())),
+        refresh_token_expires_at: None,
+        windows,
+        limit_reached,
+        provider_data: Some(ProviderDocument::new(OpaqueProviderData::new(
+            provider_data,
+        ))),
+    }
+}
+
+fn project_profile_statistics(statistics: CodexProfileStatistics) -> ProviderProfileStatistics {
+    ProviderProfileStatistics {
+        display_name: statistics.display_name,
+        username: statistics.username,
+        image_url: statistics.image_url,
+        has_stats_error: statistics.has_stats_error,
+        summary: ProviderProfileStatisticsSummary {
+            total_text_tokens: statistics.summary.total_text_tokens,
+            peak_tokens: statistics.summary.peak_tokens,
+            longest_task_duration_ms: statistics.summary.longest_task_duration_ms,
+            current_streak_days: statistics.summary.current_streak_days,
+            longest_streak_days: statistics.summary.longest_streak_days,
+        },
+        daily_usage: statistics.daily_usage.map(|daily| {
+            daily
+                .into_iter()
+                .map(|entry| ProviderProfileDailyUsage {
+                    date: entry.date,
+                    tokens: entry.tokens,
+                })
+                .collect()
+        }),
+        activity_insights: ProviderProfileActivityInsights {
+            fast_mode_percent: statistics.activity_insights.fast_mode_percent,
+            reasoning_effort: statistics.activity_insights.reasoning_effort,
+            reasoning_effort_percent: statistics.activity_insights.reasoning_effort_percent,
+            skills_explored: statistics.activity_insights.skills_explored,
+            total_skills_used: statistics.activity_insights.total_skills_used,
+            total_threads: statistics.activity_insights.total_threads,
+            invocations: statistics.activity_insights.invocations.map(|invocations| {
+                invocations
+                    .into_iter()
+                    .map(|invocation| ProviderProfileInvocation {
+                        invocation_type: invocation.invocation_type,
+                        plugin_id: invocation.plugin_id,
+                        plugin_name: invocation.plugin_name,
+                        skill_id: invocation.skill_id,
+                        skill_name: invocation.skill_name,
+                        usage_count: invocation.usage_count,
+                    })
+                    .collect()
+            }),
+        },
+    }
+}
+
+fn project_profile_avatar(avatar: CodexProfileAvatar) -> ProviderProfileAvatar {
+    ProviderProfileAvatar {
+        content_type: avatar.content_type,
+        content_length: avatar.content_length,
+        etag: avatar.etag,
+        body: Box::pin(avatar.body.map_err(|_| ProviderProfileAvatarStreamError)),
+    }
+}
+
+fn project_reset_credits(
+    credits: crate::transport::CodexRateLimitResetCredits,
+) -> ProviderResetCredits {
+    ProviderResetCredits {
+        available_count: credits.available_count,
+        credits: credits
+            .credits
+            .into_iter()
+            .map(project_reset_credit)
+            .collect(),
+    }
+}
+
+fn project_reset_credit(
+    credit: crate::transport::CodexRateLimitResetCredit,
+) -> ProviderResetCredit {
+    ProviderResetCredit {
+        id: credit.id,
+        status: credit.status,
+        title: credit.title,
+        expires_at: credit.expires_at,
+        reset_type: credit.reset_type,
+    }
+}
+
+/// `secondary_window` 有时只是上游的空占位：没有时长、重置时间，也没有用量。
+/// 它不能被可靠翻译成 5 小时或周额度，因此不应占用账号面板；带有实际事实的
+/// 次级窗口（时长、重置、非零用量或触顶）仍完整保留。
+fn should_project_quota_window(window: &CodexQuotaWindow) -> bool {
+    window.role() != CodexQuotaWindowRole::Secondary
+        || window.window_seconds().is_some()
+        || window.reset_at().is_some()
+        || window.used_percent().is_some_and(|used| used > 0.0)
+        || window.limit_reached()
+}
+
+fn quota_windows_limit_reached(windows: &[ProviderQuotaWindow]) -> bool {
+    windows.iter().any(|window| window.limit_reached)
+}
+
+const fn quota_group(kind: CodexQuotaWindowKind) -> &'static str {
+    match kind {
+        CodexQuotaWindowKind::Monthly => "monthly",
+        CodexQuotaWindowKind::ShortTerm | CodexQuotaWindowKind::Weekly => "shortTerm",
+        CodexQuotaWindowKind::Other => "other",
+    }
+}
+
+const fn quota_role(role: CodexQuotaWindowRole) -> ProviderQuotaWindowRole {
+    match role {
+        CodexQuotaWindowRole::Primary => ProviderQuotaWindowRole::Primary,
+        CodexQuotaWindowRole::Secondary => ProviderQuotaWindowRole::Secondary,
+        CodexQuotaWindowRole::Monthly => ProviderQuotaWindowRole::Monthly,
+    }
+}
+
+/// 按窗口时长显示汉化额度名；额度桶名称通过独立字段投影。
+fn codex_quota_window_label(
+    kind: CodexQuotaWindowKind,
+    role: CodexQuotaWindowRole,
+    window_seconds: Option<u64>,
+) -> String {
+    match kind {
+        CodexQuotaWindowKind::Monthly => "月额度".to_owned(),
+        CodexQuotaWindowKind::Weekly => "周额度".to_owned(),
+        CodexQuotaWindowKind::ShortTerm => "5小时额度".to_owned(),
+        CodexQuotaWindowKind::Other => custom_quota_window_label(window_seconds, role),
+    }
+}
+
+fn custom_quota_window_label(window_seconds: Option<u64>, role: CodexQuotaWindowRole) -> String {
+    let Some(seconds) = window_seconds.filter(|seconds| *seconds > 0) else {
+        // 与官方客户端一致：没有时长时不臆测为 5 小时或周额度；保留
+        // primary/secondary 语义，让用户知道这是上游未标明时长的独立窗口。
+        return match role {
+            CodexQuotaWindowRole::Primary => "主额度".to_owned(),
+            CodexQuotaWindowRole::Secondary => "次级额度".to_owned(),
+            CodexQuotaWindowRole::Monthly => "月额度".to_owned(),
+        };
+    };
+    if seconds % 86_400 == 0 {
+        format!("{}日额度", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}小时额度", seconds / 3_600)
+    } else {
+        format!("{}分钟额度", seconds.div_ceil(60))
+    }
+}
+
+/// 将 Provider-owned PKCE/OIDC 状态保存到 Store 提供的 Redis 原子端口。
+pub(crate) struct OpenAiOAuthPendingStore {
+    port: Arc<dyn OAuthPendingFlowPort>,
+    provider_kind: ProviderKind,
+}
+
+impl OpenAiOAuthPendingStore {
+    pub(crate) const fn new(
+        port: Arc<dyn OAuthPendingFlowPort>,
+        provider_kind: ProviderKind,
+    ) -> Self {
+        Self {
+            port,
+            provider_kind,
+        }
+    }
+}
+
+#[async_trait]
+impl CodexOAuthPendingStore for OpenAiOAuthPendingStore {
+    async fn create(
+        &self,
+        pending: &CodexPendingAuthorization,
+    ) -> Result<(), CodexOAuthPendingStoreError> {
+        let now = Utc::now();
+        let ttl = (pending.expires_at() - now)
+            .to_std()
+            .map_err(|_| CodexOAuthPendingStoreError::InvalidValue)?;
+        let flow = NewOAuthPendingFlow::try_new(
+            self.provider_kind.clone(),
+            binding(pending.flow_id())?,
+            binding(pending.owner_ref())?,
+            ttl,
+            OpaqueProviderData::new(encode_pending(pending)),
+        )
+        .map_err(map_pending_store_error)?;
+        match self
+            .port
+            .put_if_absent(flow)
+            .await
+            .map_err(map_pending_store_error)?
+        {
+            OAuthPendingPutOutcome::Stored => Ok(()),
+            OAuthPendingPutOutcome::AlreadyExists => Err(CodexOAuthPendingStoreError::Conflict),
+        }
+    }
+
+    async fn claim(
+        &self,
+        owner_ref: &str,
+        flow_id: &str,
+        claim_ref: &str,
+        claim_ttl: std::time::Duration,
+    ) -> Result<CodexOAuthPendingClaimOutcome, CodexOAuthPendingStoreError> {
+        let flow = binding(flow_id)?;
+        let owner = binding(owner_ref)?;
+        let claim = binding(claim_ref)?;
+        let outcome = self
+            .port
+            .claim_if_owner(&self.provider_kind, &flow, &owner, &claim, claim_ttl)
+            .await
+            .map_err(map_pending_store_error)?;
+        match outcome {
+            OAuthPendingClaimOutcome::Claimed(payload) => match decode_pending(payload) {
+                Ok(pending) => Ok(CodexOAuthPendingClaimOutcome::Claimed(Box::new(pending))),
+                Err(error) => match self
+                    .port
+                    .release_claim(&self.provider_kind, &flow, &owner, &claim)
+                    .await
+                    .map_err(map_pending_store_error)?
+                {
+                    OAuthPendingReleaseOutcome::Released => Err(error),
+                    OAuthPendingReleaseOutcome::NotFound
+                    | OAuthPendingReleaseOutcome::OwnerMismatch
+                    | OAuthPendingReleaseOutcome::ClaimMismatch => {
+                        Err(CodexOAuthPendingStoreError::Unavailable)
+                    }
+                },
+            },
+            OAuthPendingClaimOutcome::NotFound | OAuthPendingClaimOutcome::OwnerMismatch => {
+                Ok(CodexOAuthPendingClaimOutcome::NotFound)
+            }
+            OAuthPendingClaimOutcome::InProgress => Ok(CodexOAuthPendingClaimOutcome::InProgress),
+        }
+    }
+
+    async fn release_claim(
+        &self,
+        owner_ref: &str,
+        flow_id: &str,
+        claim_ref: &str,
+    ) -> Result<bool, CodexOAuthPendingStoreError> {
+        let flow = binding(flow_id)?;
+        let owner = binding(owner_ref)?;
+        let claim = binding(claim_ref)?;
+        match self
+            .port
+            .release_claim(&self.provider_kind, &flow, &owner, &claim)
+            .await
+            .map_err(map_pending_store_error)?
+        {
+            OAuthPendingReleaseOutcome::Released => Ok(true),
+            OAuthPendingReleaseOutcome::NotFound
+            | OAuthPendingReleaseOutcome::OwnerMismatch
+            | OAuthPendingReleaseOutcome::ClaimMismatch => Ok(false),
+        }
+    }
+
+    async fn consume_claim(
+        &self,
+        owner_ref: &str,
+        flow_id: &str,
+        claim_ref: &str,
+    ) -> Result<bool, CodexOAuthPendingStoreError> {
+        let flow = binding(flow_id)?;
+        let owner = binding(owner_ref)?;
+        let claim = binding(claim_ref)?;
+        match self
+            .port
+            .consume_claim(&self.provider_kind, &flow, &owner, &claim)
+            .await
+            .map_err(map_pending_store_error)?
+        {
+            OAuthPendingConsumeOutcome::Consumed => Ok(true),
+            OAuthPendingConsumeOutcome::NotFound
+            | OAuthPendingConsumeOutcome::OwnerMismatch
+            | OAuthPendingConsumeOutcome::ClaimMismatch => Ok(false),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDocument {
+    flow_id: String,
+    owner_ref: String,
+    started_request_ref: String,
+    name: String,
+    expires_at: DateTime<Utc>,
+    state: String,
+    nonce: String,
+    code_verifier: String,
+    installation_id: String,
+    reauthorization_account_id: Option<String>,
+    mutation: Map<String, Value>,
+}
+
+fn encode_pending(pending: &CodexPendingAuthorization) -> Map<String, Value> {
+    let mut document = Map::new();
+    document.insert(
+        "flow_id".to_owned(),
+        Value::String(pending.flow_id().to_owned()),
+    );
+    document.insert(
+        "owner_ref".to_owned(),
+        Value::String(pending.owner_ref().to_owned()),
+    );
+    document.insert(
+        "started_request_ref".to_owned(),
+        Value::String(pending.started_request_ref().to_owned()),
+    );
+    document.insert("name".to_owned(), Value::String(pending.name().to_owned()));
+    document.insert(
+        "expires_at".to_owned(),
+        Value::String(pending.expires_at().to_rfc3339()),
+    );
+    document.insert(
+        "state".to_owned(),
+        Value::String(pending.state().expose_secret().to_owned()),
+    );
+    document.insert(
+        "nonce".to_owned(),
+        Value::String(pending.nonce().expose_secret().to_owned()),
+    );
+    document.insert(
+        "code_verifier".to_owned(),
+        Value::String(pending.code_verifier().expose_secret().to_owned()),
+    );
+    document.insert(
+        "installation_id".to_owned(),
+        Value::String(pending.installation_id().to_owned()),
+    );
+    document.insert(
+        "reauthorization_account_id".to_owned(),
+        pending
+            .reauthorization()
+            .map_or(Value::Null, |target| Value::String(target.to_string())),
+    );
+    document.insert(
+        "mutation".to_owned(),
+        Value::Object(encode_mutation(pending.mutation())),
+    );
+    document
+}
+
+fn encode_mutation(mutation: &PendingAuthorizationMutation) -> Map<String, Value> {
+    let mut document = mutation.to_storage_v1();
+    document.insert(
+        "schema_version".to_owned(),
+        Value::Number(Number::from(PENDING_DOCUMENT_SCHEMA_VERSION)),
+    );
+    document
+}
+
+fn decode_pending(
+    payload: OpaqueProviderData,
+) -> Result<CodexPendingAuthorization, CodexOAuthPendingStoreError> {
+    let document: PendingDocument = serde_json::from_value(Value::Object(payload.into_inner()))
+        .map_err(|_| CodexOAuthPendingStoreError::InvalidValue)?;
+    CodexPendingAuthorization::from_stored(StoredCodexPendingAuthorization {
+        flow_id: document.flow_id,
+        owner_ref: document.owner_ref,
+        started_request_ref: document.started_request_ref,
+        name: document.name,
+        expires_at: document.expires_at,
+        state: SecretString::from(document.state),
+        nonce: SecretString::from(document.nonce),
+        code_verifier: SecretString::from(document.code_verifier),
+        installation_id: document.installation_id,
+        reauthorization_account_id: document.reauthorization_account_id,
+        mutation: decode_mutation(document.mutation)?,
+    })
+}
+
+fn decode_mutation(
+    mut document: Map<String, Value>,
+) -> Result<PendingAuthorizationMutation, CodexOAuthPendingStoreError> {
+    if document
+        .remove("schema_version")
+        .and_then(|value| value.as_u64())
+        != Some(PENDING_DOCUMENT_SCHEMA_VERSION)
+    {
+        return Err(CodexOAuthPendingStoreError::InvalidValue);
+    }
+    PendingAuthorizationMutation::from_storage_v1(Value::Object(document))
+        .map_err(|_| CodexOAuthPendingStoreError::InvalidValue)
+}
+
+fn binding(value: &str) -> Result<OAuthPendingBinding, CodexOAuthPendingStoreError> {
+    OAuthPendingBinding::try_new(value.to_owned()).map_err(map_pending_store_error)
+}
+
+/// 上游最新返回的 turn state。仅在进程内用于判长和钉住，绝不序列化或落日志。
+fn hunted_turn_state(response_headers: &[ProviderResponseHeader]) -> Option<&str> {
+    response_headers
+        .iter()
+        .rev()
+        .find(|header| header.name().eq_ignore_ascii_case("x-codex-turn-state"))
+        .and_then(|header| std::str::from_utf8(header.value()).ok())
+}
+
+fn provider_admin_error(kind: ProviderAdminErrorKind) -> ProviderAdminError {
+    ProviderAdminError::new(kind)
+}
+
+fn build_connection_test_operation(
+    upstream_model: &UpstreamModelId,
+    input_text: &str,
+) -> Result<Operation, ProviderAdminError> {
+    let mut body = Map::new();
+    body.insert(
+        "model".to_owned(),
+        Value::String(upstream_model.as_str().to_owned()),
+    );
+    body.insert(
+        "input".to_owned(),
+        serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": input_text}]
+        }]),
+    );
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    let payload = ProtocolPayload::json_object("openai", body)
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(Operation::Generate(GenerateRequest::from_protocol_payload(
+        payload,
+    )))
+}
+
+/// 测智台 operation：自定义 prompt + 可选 reasoning.effort。effort 只接受已知白名单值，
+/// 交由上游最终裁定是否生效（前端展示以实际观测为准，不把用户选择当已被接受）。
+fn build_test_bench_operation(
+    upstream_model: &UpstreamModelId,
+    input_text: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Operation, ProviderAdminError> {
+    let mut body = Map::new();
+    body.insert(
+        "model".to_owned(),
+        Value::String(upstream_model.as_str().to_owned()),
+    );
+    body.insert(
+        "input".to_owned(),
+        serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": input_text}]
+        }]),
+    );
+    if let Some(effort) = reasoning_effort {
+        let effort = effort.trim();
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        body.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({ "effort": effort }),
+        );
+    }
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    let payload = ProtocolPayload::json_object("openai", body)
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+    Ok(Operation::Generate(GenerateRequest::from_protocol_payload(
+        payload,
+    )))
+}
+
+fn currency_cost(money: Money) -> Result<CurrencyCost, ProviderAdminError> {
+    Ok(CurrencyCost {
+        currency: money.currency().as_str().to_owned(),
+        amount: money
+            .amount()
+            .to_string()
+            .parse::<DecimalAmount>()
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+    })
+}
+
+fn map_pending_store_error(error: ProviderStoreError) -> CodexOAuthPendingStoreError {
+    match error.kind() {
+        ProviderStoreErrorKind::InvalidData => CodexOAuthPendingStoreError::InvalidValue,
+        ProviderStoreErrorKind::Conflict => CodexOAuthPendingStoreError::Conflict,
+        ProviderStoreErrorKind::Unavailable => CodexOAuthPendingStoreError::Unavailable,
+    }
+}
+
+fn map_store_error(error: gateway_core::error::StoreError) -> ProviderAdminError {
+    provider_admin_error(match error.kind() {
+        StoreErrorKind::Conflict => ProviderAdminErrorKind::Conflict,
+        StoreErrorKind::InvalidData | StoreErrorKind::InvalidState => {
+            ProviderAdminErrorKind::NotFound
+        }
+        StoreErrorKind::Unavailable => ProviderAdminErrorKind::Unavailable,
+        _ => ProviderAdminErrorKind::Internal,
+    })
+}
+
+fn map_credential_admin_error(error: CodexCredentialAdminError) -> ProviderAdminError {
+    use crate::credential::token_client::PersonalAccessTokenError;
+    use CodexCredentialAdminError as Error;
+    use ProviderAdminErrorKind as Kind;
+    let upstream_message = error.upstream_message().map(ToOwned::to_owned);
+    let (kind, public_message) = match error {
+        Error::PersonalAccessToken(error) => match error {
+            PersonalAccessTokenError::InvalidToken => (
+                Kind::Invalid,
+                "Codex PAT 格式无效：应为 at- 开头的完整令牌，不能包含空白或控制字符",
+            ),
+            PersonalAccessTokenError::Rejected => (
+                Kind::Invalid,
+                "OpenAI 拒绝了 Codex PAT：令牌可能无效、已过期、已撤销或没有访问权限",
+            ),
+            PersonalAccessTokenError::Unavailable => (
+                Kind::Unavailable,
+                "暂时无法向 OpenAI 验证 Codex PAT，请稍后重试",
+            ),
+            PersonalAccessTokenError::InvalidResponse => (
+                Kind::BadGateway,
+                "OpenAI 返回的 Codex PAT 身份资料不完整或格式无效，请稍后重试",
+            ),
+        },
+        Error::InvalidInput => (Kind::Invalid, "OpenAI 账号输入格式不合法，请检查导入内容"),
+        Error::InvalidCredential => (
+            Kind::Invalid,
+            "OpenAI 凭据不完整或格式无效，请检查凭据或重新授权",
+        ),
+        Error::MissingRefreshToken => (Kind::Invalid, "账号没有刷新令牌，请重新授权"),
+        Error::RefreshRejected { code, .. } => (
+            Kind::Invalid,
+            refresh_rejection_message(code.as_deref()).unwrap_or("刷新令牌已失效，请重新授权"),
+        ),
+        Error::AccountBanned { .. } => (Kind::Invalid, "OpenAI 账号已被停用，请检查账号状态"),
+        Error::NotFound => (Kind::NotFound, "OpenAI 账号不存在，请刷新账号列表"),
+        Error::RefreshLeaseUnavailable => {
+            (Kind::Conflict, "令牌刷新繁忙，请等待当前刷新完成后重试")
+        }
+        Error::RefreshUnavailable => (
+            Kind::Unavailable,
+            "令牌刷新服务暂不可用，请检查出站连接与依赖服务",
+        ),
+        Error::RefreshUpstream { status, code, .. } => (
+            Kind::BadGateway,
+            refresh_rejection_message(code.as_deref()).unwrap_or(match status {
+                401 | 403 => "OpenAI 拒绝了令牌刷新，请检查账号授权状态",
+                429 => "OpenAI 令牌刷新请求被限流，请稍后重试",
+                500..=599 => "OpenAI 令牌刷新服务异常，请稍后重试",
+                _ => "OpenAI 未能完成令牌刷新，请检查账号授权与上游服务状态",
+            }),
+        ),
+        Error::RefreshAmbiguous { .. } => (
+            Kind::Ambiguous,
+            "令牌刷新结果未知，请先核对账号状态，不要立即重复刷新",
+        ),
+        Error::CdkRedeem { message } => (Kind::Invalid, cdk_redeem_public_message(&message)),
+    };
+    let error = provider_admin_error(kind).with_public_message(public_message);
+    match upstream_message {
+        Some(message) => error.with_message(message),
+        None => error,
+    }
+}
+
+fn cdk_redeem_public_message(message: &str) -> &'static str {
+    if message.contains("格式") {
+        "CDK 格式不正确，请检查卡密"
+    } else if message.contains("不存在") || message.contains("无效") {
+        "CDK 不存在或无效"
+    } else if message.contains("已兑换") {
+        "CDK 已兑换且无法再次取回，请改用已下载的 JSON 导入"
+    } else if message.contains("未启用") || message.contains("未配置") {
+        "未启用 CDK 兑换"
+    } else if message.contains("限流") {
+        "CDK 兑换被限流，请稍后重试"
+    } else if message.contains("连接") || message.contains("身份") {
+        "暂时无法连接 CDK 兑换服务，请稍后重试"
+    } else {
+        "CDK 兑换失败，请稍后重试或改用账号 JSON 导入"
+    }
+}
+
+fn refresh_rejection_message(code: Option<&str>) -> Option<&'static str> {
+    // 与官方 Codex 的失败原因对齐；只解释管理提示，不改动 Worker 的终态/退避判定。
+    match code.map(str::to_ascii_lowercase).as_deref() {
+        Some("refresh_token_expired") => Some("刷新令牌已过期，请重新授权"),
+        Some("refresh_token_reused") => Some("刷新令牌已被使用，请重新授权"),
+        Some("refresh_token_invalidated") => Some("刷新令牌已被撤销，请重新授权"),
+        // token_expired 也用于 RT 校验失败，不据此断言具体到期原因。
+        Some("token_expired") => Some("刷新令牌不可用，请重新授权"),
+        Some("invalid_grant") => Some("刷新令牌无效或已失效，请重新授权"),
+        _ => None,
+    }
+}
+
+const fn credential_admin_error_code(error: &CodexCredentialAdminError) -> &'static str {
+    match error {
+        CodexCredentialAdminError::PersonalAccessToken(_) => {
+            "personal_access_token_validation_failed"
+        }
+        CodexCredentialAdminError::InvalidInput => "invalid_input",
+        CodexCredentialAdminError::InvalidCredential => "invalid_credential",
+        CodexCredentialAdminError::NotFound => "not_found",
+        CodexCredentialAdminError::MissingRefreshToken => "missing_refresh_token",
+        CodexCredentialAdminError::RefreshLeaseUnavailable => "refresh_lease_unavailable",
+        CodexCredentialAdminError::RefreshRejected { .. } => "refresh_rejected",
+        CodexCredentialAdminError::AccountBanned { .. } => "account_banned",
+        CodexCredentialAdminError::RefreshUnavailable => "refresh_unavailable",
+        CodexCredentialAdminError::RefreshUpstream { .. } => "refresh_upstream_failed",
+        CodexCredentialAdminError::RefreshAmbiguous { .. } => "refresh_ambiguous",
+        CodexCredentialAdminError::CdkRedeem { .. } => "cdk_redeem_failed",
+    }
+}
+
+const fn provider_admin_error_code(kind: ProviderAdminErrorKind) -> &'static str {
+    match kind {
+        ProviderAdminErrorKind::Invalid => "invalid",
+        ProviderAdminErrorKind::Unsupported => "unsupported",
+        ProviderAdminErrorKind::NotFound => "not_found",
+        ProviderAdminErrorKind::Conflict => "conflict",
+        ProviderAdminErrorKind::Ambiguous => "ambiguous",
+        ProviderAdminErrorKind::Unavailable => "unavailable",
+        ProviderAdminErrorKind::CredentialRefreshRequired => "credential_refresh_required",
+        ProviderAdminErrorKind::BadGateway => "bad_gateway",
+        ProviderAdminErrorKind::Internal => "internal",
+    }
+}
+
+fn log_import_failure(stage: &'static str, error: &'static str) {
+    tracing::warn!(
+        import_stage = stage,
+        import_error = error,
+        "OpenAI credential import preparation failed"
+    );
+}
+
+fn map_oauth_error(error: CodexOAuthAdminError) -> ProviderAdminError {
+    use CodexOAuthAdminError as Error;
+    use ProviderAdminErrorKind as Kind;
+    let (kind, message) = match error {
+        Error::InvalidInput => (Kind::Invalid, "OpenAI 授权参数不合法，请重新发起授权"),
+        Error::CallbackRejected => (Kind::Invalid, "OpenAI 授权回调校验失败，请重新发起授权"),
+        Error::TokenRejected => (Kind::Invalid, "OpenAI 拒绝了授权码，请重新发起授权"),
+        Error::Credential => (Kind::Invalid, "OpenAI 授权返回的凭据不完整或无效"),
+        Error::NotFound | Error::FlowExpired => (
+            Kind::NotFound,
+            "OpenAI 授权流程不存在或已过期，请重新发起授权",
+        ),
+        Error::Conflict => (
+            Kind::Conflict,
+            "OpenAI 授权流程正在处理或已被更新，请先检查授权状态",
+        ),
+        Error::Ambiguous => (
+            Kind::Ambiguous,
+            "OpenAI 授权结果未知，请先核对账号状态，不要立即重复提交",
+        ),
+        Error::UpstreamUnavailable => (
+            Kind::Unavailable,
+            "OpenAI 授权服务暂不可用，请检查出站连接后重试",
+        ),
+        Error::StorageUnavailable => (Kind::Unavailable, "OpenAI 授权状态存储暂不可用，请稍后重试"),
+    };
+    provider_admin_error(kind).with_public_message(message)
+}
+
+const fn oauth_error_code(error: &CodexOAuthAdminError) -> &'static str {
+    match error {
+        CodexOAuthAdminError::InvalidInput => "invalid_input",
+        CodexOAuthAdminError::NotFound => "not_found",
+        CodexOAuthAdminError::Conflict => "conflict",
+        CodexOAuthAdminError::FlowExpired => "flow_expired",
+        CodexOAuthAdminError::CallbackRejected => "callback_rejected",
+        CodexOAuthAdminError::TokenRejected => "token_rejected",
+        CodexOAuthAdminError::UpstreamUnavailable => "upstream_unavailable",
+        CodexOAuthAdminError::Ambiguous => "ambiguous",
+        CodexOAuthAdminError::StorageUnavailable => "storage_unavailable",
+        CodexOAuthAdminError::Credential => "credential",
+    }
+}
+
+fn map_quota_error(error: CodexCredentialQuotaError) -> ProviderAdminError {
+    use CodexCredentialQuotaError as Error;
+    use ProviderAdminErrorKind as Kind;
+    let (kind, message) = match error {
+        Error::InvalidCredentialData => (Kind::Invalid, "OpenAI 额度查询凭据无效，请检查账号授权"),
+        Error::NotFound => (Kind::NotFound, "OpenAI 额度查询账号不存在"),
+        Error::RevisionConflict => (Kind::Conflict, "账号凭据已被更新，请刷新账号列表后重试"),
+        Error::CredentialRefreshRequired => (
+            Kind::Unavailable,
+            "OpenAI 额度查询需要有效凭据，请刷新令牌后重试",
+        ),
+        Error::Repository(_) | Error::Store { .. } => {
+            (Kind::Unavailable, "OpenAI 额度查询的依赖服务暂不可用")
+        }
+        Error::Upstream { .. } => (
+            Kind::Unavailable,
+            "OpenAI 额度查询失败，请检查出站连接与上游服务",
+        ),
+    };
+    provider_admin_error(kind).with_public_message(message)
+}
+
+fn map_profile_statistics_error(error: CodexProfileStatisticsError) -> ProviderAdminError {
+    use CodexProfileStatisticsError as Error;
+
+    match error {
+        Error::InvalidCredentialData => provider_admin_error(ProviderAdminErrorKind::Invalid),
+        Error::NotFound => provider_admin_error(ProviderAdminErrorKind::NotFound),
+        Error::Store { .. } | Error::TransportUnavailable => {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+        }
+        Error::CredentialRefreshRequired { upstream_body } => {
+            let mut error = provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired)
+                .with_public_message("OpenAI 资料查询需要有效凭据，请刷新令牌后重试");
+            if let Some(body) = upstream_body {
+                error = error.with_message(format!(
+                    "OpenAI profile-statistics upstream returned HTTP 401: {}",
+                    bounded_upstream_body(&body)
+                ));
+            }
+            error
+        }
+        Error::Upstream {
+            status,
+            body,
+            retry_after_seconds,
+        } => {
+            let retry_after = retry_after_seconds
+                .map(|seconds| format!("; retry-after={seconds}s"))
+                .unwrap_or_default();
+            provider_admin_error(ProviderAdminErrorKind::BadGateway)
+                .with_public_message("OpenAI 资料查询失败，请检查账号授权与上游服务")
+                .with_message(format!(
+                    "OpenAI profile-statistics upstream returned HTTP {status}{retry_after}: {}",
+                    bounded_upstream_body(&body)
+                ))
+        }
+    }
+}
+
+fn map_profile_avatar_error(error: CodexProfileAvatarError) -> ProviderAdminError {
+    match error {
+        CodexProfileAvatarError::ProfileStatistics(error) => map_profile_statistics_error(error),
+        CodexProfileAvatarError::Missing => provider_admin_error(ProviderAdminErrorKind::NotFound),
+        CodexProfileAvatarError::InvalidSource | CodexProfileAvatarError::Upstream { .. } => {
+            provider_admin_error(ProviderAdminErrorKind::BadGateway)
+        }
+        CodexProfileAvatarError::TransportUnavailable => {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+        }
+    }
+}
+
+fn map_reset_credits_error(error: CodexResetCreditsError) -> ProviderAdminError {
+    use CodexResetCreditsError as Error;
+
+    match error {
+        Error::InvalidCredentialData => provider_admin_error(ProviderAdminErrorKind::Invalid),
+        Error::NotFound => provider_admin_error(ProviderAdminErrorKind::NotFound),
+        Error::Store { .. } | Error::TransportUnavailable => {
+            provider_admin_error(ProviderAdminErrorKind::Unavailable)
+        }
+        Error::CredentialRefreshRequired { upstream_body } => {
+            let mut error =
+                provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired);
+            if let Some(body) = upstream_body {
+                error = error.with_message(format!(
+                    "OpenAI reset-credit upstream returned HTTP 401: {}",
+                    bounded_upstream_body(&body)
+                ));
+            }
+            error
+        }
+        Error::Upstream {
+            status,
+            body,
+            retry_after_seconds,
+        } => {
+            let retry_after = retry_after_seconds
+                .map(|seconds| format!("; retry-after={seconds}s"))
+                .unwrap_or_default();
+            provider_admin_error(ProviderAdminErrorKind::BadGateway).with_message(format!(
+                "OpenAI reset-credit upstream returned HTTP {status}{retry_after}: {}",
+                bounded_upstream_body(&body)
+            ))
+        }
+        Error::ConsumeResultUnknown => provider_admin_error(ProviderAdminErrorKind::Ambiguous)
+            .with_message(
+                "OpenAI reset-credit consume result is unknown; refresh the credit list before retrying",
+            ),
+    }
+}
+
+fn bounded_upstream_body(body: &str) -> String {
+    const MAX_ADMIN_UPSTREAM_BODY_BYTES: usize = 8 * 1024;
+    if body.len() <= MAX_ADMIN_UPSTREAM_BODY_BYTES {
+        return body.to_owned();
+    }
+    let mut end = MAX_ADMIN_UPSTREAM_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_owned()
+}
+
+fn map_catalog_error(error: CodexCredentialCatalogError) -> ProviderAdminError {
+    use CodexCredentialCatalogError as Error;
+    use ProviderAdminErrorKind as Kind;
+    let (kind, message) = match error {
+        Error::InvalidCredentialData => (Kind::Invalid, "OpenAI 模型查询凭据无效，请检查账号授权"),
+        Error::InvalidEtag => (Kind::Invalid, "OpenAI 模型目录版本标识无效，请重新查询"),
+        Error::NoEligibleCredential => (Kind::NotFound, "没有可用于查询 OpenAI 模型的账号"),
+        Error::ConcurrentUpdate => (Kind::Conflict, "OpenAI 模型目录正在更新，请稍后重试"),
+        Error::Upstream { .. } => (
+            Kind::Unavailable,
+            "OpenAI 模型查询失败，请检查出站连接与上游服务",
+        ),
+        Error::Cache => (Kind::Unavailable, "OpenAI 模型目录缓存暂不可用"),
+    };
+    provider_admin_error(kind).with_public_message(message)
+}
+
+fn map_client_profile_error(
+    error: crate::transport::profile::selection::ClientProfileError,
+) -> ProviderAdminError {
+    use crate::transport::profile::selection::ClientProfileError;
+    let message = match error {
+        ClientProfileError::Invalid => "客户端身份字段或版本组合不合法",
+        ClientProfileError::ReleaseUnavailable => {
+            "此客户端、平台与架构尚无已核验发布版本，请选择固定版本或稍后重试"
+        }
+    };
+    provider_admin_error(ProviderAdminErrorKind::Invalid).with_public_message(message)
+}

@@ -1,0 +1,308 @@
+//! OpenAI 管理资源的中立 ProviderAdmin 委托。
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use gateway_core::runtime::SnapshotControl;
+
+use crate::{
+    model::{
+        AdminError,
+        provider_credentials::{
+            AuthorizationStarted, CompleteAuthorization, CredentialDeletion,
+            CredentialDeletionResult, CredentialImportCommit, CredentialImportResult,
+            CredentialMutationResult, ImportCredentials, PrepareCredentialImport,
+            PrepareCredentialRotation, ProviderDocument, RotateCredential, StartAuthorization,
+        },
+    },
+    ports::{
+        provider::ProviderAdmin,
+        store::{AccountStore, AdminStoreErrorKind},
+    },
+};
+
+use super::{
+    commit_authorization, commit_credential_rotation, delete_credentials, map_provider_error,
+    map_store_error, pending_authorization, publish_committed,
+    publish_credentials_and_observe_quota, required_credential, validate_authorization_commit,
+    validate_prepared_import, validate_prepared_rotation,
+};
+
+/// OpenAI 固定管理路由消费的服务。
+#[async_trait]
+pub trait OpenAiService: Send + Sync {
+    async fn import_document(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError>;
+    /// 用票据登录换回单账号导入文档（经 Provider 的登录服务，走给定出口）。
+    async fn ticket_login(
+        &self,
+        ticket: &crate::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, AdminError>;
+    /// 只新建 OAuth 账号：API Key 账号与上游身份已存在的账号整批拒绝，供免登录入口使用。
+    async fn import_new_accounts(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError>;
+    async fn start_authorization(
+        &self,
+        command: StartAuthorization,
+    ) -> Result<AuthorizationStarted, AdminError>;
+    async fn complete_authorization(
+        &self,
+        command: CompleteAuthorization,
+    ) -> Result<CredentialMutationResult, AdminError>;
+    async fn rotate(
+        &self,
+        command: RotateCredential,
+    ) -> Result<CredentialMutationResult, AdminError>;
+    async fn delete(
+        &self,
+        command: CredentialDeletion,
+    ) -> Result<CredentialDeletionResult, AdminError>;
+}
+
+pub(crate) struct DefaultOpenAiService {
+    provider: Arc<dyn ProviderAdmin>,
+    accounts: Arc<dyn AccountStore>,
+    proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
+    snapshot: Arc<dyn SnapshotControl>,
+}
+
+impl DefaultOpenAiService {
+    async fn import(
+        &self,
+        command: ImportCredentials,
+        new_accounts_only: bool,
+    ) -> Result<CredentialImportResult, AdminError> {
+        let context = command.context;
+        let proxy_reservation = super::import_proxy_binding(
+            self.proxies.as_ref(),
+            command.outbound_proxy_id.as_deref(),
+        )
+        .await?;
+        let outbound_proxy = proxy_reservation
+            .as_ref()
+            .map(|reservation| reservation.binding.clone());
+        let prepared = self
+            .provider
+            .prepare_import(PrepareCredentialImport {
+                default_outbound_proxy: outbound_proxy
+                    .as_ref()
+                    .map(|binding| binding.proxy.clone()),
+                document: command.document,
+            })
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI credential import"))?;
+        validate_prepared_import(
+            self.provider.provider_kind(),
+            &prepared,
+            "OpenAI credential import",
+        )?;
+        // 免登录入口的提交者不可信：自定义 base_url 的 API Key 账号会把业务流量引向提交者，
+        // 必须经管理员导入；OAuth 以外的认证类型一律拒绝。
+        if new_accounts_only
+            && prepared
+                .credentials
+                .iter()
+                .any(|credential| credential.authentication_kind != "oauth")
+        {
+            return Err(AdminError::invalid("此入口只接受 OAuth 账号"));
+        }
+        let result = self
+            .accounts
+            .commit_credential_import(
+                CredentialImportCommit {
+                    outbound_proxy,
+                    prepared,
+                    settings: command.settings,
+                    reject_existing: new_accounts_only,
+                },
+                &context,
+            )
+            .await
+            .map_err(|error| {
+                if new_accounts_only && error.kind() == AdminStoreErrorKind::Conflict {
+                    return AdminError::conflict("账号已存在，此入口不会覆盖已有账号");
+                }
+                map_store_error(error, "OpenAI credential import")
+            })?;
+        drop(proxy_reservation);
+        publish_credentials_and_observe_quota(
+            &self.provider,
+            self.snapshot.as_ref(),
+            result.config_revision,
+            &result.credential_ids,
+            &context.request_id,
+        )
+        .await?;
+        Ok(result)
+    }
+
+    #[must_use]
+    pub(crate) fn new(
+        provider: Arc<dyn ProviderAdmin>,
+        accounts: Arc<dyn AccountStore>,
+        proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
+        snapshot: Arc<dyn SnapshotControl>,
+    ) -> Self {
+        Self {
+            provider,
+            accounts,
+            proxies,
+            snapshot,
+        }
+    }
+}
+
+#[async_trait]
+impl OpenAiService for DefaultOpenAiService {
+    async fn import_document(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError> {
+        self.import(command, false).await
+    }
+
+    async fn import_new_accounts(
+        &self,
+        command: ImportCredentials,
+    ) -> Result<CredentialImportResult, AdminError> {
+        self.import(command, true).await
+    }
+
+    async fn ticket_login(
+        &self,
+        ticket: &crate::model::account_tickets::TicketSecret,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Result<ProviderDocument, AdminError> {
+        self.provider
+            .ticket_login(ticket, proxy)
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI ticket login"))
+    }
+
+    async fn start_authorization(
+        &self,
+        command: StartAuthorization,
+    ) -> Result<AuthorizationStarted, AdminError> {
+        let pending = pending_authorization(
+            self.accounts.as_ref(),
+            self.proxies.as_ref(),
+            self.provider.provider_kind(),
+            &command,
+            "OpenAI credential",
+        )
+        .await?;
+        self.provider
+            .start_authorization(pending)
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI authorization"))
+    }
+
+    async fn complete_authorization(
+        &self,
+        mut command: CompleteAuthorization,
+    ) -> Result<CredentialMutationResult, AdminError> {
+        let context = command.context.clone();
+        let settings = command.settings.take();
+        let prepared = self
+            .provider
+            .complete_authorization(command)
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI authorization"))?;
+        let prepared = validate_authorization_commit(
+            self.provider.provider_kind(),
+            &context,
+            prepared,
+            "OpenAI authorization",
+        )
+        .await?;
+        let result = commit_authorization(
+            self.accounts.as_ref(),
+            prepared,
+            settings,
+            &context,
+            "OpenAI authorization",
+        )
+        .await?;
+        publish_credentials_and_observe_quota(
+            &self.provider,
+            self.snapshot.as_ref(),
+            result.config_revision,
+            std::slice::from_ref(&result.account_id),
+            &context.request_id,
+        )
+        .await?;
+        Ok(result)
+    }
+
+    async fn rotate(
+        &self,
+        command: RotateCredential,
+    ) -> Result<CredentialMutationResult, AdminError> {
+        let context = command.mutation.context;
+        let account_id = command.mutation.account_id;
+        if command
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.account_id != account_id.as_str())
+        {
+            return Err(AdminError::invalid("凭据和账号设置的目标不一致"));
+        }
+        let disable_account = command
+            .settings
+            .as_ref()
+            .is_some_and(|settings| !settings.enabled);
+        let details = required_credential(
+            self.accounts.as_ref(),
+            self.provider.provider_kind(),
+            &account_id,
+            "OpenAI credential rotation",
+        )
+        .await?;
+        let account = details.credential;
+        let prepared = self
+            .provider
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account.clone(),
+                provider_material: command.provider_material,
+            })
+            .await
+            .map_err(|error| map_provider_error(error, "OpenAI credential rotation"))?;
+        validate_prepared_rotation(&account, &prepared, "OpenAI credential rotation")?;
+        let result = commit_credential_rotation(
+            self.accounts.as_ref(),
+            prepared,
+            command.settings,
+            &context,
+            "OpenAI credential rotation",
+        )
+        .await?;
+        if disable_account {
+            self.provider.account_unavailable(&account_id).await;
+        }
+        self.provider
+            .account_facts_changed(std::slice::from_ref(&result.account_id))
+            .await;
+        publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        Ok(result)
+    }
+
+    async fn delete(
+        &self,
+        command: CredentialDeletion,
+    ) -> Result<CredentialDeletionResult, AdminError> {
+        let result = delete_credentials(
+            self.accounts.as_ref(),
+            self.provider.as_ref(),
+            command,
+            "OpenAI credential",
+        )
+        .await?;
+        publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        Ok(result)
+    }
+}

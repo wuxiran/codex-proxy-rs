@@ -1,0 +1,598 @@
+<script setup lang="ts">
+import type { AccountRow } from './constants'
+import { ChevronDown } from '@lucide/vue'
+import { useMediaQuery } from '@vueuse/core'
+
+import { ref, shallowRef } from 'vue'
+import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
+import BaseCard from '@/components/base/BaseCard.vue'
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
+import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
+import BasePageHeader from '@/components/base/BasePageHeader.vue'
+import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
+import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
+import BaseTable from '@/components/base/BaseTable/index.vue'
+import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
+import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
+import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
+import AccountAutoRefresh from './components/AccountAutoRefresh.vue'
+import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
+import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
+import AccountCreateModal from './components/AccountCreateModal/index.vue'
+import AccountEditModal from './components/AccountEditModal.vue'
+import AccountFilters from './components/AccountFilters.vue'
+import AccountIdentityCell from './components/AccountIdentityCell.vue'
+import AccountImportTasks from './components/AccountImportTasks/index.vue'
+import AccountOverviewCards from './components/AccountOverviewCards.vue'
+import AccountPlanBadge from './components/AccountPlanBadge.vue'
+import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
+import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
+import AccountRecentErrors from './components/AccountRecentErrors.vue'
+import AccountStateBindingCell from './components/AccountStateBindingCell.vue'
+import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
+import AccountTableActions from './components/AccountTableActions.vue'
+import AccountTicketCell from './components/AccountTicketCell.vue'
+import AccountTicketModal from './components/AccountTicketModal.vue'
+import AccountUsagePanel from './components/AccountUsagePanel.vue'
+import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
+import { useAccountConfigurations } from './composables/useAccountConfigurations'
+import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
+import { useAccountEditor } from './composables/useAccountEditor'
+import { useAccountImportTasks } from './composables/useAccountImportTasks'
+import { useAccountMutations } from './composables/useAccountMutations'
+import { useAccountsQuery } from './composables/useAccountsQuery'
+import { useAccountsTable } from './composables/useAccountsTable'
+import { accountColumns, derivedAccountStatus } from './constants'
+
+const selectedIds = ref<Set<string>>(new Set())
+const ticketAccount = shallowRef<AccountRow | null>(null)
+const showTicketModal = shallowRef(false)
+function openTicket(account: AccountRow) {
+  ticketAccount.value = account
+  showTicketModal.value = true
+}
+const narrowTable = useMediaQuery('(max-width: 639px)')
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(
+  () => accountColumns.map(column => narrowTable.value && column.key === 'actions'
+    ? { ...column, kind: 'custom' as const }
+    : column),
+  'accounts',
+)
+const {
+  loading,
+  accounts,
+  loadAccounts,
+  refreshAccountsSilently,
+  autoRefreshSeconds,
+  refreshing: refreshingAccounts,
+  refreshNow: refreshAccountsNow,
+  searchQuery,
+  providerQuery,
+  statusQuery,
+  groupQuery,
+  sort,
+  accountSummary,
+  accountPagination,
+  replaceAccount,
+  handlePageChange,
+  handlePageSizeChange,
+  handleSortChange,
+} = useAccountsQuery()
+const { entries: accountConfigurations, reload: reloadConfigurations } = useAccountConfigurations(accounts)
+
+const {
+  groups,
+  loading: groupsLoading,
+  loadGroups,
+} = useAccountGroupCatalog()
+
+const importTasks = useAccountImportTasks({
+  reload: () => Promise.all([loadAccounts(), loadGroups()]),
+})
+const {
+  open: showImportTasks,
+  tasks: recentImportTasks,
+  selectedId: importTaskId,
+  detail: importTaskDetail,
+  loading: loadingImportTasks,
+  stopping: stoppingImportTask,
+  error: importTaskError,
+  activeCount: activeImportCount,
+} = importTasks
+
+const {
+  showCreateModal,
+  showDeleteModal,
+  showSingleDeleteModal,
+  pendingDeleteAccount,
+  recoveringAccountIds,
+  refreshingAccountIds,
+  refreshingQuotaAccountIds,
+  updatingSchedulingAccountIds,
+  updatingTurnStateAccountIds,
+  revivingAccountIds,
+  deletingAccount,
+  creatingAccount,
+  authorizingOAuth,
+  batchDeleting,
+  exportingAccounts,
+  reauthorizingAccount,
+  createForm,
+  handleCreate,
+  handleAuthorizeOAuth,
+  openCreateAccount,
+  openReauthorizeAccount,
+  requestDeleteAccount,
+  handleDelete,
+  handleBatchDelete,
+  handleExportAccounts,
+  handleRecover,
+  handleRefresh,
+  handleRefreshQuota,
+  handleToggleScheduling,
+  handleToggleTurnState,
+  handleReviveGuanlan,
+  handleQuotaReset,
+} = useAccountMutations({
+  onImportTaskCreated: importTasks.created,
+  accounts,
+  selectedIds,
+  reload: () => Promise.all([loadAccounts(), loadGroups()]),
+  replaceAccount,
+  reloadConfigurations,
+})
+
+const {
+  showConnectionTestModal,
+  testingAccount,
+  connectionTestStatus,
+  connectionTestModel,
+  connectionTestLogs,
+  connectionTestError,
+  connectionTestStartedAt,
+  connectionTestFinishedAt,
+  connectionTestDurationMs,
+  testingConnectionIds,
+  loadingConnectionTestModels,
+  refreshingConnectionTestModels,
+  connectionTestSelectedModel,
+  connectionTestModelOptions,
+  connectionTestStatusView,
+  openConnectionTest,
+  handleRefreshConnectionTestModels,
+  handleTestConnection,
+} = useAccountConnectionTest({ reload: refreshAccountsSilently })
+
+const {
+  expandedAccountIds,
+  allSelected,
+  indeterminate,
+  selectedRowKeys,
+  expandedRowKeys,
+  toggleSelection,
+  toggleExpanded,
+  toggleAll,
+} = useAccountsTable(accounts, selectedIds)
+
+const {
+  showBatchEditModal,
+  schedulingEnabled: batchSchedulingEnabled,
+  concurrencyLimit: batchConcurrencyLimit,
+  weight: batchWeight,
+  modelAccess: batchModelAccess,
+  hasChanges: batchHasChanges,
+  catalogAccountId: batchCatalogAccountId,
+  proxyMode: batchProxyMode,
+  proxyId: batchProxyId,
+  selectedGroupIds: batchGroupIds,
+  saving: savingBatchEdit,
+  open: openBatchEdit,
+  save: saveBatchEdit,
+} = useAccountBatchEditor({
+  accounts,
+  selectedIds,
+  reloadAccounts: loadAccounts,
+  reloadGroups: loadGroups,
+})
+
+const {
+  apiKey: editingApiKey,
+  pinTurnState: editingPinTurnState,
+  savedPinTurnState: editingSavedPinTurnState,
+  afterTurnStateHunt,
+  afterTurnStateHuntCancelled,
+  turnStateAutoHunt: editingTurnStateAutoHunt,
+  stopTurnStateAutoHunt,
+  recaptureTurnState: editingRecaptureTurnState,
+  turnStatePins: editingTurnStatePins,
+  turnStateCaptureRule: editingTurnStateCaptureRule,
+  configurationLoading,
+  configurationReady,
+  showEditModal,
+  editingAccount,
+  notes: editingNotes,
+  schedulingEnabled,
+  concurrencyLimit: editingConcurrencyLimit,
+  weight: editingWeight,
+  modelAccess: editingModelAccess,
+  proxyMode: editingProxyMode,
+  proxyId: editingProxyId,
+  selectedGroupIds: editingGroupIds,
+  saving: savingAccountEdit,
+  open: openAccountEdit,
+  save: saveAccountEdit,
+} = useAccountEditor({
+  accounts,
+  reloadAccounts: loadAccounts,
+  reloadGroups: loadGroups,
+})
+</script>
+
+<template>
+  <div class="flex min-h-0 w-full flex-col xl:h-full xl:overflow-hidden">
+    <BasePageHeader
+      class="h-17"
+      title="账号管理"
+      description="维护账号池，查看可用性、配额与使用状态"
+    />
+
+    <AccountOverviewCards :summary="accountSummary" />
+
+    <BaseCard
+      class="mt-4 flex flex-col xl:h-[calc(100dvh-250px)] xl:min-h-125"
+    >
+      <template #header>
+        <AccountFilters
+          v-model:search="searchQuery"
+          v-model:status="statusQuery"
+          v-model:provider="providerQuery"
+          v-model:group="groupQuery"
+          :groups="groups"
+          :groups-loading="groupsLoading"
+          :selected-count="selectedIds.size"
+          :batch-deleting="batchDeleting"
+          :exporting-accounts="exportingAccounts"
+          :has-import-tasks="recentImportTasks.length > 0"
+          :active-import-count="activeImportCount"
+          @import-tasks="showImportTasks = true"
+          @delete-selected="showDeleteModal = true"
+          @export-selected="handleExportAccounts"
+          @create="openCreateAccount"
+          @edit-selected="openBatchEdit"
+        >
+          <template #actions>
+            <AccountAutoRefresh
+              v-model="autoRefreshSeconds"
+              :refreshing="refreshingAccounts"
+              @refresh="refreshAccountsNow"
+            />
+            <BaseTableColumnSettings
+              :options="columnOptions"
+              @change="setColumnVisible"
+              @reorder="setColumnOrder"
+              @reset="resetColumns"
+            />
+          </template>
+        </AccountFilters>
+      </template>
+
+      <template #body>
+        <div class="flex min-h-0 flex-col xl:h-full">
+          <BaseTable
+            class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
+            :columns="visibleColumns"
+            :rows="accounts"
+            :loading="loading"
+            :selected-row-keys="selectedRowKeys"
+            :expanded-row-keys="expandedRowKeys"
+            :sort="sort"
+            empty-text="暂无账号数据"
+            @sort-change="handleSortChange"
+          >
+            <template #expander="{ row }">
+              <button
+                type="button"
+                class="inline-flex size-6 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-cp-text-secondary transition hover:bg-cp-bg-text-hover hover:text-cp-text"
+                :title="expandedAccountIds.has(row.id) ? '收起统计' : '展开统计'"
+                @click.stop="toggleExpanded(row.id)"
+              >
+                <ChevronDown
+                  class="size-3.5 transition-transform"
+                  :class="expandedAccountIds.has(row.id) ? '' : '-rotate-90'"
+                />
+              </button>
+            </template>
+
+            <template #header-selection>
+              <BaseCheckbox
+                :model-value="allSelected"
+                :indeterminate="indeterminate"
+                label="选择当前页账号"
+                @update:model-value="toggleAll"
+              />
+            </template>
+
+            <template #selection="{ row }">
+              <BaseCheckbox
+                :model-value="selectedIds.has(row.id)"
+                label="选择账号"
+                @update:model-value="toggleSelection(row.id)"
+              />
+            </template>
+
+            <template #identity="{ row }">
+              <AccountIdentityCell :account="row" show-notes />
+            </template>
+
+            <template #provider="{ row }">
+              <ProviderIconGroup
+                :provider="row.provider"
+                :authentication-kind="row.authenticationKind"
+              />
+            </template>
+
+            <template #ticket="{ row }">
+              <AccountTicketCell :ticket="row.ticket" />
+            </template>
+
+            <template #status="{ row }">
+              <div class="grid justify-items-start gap-1">
+                <AccountStatusBadge
+                  :status="derivedAccountStatus(row)"
+                  :error-reason="row.errorReason"
+                  :error-message="row.errorMessage"
+                  :rate-limited-until="row.quota.rateLimitedUntil"
+                  :rate-limit-reason="row.quota.rateLimitReason"
+                  :recovery-probe-required="row.quota.recoveryProbeRequired"
+                  :next-refresh-at="row.nextRefreshAt"
+                />
+                <span
+                  class="whitespace-nowrap text-cp-xs font-emphasis tabular-nums text-cp-text-tertiary"
+                  :title="row.concurrencyLimit === null ? '当前并发 / 并发上限（继承全局默认）' : '当前并发 / 并发上限'"
+                >
+                  并发 {{ row.concurrency.inFlight ?? '—' }}/{{ row.concurrency.limit ?? '不限' }}
+                </span>
+                <AccountRecentErrors
+                  :account-id="row.id"
+                  :request-count="row.recentErrors.requestCount"
+                  :error-count="row.recentErrors.errorCount"
+                />
+              </div>
+            </template>
+
+            <template #enabled="{ row }">
+              <BaseSwitch
+                :model-value="row.enabled"
+                :label="`${row.name} 调度`"
+                :disabled="updatingSchedulingAccountIds.has(row.id)"
+                :aria-busy="updatingSchedulingAccountIds.has(row.id)"
+                :title="row.enabled ? '关闭调度' : '开启调度'"
+                @update:model-value="handleToggleScheduling(row, $event)"
+              />
+            </template>
+
+            <template #turnState="{ row }">
+              <BaseSwitch
+                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
+                :model-value="accountConfigurations[row.id]?.value?.pinTurnState ?? false"
+                :label="`${row.name} State`"
+                :disabled="!accountConfigurations[row.id]?.value || accountConfigurations[row.id]?.loading || updatingTurnStateAccountIds.has(row.id) || revivingAccountIds.has(row.id)"
+                :title="accountConfigurations[row.id]?.error || '切换 state 绑定'"
+                @update:model-value="handleToggleTurnState(row.id, $event)"
+              />
+              <span v-else class="text-cp-text-quaternary">不适用</span>
+            </template>
+
+            <template #stateBinding="{ row }">
+              <AccountStateBindingCell
+                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
+                :configuration="accountConfigurations[row.id]?.value"
+                :loading="accountConfigurations[row.id]?.loading"
+                :error="accountConfigurations[row.id]?.error"
+                @configure="openAccountEdit(row)"
+                @retry="reloadConfigurations"
+              />
+              <span v-else class="text-cp-text-quaternary">不适用</span>
+            </template>
+
+            <template #planType="{ row }">
+              <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+            </template>
+
+            <template #usage="{ row }">
+              <AccountQuotaSummaryCell :account="row" />
+            </template>
+
+            <template #groups="{ row }">
+              <div class="flex w-full justify-center">
+                <AccountGroupMarks :groups="row.groups" />
+              </div>
+            </template>
+
+            <template #lastUsedAt="{ row }">
+              <LastUsedAtCell :value="row.usage.lastUsedAt" />
+            </template>
+
+            <template #actions="{ row }">
+              <AccountTableActions
+                :account="row"
+                :deleting="deletingAccount"
+                :recovering="recoveringAccountIds.has(row.id)"
+                :refreshing="refreshingAccountIds.has(row.id)"
+                :testing="testingConnectionIds.has(row.id)"
+                :guanlan-revive-available="accountConfigurations[row.id]?.value?.guanlanReviveAvailable ?? false"
+                :reviving="revivingAccountIds.has(row.id)"
+                @edit="openAccountEdit"
+                @delete="requestDeleteAccount"
+                @recover="handleRecover"
+                @refresh="handleRefresh"
+                @reauthorize="openReauthorizeAccount"
+                @test="openConnectionTest"
+                @revive="handleReviveGuanlan"
+                @ticket="openTicket"
+              />
+            </template>
+
+            <template #expanded="{ row }">
+              <div class="grid items-stretch gap-3 p-4 lg:grid-cols-[1.05fr_2.45fr] xl:min-h-77">
+                <AccountQuotaPanel
+                  :account="row"
+                  :refreshing="refreshingQuotaAccountIds.has(row.id)"
+                  @quota-reset="handleQuotaReset"
+                  @account-updated="void replaceAccount($event)"
+                  @refresh-quota="handleRefreshQuota"
+                />
+                <AccountUsagePanel
+                  :account="row"
+                  @account-updated="void replaceAccount($event)"
+                />
+              </div>
+            </template>
+          </BaseTable>
+          <BaseTablePagination
+            :pagination="accountPagination"
+            :loading="loading"
+            @page-change="handlePageChange"
+            @page-size-change="handlePageSizeChange"
+          />
+        </div>
+      </template>
+    </BaseCard>
+
+    <AccountConnectionTestModal
+      v-model="showConnectionTestModal"
+      v-model:selected-model="connectionTestSelectedModel"
+      :account="testingAccount"
+      :duration-ms="connectionTestDurationMs"
+      :error="connectionTestError"
+      :finished-at="connectionTestFinishedAt"
+      :loading-models="loadingConnectionTestModels"
+      :refreshing-models="refreshingConnectionTestModels"
+      :logs="connectionTestLogs"
+      :model="connectionTestModel"
+      :model-options="connectionTestModelOptions"
+      :started-at="connectionTestStartedAt"
+      :status="connectionTestStatus"
+      :status-view="connectionTestStatusView"
+      @refresh-models="handleRefreshConnectionTestModels()"
+      @test="handleTestConnection()"
+    />
+
+    <AccountImportTasks
+      v-model="showImportTasks"
+      :tasks="recentImportTasks"
+      :selected-id="importTaskId"
+      :detail="importTaskDetail"
+      :loading="loadingImportTasks"
+      :stopping="stoppingImportTask"
+      :error="importTaskError"
+      @select="importTasks.select"
+      @refresh="importTasks.refresh"
+      @stop="importTasks.stop"
+      @view-accounts="showImportTasks = false; loadAccounts()"
+    />
+
+    <AccountCreateModal
+      v-model="showCreateModal"
+      v-model:form="createForm"
+      :account="reauthorizingAccount"
+      :groups="groups"
+      :groups-loading="groupsLoading"
+      :oauth-loading="authorizingOAuth"
+      :reauthorizing="Boolean(reauthorizingAccount)"
+      :saving="creatingAccount"
+      @create="handleCreate"
+      @generate-oauth="handleAuthorizeOAuth"
+    />
+
+    <AccountTicketModal
+      v-model="showTicketModal"
+      :account="ticketAccount"
+      @changed="refreshAccountsSilently"
+    />
+
+    <AccountEditModal
+      v-model="showEditModal"
+      v-model:api-key="editingApiKey"
+      v-model:pin-turn-state="editingPinTurnState"
+      v-model:recapture-turn-state="editingRecaptureTurnState"
+      v-model:notes="editingNotes"
+      v-model:enabled="schedulingEnabled"
+      v-model:concurrency-limit="editingConcurrencyLimit"
+      v-model:weight="editingWeight"
+      v-model:model-access="editingModelAccess"
+      v-model:proxy-mode="editingProxyMode"
+      v-model:proxy-id="editingProxyId"
+      v-model:selected-group-ids="editingGroupIds"
+      :turn-state-pins="editingTurnStatePins"
+      :turn-state-capture-rule="editingTurnStateCaptureRule"
+      :saved-pin-turn-state="editingSavedPinTurnState"
+      :turn-state-auto-hunt="editingTurnStateAutoHunt"
+      :configuration-loading="configurationLoading"
+      :configuration-ready="configurationReady"
+      :account="editingAccount"
+      :groups="groups"
+      :groups-loading="groupsLoading"
+      :saving="savingAccountEdit"
+      @turn-state-hunted="afterTurnStateHunt"
+      @turn-state-hunt-cancelled="afterTurnStateHuntCancelled"
+      @stop-turn-state-auto-hunt="stopTurnStateAutoHunt"
+      @save="saveAccountEdit"
+    />
+
+    <AccountBatchEditModal
+      v-model="showBatchEditModal"
+      v-model:enabled="batchSchedulingEnabled"
+      v-model:concurrency-limit="batchConcurrencyLimit"
+      v-model:weight="batchWeight"
+      v-model:model-access="batchModelAccess"
+      v-model:proxy-mode="batchProxyMode"
+      v-model:proxy-id="batchProxyId"
+      v-model:selected-group-ids="batchGroupIds"
+      :catalog-account-id="batchCatalogAccountId"
+      :selected-count="selectedIds.size"
+      :groups="groups"
+      :groups-loading="groupsLoading"
+      :saving="savingBatchEdit"
+      :has-changes="batchHasChanges"
+      @save="saveBatchEdit"
+    />
+
+    <BaseConfirmModal
+      v-model="showDeleteModal"
+      title="确认删除"
+      description="删除后该账号将不再参与调度，此操作不可撤销"
+      destructive
+      confirm-text="确认删除"
+      :loading="batchDeleting"
+      @confirm="handleBatchDelete"
+    >
+      <p class="m-0">
+        确定要删除选中的 {{ selectedIds.size }} 个账号吗？此操作不可撤销
+      </p>
+    </BaseConfirmModal>
+
+    <BaseConfirmModal
+      v-model="showSingleDeleteModal"
+      title="删除账号"
+      description="删除后该账号将不再参与调度，此操作不可撤销"
+      destructive
+      confirm-text="确认删除"
+      :loading="deletingAccount"
+      @confirm="handleDelete"
+    >
+      <p class="m-0">
+        确定要删除
+        {{
+          pendingDeleteAccount?.email
+            || pendingDeleteAccount?.accountId
+            || pendingDeleteAccount?.id
+            || '该账号'
+        }}
+        吗？
+      </p>
+    </BaseConfirmModal>
+  </div>
+</template>

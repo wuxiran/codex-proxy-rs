@@ -1,0 +1,44 @@
+# Rust
+/backend/**/target/
+*.profraw
+*.profdata
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/.pnpm-store/
+/frontend/.pnpm-store/
+*.tsbuildinfo
+
+# Release artifacts
+/dist/
+
+# Runtime data
+/.runtime/
+*.log
+
+# Local configuration and secrets
+/deploy/config.yaml
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+__pycache__/
+*.py[cod]
+
+# Local tools and worktrees
+/.codegraph/
+/.codex-ws-audit/
+/.reasonix/
+/.claude
+/.worktrees/
+/worktrees/
+/.cargo/
+*.tmp

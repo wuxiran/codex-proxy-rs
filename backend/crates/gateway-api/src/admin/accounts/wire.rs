@@ -1,0 +1,1486 @@
+//! 账号管理请求、响应与查询 wire contract。
+
+use super::*;
+
+#[derive(Debug, Clone)]
+pub struct AccountProxyUpdate(pub Option<gateway_core::account::OutboundProxy>);
+
+impl<'de> Deserialize<'de> for AccountProxyUpdate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.is_empty() {
+            return Ok(Self(None));
+        }
+        gateway_core::account::OutboundProxy::parse(&value)
+            .map(|proxy| Self(Some(proxy)))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+pub(super) fn proxy_selection(
+    id: Option<String>,
+    url: Option<AccountProxyUpdate>,
+) -> Result<Option<gateway_admin::model::proxies::AccountProxySelection>, WireValidationError> {
+    use gateway_admin::model::proxies::AccountProxySelection;
+    match (id, url) {
+        (Some(_), Some(_)) => Err(WireValidationError::new("outboundProxyId")),
+        (Some(id), None) if id.is_empty() => Ok(Some(AccountProxySelection::Direct)),
+        (Some(id), None) => {
+            if id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(WireValidationError::new("outboundProxyId"));
+            }
+            Ok(Some(AccountProxySelection::Saved(id)))
+        }
+        (None, Some(value)) => Ok(Some(
+            value
+                .0
+                .map_or(AccountProxySelection::Direct, AccountProxySelection::Url),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// 账号列表查询参数。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub provider: Option<String>,
+    pub group_id: Option<String>,
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchUpdateAccountsRequest {
+    pub outbound_proxy_id: Option<String>,
+    pub outbound_proxy_url: Option<AccountProxyUpdate>,
+    pub account_ids: Vec<String>,
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_limit")]
+    pub concurrency_limit: Option<Option<u64>>,
+    pub weight: Option<u64>,
+    pub model_access: Option<gateway_core::account::AccountModelAccess>,
+    pub group_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BatchUpdatedAccountsData {
+    account_ids: Vec<String>,
+    config_revision: u64,
+}
+
+impl From<AccountsUpdateResult> for BatchUpdatedAccountsData {
+    fn from(result: AccountsUpdateResult) -> Self {
+        Self {
+            account_ids: result
+                .account_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            config_revision: result.config_revision.get(),
+        }
+    }
+}
+
+fn deserialize_optional_nullable_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u64>>, D::Error> {
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
+
+impl BatchUpdateAccountsRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.account_ids.is_empty()
+            || self.account_ids.len() > MAX_ACCOUNT_GROUP_BATCH
+            || self
+                .account_ids
+                .iter()
+                .any(|id| require_account_id(id, "accountIds").is_err())
+            || self.account_ids.iter().collect::<BTreeSet<_>>().len() != self.account_ids.len()
+        {
+            return Err(WireValidationError::new("accountIds"));
+        }
+        if let Some(group_ids) = &self.group_ids {
+            validate_wire_group_ids(group_ids)?;
+        }
+        self.concurrency_limit
+            .map(parse_concurrency_limit)
+            .transpose()?;
+        self.weight.map(parse_account_weight).transpose()?;
+        if self.enabled.is_none()
+            && self.concurrency_limit.is_none()
+            && self.weight.is_none()
+            && self.group_ids.is_none()
+            && self.model_access.is_none()
+            && self.outbound_proxy_id.is_none()
+            && self.outbound_proxy_url.is_none()
+        {
+            return Err(WireValidationError::new("accountSettings"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(self) -> Result<BatchUpdateAccounts, WireValidationError> {
+        self.validate()?;
+        Ok(BatchUpdateAccounts {
+            outbound_proxy: proxy_selection(self.outbound_proxy_id, self.outbound_proxy_url)?,
+            account_ids: self.account_ids,
+            enabled: self.enabled,
+            concurrency_limit: self
+                .concurrency_limit
+                .map(parse_concurrency_limit)
+                .transpose()?,
+            weight: self.weight.map(parse_account_weight).transpose()?,
+            model_access: self.model_access,
+            group_ids: self
+                .group_ids
+                .as_deref()
+                .map(validate_wire_group_ids)
+                .transpose()?,
+        })
+    }
+}
+
+impl ListQuery {
+    /// 解析并校验全部 wire 字段，生成 Admin 查询命令。
+    pub fn validate(self) -> Result<AccountListQuery, WireValidationError> {
+        let page = self.page.unwrap_or(1);
+        if page == 0 {
+            return Err(WireValidationError::new("page"));
+        }
+        let page_size = self.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(WireValidationError::new("pageSize"));
+        }
+        let provider_kind = parse_provider(self.provider.as_deref().unwrap_or("all"))?;
+        let group_filter = match self.group_id.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some("ungrouped") => Some(AccountGroupFilter::Ungrouped),
+            Some(value) => Some(AccountGroupFilter::Group(
+                AccountGroupId::new(value.to_owned())
+                    .map_err(|_| WireValidationError::new("groupId"))?,
+            )),
+        };
+        let search = self
+            .search
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if search.as_deref().is_some_and(|value| {
+            value.len() > MAX_SEARCH_BYTES || value.chars().any(char::is_control)
+        }) {
+            return Err(WireValidationError::new("search"));
+        }
+        let status = match self.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => Some(
+                DomainAccountStatus::parse(&value.to_ascii_lowercase())
+                    .ok_or_else(|| WireValidationError::new("status"))?,
+            ),
+        };
+        let sort = match (self.sort_by.as_deref(), self.sort_direction.as_deref()) {
+            (None, None) => None,
+            (Some(field), Some(direction)) => Some(AccountSort {
+                field: parse_sort_field(field).ok_or_else(|| WireValidationError::new("sortBy"))?,
+                direction: parse_sort_direction(direction)
+                    .ok_or_else(|| WireValidationError::new("sortDirection"))?,
+            }),
+            _ => return Err(WireValidationError::new("sort")),
+        };
+        Ok(AccountListQuery {
+            page,
+            page_size: PageSize::new(
+                u16::try_from(page_size).map_err(|_| WireValidationError::new("pageSize"))?,
+            )
+            .map_err(|_| WireValidationError::new("pageSize"))?,
+            provider_kind,
+            group_filter,
+            search,
+            status,
+            sort,
+        })
+    }
+}
+
+fn parse_provider(value: &str) -> Result<Option<ProviderKind>, WireValidationError> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    ProviderKind::new(value.to_owned())
+        .map(Some)
+        .map_err(|_| WireValidationError::new("provider"))
+}
+
+fn parse_sort_field(value: &str) -> Option<AccountSortField> {
+    match value.trim() {
+        "email" => Some(AccountSortField::Email),
+        "status" => Some(AccountSortField::Status),
+        "planType" => Some(AccountSortField::PlanType),
+        "usage" => Some(AccountSortField::Usage),
+        "lastUsedAt" => Some(AccountSortField::LastUsedAt),
+        "expiresAt" => Some(AccountSortField::ExpiresAt),
+        _ => None,
+    }
+}
+
+fn parse_sort_direction(value: &str) -> Option<SortDirection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "asc" => Some(SortDirection::Asc),
+        "desc" => Some(SortDirection::Desc),
+        _ => None,
+    }
+}
+
+/// 账号列表响应数据。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPageData {
+    pub items: Vec<AccountView>,
+    pub page: PageMeta,
+    pub summary: AccountSummaryView,
+}
+
+/// 账号概览计数。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummaryView {
+    pub total: u64,
+    pub normal: u64,
+    pub quota_exhausted: u64,
+    pub rate_limited: u64,
+    pub disabled: u64,
+    pub error: u64,
+}
+
+/// 账号成本、到期与票据状态（fork 子表）；票据只回显打码邮箱。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTicketView {
+    pub purchase_amount: Option<String>,
+    pub purchase_currency: Option<String>,
+    /// 例如 `¥55.00` / `$20.00`。
+    pub purchase_display: Option<String>,
+    pub purchased_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub has_ticket: bool,
+    pub ticket_hint: Option<String>,
+    pub ticket_updated_at: Option<String>,
+    /// 自买入（或入库）起按模型价格计费的累计美元金额。
+    pub spent_usd: Option<String>,
+    pub spent_usd_display: Option<String>,
+    /// 本轮失效后已自动复活的次数（上限 3）；成功或恢复正常后清零。
+    pub auto_revive_attempts: i32,
+    pub auto_revive_last_at: Option<String>,
+    pub auto_revive_last_error: Option<String>,
+}
+
+/// 保存账号成本、到期与票据。`ticket` 为空表示保持原票据不变。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateAccountTicketRequest {
+    pub account_id: String,
+    #[serde(default)]
+    pub purchase_amount: Option<String>,
+    #[serde(default)]
+    pub purchase_currency: Option<String>,
+    #[serde(default)]
+    pub purchased_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub ticket: Option<String>,
+    #[serde(default)]
+    pub clear_ticket: bool,
+}
+
+impl std::fmt::Debug for UpdateAccountTicketRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateAccountTicketRequest")
+            .field("account_id", &self.account_id)
+            .field("ticket", &self.ticket.as_ref().map(|_| "<redacted>"))
+            .field("clear_ticket", &self.clear_ticket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpdateAccountTicketRequest {
+    pub(super) fn into_command(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::account_tickets::UpdateAccountTicket, WireValidationError>
+    {
+        require_account_id(&self.account_id, "accountId")?;
+        let account_id = ProviderAccountId::new(self.account_id)
+            .map_err(|_| WireValidationError::new("accountId"))?;
+        let time = |value: Option<String>, field: &'static str| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(value.trim())
+                        .map(|at| at.with_timezone(&Utc))
+                        .map_err(|_| WireValidationError::new(field))
+                })
+                .transpose()
+        };
+        Ok(gateway_admin::model::account_tickets::UpdateAccountTicket {
+            context,
+            account_id,
+            purchase_amount: self
+                .purchase_amount
+                .filter(|amount| !amount.trim().is_empty()),
+            purchase_currency: self
+                .purchase_currency
+                .filter(|currency| !currency.trim().is_empty()),
+            purchased_at: time(self.purchased_at, "purchasedAt")?,
+            expires_at: time(self.expires_at, "expiresAt")?,
+            ticket_line: self
+                .ticket
+                .filter(|line| !line.trim().is_empty())
+                .map(secrecy::SecretString::from),
+            clear_ticket: self.clear_ticket,
+        })
+    }
+}
+
+/// 账号实时并发；`inFlight` 为空表示实时数据不可用，`limit` 为空表示不限。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountConcurrencyView {
+    pub in_flight: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// 最近 24 小时的请求数与报错次数（未成功完成的请求）。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRecentErrorsView {
+    pub request_count: u64,
+    pub error_count: u64,
+}
+
+/// 一条安全账号视图。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountView {
+    pub outbound_proxy_endpoint: Option<String>,
+    pub id: String,
+    pub name: String,
+    pub notes: Option<String>,
+    pub provider: String,
+    pub groups: Vec<AccountGroupRefView>,
+    pub resource_ref: String,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    pub label: Option<String>,
+    pub plan_type: Option<String>,
+    /// 后端生成的套餐展示名称；缺失套餐时为“未知套餐”。
+    pub plan_type_display: String,
+    pub authentication_kind: String,
+    pub has_refresh_token: bool,
+    pub status: String,
+    /// `status == "error"` 时的具体原因；其余状态为 `null`。
+    pub error_reason: Option<String>,
+    /// 最近一次失败的上游错误描述；仅错误状态存在。
+    pub error_message: Option<String>,
+    pub enabled: bool,
+    pub concurrency_limit: Option<u32>,
+    /// 实时并发：当前占用与生效上限（未单独设置时为全局默认）。
+    pub concurrency: AccountConcurrencyView,
+    /// 最近 24 小时的请求数与报错次数。
+    pub recent_errors: AccountRecentErrorsView,
+    /// 成本、到期与票据状态；不含任何票据明文。
+    pub ticket: AccountTicketView,
+    pub weight: u16,
+    pub model_access: gateway_core::account::AccountModelAccess,
+    pub access_token_expires_at: Option<String>,
+    pub access_token_expires_at_display: Option<String>,
+    pub refresh_token_expires_at: Option<String>,
+    pub next_refresh_at: Option<String>,
+    pub added_at: String,
+    pub added_at_display: String,
+    pub updated_at: String,
+    pub updated_at_display: String,
+    pub quota: AccountQuotaView,
+    pub usage: AccountUsageView,
+}
+
+/// 容量估算仅供管理端展示；金额不是订阅账单或可消费余额。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaForecastData {
+    pub account_id: String,
+    pub generated_at: String,
+    pub forecasts: Vec<AccountQuotaForecastView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaForecastView {
+    pub period: &'static str,
+    pub target_days: f64,
+    pub extrapolated: bool,
+    pub source: Option<QuotaForecastSourceView>,
+    pub unavailable_reason: Option<&'static str>,
+    pub low_sample: bool,
+    pub incomplete_cost: bool,
+    pub incomplete_tokens: bool,
+    pub estimated_tokens: Option<u64>,
+    pub estimated_tokens_display: String,
+    pub estimated_usd: Option<f64>,
+    pub estimated_usd_display: String,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_tokens_display: String,
+    pub remaining_usd: Option<f64>,
+    pub remaining_usd_display: String,
+    pub window_start_at: Option<String>,
+    pub curve: Vec<QuotaForecastCurvePointView>,
+    pub burn_percent_per_hour: Option<f64>,
+    pub burn_percent_per_hour_display: String,
+    pub exhaustion: Option<QuotaExhaustionView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaForecastCurvePointView {
+    pub observed_at: String,
+    pub used_percent: f64,
+}
+
+/// `at` 仅在 `kind == "at"` 时存在；其余结论没有可展示的时刻。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaExhaustionView {
+    pub kind: &'static str,
+    pub at: Option<String>,
+    pub at_display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaForecastSourceView {
+    pub label: String,
+    pub used_percent: Option<f64>,
+    pub used_percent_display: String,
+    pub observed_at: Option<String>,
+    pub observed_at_display: String,
+    pub reset_at: String,
+    pub tokens_display: String,
+    pub usd_display: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountGroupRefView {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub enabled: bool,
+}
+
+/// Provider quota 安全视图。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaView {
+    pub refreshed_at_display: String,
+    pub limit_reached: bool,
+    /// 冷却到期或可开始恢复探测的时间；非限流中为 `null`。
+    pub rate_limited_until: Option<String>,
+    pub rate_limit_reason: Option<String>,
+    pub recovery_probe_required: bool,
+    pub windows: Vec<AccountQuotaWindowView>,
+}
+
+/// 一个 quota 时间窗口。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaWindowView {
+    pub key: String,
+    pub group: String,
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub role: Option<String>,
+    pub window_seconds: Option<u64>,
+    pub label_display: String,
+    pub window_label_display: String,
+    pub used_percent: Option<f64>,
+    pub used_percent_display: String,
+    pub limit_reached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_usage: Option<serde_json::Value>,
+    pub reset_at_display: String,
+}
+
+/// 账号观测用量。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsageView {
+    pub billing: AccountBillingView,
+    pub window_label_display: String,
+    /// 按额度窗口已用比例外推的整窗口额度（按模型价格计）；无窗口数据时为空。
+    pub estimated_quota_usd_display: Option<String>,
+    pub request_count: Option<u64>,
+    pub request_count_display: String,
+    pub input_tokens: Option<u64>,
+    pub input_tokens_display: String,
+    pub output_tokens: Option<u64>,
+    pub output_tokens_display: String,
+    pub cached_tokens: Option<u64>,
+    pub cached_tokens_display: String,
+    pub reasoning_tokens: Option<u64>,
+    pub reasoning_tokens_display: String,
+    pub image_input_tokens: Option<u64>,
+    pub image_input_tokens_display: String,
+    pub image_output_tokens: Option<u64>,
+    pub image_output_tokens_display: String,
+    pub image_request_count: Option<u64>,
+    pub image_request_count_display: String,
+    pub image_request_failed_count: Option<u64>,
+    pub image_request_failed_count_display: String,
+    pub total_tokens: Option<u64>,
+    pub total_tokens_display: String,
+    pub created_tokens: Option<u64>,
+    pub created_tokens_display: String,
+    pub read_tokens: Option<u64>,
+    pub read_tokens_display: String,
+    pub last_used_at: Option<String>,
+    pub last_used_at_display: String,
+    pub cost_estimate_status: String,
+    pub known_cost_count: Option<u64>,
+    pub partial_cost_count: Option<u64>,
+    pub unknown_cost_count: Option<u64>,
+    pub costs: Vec<CurrencyCostView>,
+    pub models: Vec<ModelUsageView>,
+}
+
+/// 凭据在单个上游模型上的观测用量。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageView {
+    pub key: String,
+    pub requested_model_id: Option<String>,
+    pub upstream_model_id: Option<String>,
+    pub response_model: Option<String>,
+    pub billing_model: Option<String>,
+    pub mismatch: bool,
+    pub billing: AccountBillingView,
+    pub model: String,
+    pub request_count: u64,
+    pub request_count_display: String,
+    pub success_rate: Option<f64>,
+    pub success_rate_display: String,
+    pub input_tokens: Option<u64>,
+    pub input_tokens_display: String,
+    pub output_tokens: Option<u64>,
+    pub output_tokens_display: String,
+    pub cached_tokens: Option<u64>,
+    pub cached_tokens_display: String,
+    pub image_input_tokens: Option<u64>,
+    pub image_input_tokens_display: String,
+    pub image_output_tokens: Option<u64>,
+    pub image_output_tokens_display: String,
+    pub image_request_count: u64,
+    pub image_request_count_display: String,
+    pub image_request_failed_count: u64,
+    pub image_request_failed_count_display: String,
+    pub total_tokens: Option<u64>,
+    pub total_tokens_display: String,
+    pub billing_amount_usd: Option<String>,
+    pub billing_amount_usd_display: String,
+    pub cost_estimate_status: String,
+    pub known_cost_count: u64,
+    pub partial_cost_count: u64,
+    pub unknown_cost_count: u64,
+    pub costs: Vec<CurrencyCostView>,
+    pub last_used_at: String,
+    pub last_used_at_display: String,
+}
+
+/// 两类费用独立展示，覆盖不足时不计算差额。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBillingView {
+    pub model_price_amount_usd: Option<String>,
+    pub model_price_amount_usd_display: String,
+    pub upstream_cost_amount_usd: Option<String>,
+    pub upstream_cost_amount_usd_display: String,
+    pub difference_amount_usd: Option<String>,
+    pub difference_amount_usd_display: String,
+    pub model_price_count: u64,
+    pub upstream_cost_count: u64,
+}
+
+/// 单一货币的可查询成本。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrencyCostView {
+    pub currency: String,
+    pub estimated_amount: String,
+    pub estimated_amount_display: String,
+}
+
+/// 账号详情类 GET 的固定 ID query。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountIdQuery {
+    pub account_id: String,
+}
+
+impl AccountIdQuery {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")
+    }
+
+    pub(super) fn into_id(self) -> Result<ProviderAccountId, WireValidationError> {
+        self.validate()?;
+        ProviderAccountId::new(self.account_id).map_err(|_| WireValidationError::new("accountId"))
+    }
+}
+
+/// 头像 GET 的固定 query；`version` 只参与浏览器缓存键，不进入上游请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountProfileAvatarQuery {
+    pub account_id: String,
+    pub version: Option<String>,
+}
+
+impl AccountProfileAvatarQuery {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.version.as_deref().is_some_and(|version| {
+            version.is_empty()
+                || version.len() > MAX_AVATAR_VERSION_BYTES
+                || !version.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }) {
+            return Err(WireValidationError::new("version"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_id(self) -> Result<ProviderAccountId, WireValidationError> {
+        self.validate()?;
+        ProviderAccountId::new(self.account_id).map_err(|_| WireValidationError::new("accountId"))
+    }
+}
+
+/// 敏感导出的固定 query；IDs 使用逗号分隔，禁止隐式导出全部账号。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountExportQuery {
+    pub account_ids: String,
+    pub confirm: String,
+}
+
+impl AccountExportQuery {
+    pub fn into_ids(self) -> Result<Vec<ProviderAccountId>, WireValidationError> {
+        if self.confirm != "export_sensitive_accounts" {
+            return Err(WireValidationError::new("confirm"));
+        }
+        let ids = self
+            .account_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if ids.is_empty()
+            || ids.len() > 200
+            || ids
+                .iter()
+                .any(|id| require_account_id(id, "accountIds").is_err())
+        {
+            return Err(WireValidationError::new("accountIds"));
+        }
+        let unique = ids.iter().collect::<BTreeSet<_>>();
+        if unique.len() != ids.len() {
+            return Err(WireValidationError::new("accountIds"));
+        }
+        ids.into_iter()
+            .map(|id| {
+                ProviderAccountId::new(id).map_err(|_| WireValidationError::new("accountIds"))
+            })
+            .collect()
+    }
+}
+
+/// 账号运行期动作。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountActionRequest {
+    pub account_id: String,
+}
+
+impl AccountActionRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")
+    }
+
+    pub(super) fn into_id(self) -> Result<ProviderAccountId, WireValidationError> {
+        self.validate()?;
+        ProviderAccountId::new(self.account_id).map_err(|_| WireValidationError::new("accountId"))
+    }
+}
+
+/// 主动额度重置卡消费请求。幂等键由 UI 生成并在不确定重试时复用，与官方一致。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountResetCreditConsumeRequest {
+    pub account_id: String,
+    #[serde(default)]
+    pub credit_id: Option<String>,
+    pub redeem_request_id: String,
+}
+
+impl AccountResetCreditConsumeRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.credit_id.as_deref().is_some_and(|value| {
+            let value = value.trim();
+            value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+        }) {
+            return Err(WireValidationError::new("creditId"));
+        }
+        let value = self.redeem_request_id.trim();
+        let redeem_request_id =
+            Uuid::parse_str(value).map_err(|_| WireValidationError::new("redeemRequestId"))?;
+        if redeem_request_id.get_version() != Some(Version::Random)
+            || redeem_request_id.hyphenated().to_string() != value
+        {
+            return Err(WireValidationError::new("redeemRequestId"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(self) -> Result<ConsumeProviderResetCredit, WireValidationError> {
+        self.validate()?;
+        Ok(ConsumeProviderResetCredit {
+            account_id: ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            credit_id: self.credit_id.map(|value| value.trim().to_owned()),
+            redeem_request_id: Uuid::parse_str(&self.redeem_request_id)
+                .map_err(|_| WireValidationError::new("redeemRequestId"))?,
+        })
+    }
+}
+
+/// 手工 OAuth 刷新会变更持久 credential。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountRefreshRequest {
+    pub account_id: String,
+}
+
+impl AccountRefreshRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")
+    }
+
+    pub(super) fn into_command(self) -> Result<ProviderAccountId, WireValidationError> {
+        self.validate()?;
+        ProviderAccountId::new(self.account_id).map_err(|_| WireValidationError::new("accountId"))
+    }
+}
+
+/// 连接测试 query；测试仍经唯一 Core/Provider 模型请求路径执行。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTestQuery {
+    pub account_id: String,
+    pub model_id: String,
+}
+
+impl AccountTestQuery {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(ProviderAccountId, UpstreamModelId), WireValidationError> {
+        self.validate()?;
+        Ok((
+            ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
+        ))
+    }
+}
+
+/// 测智台单账号测试请求（POST body：prompt 可能较长）。SSE 用 fetch 流式读取。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTestBenchRequest {
+    pub account_id: String,
+    pub model_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl AccountTestBenchRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.prompt.trim().is_empty() || self.prompt.len() > 32_768 {
+            return Err(WireValidationError::new("prompt"));
+        }
+        if let Some(effort) = self.reasoning_effort.as_deref()
+            && !matches!(effort.trim(), "low" | "medium" | "high" | "xhigh" | "max")
+        {
+            return Err(WireValidationError::new("reasoningEffort"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(ProviderAccountId, UpstreamModelId, String, Option<String>), WireValidationError>
+    {
+        self.validate()?;
+        let effort = self
+            .reasoning_effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        Ok((
+            ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
+            self.prompt,
+            effort,
+        ))
+    }
+}
+
+/// 遍历代理找 state 的 query。EventSource 只能发 GET，所以参数走 query。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateHuntQuery {
+    pub account_id: String,
+    pub model_id: String,
+    #[serde(default = "default_hunt_attempts")]
+    pub attempts: u8,
+    #[serde(default)]
+    pub include_direct: bool,
+    /// 只遍历这一个代理；缺省遍历全部。
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+}
+
+const fn default_hunt_attempts() -> u8 {
+    5
+}
+
+impl TurnStateHuntQuery {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.attempts == 0
+            || self.attempts > gateway_admin::model::accounts::TurnStateHuntCommand::MAX_ATTEMPTS
+        {
+            return Err(WireValidationError::new("attempts"));
+        }
+        if self.proxy_id.as_deref().is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(WireValidationError::new("proxyId"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::accounts::TurnStateHuntCommand, WireValidationError> {
+        self.validate()?;
+        Ok(gateway_admin::model::accounts::TurnStateHuntCommand {
+            account_id: ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            upstream_model: UpstreamModelId::new(self.model_id)
+                .map_err(|_| WireValidationError::new("modelId"))?,
+            attempts: self.attempts,
+            include_direct: self.include_direct,
+            only_proxy_id: self.proxy_id,
+            ephemeral: None,
+            bind_to: None,
+            // 管理员手动遍历可以用于诊断已停用的账号。
+            require_schedulable: false,
+            context,
+        })
+    }
+}
+
+/// 自动撞 state 的 query：从一条轮换代理模板即时生成多国临时出口反复撞，命中即切静态。
+/// 事件形状与遍历完全一致（前端在自动模式下把 egress 事件聚合成滚动计数）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateAutoHuntQuery {
+    pub account_id: String,
+    pub model_id: String,
+    /// 轮换代理模板的代理 id（已存的一条轮换代理，如 dongtai-US）；后端读它的地址当模板。
+    pub template_proxy_id: String,
+    /// 逗号分隔的国家代码（US/JP/DE/PH）。
+    pub countries: String,
+    /// 逗号分隔的静态出口 id：命中后从中挑一个测试通过、账号数最少的改绑。
+    pub static_proxy_ids: String,
+    /// 最多生成多少个临时 IP（额度闸）。
+    pub max_ips: u16,
+}
+
+impl TurnStateAutoHuntQuery {
+    fn parsed_countries(
+        &self,
+    ) -> Result<Vec<gateway_admin::model::accounts::HuntCountry>, WireValidationError> {
+        use gateway_admin::model::accounts::HuntCountry;
+        let mut countries = Vec::new();
+        for token in self
+            .countries
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let country =
+                HuntCountry::parse(token).ok_or_else(|| WireValidationError::new("countries"))?;
+            if !countries.contains(&country) {
+                countries.push(country);
+            }
+        }
+        if countries.is_empty() {
+            return Err(WireValidationError::new("countries"));
+        }
+        Ok(countries)
+    }
+
+    fn parsed_static_ids(&self) -> Result<Vec<String>, WireValidationError> {
+        let ids: Vec<String> = self
+            .static_proxy_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| id.len() > 128 || id.chars().any(char::is_control))
+        {
+            return Err(WireValidationError::new("staticProxyIds"));
+        }
+        Ok(ids)
+    }
+
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        if self.template_proxy_id.trim().is_empty()
+            || self.template_proxy_id.len() > 128
+            || self.template_proxy_id.chars().any(char::is_control)
+        {
+            return Err(WireValidationError::new("templateProxyId"));
+        }
+        if self.max_ips == 0
+            || self.max_ips
+                > gateway_admin::model::accounts::TurnStateHuntCommand::MAX_EPHEMERAL_IPS
+        {
+            return Err(WireValidationError::new("maxIps"));
+        }
+        self.parsed_countries()?;
+        self.parsed_static_ids()?;
+        Ok(())
+    }
+
+    /// 凭据（模板代理地址）与静态出口的选取留给 use case 层：这里只解析出请求。
+    pub(super) fn into_request(
+        self,
+        context: gateway_admin::model::MutationContext,
+    ) -> Result<gateway_admin::model::accounts::TurnStateAutoHuntRequest, WireValidationError> {
+        self.validate()?;
+        let countries = self.parsed_countries()?;
+        let static_ids = self.parsed_static_ids()?;
+        Ok(gateway_admin::model::accounts::TurnStateAutoHuntRequest {
+            account_id: ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            upstream_model: UpstreamModelId::new(self.model_id)
+                .map_err(|_| WireValidationError::new("modelId"))?,
+            template_proxy_id: self.template_proxy_id,
+            countries,
+            static_proxy_ids: static_ids,
+            max_ips: self.max_ips,
+            context,
+        })
+    }
+}
+
+/// 遍历事件的管理端 wire。只有字节数，没有 state 值。
+pub fn turn_state_hunt_event_data(
+    event: gateway_admin::model::accounts::TurnStateHuntEvent,
+) -> serde_json::Value {
+    use gateway_admin::model::accounts::{TurnStateHuntEgress, TurnStateHuntEvent as Event};
+    use serde_json::json;
+
+    fn egress(egress: TurnStateHuntEgress) -> serde_json::Value {
+        json!({ "proxyId": egress.proxy_id, "name": egress.name, "endpoint": egress.endpoint })
+    }
+    match event {
+        Event::Started {
+            model,
+            expected_length,
+            attempts,
+            egresses,
+        } => json!({
+            "type": "hunt_start",
+            "model": model,
+            "expectedLength": expected_length,
+            "attempts": attempts,
+            "proxies": egresses.into_iter().map(egress).collect::<Vec<_>>(),
+        }),
+        Event::EgressStarted {
+            egress: started,
+            index,
+            total,
+        } => {
+            let mut data = egress(started);
+            data["type"] = json!("proxy_start");
+            data["index"] = json!(index);
+            data["total"] = json!(total);
+            data
+        }
+        Event::Attempt {
+            proxy_id,
+            index,
+            length,
+            matched,
+            error,
+        } => json!({
+            "type": "attempt",
+            "proxyId": proxy_id,
+            "index": index,
+            "length": length,
+            "matched": matched,
+            "error": error.map(|error| json!({
+                "code": error.code.as_str(),
+                "source": error.source.as_str(),
+                "upstreamStatus": error.upstream_status,
+                "message": error.message,
+            })),
+        }),
+        Event::EgressFinished {
+            proxy_id,
+            attempts,
+            matched,
+            skipped,
+        } => json!({
+            "type": "proxy_done",
+            "proxyId": proxy_id,
+            "attempts": attempts,
+            "matched": matched,
+            "skipped": skipped,
+        }),
+        Event::Hit {
+            proxy_id,
+            attempt_index,
+            length,
+        } => json!({
+            "type": "hit",
+            "proxyId": proxy_id,
+            "attemptIndex": attempt_index,
+            "length": length,
+        }),
+        Event::Bound { proxy_id, changed } => {
+            json!({ "type": "bound", "proxyId": proxy_id, "changed": changed })
+        }
+        Event::Pinned {
+            model,
+            length,
+            expires_at,
+        } => json!({
+            "type": "pinned",
+            "model": model,
+            "length": length,
+            "expiresAt": expires_at,
+        }),
+        Event::Completed { success, requests } => {
+            json!({ "type": "hunt_complete", "success": success, "requests": requests })
+        }
+        Event::Failed { code, message } => {
+            json!({ "type": "error", "code": code, "message": message })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountModelView {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountModelsData {
+    pub models: Vec<AccountModelView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRefreshData {
+    pub account: AccountView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountQuotaData {
+    pub account: AccountView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDetailData {
+    pub account: AccountView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_configuration: Option<serde_json::Value>,
+}
+
+/// 个人资料、累计统计与订阅的统一响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPersonalInfoData {
+    pub profile: Option<AccountProfileStatisticsData>,
+    pub profile_error: Option<String>,
+    pub subscription: Option<AccountSubscriptionData>,
+}
+
+impl From<AccountPersonalInfo> for AccountPersonalInfoData {
+    fn from(info: AccountPersonalInfo) -> Self {
+        let (profile, profile_error) = match info.profile {
+            Ok(profile) => (Some(AccountProfileStatisticsData::from(profile)), None),
+            Err(error) => (None, Some(error.message().to_owned())),
+        };
+        Self {
+            profile,
+            profile_error,
+            subscription: info.subscription.map(AccountSubscriptionData::from),
+        }
+    }
+}
+
+/// 按需读取的订阅安全字段，不暴露原始上游响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSubscriptionData {
+    pub starts_at: Option<String>,
+    pub expires_at: String,
+    pub will_renew: Option<bool>,
+    pub billing_period: Option<String>,
+    pub billing_currency: Option<String>,
+    pub observed_at: String,
+}
+
+impl From<ProviderSubscription> for AccountSubscriptionData {
+    fn from(subscription: ProviderSubscription) -> Self {
+        Self {
+            starts_at: subscription.starts_at.map(|value| value.to_rfc3339()),
+            expires_at: subscription.expires_at.to_rfc3339(),
+            will_renew: subscription.will_renew,
+            billing_period: subscription.billing_period,
+            billing_currency: subscription.billing_currency,
+            observed_at: subscription.observed_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Provider 官方个人资料统计响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileStatisticsData {
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+    pub image_url: Option<String>,
+    pub has_stats_error: bool,
+    pub summary: AccountProfileStatisticsSummaryView,
+    pub daily_usage: Option<Vec<AccountProfileDailyUsageView>>,
+    pub activity_insights: AccountProfileActivityInsightsView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileStatisticsSummaryView {
+    pub total_text_tokens: Option<u64>,
+    pub peak_tokens: Option<u64>,
+    pub longest_task_duration_ms: Option<u64>,
+    pub current_streak_days: Option<u64>,
+    pub longest_streak_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileDailyUsageView {
+    pub date: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileActivityInsightsView {
+    pub fast_mode_percent: Option<f64>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_effort_percent: Option<f64>,
+    pub skills_explored: Option<u64>,
+    pub total_skills_used: Option<u64>,
+    pub total_threads: Option<u64>,
+    pub invocations: Option<Vec<AccountProfileInvocationView>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileInvocationView {
+    #[serde(rename = "type")]
+    pub invocation_type: String,
+    pub plugin_id: Option<String>,
+    pub plugin_name: Option<String>,
+    pub skill_id: Option<String>,
+    pub skill_name: Option<String>,
+    pub usage_count: Option<u64>,
+}
+
+impl From<ProviderProfileStatistics> for AccountProfileStatisticsData {
+    fn from(statistics: ProviderProfileStatistics) -> Self {
+        Self {
+            display_name: statistics.display_name,
+            username: statistics.username,
+            image_url: statistics.image_url,
+            has_stats_error: statistics.has_stats_error,
+            summary: profile_statistics_summary_view(statistics.summary),
+            daily_usage: statistics
+                .daily_usage
+                .map(|daily| daily.into_iter().map(profile_daily_usage_view).collect()),
+            activity_insights: profile_activity_insights_view(statistics.activity_insights),
+        }
+    }
+}
+
+const fn profile_statistics_summary_view(
+    summary: ProviderProfileStatisticsSummary,
+) -> AccountProfileStatisticsSummaryView {
+    AccountProfileStatisticsSummaryView {
+        total_text_tokens: summary.total_text_tokens,
+        peak_tokens: summary.peak_tokens,
+        longest_task_duration_ms: summary.longest_task_duration_ms,
+        current_streak_days: summary.current_streak_days,
+        longest_streak_days: summary.longest_streak_days,
+    }
+}
+
+fn profile_daily_usage_view(daily: ProviderProfileDailyUsage) -> AccountProfileDailyUsageView {
+    AccountProfileDailyUsageView {
+        date: daily.date.to_string(),
+        tokens: daily.tokens,
+    }
+}
+
+fn profile_activity_insights_view(
+    insights: ProviderProfileActivityInsights,
+) -> AccountProfileActivityInsightsView {
+    AccountProfileActivityInsightsView {
+        fast_mode_percent: insights.fast_mode_percent,
+        reasoning_effort: insights.reasoning_effort,
+        reasoning_effort_percent: insights.reasoning_effort_percent,
+        skills_explored: insights.skills_explored,
+        total_skills_used: insights.total_skills_used,
+        total_threads: insights.total_threads,
+        invocations: insights.invocations.map(|invocations| {
+            invocations
+                .into_iter()
+                .map(profile_invocation_view)
+                .collect()
+        }),
+    }
+}
+
+fn profile_invocation_view(invocation: ProviderProfileInvocation) -> AccountProfileInvocationView {
+    AccountProfileInvocationView {
+        invocation_type: invocation.invocation_type,
+        plugin_id: invocation.plugin_id,
+        plugin_name: invocation.plugin_name,
+        skill_id: invocation.skill_id,
+        skill_name: invocation.skill_name,
+        usage_count: invocation.usage_count,
+    }
+}
+
+/// 主动额度重置卡列表响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountResetCreditsData {
+    pub available_count: u64,
+    pub credits: Vec<AccountResetCreditView>,
+}
+
+/// 一张安全主动额度重置卡视图。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountResetCreditView {
+    pub id: String,
+    pub status: Option<String>,
+    pub title: Option<String>,
+    pub expires_at: Option<String>,
+    pub reset_type: Option<String>,
+}
+
+/// 主动额度重置卡消费响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountResetCreditResultData {
+    pub code: String,
+    pub credit: Option<AccountResetCreditView>,
+}
+
+impl From<ProviderResetCredit> for AccountResetCreditView {
+    fn from(credit: ProviderResetCredit) -> Self {
+        Self {
+            id: credit.id,
+            status: credit.status,
+            title: credit.title,
+            expires_at: credit.expires_at.map(|value| value.to_rfc3339()),
+            reset_type: credit.reset_type,
+        }
+    }
+}
+
+impl From<ProviderResetCredits> for AccountResetCreditsData {
+    fn from(credits: ProviderResetCredits) -> Self {
+        Self {
+            available_count: credits.available_count,
+            credits: credits
+                .credits
+                .into_iter()
+                .map(AccountResetCreditView::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<ProviderResetCreditResult> for AccountResetCreditResultData {
+    fn from(result: ProviderResetCreditResult) -> Self {
+        Self {
+            code: result.code,
+            credit: result.credit.map(AccountResetCreditView::from),
+        }
+    }
+}
+
+/// Provider-owned 明文导出文档；Debug 永远不输出内部 JSON。
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct AccountExportData(Value);
+
+impl AccountExportData {
+    #[must_use]
+    pub const fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub(super) fn from_result(bundle: AccountExportBundle) -> Self {
+        let documents = bundle
+            .documents
+            .into_iter()
+            .map(|document| {
+                serde_json::json!({
+                    "provider": document.provider_kind.to_string(),
+                    "document": provider_document_value(document.document),
+                })
+            })
+            .collect::<Vec<_>>();
+        Self::new(serde_json::json!({
+            "exportedAt": bundle.exported_at.to_rfc3339(),
+            "documents": documents,
+        }))
+    }
+}
+
+impl fmt::Debug for AccountExportData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountExportData(<redacted>)")
+    }
+}
+
+pub struct AccountConnectionTestEvent {
+    pub data: Value,
+}
+
+impl From<DomainConnectionTestEvent> for AccountConnectionTestEvent {
+    fn from(event: DomainConnectionTestEvent) -> Self {
+        let data = match event {
+            DomainConnectionTestEvent::Started { model } => serde_json::json!({
+                "type": "test_start",
+                "model": model,
+                "text": "正在连接上游 Responses"
+            }),
+            DomainConnectionTestEvent::Request {
+                model,
+                input_text,
+                stream,
+                store,
+            } => serde_json::json!({
+                "type": "request",
+                "payload": {
+                    "model": model,
+                    "input": [{
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": input_text }]
+                    }],
+                    "stream": stream,
+                    "store": store
+                }
+            }),
+            DomainConnectionTestEvent::Content { text } => {
+                serde_json::json!({ "type": "content", "text": text })
+            }
+            DomainConnectionTestEvent::Completed => serde_json::json!({
+                "type": "test_complete",
+                "success": true
+            }),
+            DomainConnectionTestEvent::Failed {
+                source,
+                gateway_error_code,
+                send_state,
+                message,
+                provider_error_code,
+                provider_error_type,
+                upstream_status,
+                upstream_content_type,
+                upstream_body,
+            } => serde_json::json!({
+                "type": "error",
+                "source": source.as_str(),
+                "gatewayErrorCode": gateway_error_code.as_str(),
+                "sendState": send_state.map(gateway_core::upstream::UpstreamSendState::as_str),
+                "error": message,
+                "providerErrorCode": provider_error_code,
+                "providerErrorType": provider_error_type,
+                "upstreamStatus": upstream_status,
+                "upstreamContentType": upstream_content_type,
+                "upstreamBody": upstream_body
+            }),
+        };
+        Self { data }
+    }
+}
