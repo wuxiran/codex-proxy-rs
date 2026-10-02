@@ -9,6 +9,7 @@
 | [architecture.md](architecture.md) | fork 组件、计量子表、密文恢复、状态归属与 worker |
 | [deploy.md](deploy.md) | fork 部署文件、构建类型、回退与升级注意 |
 | [migrations.md](migrations.md) | 9xxx 迁移编号、CRLF 字节谱系、带迁移发版 |
+| [GIT_WORKFLOW.md](GIT_WORKFLOW.md) | 分支（dev / main / release）、fork 版本号、发版与紧急修复流程 |
 | [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) | 合并上游的流程 |
 | [FORK_HOOKS_REGISTRY.md](FORK_HOOKS_REGISTRY.md) | fork 留在上游文件里的改动登记与合并策略 |
 

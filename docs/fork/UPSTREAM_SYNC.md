@@ -7,13 +7,13 @@
 
 ```bash
 git fetch --no-tags upstream refs/tags/<版本>:refs/codex/upstream-<版本>
-git worktree add -b merge/upstream-<版本>-<日期> .worktrees/upmerge origin/main
-cd .worktrees/upmerge
+git worktree add -b sync/upstream-v<版本> ~/worktrees/cpr-upstream-<版本> origin/dev
+cd ~/worktrees/cpr-upstream-<版本>
 python3 tools/fork_divergence.py --base "$(git merge-base HEAD refs/codex/upstream-<版本>)"
 git merge --no-ff --no-commit refs/codex/upstream-<版本>
 ```
 
-工作树目录须尚未存在；已有并行任务使用 `upmerge` 时改用独立目录，构建产物与 `node_modules` 也保持独立
+工作树目录须尚未存在，构建产物与 `node_modules` 保持独立。同步分支从 `dev` 拉出，合并完成后合回 `dev`（见 [GIT_WORKFLOW.md](GIT_WORKFLOW.md)）
 
 ## 2. 解决冲突
 
@@ -40,4 +40,5 @@ git merge --no-ff --no-commit refs/codex/upstream-<版本>
 
 ## 4. 发布
 
+合回 `dev` 后按 [GIT_WORKFLOW.md](GIT_WORKFLOW.md#发版) 发版：fork 版本号前三段跟上游、第四段从 1 开始，
 构建用 `CPR_BUILD_TYPE=fork`（见 [deploy.md](deploy.md)），按 `deploy/89.md` 蓝绿发布。
