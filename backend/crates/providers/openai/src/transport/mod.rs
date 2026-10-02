@@ -24,7 +24,9 @@ pub(crate) use downstream::normalize_selected_codex_downstream_body;
 pub(crate) use endpoints::valid_upstream_base_url;
 pub mod tls;
 pub mod usage;
+mod warm_connection;
 pub mod websocket;
+pub use self::warm_connection::WarmConnectionApproval;
 
 pub use self::{
     canonical::{CodexCanonicalDecoder, CodexCanonicalError},

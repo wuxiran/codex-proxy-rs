@@ -39,7 +39,17 @@ pub struct UpdateTurnStateSettingsRequest {
     cloud_mint: Option<CloudMintSettingsPatch>,
     /// 省略时保留现有 WS 保活设置。
     #[serde(default)]
-    warm_pool: Option<WarmPoolSettings>,
+    warm_pool: Option<WarmPoolSettingsPatch>,
+}
+
+/// 旧客户端不认识严格模式时，编辑其他预热参数不能把已开启的保护清掉。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct WarmPoolSettingsPatch {
+    #[serde(default)]
+    require_verified: Option<bool>,
+    #[serde(flatten)]
+    settings: WarmPoolSettings,
 }
 
 /// 旧客户端省略专用代理时保留已保存值，显式空字符串才表示清除。
@@ -87,7 +97,15 @@ impl UpdateTurnStateSettingsRequest {
                     ..patch.settings
                 })
                 .unwrap_or_else(|| current.cloud_mint.clone()),
-            warm_pool: self.warm_pool.unwrap_or_else(|| current.warm_pool.clone()),
+            warm_pool: self
+                .warm_pool
+                .map(|patch| WarmPoolSettings {
+                    require_verified: patch
+                        .require_verified
+                        .unwrap_or(current.warm_pool.require_verified),
+                    ..patch.settings
+                })
+                .unwrap_or_else(|| current.warm_pool.clone()),
         }
         .merge_secret_placeholders(current)
     }

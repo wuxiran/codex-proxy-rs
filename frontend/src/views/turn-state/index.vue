@@ -19,6 +19,7 @@ import {
   updateTurnStateSettings,
 } from '@/api'
 import SyncedSwitch from '@/components/SyncedSwitch.vue'
+import AccountTicketManager from './components/AccountTicketManager.vue'
 
 const MIN_LEN = 200
 const POLL_MS = 30_000
@@ -49,10 +50,11 @@ const effortOptions = [
   { label: 'xhigh', value: 'xhigh' },
 ]
 const warmModelsText = computed({
-  get: () => settings.value?.warmPool.models.join(', ') ?? '',
+  get: () => settings.value?.warmPool.probeModel || settings.value?.warmPool.models.join(', ') || '',
   set: (value: string) => {
     if (settings.value) {
       settings.value.warmPool.models = value.split(/[\s,]+/).map(item => item.trim()).filter(Boolean)
+      settings.value.warmPool.probeModel = ''
       markDirty()
     }
   },
@@ -104,7 +106,19 @@ const proxyError = computed(() => {
   catch {}
   return '请填写完整的 HTTP、HTTPS 或 SOCKS5 代理地址'
 })
-const canSave = computed(() => settingsDirty.value && !saving.value && !proxyError.value)
+const warmError = computed(() => {
+  const warm = settings.value?.warmPool
+  if (!warm?.enabled)
+    return ''
+  if (warm.requireVerified && (!warm.probe || !warm.businessReuse))
+    return '只用已验证连接需要开启业务复用和答案检查'
+  if (warm.probe && !warm.probeExpect.trim())
+    return '请填写验证通过判据'
+  if (warm.models.length > 16)
+    return '预热模型最多填写 16 个'
+  return ''
+})
+const canSave = computed(() => settingsDirty.value && !saving.value && !proxyError.value && !warmError.value)
 const activeBuckets = computed(() => buckets.value.filter(bucket => bucket.expiresAt > bucketsNow.value))
 const mismatchCount = computed(() => Object.values(observations.value?.buckets ?? {}).reduce((sum, row) => sum + (row.servedMismatch ?? 0), 0))
 
@@ -158,7 +172,7 @@ async function loadData() {
 }
 
 async function saveSettings() {
-  if (!settings.value || proxyError.value)
+  if (!settings.value || proxyError.value || warmError.value)
     return
   saving.value = true
   try {
@@ -305,7 +319,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="flex w-full flex-col gap-5 py-6 pr-4 pl-6 sm:px-4">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <BasePageHeader title="票据管理" description="配置打票代理，查看有效票据与模型声明" />
+      <BasePageHeader title="票据管理" description="管理账号票据、预热连接和打票代理" />
       <div class="flex items-center gap-3">
         <span v-if="settingsDirty" class="text-cp-sm text-cp-text-secondary">有未保存的修改</span>
         <BaseButton variant="primary" :loading="saving" :disabled="!canSave" @click="saveSettings">
@@ -324,7 +338,9 @@ onBeforeUnmount(() => {
       正在读取设置
     </p>
 
-    <BaseCard v-if="settings" title="自动打票" description="用于已开启「固定自身 state」的 OAuth 账号">
+    <AccountTicketManager @changed="loadData" />
+
+    <BaseCard v-if="settings" title="自动打票" description="用于已开启「票与预热」的账号">
       <div class="flex flex-col gap-4">
         <div class="flex flex-wrap items-center gap-5">
           <SyncedSwitch v-model="settings.cloudMint.enabled" label="缺票时自动补充" show-label @update:model-value="markDirty" />
@@ -344,7 +360,7 @@ onBeforeUnmount(() => {
               {{ proxyError }}
             </p>
             <p v-else class="mt-1 text-cp-xs text-cp-text-secondary">
-              支持动态出口 IP，仅用于打票，不改变账号业务代理
+              用于打票和连接预热，通过验证的连接可供业务复用
             </p>
           </div>
           <div>
@@ -430,7 +446,7 @@ onBeforeUnmount(() => {
             </tr>
             <tr v-if="!activeBuckets.length">
               <td colspan="5" class="px-2 py-6 text-center text-sm whitespace-normal text-neutral-400">
-                暂无有效票据，启用自动打票后会按业务需要补充，也可到账号页手动打票
+                暂无有效票据，可在上方选择账号立即打票，或启用自动补票
               </td>
             </tr>
           </tbody>
@@ -543,11 +559,18 @@ onBeforeUnmount(() => {
               <SyncedSwitch v-model="settings.warmPool.enabled" label="启用连接预热" show-label @update:model-value="markDirty" />
               <SyncedSwitch v-model="settings.warmPool.businessReuse" label="业务可复用" show-label @update:model-value="markDirty" />
               <SyncedSwitch v-model="settings.warmPool.probe" label="检查探针回答" show-label @update:model-value="markDirty" />
+              <SyncedSwitch v-model="settings.warmPool.requireVerified" label="只用已验证连接" show-label @update:model-value="markDirty" />
             </div>
+            <p v-if="warmError" class="m-0 text-sm text-cp-danger" role="alert">
+              {{ warmError }}
+            </p>
+            <p v-else-if="settings.warmPool.requireVerified" class="m-0 text-xs text-neutral-500">
+              单次最多等待 2 秒，仍无合格连接时返回暂不可用
+            </p>
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <div class="w-40">
-                <span class="block text-xs text-neutral-500">每账号连接数</span>
-                <BaseNumberInput v-model="settings.warmPool.connectionsPerAccount" label="每账号连接数" :min="1" :max="16" class="mt-1" @update:model-value="markDirty" />
+                <span class="block text-xs text-neutral-500">每账号、每模型连接数</span>
+                <BaseNumberInput v-model="settings.warmPool.connectionsPerAccount" label="每账号每模型连接数" :min="1" :max="16" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">探针失败重试次数</span>
@@ -582,12 +605,14 @@ onBeforeUnmount(() => {
                 <BaseInput v-model="settings.warmPool.probeExpect" placeholder="21" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="md:col-span-2">
-                <span class="block text-xs text-neutral-500">探针模型（逗号分隔，空 = 用内置 gpt-6-astra）</span>
-                <BaseInput v-model="warmModelsText" placeholder="gpt-6-astra" class="mt-1" />
+                <span class="block text-xs text-neutral-500">预热模型（逗号分隔，留空跟随业务）</span>
+                <BaseInput v-model="warmModelsText" aria-label="预热模型" placeholder="gpt-6-astra" class="mt-1" />
               </div>
             </div>
             <p class="m-0 text-xs text-neutral-500">
-              仅对开启「固定自身 state」的账号生效（导入的新号默认开）探针走账号自己出口现建连接、去 residency 头，命中验证通过(答案以「验证通过判据」开头)就挂住供业务领养，探到探针失败会 evict 换节点重试账号级 WS 状态见账号详情的 warmPool
+              仅对开启「票与预热」的账号生效
+              {{ settings.cloudMint.enabled && hasMintProxy ? '使用专用打票代理筛选，成功后复用同一连接' : '使用账号出口预热连接' }}
+              多个模型分别验证，失败按重试次数继续，耗尽后冷却再试
             </p>
           </div>
         </BaseCard>

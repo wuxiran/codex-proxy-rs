@@ -256,6 +256,9 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
         pool_account_id: Option<&str>,
     ) -> CodexClientResult<PreparedResponseTransport> {
+        if request.require_verified_warm && request.force_http_sse {
+            return Err(CodexWebSocketExchangeError::WarmUnavailable.into());
+        }
         let requirement = transport_requirement(request);
         context.trace.cloned().unwrap_or_default().record(
             "transport.preparing",
@@ -307,13 +310,7 @@ impl CodexBackendClient {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
-        let mut connection_profile =
-            websocket_connection_profile(&headers, &self.middleware_headers);
-        if let Some(route) = &request.minted_turn_state_route {
-            // 云端票的新链不领养其他路由的连接；精确续链仍由连接实际路由复核。
-            connection_profile.push_str(":mint-route:");
-            connection_profile.push_str(route);
-        }
+        let connection_profile = websocket_connection_profile(&headers, &self.middleware_headers);
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
         let pool_log_context = pool_key.as_ref().map(WebSocketPoolLogContext::from_key);
@@ -522,7 +519,8 @@ impl CodexBackendClient {
             .or(request.previous_response_id())?;
         let mut key = CodexWebSocketPoolKey::new(&self.base_url, account_id, conversation_id)
             .with_egress_key(&self.egress_key)
-            .with_connection_profile(connection_profile);
+            .with_connection_profile(connection_profile)
+            .with_mint_route(request.minted_turn_state_route.as_deref());
         if let Some(connection_id) = request.downstream_websocket_connection_id.as_deref() {
             key = key.with_downstream_connection_id(connection_id);
         }

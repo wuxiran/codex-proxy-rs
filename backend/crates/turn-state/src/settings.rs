@@ -73,15 +73,15 @@ pub struct Settings {
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct WarmPoolSettings {
     pub enabled: bool,
-    /// 每个账号预热并挂住多少条 WS。
+    /// 每个账号、每个探针模型分别保留多少条 WS，仍受全局连接上限约束。
     pub connections_per_account: u32,
-    /// 预热的模型列表；空 = 用账号支持的模型 / cloud_mint.models。
+    /// 分别建立并验证连接的模型列表；空 = 活跃业务模型，首次使用内置模型。
     pub models: Vec<String>,
     /// 一条 WS 最多挂多久（秒），到点主动弃用；应 < 上游 55min。
     pub max_age_seconds: u64,
     /// canary 复探间隔（秒）：开连接后每隔这么久在同一条 WS 上再问一次探针题。
     pub reprobe_seconds: u64,
-    /// 是否跑 canary 探针（发探针题、按答案判满血）；关掉则只开连接挂住不验。
+    /// 是否检查探针答案；关闭后仍检查完整响应与模型声明，不标记为质量验证通过。
     pub probe: bool,
     /// 探针题正文；空 = 用内置糖果题。
     pub probe_prompt: String,
@@ -93,6 +93,9 @@ pub struct WarmPoolSettings {
     pub probe_effort: String,
     /// 业务请求是否可领养保活连接；关掉则只建/只验不复用（观测态）。
     pub business_reuse: bool,
+    /// 新对话短暂等待已验证连接；缺少时返回暂不可用，不回退普通建连。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_verified: bool,
     /// 探针判降智/失败后，该账号多久内不再开保活连接（秒）。
     pub cooldown_seconds: u64,
     /// 进程内保活连接总数上限。
@@ -122,6 +125,7 @@ impl Default for WarmPoolSettings {
             probe_model: String::new(),
             probe_effort: "high".to_owned(),
             business_reuse: true,
+            require_verified: false,
             cooldown_seconds: 600,
             max_total_connections: 64,
             probe_timeout_seconds: 180,
@@ -132,6 +136,10 @@ impl Default for WarmPoolSettings {
 }
 
 impl WarmPoolSettings {
+    pub fn requires_verified_connections(&self) -> bool {
+        self.enabled && self.business_reuse && self.probe && self.require_verified
+    }
+
     pub fn max_age(&self) -> Duration {
         Duration::from_secs(self.max_age_seconds)
     }
@@ -151,6 +159,19 @@ impl WarmPoolSettings {
     fn validate(&self) -> Result<(), SettingsError> {
         if !self.enabled {
             return Ok(());
+        }
+        if self.require_verified && (!self.probe || !self.business_reuse) {
+            return Err(SettingsError::WarmVerification);
+        }
+        if (self.probe && self.probe_expect.trim().is_empty())
+            || self.models.len() > 16
+            || self
+                .models
+                .iter()
+                .any(|model| model.trim().is_empty() || model.len() > 96)
+            || self.probe_model.len() > 96
+        {
+            return Err(SettingsError::WarmProbe);
         }
         if !(1..=16).contains(&self.connections_per_account) {
             return Err(SettingsError::WarmConnections);
@@ -381,6 +402,10 @@ pub enum SettingsError {
     WarmProbeTimeout,
     #[error("warm pool probe retries must be at most 16")]
     WarmRetries,
+    #[error("verified-only mode requires answer checks and business reuse")]
+    WarmVerification,
+    #[error("warm probe needs an answer expectation and at most 16 nonempty model names")]
+    WarmProbe,
 }
 
 impl Settings {
@@ -392,6 +417,18 @@ impl Settings {
     pub fn normalized(mut self) -> Result<Self, SettingsError> {
         self.cloud_mint.upstream_proxy_url = self.cloud_mint.upstream_proxy_url.trim().to_owned();
         self.cloud_mint.proxy_url = self.cloud_mint.proxy_url.trim().to_owned();
+        self.warm_pool.probe_model = self.warm_pool.probe_model.trim().to_owned();
+        let mut models = Vec::<String>::new();
+        for model in &self.warm_pool.models {
+            let model = model.trim();
+            if !models
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(model))
+            {
+                models.push(model.to_owned());
+            }
+        }
+        self.warm_pool.models = models;
         self.template_lengths.sort_unstable();
         self.template_lengths.dedup();
         self.degraded_lengths.sort_unstable();

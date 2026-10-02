@@ -30,6 +30,8 @@ pub(in crate::transport::websocket) struct WebSocketStreamPoolReturn {
     pub(in crate::transport::websocket) lease: WebSocketPoolLease,
     pub(in crate::transport::websocket) created_at: tokio::time::Instant,
     pub(in crate::transport::websocket) continuation: WebSocketContinuationState,
+    pub(in crate::transport::websocket) warm_approval:
+        Option<crate::transport::WarmConnectionApproval>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -583,6 +585,7 @@ async fn finish_stream_websocket(
             metadata: reusable_websocket_metadata(metadata),
             continuation,
             created_at: pool_return.created_at,
+            warm_approval: pool_return.warm_approval,
         })
         .await;
 }

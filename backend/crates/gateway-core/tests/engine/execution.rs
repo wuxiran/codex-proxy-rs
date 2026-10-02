@@ -2864,6 +2864,176 @@ use gateway_core::runtime::{
 use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use serde_json::{Value, json};
 
+#[derive(Default)]
+struct ProbeModeProvider {
+    observed: Mutex<Vec<bool>>,
+    http_fallback: bool,
+}
+
+#[async_trait]
+impl Provider for ProbeModeProvider {
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+    fn catalog_generation(&self) -> ProviderCatalogGeneration {
+        ProviderCatalogGeneration::default()
+    }
+    async fn query_model_capabilities(
+        &self,
+    ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
+        Ok(Vec::new())
+    }
+    async fn execute(
+        self: Arc<Self>,
+        _: ProviderRequest,
+        context: AttemptContext,
+    ) -> Result<ProviderStream, ProviderError> {
+        assert_eq!(context.required_account().unwrap().as_str(), "acct_probe");
+        let diagnostic = context.is_diagnostic_required_account();
+        self.observed.lock().unwrap().push(diagnostic);
+        context
+            .trace()
+            .record("upstream.turn_state", json!({"attached": !diagnostic}));
+        let trace = context.trace().exchange("websocket");
+        trace.record("upstream.connection", json!({"reused":true,"warmVerified":true,"connectionId":"fixture-connection","headers":{"authorization":"SECRET-MUST-NOT-LEAK"}}));
+        if self.http_fallback {
+            let _ = context.trace().exchange("http_sse");
+        }
+        Err(ProviderError::new(
+            ProviderErrorKind::Unsupported,
+            UpstreamSendState::NotSent,
+        ))
+    }
+}
+
+#[test]
+fn business_probe_uses_normal_pinned_context_and_reports_only_safe_facts() {
+    use gateway_core::engine::probe::AccountProbeMode;
+    for mode in [AccountProbeMode::Diagnostic, AccountProbeMode::Business] {
+        for http_fallback in [false, true] {
+            let provider = Arc::new(ProbeModeProvider {
+                http_fallback,
+                ..Default::default()
+            });
+            let snapshot = probe_snapshot().with_account_directory(Arc::new(
+                RuntimeAccountDirectory::new(BTreeMap::from([(
+                    ProviderAccountId::new("acct_probe").unwrap(),
+                    RuntimeAccount::new(ProviderKind::new("openai").unwrap(), BTreeSet::new()),
+                )])),
+            ));
+            let service = DefaultExecutionService::new(
+                RuntimeSnapshotHandle::new(snapshot),
+                Arc::new(TrackingExecutionStore::default()),
+                ProviderRegistry::new([provider.clone() as Arc<dyn Provider>]).unwrap(),
+                Arc::new(UnusedAdmissions),
+                Arc::new(UnusedContinuation),
+                Arc::new(RecordingClientApiKeyUsage::default()),
+            );
+            let error = block_on(service.probe(
+                AccountProbeRequest {
+                    mode,
+                    account_id: ProviderAccountId::new("acct_probe").unwrap(),
+                    provider_kind: ProviderKind::new("openai").unwrap(),
+                    upstream_model: UpstreamModelId::new("gpt-probe").unwrap(),
+                    operation: probe_operation(),
+                    egress: None,
+                },
+                None,
+            ))
+            .unwrap_err();
+            assert_eq!(
+                *provider.observed.lock().unwrap(),
+                [mode == AccountProbeMode::Diagnostic]
+            );
+            let facts = error.execution().unwrap();
+            assert_eq!(
+                facts.ticket_attached,
+                Some(mode == AccountProbeMode::Business)
+            );
+            assert_eq!(facts.warm_pool_used, Some(!http_fallback));
+            assert_eq!(facts.connection_reused, (!http_fallback).then_some(true));
+            assert_eq!(
+                facts.connection_id.as_deref(),
+                (!http_fallback).then_some("fixture-connection")
+            );
+            assert!(!serde_json::to_string(facts).unwrap().contains("SECRET"));
+        }
+    }
+}
+
+#[test]
+fn business_probe_rejects_temporary_egress_before_calling_a_provider() {
+    use gateway_core::engine::probe::AccountProbeMode;
+    let provider = Arc::new(ProbeModeProvider::default());
+    let service = DefaultExecutionService::new(
+        RuntimeSnapshotHandle::new(probe_snapshot()),
+        Arc::new(TrackingExecutionStore::default()),
+        ProviderRegistry::new([provider.clone() as Arc<dyn Provider>]).unwrap(),
+        Arc::new(UnusedAdmissions),
+        Arc::new(UnusedContinuation),
+        Arc::new(RecordingClientApiKeyUsage::default()),
+    );
+    let error = block_on(service.probe(
+        AccountProbeRequest {
+            mode: AccountProbeMode::Business,
+            account_id: ProviderAccountId::new("acct_probe").unwrap(),
+            provider_kind: ProviderKind::new("openai").unwrap(),
+            upstream_model: UpstreamModelId::new("gpt-probe").unwrap(),
+            operation: probe_operation(),
+            egress: Some(gateway_core::engine::DiagnosticEgress::new(None, None)),
+        },
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind(), GatewayErrorKind::Unsupported);
+    assert!(provider.observed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn business_probe_enforces_account_model_access_before_network() {
+    use gateway_core::{
+        account::{AccountModelAccess, AccountModelAccessMode},
+        engine::probe::AccountProbeMode,
+    };
+    let provider = Arc::new(ProbeModeProvider::default());
+    let snapshot = probe_snapshot().with_account_directory(Arc::new(RuntimeAccountDirectory::new(
+        BTreeMap::from([(
+            ProviderAccountId::new("acct_probe").unwrap(),
+            RuntimeAccount::new(ProviderKind::new("openai").unwrap(), BTreeSet::new())
+                .with_model_access(
+                    AccountModelAccess::new(
+                        AccountModelAccessMode::Denylist,
+                        vec!["gpt-probe".to_owned()],
+                    )
+                    .unwrap(),
+                ),
+        )]),
+    )));
+    let service = DefaultExecutionService::new(
+        RuntimeSnapshotHandle::new(snapshot),
+        Arc::new(TrackingExecutionStore::default()),
+        ProviderRegistry::new([provider.clone() as Arc<dyn Provider>]).unwrap(),
+        Arc::new(UnusedAdmissions),
+        Arc::new(UnusedContinuation),
+        Arc::new(RecordingClientApiKeyUsage::default()),
+    );
+    assert!(
+        block_on(service.probe(
+            AccountProbeRequest {
+                mode: AccountProbeMode::Business,
+                account_id: ProviderAccountId::new("acct_probe").unwrap(),
+                provider_kind: ProviderKind::new("openai").unwrap(),
+                upstream_model: UpstreamModelId::new("gpt-probe").unwrap(),
+                operation: probe_operation(),
+                egress: None
+            },
+            None
+        ))
+        .is_err()
+    );
+    assert!(provider.observed.lock().unwrap().is_empty());
+}
+
 #[test]
 fn account_probe_should_not_write_to_the_persistent_execution_store() {
     let store = Arc::new(TrackingExecutionStore::default());
@@ -2878,6 +3048,7 @@ fn account_probe_should_not_write_to_the_persistent_execution_store() {
 
     let error = block_on(service.probe(
         AccountProbeRequest {
+            mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
             account_id: ProviderAccountId::new("acct_probe").expect("account ID"),
             provider_kind: ProviderKind::new("openai").expect("provider kind"),
             upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
@@ -2910,6 +3081,7 @@ fn probe_failures_should_be_observable_without_a_model_request_row() {
 
     let error = block_on(service.probe(
         AccountProbeRequest {
+            mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
             account_id: ProviderAccountId::new("acct_probe").expect("account ID"),
             provider_kind: ProviderKind::new("openai").expect("provider kind"),
             upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
@@ -2956,6 +3128,7 @@ fn provider_local_probe_failure_should_remain_distinct_from_upstream() {
 
     let error = block_on(service.probe(
         AccountProbeRequest {
+            mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
             account_id: ProviderAccountId::new("acct_probe").expect("account ID"),
             provider_kind: ProviderKind::new("openai").expect("provider kind"),
             upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),
@@ -2999,6 +3172,7 @@ fn diagnostic_probe_does_not_apply_data_plane_account_model_policy() {
 
     let error = block_on(service.probe(
         AccountProbeRequest {
+            mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
             account_id,
             provider_kind: provider,
             upstream_model: UpstreamModelId::new("gpt-probe").expect("model"),
@@ -3031,6 +3205,7 @@ fn probe_observation_store_failure_preserves_the_provider_error() {
 
     let error = block_on(service.probe(
         AccountProbeRequest {
+            mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
             account_id: ProviderAccountId::new("acct_probe").expect("account ID"),
             provider_kind: ProviderKind::new("openai").expect("provider kind"),
             upstream_model: UpstreamModelId::new("gpt-probe").expect("model ID"),

@@ -15,6 +15,7 @@ const emit = defineEmits<{
   hunted: [boundChanged: boolean, autoRenew: TurnStateAutoHunt | null]
   /** 取消后账号是否被改动只有服务端知道，让上层按实际状态刷新。 */
   cancelled: []
+  busy: [value: boolean]
 }>()
 
 const PREFERRED_MODEL = 'gpt-6-astra'
@@ -136,6 +137,7 @@ const auto = useAccountAutoHunt()
 const autoBusy = computed(() => auto.status.value === 'running' || auto.status.value === 'finalizing')
 
 const busy = computed(() => sweepBusy.value || autoBusy.value)
+watch(busy, value => emit('busy', value), { flush: 'sync' })
 const canStart = computed(() => !busy.value
   && Boolean(modelId.value)
   && attempts.value >= 1 && attempts.value <= maxAttempts.value
@@ -223,7 +225,8 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       </BaseButton>
     </div>
     <p class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
-      依次经每个已测试通过的代理向上游发真实请求，直到返回符合长度规则的 state；命中后把账号绑定到该代理，并把这个 state 钉给该账号此模型的全部客户端（替换已有的固定）。每次尝试都会消耗少量额度，未命中不改动账号。勾选自动续期后，服务端会在到期前 5 分钟用同样的参数重新遍历：先试当前绑定的代理，续不上就继续打其它代理；整轮都没续上则 5 分钟后再来。
+      经已测试通过的代理请求票据，成功后更换账号出口并更新账号共享票
+      此操作消耗请求额度，获得票据不代表连接已通过答案验证
     </p>
     <div class="mt-3 flex flex-wrap items-end gap-3">
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
@@ -236,7 +239,7 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       </div>
     </div>
     <p v-if="models.length && mode === 'auto'" class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
-      从轮换代理模板即时生成美/日/德/菲随机出口，逐个 IP 打 1 次（同一 IP 复打会被上游抹掉 state），命中即把账号改绑到你选的静态出口并按静态出口钉住 state（state 已确认可跨 IP 移植）。每个 IP 都是一次真实请求、消耗额度，到「最多 IP 数」即止。
+      按所选地区生成轮换出口，命中后改绑到所选静态出口，达到 IP 数上限即停止
     </p>
     <div v-if="models.length && mode === 'sweep'" class="mt-3 flex flex-wrap items-end gap-3">
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">

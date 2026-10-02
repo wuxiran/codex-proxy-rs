@@ -297,15 +297,7 @@ impl TurnStateService {
     /// 钉住一个刚在目标出口上观测到的账号级 state；返回生效模板的到期时间。
     pub fn pin_account_wide(&self, pin: AccountWidePin<'_>) -> Result<SystemTime, PinRejected> {
         let settings = self.settings();
-        if !classify::storable(pin.value, &settings) {
-            return Err(PinRejected::Length);
-        }
-        let issued = fernet::resolve_issued_at(pin.value, pin.captured_at, pin.now, FUTURE_SKEW)
-            .map_err(|_| PinRejected::FutureStamped)?;
-        let expires_at = issued.at + pin.ttl.unwrap_or_else(|| settings.ttl());
-        if expires_at <= pin.now {
-            return Err(PinRejected::Expired);
-        }
+        let (issued, expires_at) = Self::account_wide_times(&pin, &settings)?;
         let record = BucketRecord {
             account: pin.account.to_owned(),
             model: pin.model.to_owned(),
@@ -329,6 +321,27 @@ impl TurnStateService {
                 StoreError::Full => PinRejected::Full,
                 StoreError::Io | StoreError::Path => PinRejected::Io,
             })
+    }
+
+    /// 发布路由前检查票据；不写入模板，磁盘和容量错误仍需由发布方处理。
+    pub fn validate_account_wide(&self, pin: &AccountWidePin<'_>) -> Result<(), PinRejected> {
+        Self::account_wide_times(pin, &self.settings()).map(|_| ())
+    }
+
+    fn account_wide_times(
+        pin: &AccountWidePin<'_>,
+        settings: &Settings,
+    ) -> Result<(fernet::ResolvedIssuedAt, SystemTime), PinRejected> {
+        if !classify::storable(pin.value, settings) {
+            return Err(PinRejected::Length);
+        }
+        let issued = fernet::resolve_issued_at(pin.value, pin.captured_at, pin.now, FUTURE_SKEW)
+            .map_err(|_| PinRejected::FutureStamped)?;
+        let expires_at = issued.at + pin.ttl.unwrap_or_else(|| settings.ttl());
+        if expires_at <= pin.now {
+            return Err(PinRejected::Expired);
+        }
+        Ok((issued, expires_at))
     }
 
     /// 云端票与签发路由共同构成模板身份，防止同一秒的新路由误保留旧路由的票。

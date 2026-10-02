@@ -531,6 +531,7 @@ pub(super) fn websocket_client_failure_policy(
                     | CodexWebSocketExchangeError::ContinuationUnavailable { .. }
                     | CodexWebSocketExchangeError::OriginCircuitOpen
                     | CodexWebSocketExchangeError::OriginHalfOpenBusy
+                    | CodexWebSocketExchangeError::WarmUnavailable
             ) =>
         {
             Some(WebSocketFailurePolicy::Budgeted)
@@ -803,6 +804,7 @@ pub(super) fn stream_transport_allows_pre_delivery_retry(error: &CodexClientErro
             CodexWebSocketExchangeError::InvalidRequest(_)
                 | CodexWebSocketExchangeError::Upstream(_)
                 | CodexWebSocketExchangeError::ContinuationUnavailable { .. }
+                | CodexWebSocketExchangeError::WarmUnavailable
         ),
         _ => false,
     }
@@ -967,6 +969,17 @@ pub(super) fn map_client_error(
                 websocket_error_kind(&error),
                 websocket_send_state(&error),
             ));
+            if matches!(
+                error.classified(),
+                CodexWebSocketExchangeError::WarmUnavailable
+            ) {
+                failure.error = failure
+                    .error
+                    .with_retry_after(Duration::from_secs(2))
+                    .with_upstream_code(OpaqueUpstreamValue::new(
+                        "warm_connection_unavailable".to_owned(),
+                    ));
+            }
             if let Some(close_code) = close_code {
                 failure.error =
                     failure
@@ -1132,6 +1145,7 @@ fn websocket_diagnostic(error: &CodexWebSocketExchangeError) -> ProviderDiagnost
                 .unwrap_or("websocket_connect_failed"),
         ),
         CodexWebSocketExchangeError::ConnectTimeout { .. } => ("connect", "connect_timeout"),
+        CodexWebSocketExchangeError::WarmUnavailable => ("connect", "warm_connection_unavailable"),
         CodexWebSocketExchangeError::SharedConnectFailed => ("connect", "shared_connect_failed"),
         CodexWebSocketExchangeError::OriginCircuitOpen => ("connect", "origin_circuit_open"),
         CodexWebSocketExchangeError::OriginHalfOpenBusy => ("connect", "origin_half_open_busy"),
@@ -1215,6 +1229,9 @@ fn websocket_diagnostic_message(error: &CodexWebSocketExchangeError) -> Provider
         }
         CodexWebSocketExchangeError::OriginHalfOpenBusy => {
             "OpenAI WebSocket origin half-open probe is busy".to_owned()
+        }
+        CodexWebSocketExchangeError::WarmUnavailable => {
+            "No verified warm connection is ready; retry later".to_owned()
         }
         CodexWebSocketExchangeError::SharedConnectFailed => {
             "OpenAI shared WebSocket connection failed before payload send".to_owned()
@@ -1537,6 +1554,7 @@ pub(super) fn websocket_send_state(error: &CodexWebSocketExchangeError) -> Upstr
         | CodexWebSocketExchangeError::ConnectTimeout { .. }
         | CodexWebSocketExchangeError::OriginCircuitOpen
         | CodexWebSocketExchangeError::OriginHalfOpenBusy
+        | CodexWebSocketExchangeError::WarmUnavailable
         | CodexWebSocketExchangeError::SharedConnectFailed
         | CodexWebSocketExchangeError::ContinuationUnavailable { .. } => UpstreamSendState::NotSent,
         CodexWebSocketExchangeError::Upstream(_)
@@ -1560,6 +1578,9 @@ pub(super) fn websocket_send_state(error: &CodexWebSocketExchangeError) -> Upstr
 
 pub(super) fn websocket_error_kind(error: &CodexWebSocketExchangeError) -> ProviderErrorKind {
     match error.classified() {
+        CodexWebSocketExchangeError::WarmUnavailable => {
+            ProviderErrorKind::AccountCapacityUnavailable
+        }
         CodexWebSocketExchangeError::InvalidRequest(_)
         | CodexWebSocketExchangeError::InvalidSse(_)
         | CodexWebSocketExchangeError::UnexpectedBinaryEvent => ProviderErrorKind::Protocol,

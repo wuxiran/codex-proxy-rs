@@ -27,21 +27,23 @@ export interface TurnStateWarmPoolSettings {
   enabled: boolean
   /** 业务请求是否可领养保活连接。 */
   businessReuse: boolean
-  /** 每个账号挂几条满血连接。 */
+  /** 新对话只使用完成答题验证的连接，暂缺时返回 503。 */
+  requireVerified?: boolean
+  /** 每账号、每模型保留的连接数。 */
   connectionsPerAccount: number
-  /** 预热的模型；空 = 用探针模型。 */
+  /** 逐模型建立并验证连接；空 = 跟随业务模型，首次使用内置模型。 */
   models: string[]
   /** 一条连接最多挂多久(秒)，<上游 55min。 */
   maxAgeSeconds: number
   /** 复探间隔(秒)：低频验连接还满不满血。 */
   reprobeSeconds: number
-  /** 是否跑 canary 探针(糖果题)。 */
+  /** 是否检查答案；关闭后只检查完整响应和模型声明。 */
   probe: boolean
   /** 探针题正文；空 = 内置糖果题。 */
   probePrompt: string
   /** 满血判据：答案以此开头(如 21)。 */
   probeExpect: string
-  /** 探针模型；空 = models 首个。 */
+  /** 旧版单模型字段；页面编辑模型列表时清除此覆盖。 */
   probeModel: string
   /** 探针 effort。 */
   probeEffort: 'low' | 'medium' | 'high' | 'xhigh'

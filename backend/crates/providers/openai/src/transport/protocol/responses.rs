@@ -81,6 +81,12 @@ pub struct CodexResponsesRequest {
     pub discard_mismatched_connection: bool,
     /// CPR 注入的云端票所需的路由指纹，不进入请求正文。
     pub minted_turn_state_route: Option<String>,
+    /// 仅内部预热请求持有；没有发布凭证的 warm 连接不能被业务领养。
+    pub warm_approval: Option<crate::transport::WarmConnectionApproval>,
+    /// 只用于本地选择连接，不进入上游正文。
+    pub require_verified_warm: bool,
+    /// 请求冻结的预热复用开关，模拟运行或关闭预热时不领养候选。
+    pub allow_warm_reuse: bool,
 }
 
 impl fmt::Debug for CodexResponsesRequest {
@@ -178,6 +184,9 @@ impl TransportRequirement {
 
 /// 将已完成 history preparation 的请求规范化为唯一 transport requirement。
 pub fn transport_requirement(request: &CodexResponsesRequest) -> TransportRequirement {
+    if request.require_verified_warm {
+        return TransportRequirement::WebSocketNewChain;
+    }
     if !request.generate() && !request.store() {
         return TransportRequirement::ExplicitWebSocketWarmup;
     }
@@ -531,6 +540,9 @@ impl CodexResponsesRequest {
             previous_response_scope: None,
             discard_mismatched_connection: false,
             minted_turn_state_route: None,
+            warm_approval: None,
+            require_verified_warm: false,
+            allow_warm_reuse: true,
         }
     }
 

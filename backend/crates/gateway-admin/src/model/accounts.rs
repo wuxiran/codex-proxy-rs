@@ -371,6 +371,10 @@ pub enum AccountConnectionTestEvent {
         text: String,
     },
     Completed,
+    Execution {
+        mode: gateway_core::engine::probe::AccountProbeMode,
+        details: gateway_core::engine::probe::AccountProbeExecution,
+    },
     Failed {
         source: AccountProbeErrorSource,
         gateway_error_code: GatewayErrorKind,

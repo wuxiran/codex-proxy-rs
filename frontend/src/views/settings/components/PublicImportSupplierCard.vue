@@ -168,8 +168,8 @@ async function remove() {
       <AccountGroupCheckboxGrid v-model="groupIds" :groups="groups" :loading="groupsLoading" :disabled="busy" />
     </BaseFormItem>
 
-    <BaseFormItem label="自动开启 state 绑定 + WS 保活" description="导入成功后为 OAuth 账号开启「固定自身 state」；开启后 WS 保活暖池会给这些账号预建并挂住满血 WebSocket。API Key 账号不支持，会跳过">
-      <SyncedSwitch v-model="pinTurnState" label="导入后开启 state 绑定 + WS 保活" :disabled="busy" />
+    <BaseFormItem label="自动启用票与预热" description="导入后为 OAuth 账号启用，后续在票据管理页维护，API Key 账号跳过">
+      <SyncedSwitch v-model="pinTurnState" label="导入后启用票与预热" :disabled="busy" />
     </BaseFormItem>
 
     <BaseFormItem label="链接有效期" :error="expiryError" :description="`${expiryText}。预设时长从点击保存时起算；到期后链接自动失效，更换链接不会重置有效期`">

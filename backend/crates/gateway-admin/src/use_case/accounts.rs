@@ -170,13 +170,14 @@ pub trait AccountsService: Send + Sync {
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
 
     /// 测智台：对指定账号发一条自定义 prompt（可选思考强度）的测试请求，流式回输出。
-    /// 走 probe 路径钉住该账号；钉票随账号自动带（有则带、无则按无票客户跑）。
+    /// 业务方式使用正常票与连接策略，原始诊断保留不注票、不领用暖池的行为。
     async fn run_test_bench(
         &self,
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
         prompt: String,
         reasoning_effort: Option<String>,
+        mode: gateway_core::engine::probe::AccountProbeMode,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
 
     /// 账号级 state 缺失或将在 `margin` 内到期、需要自动续期的账号。
@@ -1291,6 +1292,7 @@ impl AccountsService for DefaultAccountsService {
             let result = probe
                 .probe(
                     AccountProbeRequest {
+                        mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
                         account_id,
                         provider_kind: account.provider_kind,
                         upstream_model,
@@ -1344,6 +1346,7 @@ impl AccountsService for DefaultAccountsService {
         upstream_model: UpstreamModelId,
         prompt: String,
         reasoning_effort: Option<String>,
+        mode: gateway_core::engine::probe::AccountProbeMode,
     ) -> Result<AccountConnectionTestEventStream, AdminError> {
         let (stored, provider) = self.provider_for_account(&account_id).await?;
         let account = stored.account;
@@ -1368,6 +1371,7 @@ impl AccountsService for DefaultAccountsService {
             let result = probe
                 .probe(
                     AccountProbeRequest {
+                        mode,
                         account_id,
                         provider_kind: account.provider_kind,
                         upstream_model,
@@ -1379,9 +1383,15 @@ impl AccountsService for DefaultAccountsService {
                 .await;
             match result {
                 Ok(result) => result
-                    .text
+                    .execution
                     .into_iter()
-                    .map(|text| AccountConnectionTestEvent::Content { text })
+                    .map(|details| AccountConnectionTestEvent::Execution { mode, details })
+                    .chain(
+                        result
+                            .text
+                            .into_iter()
+                            .map(|text| AccountConnectionTestEvent::Content { text }),
+                    )
                     .chain(std::iter::once(AccountConnectionTestEvent::Completed))
                     .collect(),
                 Err(error) => {
@@ -1397,7 +1407,11 @@ impl AccountsService for DefaultAccountsService {
                         .upstream_response()
                         .map(|response| String::from_utf8_lossy(response.body()).into_owned());
                     let message = error.client_message().to_owned();
-                    vec![AccountConnectionTestEvent::Failed {
+                    let mut events = Vec::new();
+                    if let Some(details) = error.execution().cloned() {
+                        events.push(AccountConnectionTestEvent::Execution { mode, details });
+                    }
+                    events.push(AccountConnectionTestEvent::Failed {
                         source: error.source(),
                         gateway_error_code: error.kind(),
                         send_state: error.send_state(),
@@ -1407,7 +1421,8 @@ impl AccountsService for DefaultAccountsService {
                         upstream_status,
                         upstream_content_type,
                         upstream_body,
-                    }]
+                    });
+                    events
                 }
             }
         })

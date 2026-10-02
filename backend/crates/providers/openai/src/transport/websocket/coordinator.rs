@@ -121,6 +121,9 @@ pub(crate) async fn prepare_response_create_request_with_pool(
 ) -> Result<WebSocketFastPath<PreparedWebSocket>, CodexWebSocketExchangeError> {
     let decision_started_at = Instant::now();
     let Some((pool, key)) = pool else {
+        if request.require_verified_warm {
+            return Err(CodexWebSocketExchangeError::WarmUnavailable);
+        }
         if require_pool || !request.continuation().permits_fresh_connection() {
             return Err(continuation_unavailable(
                 PreviousResponseUnavailableReason::PoolUnavailable,
@@ -145,7 +148,28 @@ pub(crate) async fn prepare_response_create_request_with_pool(
         | WebSocketContinuationRequirement::Persisted { .. }
         | WebSocketContinuationRequirement::ExternalUnknown { .. } => None,
     };
-    match pool.acquire(&key, required_response_id).await {
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let acquired = loop {
+        let acquired = pool
+            .acquire(
+                &key,
+                required_response_id,
+                request.requested_model(),
+                request.require_verified_warm,
+                request.allow_warm_reuse,
+            )
+            .await;
+        if !request.require_verified_warm || matches!(acquired, WebSocketPoolAcquire::Reused { .. })
+        {
+            break acquired;
+        }
+        if tokio::time::Instant::now() >= ready_deadline {
+            return Err(CodexWebSocketExchangeError::WarmUnavailable);
+        }
+        // 不新拨、不重放正文；等待后台发布候选，取消时 Future 释放即可。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    match acquired {
         WebSocketPoolAcquire::Reused { connection, lease } => {
             if let WebSocketContinuationRequirement::ConnectionLocal { response_id } =
                 request.continuation()
@@ -492,6 +516,7 @@ async fn connect_websocket_connection(
             metadata,
             continuation: WebSocketContinuationState::default(),
             created_at: tokio::time::Instant::now(),
+            warm_approval: None,
         },
         started_at.elapsed(),
     ))
@@ -602,6 +627,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         metadata,
         continuation,
         created_at,
+        warm_approval,
     } = connection;
     if request
         .minted_turn_state_route
@@ -631,6 +657,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         "connectionId": websocket.connection_id().to_string(), "reused": reused,
         "pool": pool_decision.map_or("unpooled", WebSocketPoolDecision::kind),
         "status": metadata.diagnostics.status_code,
+        "warmVerified": warm_approval.as_ref().map(|approval| approval.checked()),
         "upstreamRequestId": metadata.diagnostics.request_id,
         "headers": gateway_core::diagnostics::diagnostic_headers(metadata.diagnostics.trace_headers.iter().map(|(name, value)| (name.as_str(), value.as_str()))),
     }));
@@ -661,6 +688,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         lease,
         created_at,
         continuation,
+        warm_approval: request.warm_approval.clone().or(warm_approval),
     });
     let mut exchange = stream_websocket_response(
         websocket,

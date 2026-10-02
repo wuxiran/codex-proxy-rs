@@ -9,6 +9,7 @@ import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import SyncedSwitch from '@/components/SyncedSwitch.vue'
+import { useAccountConfigurations } from '@/composables/useAccountConfigurations'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import AccountAutoRefresh from './components/AccountAutoRefresh.vue'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
@@ -23,14 +24,12 @@ import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
 import AccountRecentErrors from './components/AccountRecentErrors.vue'
-import AccountStateBindingCell from './components/AccountStateBindingCell.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountTicketCell from './components/AccountTicketCell.vue'
 import AccountTicketModal from './components/AccountTicketModal.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
-import { useAccountConfigurations } from './composables/useAccountConfigurations'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
 import { useAccountEditor } from './composables/useAccountEditor'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
@@ -73,7 +72,7 @@ const {
   handlePageSizeChange,
   handleSortChange,
 } = useAccountsQuery()
-const { entries: accountConfigurations, reload: reloadConfigurations } = useAccountConfigurations(accounts)
+const { entries: accountConfigurations } = useAccountConfigurations(accounts)
 
 const {
   groups,
@@ -103,7 +102,6 @@ const {
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
-  updatingTurnStateAccountIds,
   revivingAccountIds,
   downloadingCatalogAccountIds,
   togglingSchedulingAccountIds,
@@ -130,7 +128,6 @@ const {
   handleRefresh,
   handleRefreshQuota,
   handleToggleScheduling,
-  handleToggleTurnState,
   handleReviveGuanlan,
   handleQuotaReset,
 } = useAccountMutations({
@@ -139,7 +136,6 @@ const {
   selectedIds,
   reload: () => Promise.all([loadAccounts(), loadGroups()]),
   replaceAccount,
-  reloadConfigurations,
 })
 
 const {
@@ -197,15 +193,6 @@ const {
 
 const {
   apiKey: editingApiKey,
-  pinTurnState: editingPinTurnState,
-  savedPinTurnState: editingSavedPinTurnState,
-  afterTurnStateHunt,
-  afterTurnStateHuntCancelled,
-  turnStateAutoHunt: editingTurnStateAutoHunt,
-  stopTurnStateAutoHunt,
-  recaptureTurnState: editingRecaptureTurnState,
-  turnStatePins: editingTurnStatePins,
-  turnStateCaptureRule: editingTurnStateCaptureRule,
   oauthTransport: editingOAuthTransport,
   configurationLoading,
   configurationReady,
@@ -373,30 +360,6 @@ const {
               />
             </template>
 
-            <template #turnState="{ row }">
-              <SyncedSwitch
-                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
-                :model-value="accountConfigurations[row.id]?.value?.pinTurnState ?? false"
-                :label="`${row.name} State`"
-                :disabled="!accountConfigurations[row.id]?.value || accountConfigurations[row.id]?.loading || updatingTurnStateAccountIds.has(row.id) || revivingAccountIds.has(row.id)"
-                :title="accountConfigurations[row.id]?.error || '切换 state 绑定'"
-                @update:model-value="handleToggleTurnState(row.id, $event)"
-              />
-              <span v-else class="text-cp-text-quaternary">不适用</span>
-            </template>
-
-            <template #stateBinding="{ row }">
-              <AccountStateBindingCell
-                v-if="row.provider === 'openai' && row.authenticationKind === 'oauth'"
-                :configuration="accountConfigurations[row.id]?.value"
-                :loading="accountConfigurations[row.id]?.loading"
-                :error="accountConfigurations[row.id]?.error"
-                @configure="openAccountEdit(row)"
-                @retry="reloadConfigurations"
-              />
-              <span v-else class="text-cp-text-quaternary">不适用</span>
-            </template>
-
             <template #planType="{ row }">
               <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
             </template>
@@ -519,8 +482,6 @@ const {
     <AccountEditModal
       v-model="showEditModal"
       v-model:api-key="editingApiKey"
-      v-model:pin-turn-state="editingPinTurnState"
-      v-model:recapture-turn-state="editingRecaptureTurnState"
       v-model:oauth-transport="editingOAuthTransport"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
@@ -530,20 +491,12 @@ const {
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
-      :turn-state-pins="editingTurnStatePins"
-      :turn-state-capture-rule="editingTurnStateCaptureRule"
-      :saved-pin-turn-state="editingSavedPinTurnState"
-      :turn-state-auto-hunt="editingTurnStateAutoHunt"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
-      @turn-state-hunted="afterTurnStateHunt"
-      @turn-state-hunt-cancelled="afterTurnStateHuntCancelled"
-      @turn-state-minted="afterTurnStateHuntCancelled"
-      @stop-turn-state-auto-hunt="stopTurnStateAutoHunt"
       @save="saveAccountEdit"
     />
 

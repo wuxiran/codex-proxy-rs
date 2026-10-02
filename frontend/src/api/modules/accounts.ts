@@ -896,6 +896,18 @@ export interface TurnStateAutoHunt {
 export interface OAuthStateConfiguration {
   guanlanReviveAvailable?: boolean
   cloudMint?: TurnStateCloudMintStatus | null
+  warmPool?: {
+    enabled: boolean
+    held: number
+    last: {
+      verdict: 'verified' | 'ready' | 'degraded' | 'failed' | null
+      probeModel: string | null
+      servedModel: string | null
+      atMs: number
+      attempts: number
+      gateway: string | null
+    } | null
+  } | null
   pinTurnState: boolean
   turnStateAutoHunt?: TurnStateAutoHunt | null
   turnStatePins: TurnStatePinStatus[]

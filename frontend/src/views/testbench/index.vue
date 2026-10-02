@@ -10,6 +10,7 @@ import { useTestBenchStore } from '@/stores/modules/testbench'
 
 const store = useTestBenchStore()
 const {
+  mode,
   groupId,
   model,
   effort,
@@ -25,6 +26,11 @@ const {
   filteredAccounts,
   allVisibleSelected,
 } = storeToRefs(store)
+
+const modeOptions = [
+  { label: '业务方式', value: 'business' },
+  { label: '原始诊断', value: 'diagnostic' },
+]
 
 const effortOptions = [
   { label: '思考强度：低', value: 'low' },
@@ -97,13 +103,17 @@ onMounted(() => {
   <div class="flex w-full flex-col gap-5 px-4 py-6">
     <BasePageHeader
       title="测智台"
-      description="选一批账号并行发同一条测试 prompt（可选思考强度），并排看输出、人工判满血/降智。走 probe 路径钉住账号，钉票随账号自动带。切换页面不会丢结果。"
+      description="按账号对比回答，查看实际票与连接使用情况"
     />
 
     <BaseCard>
       <div class="flex flex-col gap-4">
         <!-- 参数行 -->
         <div class="flex flex-wrap items-end gap-3">
+          <div class="w-40">
+            <span class="block text-xs text-neutral-500">测试方式</span>
+            <BaseSelect v-model="mode" :options="modeOptions" aria-label="测试方式" class="mt-1" />
+          </div>
           <div class="w-48">
             <span class="block text-xs text-neutral-500">分组</span>
             <BaseSelect v-model="groupId" :options="groupOptions()" class="mt-1" @update:model-value="store.loadAccounts()" />
@@ -128,6 +138,10 @@ onMounted(() => {
           </BaseButton>
         </div>
 
+        <p class="m-0 text-xs text-neutral-500">
+          {{ mode === 'business' ? '固定所选账号，使用当前业务票与连接策略' : '跳过固定票与暖池，用于对照排查' }}
+        </p>
+
         <!-- prompt -->
         <div>
           <span class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</span>
@@ -136,21 +150,21 @@ onMounted(() => {
 
         <!-- 账号选择 -->
         <div>
-          <div class="mb-2 flex items-center gap-3">
-            <span class="text-xs text-neutral-500">
+          <div class="mb-2 flex flex-wrap items-center gap-3">
+            <span class="shrink-0 text-xs text-neutral-500">
               账号
               <span v-if="accountsLoading" class="ml-1 text-amber-500">加载中…</span>
               <span v-else class="ml-1 text-neutral-400">（{{ filteredAccounts.length }} 个，已选 {{ selected.length }}）</span>
             </span>
-            <BaseInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-56 text-xs" />
+            <BaseInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-full text-xs sm:w-56" />
             <BaseCheckbox
               :model-value="allVisibleSelected" label="全选可见" show-label
-              class="text-xs" @update:model-value="store.toggleAllVisible"
+              class="shrink-0 text-xs" @update:model-value="store.toggleAllVisible"
             />
-            <button class="text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="store.clearSelection()">
+            <button class="shrink-0 text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="store.clearSelection()">
               清空
             </button>
-            <button class="text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="store.loadAccounts()">
+            <button class="shrink-0 text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="store.loadAccounts()">
               刷新列表
             </button>
           </div>
@@ -200,7 +214,18 @@ onMounted(() => {
               </span>
             </div>
             <div class="text-[11px] text-neutral-400">
-              {{ run.model }} · {{ run.effort }} · {{ runTime(run) }}
+              {{ run.model }} · {{ run.effort }} · {{ run.mode === 'business' ? '业务方式' : run.mode === 'diagnostic' ? '原始诊断' : '历史模式未记录' }} · {{ runTime(run) }}
+            </div>
+            <div v-if="run.status !== 'queued' && run.status !== 'running'" class="flex flex-wrap gap-x-3 gap-y-1 text-xs" aria-label="票与连接使用情况">
+              <span :class="run.execution?.ticketAttached ? 'text-emerald-600 dark:text-emerald-400' : 'text-neutral-500'">
+                {{ run.execution?.ticketAttached === true ? '已带票' : run.execution?.ticketAttached === false ? '未带票' : '带票未记录' }}
+              </span>
+              <span :class="run.execution?.warmPoolUsed ? 'text-emerald-600 dark:text-emerald-400' : 'text-neutral-500'">
+                {{ run.execution?.warmPoolUsed === true ? '暖池命中' : run.execution?.warmPoolUsed === false ? '未命中暖池' : '暖池未记录' }}
+              </span>
+              <span class="text-neutral-500" :title="run.execution?.connectionId || undefined">
+                {{ run.execution?.transport === 'http_sse' || run.execution?.transport === 'http' ? 'HTTP SSE' : run.execution?.connectionReused === true ? 'WS 已复用' : run.execution?.connectionReused === false ? 'WS 新建' : '连接未记录' }}
+              </span>
             </div>
             <!-- 人工判定（独立于运行状态） -->
             <div class="flex items-center gap-1.5">

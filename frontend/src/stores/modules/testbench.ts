@@ -25,11 +25,23 @@ function loadRuns(): RunState[] {
   }
 }
 
+export type TestBenchMode = 'business' | 'diagnostic'
+export interface ExecutionDetails {
+  ticketAttached?: boolean | null
+  warmPoolUsed?: boolean | null
+  warmVerified?: boolean | null
+  connectionReused?: boolean | null
+  connectionId?: string | null
+  transport?: string | null
+}
+
 export type RunStatus = 'queued' | 'running' | 'success' | 'empty' | 'error'
 export type Verdict = 'unknown' | 'full' | 'degraded'
 
 export interface RunState {
   accountId: string
+  mode?: TestBenchMode
+  execution?: ExecutionDetails | null
   name: string
   model: string
   effort: string
@@ -59,6 +71,7 @@ export const useTestBenchStore = defineStore(
   'testbench',
   () => {
     // 表单（持久到 localStorage）
+    const mode = ref<TestBenchMode>('business')
     const groupId = ref('')
     const model = ref('gpt-6-astra')
     const effort = ref('medium')
@@ -164,13 +177,17 @@ export const useTestBenchStore = defineStore(
       selected.value = []
     }
 
-    async function runOne(run: RunState) {
+    async function runOne(run: RunState, batchPrompt: string) {
       run.status = 'running'
       run.output = ''
       run.errorMsg = ''
+      run.execution = null
       const started = performance.now()
-      const handle = (ev: { type?: string, text?: string, message?: string, success?: boolean }) => {
+      const handle = (ev: { type?: string, text?: string, message?: string, error?: string, success?: boolean, details?: ExecutionDetails }) => {
         switch (ev.type) {
+          case 'execution':
+            run.execution = ev.details ?? null
+            break
           case 'content':
             if (typeof ev.text === 'string')
               run.output += ev.text
@@ -182,7 +199,7 @@ export const useTestBenchStore = defineStore(
             break
           case 'error':
             run.status = 'error'
-            run.errorMsg = ev.message || ev.text || '测试失败'
+            run.errorMsg = ev.message || ev.error || ev.text || '测试失败'
             break
         }
       }
@@ -193,8 +210,9 @@ export const useTestBenchStore = defineStore(
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             accountId: run.accountId,
+            mode: run.mode,
             modelId: run.model,
-            prompt: prompt.value,
+            prompt: batchPrompt,
             reasoningEffort: run.effort || null,
           }),
         })
@@ -250,8 +268,12 @@ export const useTestBenchStore = defineStore(
       const nameOf = (id: string) => accounts.value.find(a => a.id === id)?.name || id
       const modelId = model.value.trim()
       const effortValue = effort.value
+      const batchMode = mode.value
+      const batchPrompt = prompt.value
       runs.value = ids.map(id => ({
         accountId: id,
+        mode: batchMode,
+        execution: null,
         name: nameOf(id),
         model: modelId,
         effort: effortValue,
@@ -271,7 +293,7 @@ export const useTestBenchStore = defineStore(
       const worker = async () => {
         while (cursor < batch.length) {
           const idx = cursor++
-          await runOne(batch[idx])
+          await runOne(batch[idx], batchPrompt)
         }
       }
       try {
@@ -309,6 +331,7 @@ export const useTestBenchStore = defineStore(
     }
 
     return {
+      mode,
       groupId,
       model,
       effort,
@@ -339,7 +362,7 @@ export const useTestBenchStore = defineStore(
   {
     persist: {
       key: 'codex-proxy-rs-testbench-form',
-      pick: ['groupId', 'model', 'effort', 'prompt', 'concurrency', 'selected'],
+      pick: ['mode', 'groupId', 'model', 'effort', 'prompt', 'concurrency', 'selected'],
     },
   },
 )

@@ -14,7 +14,6 @@ import {
   refreshAccount,
   refreshAccountQuota,
   reviveGuanlanAccount,
-  updateAccountTurnState,
 } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useDownload } from '@/composables/useDownload'
@@ -32,7 +31,6 @@ export function useAccountMutations(options: {
   onImportTaskCreated: (task: AccountImportTask) => void
   reload: () => Promise<unknown>
   replaceAccount: (account: AccountRow) => Promise<boolean>
-  reloadConfigurations: () => Promise<void>
 }) {
   const loadAccounts = options.reload
   const { downloadJson } = useDownload()
@@ -47,7 +45,6 @@ export function useAccountMutations(options: {
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
-  const updatingTurnStateAccounts = useIdSet<string>()
   const revivingAccounts = useIdSet<string>()
   const downloadingCatalogAccounts = useIdSet<string>()
   const togglingSchedulingAccounts = useIdSet<string>()
@@ -57,7 +54,6 @@ export function useAccountMutations(options: {
   const recoveringAccountIds = recoveringAccounts.ids
   const refreshingAccountIds = refreshingAccounts.ids
   const refreshingQuotaAccountIds = refreshingQuotaAccounts.ids
-  const updatingTurnStateAccountIds = updatingTurnStateAccounts.ids
   const revivingAccountIds = revivingAccounts.ids
   const downloadingCatalogAccountIds = downloadingCatalogAccounts.ids
   const togglingSchedulingAccountIds = togglingSchedulingAccounts.ids
@@ -230,17 +226,6 @@ export function useAccountMutations(options: {
     })
   }
 
-  async function handleToggleTurnState(accountId: string, pinTurnState: boolean) {
-    await updatingTurnStateAccounts.run(accountId, async () => {
-      try {
-        await updateAccountTurnState({ accountId, pinTurnState })
-        toast.success(pinTurnState ? '已开启 state 绑定' : '已关闭 state 绑定')
-        await options.reloadConfigurations()
-      }
-      catch {}
-    })
-  }
-
   async function handleReviveGuanlan(accountId: string) {
     await revivingAccounts.run(accountId, async () => {
       try {
@@ -355,7 +340,6 @@ export function useAccountMutations(options: {
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,
-    updatingTurnStateAccountIds,
     revivingAccountIds,
     downloadingCatalogAccountIds,
     togglingSchedulingAccountIds,
@@ -372,7 +356,6 @@ export function useAccountMutations(options: {
     handleRefresh,
     handleRefreshQuota,
     handleToggleScheduling,
-    handleToggleTurnState,
     handleReviveGuanlan,
     handleQuotaReset,
   }

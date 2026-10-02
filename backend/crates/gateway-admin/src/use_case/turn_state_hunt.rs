@@ -171,6 +171,7 @@ impl DefaultAccountsService {
             service: self.clone(),
             provider,
             request: AccountProbeRequest {
+                mode: gateway_core::engine::probe::AccountProbeMode::Diagnostic,
                 account_id: command.account_id.clone(),
                 provider_kind: stored.account.provider_kind,
                 upstream_model: command.upstream_model.clone(),

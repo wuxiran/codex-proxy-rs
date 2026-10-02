@@ -35,6 +35,7 @@ pub(crate) use self::{
         WebSocketContinuationState,
     },
 };
+pub(crate) use crate::transport::WarmConnectionApproval;
 
 const DEFAULT_MAX_CONNECTING: usize = 16;
 const DEFAULT_MAX_AGE: Duration = Duration::from_mins(55);
@@ -145,9 +146,21 @@ impl CodexWebSocketPool {
         self.warm_reuse.store(enabled, Ordering::Release);
     }
 
-    /// 一条建连许可（不阻塞前台）；warmer 建保活连接前先拿，拿不到就本轮少建。
-    pub(crate) fn try_connect_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.connect_semaphore.clone().try_acquire_owned().ok()
+    /// 缩短设置立即限制已有候选；延长寿命只用于新候选，不复活已到期连接。
+    pub(crate) fn restrict_warm_lifetime(&self, max_age: Duration) {
+        let state = self.lock_state();
+        for slot in state.slots.values() {
+            if let WebSocketPoolSlot::Idle { connection } = slot
+                && let Some(approval) = &connection.warm_approval
+            {
+                approval.restrict_lifetime(max_age);
+            }
+        }
+    }
+
+    /// 只预检容量；真正拨号由 acquire 取得一次许可，避免预热外层重复占用。
+    pub(crate) fn has_connect_capacity(&self) -> bool {
+        self.connect_semaphore.available_permits() > 0
     }
 
     /// 某账号当前挂着的保活连接数（空闲的保活 key slot）。观测用。
@@ -159,7 +172,9 @@ impl CodexWebSocketPool {
             .filter(|(key, slot)| {
                 key.is_warm()
                     && key.account_id() == account_id
-                    && matches!(slot, WebSocketPoolSlot::Idle { .. })
+                    && matches!(slot, WebSocketPoolSlot::Idle { connection }
+                        if connection.warm_approval.as_ref().is_some_and(|approval| approval.published())
+                        && !state::should_close_idle_connection(connection, tokio::time::Instant::now(), self.config.max_age))
             })
             .count()
     }
@@ -248,6 +263,51 @@ impl CodexWebSocketPool {
         count
     }
 
+    /// 复探前先撤销可领养状态；已有业务租约不受影响。
+    pub(crate) fn begin_warm_probe(
+        &self,
+        account_id: &str,
+        slot: usize,
+        approval: &WarmConnectionApproval,
+    ) {
+        let mut state = self.lock_state();
+        for (key, value) in &mut state.slots {
+            if key.account_id() == account_id
+                && key.warm_slot() == Some(slot)
+                && let WebSocketPoolSlot::Idle { connection } = value
+            {
+                connection.warm_approval = Some(approval.clone());
+            }
+        }
+    }
+
+    pub(crate) fn has_warm_candidate(&self, approval: &WarmConnectionApproval) -> bool {
+        let state = self.lock_state();
+        state.slots.iter().any(|(key, slot)| key.is_warm()
+            && matches!(slot, WebSocketPoolSlot::Idle { connection }
+                if connection.warm_approval.as_ref() == Some(approval)
+                && !state::should_close_idle_connection(connection, tokio::time::Instant::now(), self.config.max_age)))
+    }
+
+    /// 账号切换已验证路由时，关闭旧候选；已经交给业务的连接保留原有续接生命周期。
+    pub(crate) async fn evict_other_warm_routes(&self, account_id: &str, route: &str) {
+        let mut close = Vec::new();
+        {
+            let mut state = self.lock_state();
+            let keys: Vec<_> = state.slots.iter().filter(|(key, slot)| {
+                key.is_warm() && key.account_id() == account_id
+                    && matches!(slot, WebSocketPoolSlot::Idle { connection }
+                        if connection.metadata.route_pair.as_ref().is_none_or(|pair| pair.fingerprint != route))
+            }).map(|(key, _)| key.clone()).collect();
+            for key in keys {
+                if let Some(WebSocketPoolSlot::Idle { connection }) = state.slots.remove(&key) {
+                    close.push(*connection);
+                }
+            }
+        }
+        close_pooled_connections(close).await;
+    }
+
     /// pump 后台任务的保活策略（供建连时传入）。
     pub(crate) fn keepalive(&self) -> PumpKeepalive {
         self.config.keepalive()
@@ -267,6 +327,9 @@ impl CodexWebSocketPool {
         &self,
         key: &CodexWebSocketPoolKey,
         required_response_id: Option<&str>,
+        model: &str,
+        require_verified: bool,
+        allow_warm: bool,
     ) -> WebSocketPoolAcquire {
         self.spawn_maintenance_task();
         let mut connections_to_close = Vec::new();
@@ -312,7 +375,15 @@ impl CodexWebSocketPool {
                     };
                     // 零成本探活：后台 pump 已实时感知连接死亡（RST/Close/EOF/失活），
                     // 复用前只需读取 is_closed 标志，避免复用到静默死连接后卡到超时。
-                    let expired = connection.created_at.elapsed() >= self.config.max_age;
+                    let expired = state::should_close_idle_connection(
+                        &connection,
+                        tokio::time::Instant::now(),
+                        self.config.max_age,
+                    ) || (require_verified
+                        && !connection.warm_approval.as_ref().is_some_and(|approval| {
+                            approval.checked()
+                                && approval.permits(model, connection.created_at.elapsed())
+                        }));
                     let closed = connection.websocket.is_closed();
                     if !expired && !closed {
                         let lease = WebSocketPoolLease::reserve(
@@ -352,13 +423,21 @@ impl CodexWebSocketPool {
                 WebSocketPoolAcquire::ContinuationLost(observation)
             } else if required_response_id.is_some() {
                 WebSocketPoolAcquire::Bypass(WebSocketPoolBypassReason::ContinuationNotFound)
-            } else if self.warm_reuse.load(Ordering::Acquire)
-                && let Some(reused) =
-                    self.adopt_warm_locked(&mut state, &key, &mut connections_to_close)
+            } else if allow_warm
+                && self.warm_reuse.load(Ordering::Acquire)
+                && let Some(reused) = self.adopt_warm_locked(
+                    &mut state,
+                    &key,
+                    model,
+                    require_verified,
+                    &mut connections_to_close,
+                )
             {
                 // 没有该对话的连接、又是可新拨的请求：优先领养一条 warmer 挂住的满血连接，
                 // 让业务跑在"健康期"内建立的连接上。没有可领养的就落到下面照常新拨（行为不变）。
                 reused
+            } else if require_verified {
+                WebSocketPoolAcquire::Bypass(WebSocketPoolBypassReason::Busy)
             } else {
                 let connect_permit = self.connect_semaphore.clone().try_acquire_owned().ok();
                 match connect_permit {
@@ -398,12 +477,19 @@ impl CodexWebSocketPool {
         &self,
         state: &mut WebSocketPoolState,
         key: &CodexWebSocketPoolKey,
+        model: &str,
+        require_verified: bool,
         connections_to_close: &mut Vec<PooledWebSocketConnection>,
     ) -> Option<WebSocketPoolAcquire> {
         loop {
             let warm_key = state.slots.iter().find_map(|(candidate, slot)| {
                 (candidate.serves_warm_target(key)
-                    && matches!(slot, WebSocketPoolSlot::Idle { .. }))
+                    && matches!(slot, WebSocketPoolSlot::Idle { connection }
+                        if connection.warm_approval.as_ref().is_some_and(|approval|
+                            approval.permits(model, connection.created_at.elapsed())
+                            && (!require_verified || approval.checked())
+                            && candidate.accepts_warm_egress(key, approval))
+                        && key.accepts_route(connection.metadata.route_pair.as_ref())))
                 .then(|| candidate.clone())
             })?;
             let Some(WebSocketPoolSlot::Idle { connection }) = state.slots.remove(&warm_key) else {

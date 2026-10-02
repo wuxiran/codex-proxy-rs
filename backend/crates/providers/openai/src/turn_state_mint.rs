@@ -20,7 +20,7 @@ use std::{
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use gateway_core::account::{ProviderAccount, ProviderAccountId};
+use gateway_core::account::{CredentialRevision, ProviderAccount, ProviderAccountId};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderValue};
 use secrecy::ExposeSecret as _;
 use serde::Deserialize;
@@ -45,6 +45,8 @@ const NATIVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const NATIVE_MAX_TOTAL_ATTEMPTS: u64 = 24;
 const NATIVE_TOTAL_TIMEOUT: Duration = Duration::from_secs(75);
 const NATIVE_ATTEMPT_GAP: Duration = Duration::from_millis(1500);
+/// 多账号同时缺票时仍共享预算，避免每个账号各自启动一组代理连接。
+const MAX_CONCURRENT_MINTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum MintError {
@@ -157,6 +159,15 @@ struct State {
     last: HashMap<String, MintReport>,
 }
 
+/// 预热开始时冻结发布前提，避免失败候选或过时凭据覆盖正在使用的路由。
+pub(crate) struct WarmPublication {
+    account: ProviderAccount,
+    binding: String,
+    original_route: Option<RoutePairRef>,
+    seed: Option<RoutePair>,
+    original_cookies: Vec<CodexCookie>,
+}
+
 /// 不实现 Debug：持有仓库句柄，且报告里有网关名以外的敏感上下文。
 pub(crate) struct CloudMintService {
     repository: CodexCredentialRepository,
@@ -173,6 +184,149 @@ pub(crate) struct CloudMintService {
 }
 
 impl CloudMintService {
+    pub(crate) async fn warm_publication(
+        &self,
+        account_id: &str,
+    ) -> Result<WarmPublication, MintError> {
+        let (account, binding) = self.load_binding(account_id).await?;
+        let data = self
+            .repository
+            .load_complete_data(&account)
+            .await
+            .map_err(|_| MintError::Store)?;
+        let original_route = RoutePairRef::stored(data.cookies());
+        let seed = self.stored_pair(&account, &self.settings()).await;
+        Ok(WarmPublication {
+            account,
+            binding,
+            original_route,
+            seed,
+            original_cookies: data
+                .cookies()
+                .iter()
+                .filter(|cookie| is_root_route_cookie(cookie))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    /// 仅在完整探针通过后提交同一连接的路由和当前模型票；调用方随后才可发布连接。
+    pub(crate) async fn publish_warm(
+        &self,
+        snapshot: &WarmPublication,
+        headers: &[String],
+        actual_route: &RoutePairRef,
+        ticket: Option<(&str, &str)>,
+    ) -> Result<(), MintError> {
+        let settings = self.pins.service().settings();
+        if settings.dry_run
+            || !settings.warm_pool.enabled
+            || !settings.warm_pool.business_reuse
+            || settings.cloud_mint.observe_only
+        {
+            return Err(MintError::Disabled);
+        }
+        // 同路由复探可以不签新票；换路由则必须连同新票发布，不能留下旧路由的票。
+        if ticket.is_none() && snapshot.original_route.as_ref() != Some(actual_route) {
+            return Err(MintError::InvalidResponse);
+        }
+        let pair = RoutePair::from_set_cookie(headers)
+            .or_else(|| snapshot.seed.clone())
+            .ok_or(MintError::InvalidResponse)?;
+        if !pair.live(mint_target(&settings.cloud_mint.gateway).as_deref())
+            || RoutePairRef::of(&pair.cflb, &pair.oailb).as_ref() != Some(actual_route)
+        {
+            return Err(MintError::InvalidResponse);
+        }
+        let now = SystemTime::now();
+        let mut pin = ticket.map(|(model, value)| turn_state::AccountWidePin {
+            account: snapshot.account.id().as_str(),
+            binding: snapshot.binding.clone(),
+            model,
+            egress: crate::turn_state_pin::egress_fingerprint(
+                snapshot
+                    .account
+                    .outbound_proxy()
+                    .map(|proxy| proxy.expose_url()),
+            ),
+            value,
+            captured_at: now,
+            now,
+            source: turn_state::Source::Mint,
+            ttl: Some(settings.cloud_mint.ticket_ttl()),
+            gateway: pair.gateway.clone(),
+        });
+        if let Some(pin) = &pin {
+            self.pins
+                .service()
+                .validate_account_wide(pin)
+                .map_err(|_| MintError::InvalidResponse)?;
+        }
+        let (account, written_revision) = self
+            .write_route_pair(
+                &snapshot.account,
+                &snapshot.binding,
+                snapshot.original_route.as_ref(),
+                &pair,
+            )
+            .await?;
+        let current = self.pins.service().settings();
+        let outcome = if current.dry_run
+            || current.warm_pool != settings.warm_pool
+            || current.cloud_mint != settings.cloud_mint
+        {
+            Err(MintError::Disabled)
+        } else if let Some(mut pin) = pin.take() {
+            pin.egress = crate::turn_state_pin::egress_fingerprint(
+                account.outbound_proxy().map(|proxy| proxy.expose_url()),
+            );
+            // CAS 可能耗时，重新检查此刻票是否已经到期。
+            pin.now = SystemTime::now();
+            self.pins
+                .service()
+                .pin_minted_account_wide(pin, &actual_route.fingerprint)
+                .map(|_| ())
+                .map_err(|_| MintError::InvalidResponse)
+        } else {
+            Ok(())
+        };
+        if outcome.is_err()
+            && let Some(revision) = written_revision
+        {
+            self.restore_warm_route(snapshot, actual_route, revision)
+                .await?;
+        }
+        outcome
+    }
+
+    /// 只撤回本次 CAS 写入，凭据或路由已经被其他请求更新时让步。
+    async fn restore_warm_route(
+        &self,
+        snapshot: &WarmPublication,
+        published: &RoutePairRef,
+        revision: CredentialRevision,
+    ) -> Result<(), MintError> {
+        let current = self.load_account(snapshot.account.id().as_str()).await?;
+        if current.revision() != revision {
+            return Ok(());
+        }
+        let mut data = self
+            .repository
+            .load_complete_data(&current)
+            .await
+            .map_err(|_| MintError::Store)?;
+        if RoutePairRef::stored(data.cookies()).as_ref() != Some(published) {
+            return Ok(());
+        }
+        let cookies = data.cookies_mut().ok_or(MintError::NotEligible)?;
+        cookies.retain(|cookie| !is_root_route_cookie(cookie));
+        cookies.extend(snapshot.original_cookies.iter().cloned());
+        match self.repository.compare_and_swap_data(&current, data).await {
+            Ok(_) | Err(CredentialRepositoryError::RevisionConflict) => Ok(()),
+            Err(_) => Err(MintError::Store),
+        }
+    }
+
     pub(crate) fn new(
         repository: CodexCredentialRepository,
         pins: crate::turn_state_pin::TurnStatePins,
@@ -229,7 +383,14 @@ impl CloudMintService {
 
     /// 缺票预热：后台打一次，不阻塞当前请求（当前请求照常裸发）。
     pub(crate) fn prefetch(self: &Arc<Self>, account_id: &str, model: &str) {
-        if !self.enabled() {
+        if !self.enabled()
+            || self
+                .pins
+                .service()
+                .settings()
+                .warm_pool
+                .requires_verified_connections()
+        {
             return;
         }
         let this = Arc::clone(self);
@@ -259,7 +420,14 @@ impl CloudMintService {
     /// （顺带得到的票照常钉住）。票本身不在这里续。
     pub(crate) async fn renew_cycle(&self) -> usize {
         let settings = self.settings();
-        if !self.enabled() {
+        if !self.enabled()
+            || self
+                .pins
+                .service()
+                .settings()
+                .warm_pool
+                .requires_verified_connections()
+        {
             return 0;
         }
         let due: Vec<(String, Vec<String>)> = {
@@ -493,11 +661,12 @@ impl CloudMintService {
             || !current_settings.cloud_mint.enabled;
         // 先条件提交路由，再发布绑定该路由的票。并发请求握着旧凭据快照时不能读到新路由票。
         let (account, pair_written) = if observe_only {
-            (account, false)
+            (account, None)
         } else {
             self.write_route_pair(&account, &binding, original_route.as_ref(), pair)
                 .await?
         };
+        let pair_written = pair_written.is_some();
         // 专用打票代理不修改账号的业务出口绑定。
         let egress = crate::turn_state_pin::egress_fingerprint(
             account.outbound_proxy().map(|proxy| proxy.expose_url()),
@@ -950,7 +1119,7 @@ impl CloudMintService {
         expected_binding: &str,
         original_route: Option<&RoutePairRef>,
         pair: &RoutePair,
-    ) -> Result<(ProviderAccount, bool), MintError> {
+    ) -> Result<(ProviderAccount, Option<CredentialRevision>), MintError> {
         let desired =
             RoutePairRef::of(&pair.cflb, &pair.oailb).ok_or(MintError::InvalidResponse)?;
         let values = [("__cflb", &pair.cflb), ("__oailb", &pair.oailb)];
@@ -975,7 +1144,7 @@ impl CloudMintService {
             }
             let current_route = RoutePairRef::stored(data.cookies());
             if current_route.as_ref() == Some(&desired) {
-                return Ok((current, false));
+                return Ok((current, None));
             }
             if current_route.as_ref() != original_route {
                 return Err(MintError::Stale);
@@ -994,13 +1163,17 @@ impl CloudMintService {
                 });
             }
             match self.repository.compare_and_swap_data(&current, data).await {
-                Ok(_) => return Ok((current, true)),
+                Ok(revision) => return Ok((current, Some(revision))),
                 Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => {}
                 Err(_) => return Err(MintError::Store),
             }
         }
         Err(MintError::Store)
     }
+}
+
+fn is_root_route_cookie(cookie: &CodexCookie) -> bool {
+    cookie.path == "/" && matches!(cookie.name.as_str(), "__cflb" | "__oailb")
 }
 
 struct NativeAttempt {
@@ -1221,7 +1394,9 @@ impl<'a> InFlight<'a> {
         {
             return Err(MintError::CoolingDown);
         }
-        if !state.in_flight.insert(account_id.to_owned()) {
+        if state.in_flight.len() >= MAX_CONCURRENT_MINTS
+            || !state.in_flight.insert(account_id.to_owned())
+        {
             return Err(MintError::Busy);
         }
         Ok(Self {

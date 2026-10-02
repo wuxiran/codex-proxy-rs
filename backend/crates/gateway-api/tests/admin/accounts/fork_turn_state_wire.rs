@@ -248,3 +248,38 @@ fn guanlan_revive_wire_requires_explicit_exclusive_action() {
         );
     }
 }
+
+#[test]
+fn test_bench_defaults_to_business_and_exposes_observations_without_secrets() {
+    use gateway_api::admin::accounts::AccountTestBenchRequest;
+    use gateway_core::engine::probe::{AccountProbeExecution, AccountProbeMode};
+    let body = json!({"accountId":"acct_1","modelId":"gpt-6-astra","prompt":"question"});
+    let parsed: AccountTestBenchRequest = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(parsed.mode, AccountProbeMode::Business);
+    let mut diagnostic = body.clone();
+    diagnostic["mode"] = json!("diagnostic");
+    assert_eq!(
+        serde_json::from_value::<AccountTestBenchRequest>(diagnostic)
+            .unwrap()
+            .mode,
+        AccountProbeMode::Diagnostic
+    );
+    let mut invalid = body;
+    invalid["mode"] = json!("unknown");
+    assert!(serde_json::from_value::<AccountTestBenchRequest>(invalid).is_err());
+    let event = gateway_api::admin::accounts::AccountConnectionTestEvent::from(
+        gateway_admin::model::accounts::AccountConnectionTestEvent::Execution {
+            mode: AccountProbeMode::Business,
+            details: AccountProbeExecution {
+                ticket_attached: Some(false),
+                warm_pool_used: Some(true),
+                connection_reused: Some(true),
+                ..Default::default()
+            },
+        },
+    );
+    assert_eq!(event.data["type"], "execution");
+    assert_eq!(event.data["details"]["ticketAttached"], false);
+    assert_eq!(event.data["details"]["warmPoolUsed"], true);
+    assert!(event.data["details"]["connectionId"].is_null());
+}
