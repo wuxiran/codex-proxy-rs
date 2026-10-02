@@ -7,6 +7,75 @@ fn fingerprint(label: &str) -> String {
     ))
 }
 
+async fn warm_mint_route_case(route: &str, expected: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut candidate = accept_codex_test_websocket(stream).await;
+        candidate.next().await.unwrap().unwrap();
+        candidate
+            .send(Message::Text(
+                completed_websocket_response("resp_route_probe", 1, 0).into(),
+            ))
+            .await
+            .unwrap();
+        tokio::select! {
+            accepted = listener.accept() => {
+                let mut business = accept_codex_test_websocket(accepted.unwrap().0).await;
+                business.next().await.unwrap().unwrap();
+                business.send(Message::Text(completed_websocket_response("resp_route_fresh", 1, 0).into())).await.unwrap();
+                business.close(None).await.unwrap();
+            }
+            _ = candidate.next() => {
+                candidate.send(Message::Text(completed_websocket_response("resp_route_adopted", 1, 0).into())).await.unwrap();
+            }
+        }
+        candidate.close(None).await.unwrap();
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_secs(60))));
+    let mut probe = pooled_websocket_request("__cpr_warm__:0");
+    let approval = provider_openai::transport::WarmConnectionApproval::new(
+        probe.model().to_owned(),
+        Duration::from_secs(60),
+    );
+    probe.warm_approval = Some(approval.clone());
+    let mut context = request_context("warm-route-probe", Some("acct"));
+    context.cookie_header = Some("__cflb=cflb-a; __oailb=oailb-a");
+    backend.create_response(&probe, context).await.unwrap();
+    approval.publish(true);
+    let mut business = pooled_websocket_request("mint-after-warm");
+    business.minted_turn_state_route = Some(fingerprint(route));
+    let cookie = format!("__cflb=cflb-{route}; __oailb=oailb-{route}");
+    let mut context = request_context("mint-after-warm", Some("acct"));
+    context.cookie_header = Some(&cookie);
+    context.turn_state = Some("synthetic-mint-ticket");
+    let result = timeout(
+        Duration::from_secs(5),
+        backend.create_response(&business, context),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(result.websocket_pool_decision.unwrap().kind(), expected);
+}
+
+#[tokio::test]
+async fn minted_ticket_adopts_verified_warm_connection_on_the_same_route() {
+    warm_mint_route_case("a", "reuse").await;
+}
+
+#[tokio::test]
+async fn minted_ticket_does_not_adopt_verified_warm_connection_on_another_route() {
+    warm_mint_route_case("b", "new").await;
+}
+
 #[tokio::test]
 async fn minted_ticket_is_rejected_before_payload_when_handshake_changes_route() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

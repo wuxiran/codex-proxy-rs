@@ -52,6 +52,37 @@ fn scope(client: &str) -> Scope {
 }
 
 #[test]
+fn full_store_rejects_new_disk_pin_without_writing_but_allows_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PinStore::open(dir.path()).unwrap();
+    for index in 0..turn_state::store::MAX_PINS {
+        assert!(store.insert_passive(
+            passive(&format!("acct-{index}"), "model", "bind", "cli", now()),
+            "egress-a",
+            now(),
+            TtlCaps::UNBOUNDED,
+        ));
+    }
+    assert!(matches!(
+        store.pin_account_wide(
+            account_wide("new", "model", "bind", now()),
+            now(),
+            TtlCaps::UNBOUNDED
+        ),
+        Err(turn_state::store::StoreError::Full)
+    ));
+    assert!(!dir.path().join("buckets/new/model.json").exists());
+    store
+        .pin_account_wide(
+            account_wide("acct-0", "model", "bind", now()),
+            now(),
+            TtlCaps::UNBOUNDED,
+        )
+        .unwrap();
+    assert!(dir.path().join("buckets/acct-0/model.json").exists());
+}
+
+#[test]
 fn account_wide_pin_survives_a_fresh_open_and_index_is_value_free() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PinStore::open(dir.path()).expect("open");

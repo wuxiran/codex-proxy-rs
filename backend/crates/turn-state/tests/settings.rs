@@ -2,6 +2,53 @@ use turn_state::settings::SettingsStore;
 use turn_state::{InjectMode, Settings, SettingsError};
 
 #[test]
+fn verified_only_mode_requires_probe_checks_and_business_reuse() {
+    let mut settings = Settings::default();
+    settings.warm_pool.require_verified = true;
+    assert!(settings.validate().is_ok());
+    settings.warm_pool.probe = false;
+    assert_eq!(settings.validate(), Err(SettingsError::WarmVerification));
+    settings.warm_pool.probe = true;
+    settings.warm_pool.business_reuse = false;
+    assert_eq!(settings.validate(), Err(SettingsError::WarmVerification));
+}
+
+#[test]
+fn warm_probe_rejects_empty_expectations_and_invalid_model_lists() {
+    let mut settings = Settings::default();
+    settings.warm_pool.probe_expect.clear();
+    assert_eq!(settings.validate(), Err(SettingsError::WarmProbe));
+    settings.warm_pool.probe = false;
+    assert!(settings.validate().is_ok());
+    settings.warm_pool.models = vec![" ".to_owned()];
+    assert_eq!(settings.validate(), Err(SettingsError::WarmProbe));
+    settings.warm_pool.models = (0..17).map(|i| format!("model-{i}")).collect();
+    assert_eq!(settings.validate(), Err(SettingsError::WarmProbe));
+}
+
+#[test]
+fn warm_settings_keep_old_files_compatible_and_deduplicate_only_ascii_case() {
+    let mut settings: Settings =
+        serde_json::from_str(r#"{"warmPool":{"enabled":true,"models":["gpt-6-astra"]}}"#).unwrap();
+    assert!(!settings.warm_pool.require_verified);
+    assert!(
+        serde_json::to_value(&settings).unwrap()["warmPool"]
+            .get("requireVerified")
+            .is_none()
+    );
+    settings.warm_pool.models = vec![
+        " gpt-6-astra ".to_owned(),
+        "GPT-6-ASTRA".to_owned(),
+        "gpt-6-astra-2026-09-15".to_owned(),
+    ];
+    let normalized = settings.normalized().unwrap();
+    assert_eq!(
+        normalized.warm_pool.models,
+        vec!["gpt-6-astra", "gpt-6-astra-2026-09-15"]
+    );
+}
+
+#[test]
 fn defaults_reproduce_production_behaviour() {
     let settings = Settings::default();
     assert_eq!(settings.ttl_seconds, 240);

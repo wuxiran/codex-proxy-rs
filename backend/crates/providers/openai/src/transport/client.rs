@@ -806,6 +806,11 @@ impl CodexBackendClient {
         };
         Ok(client)
     }
+
+    /// 仅供已验证候选绑定原账号的业务出口；实际拨号仍由客户端自己的代理决定。
+    pub(crate) fn pool_egress_key(&self) -> &str {
+        &self.egress_key
+    }
 }
 
 /// 已完成账号级 opening 准备、但尚未发送 payload 的 transport。

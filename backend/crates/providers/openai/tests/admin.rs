@@ -1501,7 +1501,10 @@ fn reset_credit_command(account_id: ProviderAccountId) -> ConsumeProviderResetCr
     }
 }
 
-fn initialized_provider_request(operation: Operation, account_id: &str) -> ProviderRequest {
+pub(crate) fn initialized_provider_request(
+    operation: Operation,
+    account_id: &str,
+) -> ProviderRequest {
     let provider = ProviderKind::new("openai").expect("provider");
     let upstream_model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
@@ -1531,7 +1534,7 @@ fn initialized_provider_request(operation: Operation, account_id: &str) -> Provi
     ProviderRequest::new(operation, plan.candidates()[0].clone())
 }
 
-fn initialized_attempt_context(request_id: &str, account_id: &str) -> AttemptContext {
+pub(crate) fn initialized_attempt_context(request_id: &str, account_id: &str) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new(request_id).expect("request id"),
@@ -2611,6 +2614,48 @@ mod mint_publication {
 
     const ACCOUNT: &str = "acct_mint_publication";
     const MODEL: &str = "gpt-5.4";
+
+    #[tokio::test]
+    async fn cloud_mint_limits_total_concurrent_accounts_to_four() {
+        let relay = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(minted("m", Utc::now()))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .expect(4)
+            .mount(&relay)
+            .await;
+        let (bundle, store, _config) = fixture(&relay).await;
+        let mut accounts = vec![ProviderAccountId::new(ACCOUNT).unwrap()];
+        for index in 1..5 {
+            let id = format!("acct_mint_limit_{index}");
+            store
+                .seed_oauth_credential(ImportCodexOAuthCredential {
+                    account_id: id.clone(),
+                    name: id.clone(),
+                    secret: secret("synthetic-concurrency-token"),
+                    verified_account: profile(&format!("synthetic-user-{index}")),
+                    next_refresh_at: None,
+                    enabled: true,
+                })
+                .await;
+            store.set_turn_state_pin(&id, true);
+            accounts.push(ProviderAccountId::new(id).unwrap());
+        }
+        let admin = bundle.admin_provider();
+        let results = futures::future::join_all(
+            accounts
+                .iter()
+                .map(|account| admin.mint_turn_state(account, vec![MODEL.to_owned()])),
+        )
+        .await;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 4);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(relay.received_requests().await.unwrap().len(), 4);
+    }
 
     async fn fixture(
         relay: &MockServer,

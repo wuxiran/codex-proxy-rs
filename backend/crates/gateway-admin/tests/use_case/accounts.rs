@@ -1343,6 +1343,69 @@ fn provider_registry_should_reject_duplicate_kind() {
     ));
 }
 
+#[derive(Default)]
+struct TestBenchProbe {
+    modes: Mutex<Vec<gateway_core::engine::probe::AccountProbeMode>>,
+}
+
+impl AccountProbe for TestBenchProbe {
+    fn probe(
+        &self,
+        request: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
+    ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
+        self.modes.lock().unwrap().push(request.mode);
+        Box::pin(async {
+            Ok(AccountProbeResult {
+                text: vec!["21".to_owned()],
+                execution: Some(gateway_core::engine::probe::AccountProbeExecution {
+                    ticket_attached: Some(false),
+                    warm_pool_used: Some(false),
+                    connection_reused: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_bench_forwards_mode_and_actual_fallback_evidence() {
+    use gateway_core::engine::probe::AccountProbeMode;
+    let probe = Arc::new(TestBenchProbe::default());
+    let services = accounts_service_with_probe(
+        FakeProviderAdmin::new("xai", events()),
+        FakeAccountStore::with_account(account_record("xai"), events()),
+        probe.clone(),
+    )
+    .await;
+    for mode in [AccountProbeMode::Business, AccountProbeMode::Diagnostic] {
+        let events = services
+            .accounts()
+            .run_test_bench(
+                ProviderAccountId::new("acct_test").unwrap(),
+                gateway_core::routing::UpstreamModelId::new("grok-4.5").unwrap(),
+                "question".to_owned(),
+                Some("high".to_owned()),
+                mode,
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(event, AccountConnectionTestEvent::Execution { mode: observed, details } if *observed==mode && details.ticket_attached==Some(false) && details.warm_pool_used==Some(false))));
+        assert!(matches!(
+            events.last(),
+            Some(AccountConnectionTestEvent::Completed)
+        ));
+    }
+    assert_eq!(
+        *probe.modes.lock().unwrap(),
+        [AccountProbeMode::Business, AccountProbeMode::Diagnostic]
+    );
+}
+
 #[tokio::test]
 async fn connection_test_should_probe_unavailable_account() {
     let provider = FakeProviderAdmin::new("xai", events());

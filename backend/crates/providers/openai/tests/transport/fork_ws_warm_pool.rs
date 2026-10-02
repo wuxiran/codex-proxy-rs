@@ -3,6 +3,106 @@
 use super::*;
 
 #[tokio::test]
+async fn verified_only_request_never_opens_an_unverified_upstream_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_secs(60))));
+    let mut request = pooled_websocket_request("verified-required");
+    request.require_verified_warm = true;
+    let error = timeout(
+        Duration::from_secs(4),
+        backend.create_response(&request, request_context("req_verified_only", Some("acct"))),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::WarmUnavailable)
+    ));
+    assert!(
+        timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    request.force_http_sse = true;
+    let error = backend
+        .create_response(
+            &request,
+            request_context("req_verified_http_only", Some("acct")),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::WarmUnavailable)
+    ));
+    assert!(
+        timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn business_should_not_adopt_an_unverified_warm_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut candidate = accept_codex_test_websocket(stream).await;
+        candidate.next().await.unwrap().unwrap();
+        candidate
+            .send(Message::Text(
+                completed_websocket_response("resp_candidate", 1, 0).into(),
+            ))
+            .await
+            .unwrap();
+        // 两条路径都回包，让错误复用表现为断言失败，而不是等待第二条连接直到超时。
+        tokio::select! {
+            accepted = listener.accept() => {
+                let mut business = accept_codex_test_websocket(accepted.unwrap().0).await;
+                business.next().await.unwrap().unwrap();
+                business.send(Message::Text(completed_websocket_response("resp_checked_business", 1, 0).into())).await.unwrap();
+                business.close(None).await.unwrap();
+            }
+            _ = candidate.next() => {
+                candidate.send(Message::Text(completed_websocket_response("resp_unchecked_business", 1, 0).into())).await.unwrap();
+            }
+        }
+        candidate.close(None).await.unwrap();
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(5))));
+    backend
+        .create_response(
+            &pooled_websocket_request("__cpr_warm__:0"),
+            request_context("req_candidate", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    let business = backend
+        .create_response(
+            &pooled_websocket_request("business-after-unverified"),
+            request_context("req_business_after_unverified", Some("chatgpt-account")),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(business.websocket_pool_decision.unwrap().kind(), "new");
+    assert!(business.body.contains("resp_checked_business"));
+}
+
+#[tokio::test]
 async fn business_new_chain_should_adopt_a_held_warm_connection() {
     // 一条在保活 conversation（__cpr_warm__:*）上建立的连接，应被后续新对话（不同 conversation）
     // 领养复用，而不是新拨一条 TCP 连接。这验证 acquire 的暖池领养分支。
@@ -35,14 +135,21 @@ async fn business_new_chain_should_adopt_a_held_warm_connection() {
     .with_websocket_pool(Arc::clone(&pool));
 
     // warmer 打开一条保活连接（conversation 以保活前缀命名）。
+    let mut warm_request = pooled_websocket_request("__cpr_warm__:0");
+    let approval = provider_openai::transport::WarmConnectionApproval::new(
+        warm_request.model().to_owned(),
+        Duration::from_mins(5),
+    );
+    warm_request.warm_approval = Some(approval.clone());
     let warm = backend
         .create_response(
-            &pooled_websocket_request("__cpr_warm__:0"),
+            &warm_request,
             request_context("req_warm_open", Some("chatgpt-account")),
         )
         .await
         .expect("warm connection should open");
     assert_eq!(warm.websocket_pool_decision.unwrap().kind(), "new");
+    approval.publish(true);
 
     // 一条全新业务对话：没有自己的连接，应领养上面那条保活连接（reuse，不新拨）。
     let business = backend

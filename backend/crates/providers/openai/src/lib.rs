@@ -189,6 +189,7 @@ pub async fn initialize(
     let ws_warm_pool = Arc::new(ws_warm_pool::WarmPoolService::new(
         repository.clone(),
         turn_state_pins.clone(),
+        Arc::clone(&cloud_mint),
         http.clone(),
         config.base_url().to_owned(),
         profile.clone(),

@@ -35,6 +35,9 @@ pub struct CodexWebSocketRequest {
     pub(super) requested_model: String,
     pub(super) discard_mismatched_connection: bool,
     pub(super) minted_turn_state_route: Option<String>,
+    pub(super) warm_approval: Option<crate::transport::WarmConnectionApproval>,
+    pub(super) require_verified_warm: bool,
+    pub(super) allow_warm_reuse: bool,
 }
 
 /// 当前 WebSocket 请求对 previous response 状态的要求。

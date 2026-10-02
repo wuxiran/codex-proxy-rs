@@ -888,11 +888,17 @@ impl AccountTestQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountTestBenchRequest {
+    #[serde(default = "default_test_bench_mode")]
+    pub mode: gateway_core::engine::probe::AccountProbeMode,
     pub account_id: String,
     pub model_id: String,
     pub prompt: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+}
+
+fn default_test_bench_mode() -> gateway_core::engine::probe::AccountProbeMode {
+    gateway_core::engine::probe::AccountProbeMode::Business
 }
 
 impl AccountTestBenchRequest {
@@ -914,8 +920,16 @@ impl AccountTestBenchRequest {
 
     pub(super) fn into_command(
         self,
-    ) -> Result<(ProviderAccountId, UpstreamModelId, String, Option<String>), WireValidationError>
-    {
+    ) -> Result<
+        (
+            ProviderAccountId,
+            UpstreamModelId,
+            String,
+            Option<String>,
+            gateway_core::engine::probe::AccountProbeMode,
+        ),
+        WireValidationError,
+    > {
         self.validate()?;
         let effort = self
             .reasoning_effort
@@ -927,6 +941,7 @@ impl AccountTestBenchRequest {
             UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
             self.prompt,
             effort,
+            self.mode,
         ))
     }
 }
@@ -1547,6 +1562,9 @@ impl From<DomainConnectionTestEvent> for AccountConnectionTestEvent {
             DomainConnectionTestEvent::Content { text } => {
                 serde_json::json!({ "type": "content", "text": text })
             }
+            DomainConnectionTestEvent::Execution { mode, details } => serde_json::json!({
+                "type": "execution", "mode": mode, "details": details
+            }),
             DomainConnectionTestEvent::Completed => serde_json::json!({
                 "type": "test_complete",
                 "success": true

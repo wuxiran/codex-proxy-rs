@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import type { TurnStateHistoryRow } from '../utils/turnStateHistory'
-import type { TurnStateCaptureRule } from '@/api'
 import { BaseButton, BaseEmpty, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed, ref, watch } from 'vue'
@@ -8,7 +7,7 @@ import { getUsageRecordDetail, getUsageRecords } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
 import { turnStateHistoryRow } from '../utils/turnStateHistory'
 
-const props = defineProps<{ accountId: string, captureRule: TurnStateCaptureRule | null }>()
+const props = defineProps<{ accountId: string }>()
 const emit = defineEmits<{ close: [] }>()
 const rows = ref<TurnStateHistoryRow[]>([])
 const request = useRequestState()
@@ -17,9 +16,9 @@ const latestLength = computed(() => rows.value.find(row => row.lengths.length)?.
 const columns = defineTableColumns<TurnStateHistoryRow>([
   { key: 'time', label: '请求时间', kind: 'datetime', size: 'lg' },
   { key: 'model', label: '模型', kind: 'text', size: 'md' },
-  { key: 'lengths', label: 'state 长度', kind: 'custom', size: 'sm' },
+  { key: 'lengths', label: '票据长度', kind: 'custom', size: 'sm' },
   { key: 'result', label: '请求结果', kind: 'status', size: 'sm', align: 'left' },
-  { key: 'reason', label: '筛选说明', kind: 'custom', size: '2xl' },
+  { key: 'reason', label: '观测说明', kind: 'custom', size: '2xl' },
 ])
 
 async function load() {
@@ -50,7 +49,6 @@ async function load() {
         batch[index]!,
         result.status === 'fulfilled' ? result.value : null,
         accountId,
-        props.captureRule,
       )))
     }
   }
@@ -62,16 +60,16 @@ async function load() {
   }
 }
 
-watch([() => props.accountId, () => props.captureRule], () => {
+watch(() => props.accountId, () => {
   void load()
 }, { immediate: true })
 </script>
 
 <template>
-  <section class="min-w-0 rounded-cp bg-cp-bg-container p-3" aria-label="最近捕获记录">
+  <section class="min-w-0 rounded-cp bg-cp-bg-container p-3" aria-label="上游票据记录记录">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <h4 class="m-0 text-cp-sm font-heavy text-cp-text">
-        最近捕获
+        上游票据记录
       </h4>
       <div class="flex gap-2">
         <BaseButton variant="soft" size="sm" :loading="loading" @click="load">
@@ -86,22 +84,22 @@ watch([() => props.accountId, () => props.captureRule], () => {
       </div>
     </div>
     <p class="mt-2 mb-1 text-cp-xs leading-relaxed text-cp-text-secondary">
-      最近 24 小时最多 10 条可查询的用量记录，包含未满足固定条件的返回值。这里只显示诊断摘要，当前已固定项仍以上方列表为准。
+      最近 24 小时最多 10 条业务记录，长度仅供排查，不代表模型能力
     </p>
     <p v-if="latestLength" class="my-2 text-cp-sm font-emphasis text-cp-primary-text" role="status">
-      最近可见的 state 长度：{{ latestLength }} 字节
+      最近可见票据长度：{{ latestLength }} 字节
     </p>
     <p v-if="error" class="my-3 text-cp-sm text-cp-error-text" role="alert">
       {{ error }}
     </p>
     <p v-else-if="loading" class="my-3 text-cp-sm text-cp-text-secondary" role="status">
-      正在读取最近捕获记录…
+      正在读取上游票据记录记录…
     </p>
-    <BaseEmpty v-else-if="!rows.length" title="最近 24 小时暂无请求记录" description="该账号有新请求后，可点击刷新记录查看。" size="sm" surface="none" />
+    <BaseEmpty v-else-if="!rows.length" title="最近 24 小时暂无请求记录" description="有新请求后可刷新查看" size="sm" surface="none" />
     <div v-if="rows.length" class="mt-2 h-64 min-w-0">
-      <BaseTable :columns="columns" :rows="rows" density="compact" class="h-full" empty-text="暂无捕获记录">
+      <BaseTable :columns="columns" :rows="rows" density="compact" class="h-full" empty-text="暂无票据记录">
         <template #lengths="{ row }">
-          <span class="font-mono font-heavy" :class="row.matchesRule ? 'text-cp-primary-text' : 'text-cp-text'">{{ row.lengths.join(' / ') || '—' }}</span>
+          <span class="font-mono font-heavy">{{ row.lengths.join(' / ') || '—' }}</span>
         </template>
         <template #reason="{ row }">
           <div class="whitespace-normal text-cp-xs leading-relaxed">

@@ -20,6 +20,9 @@ use super::pump::WebSocketConnectionObservation;
 /// Responses WebSocket 交互错误。
 #[derive(Debug, Error)]
 pub enum CodexWebSocketExchangeError {
+    /// 本地尚无通过质量检查的连接，业务正文没有发送。
+    #[error("verified warm connection is not ready; retry later")]
+    WarmUnavailable,
     /// opening request 无法构造。
     #[error("invalid websocket request: {0}")]
     InvalidRequest(#[from] tungstenite::http::Error),

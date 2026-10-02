@@ -45,8 +45,8 @@ use crate::engine::policy::{
     ModelRouteDecision, RequestPolicyContext, RequestPolicyExtensionIndex,
 };
 use crate::engine::probe::{
-    AccountProbe, AccountProbeError, AccountProbeErrorSource, AccountProbeRequest,
-    AccountProbeResult, AccountProbeUpstreamResponse,
+    AccountProbe, AccountProbeError, AccountProbeErrorSource, AccountProbeExecution,
+    AccountProbeMode, AccountProbeRequest, AccountProbeResult, AccountProbeUpstreamResponse,
 };
 use crate::engine::provider::ProviderRegistry;
 use crate::engine::{
@@ -1944,12 +1944,20 @@ impl DefaultExecutionService {
         frozen: Option<Arc<crate::routing::RuntimeSnapshot>>,
     ) -> Result<AccountProbeResult, AccountProbeError> {
         let AccountProbeRequest {
+            mode,
             account_id,
             provider_kind,
             upstream_model,
             operation,
             egress,
         } = request;
+        if mode == AccountProbeMode::Business && egress.is_some() {
+            return Err(GatewayError::new(
+                GatewayErrorKind::Unsupported,
+                "business test cannot override account egress",
+            )
+            .into());
+        }
         // 遍历代理时的失败多半是出口问题：不计入全局熔断，也不写成账号的探测失败事实。
         let isolated = egress.is_some();
         let observed = ProbeObservation {
@@ -1973,9 +1981,18 @@ impl DefaultExecutionService {
             required_provider: Some(provider_kind),
             ..RoutingContext::default()
         };
-        let plan = snapshot
-            .plan_diagnostic(&public_model, &operation, &routing_context)
-            .map_err(map_routing_error)?;
+        let plan = match mode {
+            AccountProbeMode::Diagnostic => {
+                snapshot.plan_diagnostic(&public_model, &operation, &routing_context)
+            }
+            AccountProbeMode::Business => snapshot.plan(
+                &public_model,
+                &operation,
+                snapshot.all_account_scope(),
+                &routing_context,
+            ),
+        }
+        .map_err(map_routing_error)?;
         let started_at = SystemTime::now();
         let deadline_at = started_at
             .checked_add(MODEL_REQUEST_DEADLINE)
@@ -2024,17 +2041,33 @@ impl DefaultExecutionService {
         let providers = self.providers.clone();
         let transient: Arc<dyn ExecutionStore> = Arc::new(TransientExecutionStore);
         let coordinator = AttemptCoordinator::new(GatewayEngine::new(transient, providers));
-        let mut session = match coordinator
-            .start_diagnostic(
-                new_request,
-                operation,
-                plan,
-                account_id,
-                egress,
-                CancellationToken::new(),
-            )
-            .await
-        {
+        let started = match mode {
+            AccountProbeMode::Diagnostic => {
+                coordinator
+                    .start_diagnostic(
+                        new_request,
+                        operation,
+                        plan,
+                        account_id,
+                        egress,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+            AccountProbeMode::Business => {
+                coordinator
+                    .start(
+                        new_request,
+                        operation,
+                        plan,
+                        Some(account_id),
+                        None,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+        let mut session = match started {
             Ok(session) => session,
             Err(error) => {
                 return Err(self
@@ -2042,22 +2075,26 @@ impl DefaultExecutionService {
                     .await);
             }
         };
+        let trace = session.trace();
         let events = session.collect_uncommitted().await;
         let events = match events {
             Ok(events) => events,
             Err(error) => {
                 return Err(self
                     .observe_probe_failure(&observed, started_at, &error, isolated)
-                    .await);
+                    .await
+                    .with_execution(AccountProbeExecution::from_trace(trace.snapshot())));
             }
         };
         if let Err(error) = session.commit_downstream(Some(200)).await {
             return Err(self
                 .observe_probe_failure(&observed, started_at, &error, isolated)
-                .await);
+                .await
+                .with_execution(AccountProbeExecution::from_trace(trace.snapshot())));
         }
         let response_headers = session.response_headers().to_vec();
         Ok(AccountProbeResult {
+            execution: Some(AccountProbeExecution::from_trace(trace.snapshot())),
             response_headers,
             text: events
                 .into_iter()

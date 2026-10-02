@@ -382,6 +382,16 @@ impl PinStore {
         let mut inner = self.inner.lock().map_err(|_| StoreError::Io)?;
         inner.prune(now, caps);
         let mut effective = record;
+        // 先检查替换后的容量，拒绝时不能已经落盘或删掉旧模板。
+        let replaces = |scope: &Scope| {
+            scope.account == effective.account
+                && crate::binding::credential_scope(&scope.binding)
+                    == crate::binding::credential_scope(&effective.binding)
+                && scope.model == effective.model
+        };
+        if inner.pins.keys().filter(|scope| !replaces(scope)).count() >= MAX_PINS {
+            return Err(StoreError::Full);
+        }
         if let Some(root) = &self.root {
             let path = self
                 .bucket_path(&effective.account, &effective.model)
@@ -389,9 +399,9 @@ impl PinStore {
             let _guard = fs_util::lock(root).map_err(|_| StoreError::Io)?;
             let key = (effective.account.clone(), effective.model.clone());
             // 作废后没删掉的旧文件不能在这里被当成「更新的同绑定模板」而保留下来。
-            let stale = inner.revoked.remove(&key);
+            let stale = inner.revoked.get(&key);
             if let Some(existing) = read_record(&path, &effective.account, &effective.model)
-                && stale.as_ref() != Some(&existing.value)
+                && stale != Some(&existing.value)
                 && existing.active_under(now, caps)
                 && existing.binding == effective.binding
                 && existing.issued_at >= effective.issued_at
@@ -407,6 +417,7 @@ impl PinStore {
                 fs_util::atomic_write(dir, name, &bytes).map_err(|_| StoreError::Io)?;
                 rewrite_index(root, now);
             }
+            inner.revoked.remove(&key);
             inner.disk.insert(
                 (effective.account.clone(), effective.model.clone()),
                 DiskState {
@@ -426,9 +437,6 @@ impl PinStore {
                     == crate::binding::credential_scope(&binding)
                 && scope.model == model)
         });
-        if inner.pins.len() >= MAX_PINS {
-            return Err(StoreError::Full);
-        }
         let expires_at = effective.expires_under(caps);
         inner.pins.insert(Scope::of(&effective), effective);
         Ok(expires_at)

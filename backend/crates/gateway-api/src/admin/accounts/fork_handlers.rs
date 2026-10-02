@@ -265,12 +265,12 @@ async fn run_account_test_bench<S>(
 where
     S: SessionState + Send + Sync,
 {
-    let (account_id, upstream_model, prompt, effort) =
+    let (account_id, upstream_model, prompt, effort, mode) =
         request.into_command().map_err(map_wire_error)?;
     let stream = state
         .admin_services()
         .accounts()
-        .run_test_bench(account_id, upstream_model, prompt, effort)
+        .run_test_bench(account_id, upstream_model, prompt, effort, mode)
         .await
         .map_err(map_service_error)?
         .map(|event| {

@@ -878,6 +878,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                     UpstreamSendState::NotSent,
                 )
             })?;
+        let client_carried_state = request.turn_state.is_some();
         let mut pin_attempt = if request.generate() && !context.is_diagnostic_required_account()
             && allows_account_state_mutation
             && let Some(generation) = lease.turn_state_pin()
@@ -913,12 +914,22 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 mint.prefetch(active_account.id().as_str(), upstream_model.as_str());
             }
         }
-        // WS 保活：记下活跃账号/模型，让 warmer 优先补齐/续探它们的满血连接。
+        // 复用决定随请求冻结，不能等待后台轮询才关闭模拟运行中的候选领养。
+        let warm_runtime = turn_state_pins.service().settings();
+        request.allow_warm_reuse = !warm_runtime.dry_run && warm_runtime.warm_pool.enabled && warm_runtime.warm_pool.business_reuse
+            && lease.turn_state_pin().is_some() && allows_account_state_mutation && !context.is_diagnostic_required_account();
+        // WS 预热：记录实际业务模型，唤醒候选补齐。
         if let Some(warm) = ws_warm_pool.as_ref()
             && warm.enabled()
         {
             warm.note_request(active_account.id().as_str(), upstream_model.as_str());
+            let settings = turn_state_pins.service().settings().warm_pool;
+            request.require_verified_warm = settings.requires_verified_connections()
+                && lease.turn_state_pin().is_some() && request.generate() && allows_account_state_mutation
+                && !context.is_diagnostic_required_account() && request.previous_response_id().is_none() && !client_carried_state;
         }
+        // 只记录载荷是否附带票，不记录票值；传输失败不代表上游已收到。
+        context.trace().record("upstream.turn_state", serde_json::json!({ "attached": request.turn_state.is_some() }));
         let request_id = context.request_id().as_str().to_owned();
         let capture_request_log = context.should_capture_request_log();
         // 模拟运行只观测，不改变 WebSocket 的回池与续接能力。

@@ -105,6 +105,11 @@ impl CodexWebSocketConnection {
             requested_model: request.model().to_owned(),
             discard_mismatched_connection: request.discard_mismatched_connection,
             minted_turn_state_route: request.minted_turn_state_route.clone(),
+            warm_approval: request.warm_approval.clone(),
+            require_verified_warm: request.require_verified_warm,
+            // 客户端当轮票没有候选路由证明，不能把它送进另一条新领养的连接。
+            allow_warm_reuse: request.allow_warm_reuse
+                && (request.turn_state.is_none() || request.minted_turn_state_route.is_some()),
         })
     }
 }

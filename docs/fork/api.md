@@ -135,10 +135,11 @@ D（≥40）、F。`status` 按 `challenge` > `failed` > `warn` > `healthy` 取�
 
 ## 固定自身 state、观澜复活与遍历代理
 
-OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。通过 `rotate` 提交
+OpenAI OAuth 账号在「票据管理 → 账号票与预热」启停票据与预热，账号编辑页不提供此开关。通过 `rotate` 提交
 `{ provider: "openai", accountId, pinTurnState: true | false, settings? }`，此分支不能混入 token、API Key
 或外部 state。开关使用现有管理员鉴权、账号 CAS 和审计事务，保留凭据健康状态、错误及额度；
 再次提交 `true` 表示重新捕获。普通账号更新和令牌刷新保留开关，其他 Provider / API Key 不支持。
+该页分别展示有效票和预热连接数，最近探针判定只描述最近一次探测，票据长度不用于推断模型能力。
 详情的 `credentialConfiguration` 返回 `{ pinTurnState, maxAgeSeconds, turnStatePins, turnStateCaptureRule, guanlanReviveAvailable }`；每条缓存摘要仅含
 `model`、`length`、`capturedAt`、`expiresAt` 和 `hits`，不包含原始 state 或令牌。
 
@@ -149,15 +150,12 @@ OpenAI OAuth 账号可在编辑页开启实验性的「固定自身 state」。�
 手动任务与自动复活互斥；失败使用现有 30 分钟冷却。该请求可能包含两段最长各 30 分钟的上游轮询，
 调用方及反向代理需要容纳相应超时；请求失败后应先回读账号，不自动重放。手动复活不改变账号调度开关。
 
-开启后，从该账号普通生成请求的成功完整响应中捕获首个符合套餐规则的候选，按账号、上游模型及客户端密钥隔离。
-`turnStateCaptureRule` 返回 `defaultLength`（字节数或 null）和 `modelLengths`（上游模型 ID 到字节数）。
-Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage_based`）账号中，`gpt-5.5`、`gpt-5.6-sol`、`gpt-6-astra` 使用 332 字节，`gpt-5.6-terra` 使用
-356 字节；其它模型暂不捕获。Pro 和其它套餐保留原有 292 字节规则。长度按原始 ASCII state 字节计算，
-不解码或截断；缓存摘要 `length` 返回实际字节数，管理端以服务端规则展示筛选说明。
-固定期内覆盖发往上游的 state，后续返回值不覆盖已固定值；失败、不完整响应、预热和连接测试不捕获。
-默认关闭。单个候选的本地最长保留时间为 240 秒（自票内嵌的签发时刻起算，可在 turn-state 设置里调），不随命中续期。
-到期、访问令牌改变、重新捕获或服务重启后等待新的候选，尚无候选时保持原有透传行为。
-此功能偏离常规同轮粘性路由合同，state 长度不构成模型质量判断，也不保证减少 overload。
+开启后，普通生成请求可从完整成功响应中捕获候选，按账号、模型及客户端密钥隔离，被动捕获不覆盖已有有效票。
+票据合法性检查使用 ASCII 与最小长度，不再按套餐或模型精确匹配长度。`turnStateCaptureRule` 是兼容字段，
+`defaultLength: 0` 表示无精确长度门，不能解释成要求零字节。上游票据记录只展示观测摘要，不推断是否入库。
+注入按运行设置决定，默认 `fill-missing` 保留客户端自带当轮票。失败、不完整响应及原始诊断不进入被动捕获，
+暖池验证后的发布遵循[连接预热](#连接预热)规则。被动票有效期默认 240 秒，不随命中续期，最终以票据到期时间为准。
+到期、凭据绑定变化或重新捕获后重新获取候选，持久化的有效账号票可在重启后重新读取，尚无票时保留普通请求路径。
 
 #### 遍历代理找 state
 
@@ -212,7 +210,7 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 | 方法 | 路径 | 请求 | 说明 |
 | --- | --- | --- | --- |
 | `GET` | `/api/admin/turn-state/settings` | 无 | 运行设置；`cloudMint.relayKey`、`proxyUrl` 与 `upstreamProxyUrl` 只回 `<set>`/空 |
-| `POST` | `/api/admin/turn-state/settings/update` | 全部字段 + 可选 `cloudMint` | 整体替换并热生效；`cloudMint` 省略时保留现值，`relayKey` 为 `<set>` 时沿用已保存密钥；模板/受限长度表不能重叠 |
+| `POST` | `/api/admin/turn-state/settings/update` | 全部基础字段 + 可选 `cloudMint` / `warmPool` | 整体替换并热生效；`cloudMint` 省略时保留现值，`relayKey` 为 `<set>` 时沿用已保存密钥；模板/受限长度表不能重叠 |
 | `GET` | `/api/admin/turn-state/observations` | 无 | 按桶的正常/受限/未知/沉默与注入盲区计数、模型对照计数（`servedMatch` / `servedMismatch` / `servedUnknown`）、48 小时分时、长度直方图、最近 100 条事件 |
 | `GET` | `/api/admin/turn-state/buckets` | `account?`、`model?` | 有效模板摘要（范围、长度、签发/到期、来源、网关、命中），不含值 |
 | `POST` | `/api/admin/turn-state/buckets/clear` | `{ account, model? }` | 清除模板（内存与磁盘） |
@@ -227,6 +225,35 @@ Team / Business（含 `self_serve_business_prolite`、`self_serve_business_usage
 `ttlSeconds` 调短对已写入的票同样生效：读取时按「签发时刻 + 当前 `ttlSeconds`」封顶（云端打票的票按 `cloudMint.ticketTtlSeconds`），调大不会延长已写入的票。
 
 已经保存过的 `settings.json` 不会跟着代码默认值改。文件里如果还是 `injectMode: always`、`ttlSeconds: 3600`，或 `degradedLengths` 里有 `292` / `312`，行为保持旧值，直到在状态页改完保存。`degradedLengths` 不再表示降级：非空时 `always` 和 `replace-only` 仍会按这些长度换掉客户端的票，服务启动读到非空表会打一条警告。新装、或从未保存过设置的实例直接用当前默认（`ttlSeconds` 240、`fill-missing`、空的 `degradedLengths`）。
+
+### 连接预热
+
+`warmPool` 控制后台 WebSocket 候选，仅作用于启用 `pinTurnState` 的 OpenAI OAuth 账号
+
+- `models` 中每个模型分别建立连接，`connectionsPerAccount` 是每账号、每模型的保留数，合计受 `maxTotalConnections` 限制；模型列表留空时跟随业务，首次使用 `gpt-6-astra`
+- `probe=true` 要求完整响应、模型声明匹配且答案通过检查，期望 `21` 不接受 `210`；关闭答案检查只标记 `ready`，不标记 `verified`
+- 启用专用打票且已配置代理时，候选通过该代理建立，失败后关闭连接再尝试；开启 `businessReuse` 后，候选通过才条件发布路由及新签票，业务复用同一条连接，账号保存的业务代理不改写
+- `businessReuse=false` 只建立和检查候选，预热不发布账号票或路由，也不向业务提供候选连接；普通业务继续原有路径
+- `probeRetries` 是首次之后的追加次数，`0` 表示每轮只尝试一次；失败槽位在 `cooldownSeconds` 后继续尝试，不影响其他已通过的槽位
+- `probeTimeoutSeconds` 限制探针请求阶段，已开始的发布与失败恢复会完成；`maxAgeSeconds` 限制连接寿命，`reprobeSeconds` 控制复探，池满或其他槽位冷却不阻止已有连接复探；后台每 20 秒应用设置，配置改变会重新验证候选
+- `requireVerified=true` 要求新对话使用验证通过的连接，每次账号尝试最多等待 2 秒，未就绪返回 503 和 `Retry-After: 2`；此模式须开启答案检查与业务复用，自动补票和续 pair 交由预热验证后发布；客户端自带当轮票及已有续接不改写
+
+`requireVerified` 初始为 `false`，保留无可用候选时普通建连的行为，管理更新省略该字段时保留现值；为兼容已有设置，关闭时不序列化该字段。回滚到不支持该字段的版本前，应恢复可读取的设置备份
+
+账号详情 `warmPool` 返回已发布连接数与最近探测的模型、判定、连接 ID、网关和尝试次数。`verified` 仅表示该模型通过配置的探针，不代表所有模型或所有任务的能力保证
+
+云端打票任务除同账号去重外，进程内最多同时执行 4 个；此限制与预热连接总上限独立
+
+### 测智台
+
+`POST /api/admin/accounts/test-bench` 接受 `accountId`、`modelId`、`prompt`、可选 `reasoningEffort` 和 `mode`
+
+- `mode=business` 为默认，固定所选账号，遵守账号可用性、模型权限和并发限制，使用当前票与暖池策略
+- `mode=diagnostic` 保留原始账号诊断，跳过固定票与暖池领用，可用于对照和排查停用账号
+- SSE 的 `execution` 事件返回 `mode` 和 `details`，其中 `ticketAttached` 表示请求是否附带票，`warmPoolUsed`、`warmVerified`、`connectionReused`、`connectionId`、`transport` 来自实际执行观测
+- 未记录的事实为 `null`，页面显示未记录；仅返回布尔值和连接标识，不返回票、Cookie 或认证头
+
+业务方式仍是管理员固定账号测试，不经过 Client Key 的分组选号和限额计费；完整 API 验收使用实际 Client Key。票附带状态不等于上游已接收，传输失败仍按错误结果处理
 
 ### 换模型
 

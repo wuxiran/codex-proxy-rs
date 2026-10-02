@@ -45,6 +45,25 @@ fn update_request_requires_every_field_and_rejects_unknown_ones() {
     );
 }
 
+#[test]
+fn old_warm_settings_clients_preserve_verified_only_mode_unless_explicitly_changed() {
+    let mut current = ::turn_state::Settings::default();
+    current.warm_pool.require_verified = true;
+    let mut payload = serde_json::to_value(&current).unwrap();
+    payload["warmPool"]
+        .as_object_mut()
+        .unwrap()
+        .remove("requireVerified");
+    payload["warmPool"]["maxAgeSeconds"] = serde_json::json!(120);
+    let request: UpdateTurnStateSettingsRequest = serde_json::from_value(payload.clone()).unwrap();
+    let result = request.into_settings(&current);
+    assert!(result.warm_pool.require_verified);
+    assert_eq!(result.warm_pool.max_age_seconds, 120);
+    payload["warmPool"]["requireVerified"] = serde_json::json!(false);
+    let request: UpdateTurnStateSettingsRequest = serde_json::from_value(payload).unwrap();
+    assert!(!request.into_settings(&current).warm_pool.require_verified);
+}
+
 #[tokio::test]
 async fn settings_round_trip_and_validation() {
     let fixture = AdminTestFixture::new().await;

@@ -1,27 +1,22 @@
-//! WS 保活暖池：为每个合格账号在"健康期"内预建并挂住若干条上游 WebSocket，
-//! 用 canary 探针（默认糖果题）验满血；业务新对话由连接池领养这些满血连接
-//! （见 `transport/websocket/pool` 的 `adopt_warm_locked`），从而不被后续坏路由拖降。
-//!
-//! 打开一条保活连接不需要专门的握手代码：直接用业务同一条客户端路径
-//! `create_response_stream_with_pool_account` 发一条 conversation 以 `__cpr_warm__:{slot}`
-//! 命名的请求即可——连接落进池里的保活 key，业务据此领养。探针答案只读开头、判满血，
-//! 不落明文；降智则关掉该账号的保活连接并冷却，避免业务领养到降智连接、也避免空转烧配额。
+//! 按账号和模型建立、验证并保留 WebSocket 候选。
+//! 完整响应、模型声明和启用的答案检查通过后才发布，回池的待验证连接不能被业务领养。
+//! 配置专用代理时，失败候选关闭后重新寻找路由，通过后业务复用同一条活连接。
+//! 普通账号出口设置不改写，客户端当轮票和既有续接仍遵守原来的路由约束。
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
-use base64::Engine as _;
 use futures::StreamExt as _;
 use gateway_core::account::ProviderAccount;
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value, json};
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 use turn_state::WarmPoolSettings;
 
 use crate::credential::{CODEX_AUTHENTICATION_KIND_OAUTH, CodexCredentialRepository};
@@ -30,14 +25,13 @@ use crate::transport::protocol::responses::CodexResponsesRequest;
 use crate::transport::websocket::WARM_CONVERSATION_PREFIX;
 use crate::transport::{
     CodexBackendClient, CodexBackendStreamingResponse, CodexRequestContext, CodexWebSocketPool,
+    WarmConnectionApproval,
 };
 
-/// 最近有请求的账号优先补齐 / 续探。
-const ACTIVE_WINDOW: Duration = Duration::from_secs(600);
-/// 刚导入的账号视为"在健康期内"，立刻把所有 slot 一次性补满以抢窗口。
-const IMPORT_BURST_WINDOW: Duration = Duration::from_secs(600);
 /// 探针/开连接的整次调用硬上限的下限保护。
 const MIN_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_ACTIVITY_WINDOW: Duration = Duration::from_secs(600);
+const MAX_ACTIVE_MODELS: usize = 16;
 /// 缺省探针模型（设置没配时）。
 const DEFAULT_WARM_MODEL: &str = "gpt-6-astra";
 /// 缺省探针题：糖果题，满血答 21。答案只读开头判定，不落明文。
@@ -66,18 +60,17 @@ pub(crate) struct WarmReport {
     pub(crate) attempts: u32,
     /// 重试路上探到的网关序列（含最终那个），看有没有真的换到不同节点。
     pub(crate) tried_gateways: Vec<String>,
+    pub(crate) connection_id: Option<uuid::Uuid>,
+    pub(crate) model: String,
 }
 
 #[derive(Default)]
 struct AccountState {
-    imported_at: Option<Instant>,
-    last_request: Option<Instant>,
-    models: BTreeSet<String>,
-    cooldown_until: Option<Instant>,
+    models: BTreeMap<String, Instant>,
+    warm_models: Vec<String>,
+    cooldown_until: HashMap<usize, Instant>,
     /// 每个 slot 上一次探针通过的时间；用于低频复探。
     verified_at: HashMap<usize, Instant>,
-    /// 是否已经至少尝试过一次开连接（首次见到的启用账号 bootstrap 一次）。
-    bootstrapped: bool,
     in_flight: bool,
     last: Option<WarmReport>,
 }
@@ -85,22 +78,43 @@ struct AccountState {
 #[derive(Default)]
 struct State {
     accounts: HashMap<String, AccountState>,
+    policy: Option<(WarmPoolSettings, turn_state::CloudMintSettings)>,
 }
 
 /// 探针判决。
 enum Verdict {
-    /// 满血：答案开头匹配期望值。
+    /// 本次启用的检查通过，是否检查答案由报告单独标记。
     Verified(Option<String>),
-    /// 降智：连上了、答出来了，但不是满血答案。
+    /// 声明或答案未通过检查。
     Degraded(Option<String>),
     /// 没答成：上游报错 / 连接断 / 超时。
     Failed(String),
+}
+
+/// 候选的敏感内容只在验收与条件发布期间存在，不进入 Debug 或管理响应。
+struct ProbeCapture {
+    ticket: Option<String>,
+    headers: Vec<String>,
+    route: Option<crate::route_pair::RoutePairRef>,
+    connection_id: Option<uuid::Uuid>,
+}
+
+/// 取消或提前返回也撤销候选，后台维护随后回收连接，不会遗留可被领养的半成品。
+struct PendingApproval(WarmConnectionApproval);
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        if !self.0.published() {
+            self.0.reject();
+        }
+    }
 }
 
 /// 不实现 Debug：持有仓库句柄与账号上下文。
 pub(crate) struct WarmPoolService {
     repository: CodexCredentialRepository,
     pins: crate::turn_state_pin::TurnStatePins,
+    mint: Arc<crate::turn_state_mint::CloudMintService>,
     /// 每次探针从活 profile 快照现建客户端（清掉 residency 头）：既能拿到 __oailb 看网关、
     /// 让裸开探到不同节点，又跟随线上 profile 版本、不产生 connection_profile 漂移使领养失配。
     http: reqwest::Client,
@@ -131,6 +145,7 @@ impl WarmPoolService {
     pub(crate) fn new(
         repository: CodexCredentialRepository,
         pins: crate::turn_state_pin::TurnStatePins,
+        mint: Arc<crate::turn_state_mint::CloudMintService>,
         http: reqwest::Client,
         base_url: impl Into<String>,
         profile: CodexWireProfileState,
@@ -139,6 +154,7 @@ impl WarmPoolService {
         Self {
             repository,
             pins,
+            mint,
             http,
             base_url: base_url.into(),
             profile,
@@ -169,23 +185,43 @@ impl WarmPoolService {
         self.settings().enabled && !self.pins.service().settings().dry_run
     }
 
-    /// 请求侧：记下账号在用哪些模型、最近何时有流量（补齐/续探优先照顾活跃账号）。
+    /// 记录业务模型，并唤醒自动模型配置的预热任务。
     pub(crate) fn note_request(&self, account_id: &str, model: &str) {
-        if let Ok(mut state) = self.state.lock() {
+        let added = if let Ok(mut state) = self.state.lock() {
             let entry = state.accounts.entry(account_id.to_owned()).or_default();
-            entry.last_request = Some(Instant::now());
-            if !model.is_empty() {
-                entry.models.insert(model.to_owned());
+            entry
+                .models
+                .retain(|_, seen| seen.elapsed() < MODEL_ACTIVITY_WINDOW);
+            if model.is_empty() {
+                false
+            } else {
+                let added = !entry.models.contains_key(model);
+                if added
+                    && entry.models.len() >= MAX_ACTIVE_MODELS
+                    && let Some(oldest) = entry
+                        .models
+                        .iter()
+                        .min_by_key(|(_, seen)| *seen)
+                        .map(|(model, _)| model.clone())
+                {
+                    entry.models.remove(&oldest);
+                }
+                entry.models.insert(model.to_owned(), Instant::now());
+                added
             }
+        } else {
+            false
+        };
+        if added {
+            self.wake.notify_one();
         }
     }
 
-    /// 账号导入/变更：标记为刚导入（在健康期内），并唤醒 worker 立刻补齐。
+    /// 账号导入或变更后唤醒 worker，资格与在途状态在调度时重新核对。
     pub(crate) fn notify_accounts_changed(&self, account_ids: &[String]) {
         if let Ok(mut state) = self.state.lock() {
-            let now = Instant::now();
             for id in account_ids {
-                state.accounts.entry(id.clone()).or_default().imported_at = Some(now);
+                state.accounts.entry(id.clone()).or_default();
             }
         }
         self.wake.notify_one();
@@ -223,6 +259,8 @@ impl WarmPoolService {
                 "gateway": r.gateway,
                 "attempts": r.attempts,
                 "triedGateways": r.tried_gateways,
+                "connectionId": r.connection_id.map(|id| id.to_string()),
+                "probeModel": r.model,
             })),
         })
     }
@@ -238,6 +276,24 @@ impl WarmPoolService {
         if !settings.enabled {
             return;
         }
+        let changed_accounts = {
+            let mut state = Self::lock_state(&self.state);
+            let policy = (settings.clone(), self.pins.service().settings().cloud_mint);
+            if state.policy.as_ref() == Some(&policy) {
+                Vec::new()
+            } else {
+                state.policy = Some(policy);
+                for entry in state.accounts.values_mut() {
+                    entry.verified_at.clear();
+                    entry.cooldown_until.clear();
+                }
+                state.accounts.keys().cloned().collect::<Vec<_>>()
+            }
+        };
+        for account in changed_accounts {
+            self.pool.evict_warm_for_account(&account).await;
+        }
+        self.pool.restrict_warm_lifetime(settings.max_age());
         let accounts = match self.repository.list_for_provider().await {
             Ok(accounts) => accounts,
             Err(_) => return,
@@ -263,10 +319,32 @@ impl WarmPoolService {
                 continue;
             }
             let id = account.id().as_str().to_owned();
-            let want = settings.connections_per_account as usize;
+            let models = self.probe_models(&id, &settings);
+            let models_changed = {
+                let mut state = Self::lock_state(&self.state);
+                let entry = state.accounts.entry(id.clone()).or_default();
+                if entry.in_flight {
+                    continue;
+                }
+                let changed = entry.warm_models != models;
+                if changed {
+                    entry.warm_models = models.clone();
+                    entry.cooldown_until.clear();
+                    entry.verified_at.clear();
+                }
+                changed
+            };
+            if models_changed {
+                self.pool.evict_warm_for_account(&id).await;
+            }
+            let want = settings.connections_per_account as usize * models.len();
             // 池是「哪些 slot 有活连接」的唯一真相（可能被业务领养/被 evict 掉）。
             // 先在池锁外取占用序号，再进 warmer 状态锁，避免同时持两把锁。
             let occupied = self.pool.warm_slots_for_account(&id);
+            let can_open = self.in_flight_total.load(Ordering::Acquire)
+                + self.pool.warm_len_total()
+                < settings.max_total_connections as usize
+                && self.pool.has_connect_capacity();
 
             // 挑一个要开/要复探的 slot（open 用空闲序号、reprobe 用已占用且到期的序号）。
             let (slot, reason) = {
@@ -277,59 +355,49 @@ impl WarmPoolService {
                 if entry.in_flight {
                     continue;
                 }
-                if entry.cooldown_until.is_some_and(|until| until > now) {
-                    continue;
-                }
-                let imported_recently = entry
-                    .imported_at
-                    .is_some_and(|at| at.elapsed() < IMPORT_BURST_WINDOW);
-                let recent_traffic = entry
-                    .last_request
-                    .is_some_and(|at| at.elapsed() < ACTIVE_WINDOW);
-                let active = imported_recently || recent_traffic;
-                let pick = if occupied.len() < want {
-                    // 补一条：挑第一个**空闲**序号（不是用计数当序号，否则会反复命中已占用的 slot）。
-                    // 活跃/刚导入的账号补，首次见到的启用账号也 bootstrap 一条。
-                    (active || !entry.bootstrapped)
-                        .then(|| (0..want).find(|slot| !occupied.contains(slot)))
-                        .flatten()
-                        .map(|slot| (slot, "open"))
-                } else if settings.probe && active {
-                    // 补满了：挑一个**已占用**且到复探点的序号，在其上复用同一条连接复探。
-                    occupied
-                        .iter()
-                        .find(|slot| {
-                            entry
-                                .verified_at
-                                .get(slot)
-                                .is_none_or(|at| at.elapsed() >= settings.reprobe())
+                // 复探不依赖补池成功；同时有两类任务时交替，避免较短复探间隔饿死补池。
+                let due = settings
+                    .probe
+                    .then(|| {
+                        occupied
+                            .iter()
+                            .find(|slot| {
+                                entry
+                                    .verified_at
+                                    .get(slot)
+                                    .is_none_or(|at| now.duration_since(*at) >= settings.reprobe())
+                            })
+                            .copied()
+                    })
+                    .flatten();
+                let missing = can_open
+                    .then(|| {
+                        (0..want).find(|slot| {
+                            !occupied.contains(slot)
+                                && entry
+                                    .cooldown_until
+                                    .get(slot)
+                                    .is_none_or(|until| *until <= now)
                         })
-                        .map(|slot| (*slot, "reprobe"))
-                } else {
-                    None
+                    })
+                    .flatten();
+                let pick = match (due, missing) {
+                    (Some(slot), None) => Some((slot, "reprobe")),
+                    (Some(slot), Some(_))
+                        if entry.last.as_ref().is_some_and(|last| last.opened) =>
+                    {
+                        Some((slot, "reprobe"))
+                    }
+                    (_, Some(slot)) => Some((slot, "open")),
+                    (None, None) => None,
                 };
                 match pick {
                     Some(pick) => {
                         entry.in_flight = true;
-                        if pick.1 == "open" {
-                            entry.bootstrapped = true;
-                        }
                         pick
                     }
                     None => continue,
                 }
-            };
-
-            // 全局在途上限：在途 + 进程内所有账号的保活连接总数。
-            if self.in_flight_total.load(Ordering::Acquire) + self.pool.warm_len_total()
-                >= settings.max_total_connections as usize
-            {
-                self.clear_in_flight(&id);
-                continue;
-            }
-            let Some(permit) = self.pool.try_connect_permit() else {
-                self.clear_in_flight(&id);
-                continue;
             };
 
             let service = Arc::clone(self);
@@ -341,7 +409,6 @@ impl WarmPoolService {
                 account_id: id.clone(),
             };
             self.pool.spawn_connect_task(async move {
-                let _permit = permit;
                 let _guard = guard;
                 service
                     .warm_one(account, slot, reason, &task_settings)
@@ -369,9 +436,8 @@ impl WarmPoolService {
             && account.enabled()
     }
 
-    /// 为一个账号的一个 slot 开/复探一条保活连接。**探到降智会换节点重试**（evict 掉这条→
-    /// 同出口重开=落新节点实例），挑出第一条满血的挂住；只有连续 `probe_retries+1` 次全降智
-    /// 才冷却（那基本是死号）。auth/超时不重试。
+    /// 为一个模型槽位寻找或复探连接，失败候选关闭后有限重试。
+    /// 新拨不保证网关一定变化，仍以完整探针结果决定发布，耗尽后仅冷却该槽位。
     async fn warm_one(
         &self,
         account: ProviderAccount,
@@ -390,15 +456,136 @@ impl WarmPoolService {
             gateway: None,
             attempts: 0,
             tried_gateways: Vec::new(),
+            connection_id: None,
+            model: String::new(),
         };
         let mut verified = false;
         let mut all_degraded = false;
+        let models = self.probe_models(&id, settings);
+        let model = models[slot / settings.connections_per_account as usize % models.len()].clone();
+        report.model.clone_from(&model);
+        let mint_settings = self.pins.service().settings().cloud_mint;
+        let proxy_url = if mint_settings.enabled {
+            mint_settings.upstream_proxy_url.clone()
+        } else {
+            String::new()
+        };
+        let business_client = match self.residency_free_client().for_account(&account) {
+            Ok(client) => client,
+            Err(_) => {
+                self.set_cooldown(&id, slot, settings.cooldown());
+                return;
+            }
+        };
+        let deadline =
+            tokio::time::Instant::now() + settings.probe_timeout().max(MIN_PROBE_TIMEOUT);
         for attempt in 0..=settings.probe_retries {
             report.attempts = attempt + 1;
-            match self.warm_probe(&account, slot, settings).await {
-                Ok((Verdict::Verified(model), gateway)) => {
-                    report.verdict = Some("verified");
-                    report.served_model = model;
+            let approval = WarmConnectionApproval::scoped(
+                model.clone(),
+                settings.max_age(),
+                (!proxy_url.is_empty()).then(|| business_client.pool_egress_key().to_owned()),
+            );
+            let _pending = PendingApproval(approval.clone());
+            self.pool.begin_warm_probe(&id, slot, &approval);
+            let publication = if proxy_url.is_empty() || !settings.business_reuse {
+                None
+            } else {
+                match tokio::time::timeout_at(deadline, self.mint.warm_publication(&id)).await {
+                    Ok(Ok(snapshot)) => Some(snapshot),
+                    Ok(Err(_)) => {
+                        report.error = Some("credential_changed".to_owned());
+                        break;
+                    }
+                    Err(_) => {
+                        report.error = Some("timeout".to_owned());
+                        break;
+                    }
+                }
+            };
+            let fresh =
+                attempt > 0 || (reason == "open" && self.pool.warm_len_for_account(&id) == 0);
+            let result = tokio::time::timeout_at(
+                deadline,
+                self.warm_probe_model(
+                    &account, slot, settings, &model, &approval, &proxy_url, fresh,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err("timeout".to_owned()));
+            let mut capture = None;
+            let result = result.map(|(verdict, evidence)| {
+                report.connection_id = evidence.connection_id;
+                let gateway = evidence
+                    .route
+                    .as_ref()
+                    .and_then(|route| route.gateway.clone());
+                capture = Some(evidence);
+                (verdict, gateway)
+            });
+            let current = self.pins.service().settings();
+            if current.dry_run
+                || !current.warm_pool.enabled
+                || current.warm_pool != *settings
+                || current.cloud_mint != mint_settings
+            {
+                approval.reject();
+                self.pool.evict_warm_slot(&id, slot).await;
+                return;
+            }
+            match result {
+                Ok((Verdict::Verified(served_model), gateway)) => {
+                    if !self.pool.has_warm_candidate(&approval) {
+                        approval.reject();
+                        report.error = Some("connection_lost".to_owned());
+                        self.set_cooldown(&id, slot, settings.cooldown());
+                        break;
+                    }
+                    if let Some(snapshot) = &publication {
+                        let Some(evidence) = &capture else {
+                            approval.reject();
+                            break;
+                        };
+                        let Some(route) = &evidence.route else {
+                            approval.reject();
+                            self.pool.evict_warm_slot(&id, slot).await;
+                            report.error = Some("no_route_pair".to_owned());
+                            continue;
+                        };
+                        // 复探未新签票时保留原票的到期约束，连接质量由本次完整答题决定。
+                        let ticket = evidence
+                            .ticket
+                            .as_deref()
+                            .map(|ticket| (model.as_str(), ticket));
+                        // 进入提交后必须完成失败恢复，不能在 CAS 已提交时用探针超时取消。
+                        if tokio::time::Instant::now() >= deadline
+                            || self
+                                .mint
+                                .publish_warm(snapshot, &evidence.headers, route, ticket)
+                                .await
+                                .is_err()
+                        {
+                            approval.reject();
+                            self.pool.evict_warm_slot(&id, slot).await;
+                            report.error = Some("candidate_publication_failed".to_owned());
+                            break;
+                        }
+                        self.pool
+                            .evict_other_warm_routes(&id, &route.fingerprint)
+                            .await;
+                    }
+                    let latest = self.pins.service().settings();
+                    if latest.dry_run
+                        || latest.warm_pool != *settings
+                        || latest.cloud_mint != mint_settings
+                    {
+                        approval.reject();
+                        self.pool.evict_warm_slot(&id, slot).await;
+                        return;
+                    }
+                    approval.publish(settings.probe);
+                    report.verdict = Some(if settings.probe { "verified" } else { "ready" });
+                    report.served_model = served_model;
                     report.gateway = gateway.clone();
                     if let Some(gw) = gateway {
                         report.tried_gateways.push(gw);
@@ -413,12 +600,15 @@ impl WarmPoolService {
                         slot,
                         attempt = report.attempts,
                         gateway = report.gateway.as_deref().unwrap_or("?"),
-                        "[ws-warm] verified and held"
+                        checked = settings.probe,
+                        connection_id = report.connection_id.map(|id| id.to_string()).as_deref().unwrap_or(""),
+                        "[ws-warm] candidate accepted and held"
                     );
                     verified = true;
                     break;
                 }
                 Ok((Verdict::Degraded(model), gateway)) => {
+                    approval.reject();
                     report.verdict = Some("degraded");
                     report.served_model = model;
                     report.gateway = gateway.clone();
@@ -426,27 +616,50 @@ impl WarmPoolService {
                         report.tried_gateways.push(gw);
                     }
                     all_degraded = true;
-                    // evict 这条降智连接，下次开就落新节点；到重试上限则跳出去冷却。
+                    // 下一次从新连接、新候选路由开始，到重试上限后冷却该槽位。
                     self.pool.evict_warm_slot(&id, slot).await;
                 }
                 Ok((Verdict::Failed(code), gateway)) => {
+                    approval.reject();
                     report.verdict = Some("failed");
                     report.error = Some(code);
                     report.gateway = gateway;
                     self.pool.evict_warm_slot(&id, slot).await;
-                    self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
+                    if matches!(
+                        report.error.as_deref(),
+                        Some("timeout" | "no_answer" | "no_terminal")
+                    ) && tokio::time::Instant::now() < deadline
+                    {
+                        continue;
+                    }
+                    self.set_cooldown(&id, slot, settings.cooldown().min(Duration::from_secs(120)));
                     break; // auth/超时重试也没用
                 }
                 Err(error) => {
+                    approval.reject();
+                    self.pool.evict_warm_slot(&id, slot).await;
+                    report.verdict = Some("failed");
                     report.error = Some(error);
-                    self.set_cooldown(&id, settings.cooldown().min(Duration::from_secs(120)));
+                    if matches!(
+                        report.error.as_deref(),
+                        Some(
+                            "upstream_transport"
+                                | "upstream_http_502"
+                                | "upstream_http_503"
+                                | "upstream_http_504"
+                        )
+                    ) && tokio::time::Instant::now() < deadline
+                    {
+                        continue;
+                    }
+                    self.set_cooldown(&id, slot, settings.cooldown().min(Duration::from_secs(120)));
                     break;
                 }
             }
         }
         if !verified && all_degraded {
-            // 换了 probe_retries+1 个节点都降智 → 冷却（死号或该出口全落坏节点）。
-            let closed = self.pool.evict_warm_for_account(&id).await;
+            // 本轮候选均未通过，保留其他模型已经验证的连接。
+            let closed = self.pool.evict_warm_slot(&id, slot).await;
             tracing::info!(
                 target: "ws_warm",
                 account_id = %id,
@@ -455,7 +668,10 @@ impl WarmPoolService {
                 closed,
                 "[ws-warm] all attempts degraded, cooling down"
             );
-            self.set_cooldown(&id, settings.cooldown());
+            self.set_cooldown(&id, slot, settings.cooldown());
+        } else if !verified {
+            self.pool.evict_warm_slot(&id, slot).await;
+            self.set_cooldown(&id, slot, settings.cooldown().min(Duration::from_secs(120)));
         }
         report.held = self.pool.warm_len_for_account(&id);
         if let Ok(mut state) = self.state.lock() {
@@ -465,21 +681,29 @@ impl WarmPoolService {
         // in_flight 的清除交给 WarmInFlight 守卫（任务结束/panic 都清），这里不动。
     }
 
-    fn set_cooldown(&self, account_id: &str, cooldown: Duration) {
+    fn set_cooldown(&self, account_id: &str, slot: usize, cooldown: Duration) {
         if let Ok(mut state) = self.state.lock() {
             let entry = state.accounts.entry(account_id.to_owned()).or_default();
-            entry.cooldown_until = Some(Instant::now() + cooldown);
+            entry.cooldown_until.insert(slot, Instant::now() + cooldown);
         }
     }
 
     /// 发一条 canary 请求（WS 强制、store=false），落进保活 key、读答案判满血。
     /// 返回判决 + 这条连接落的网关（从上游回的 `__oailb` 解出，可能为 None）。
-    async fn warm_probe(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "候选探测分别携带模型、审批、出口与新路由选择"
+    )]
+    async fn warm_probe_model(
         &self,
         account: &ProviderAccount,
         slot: usize,
         settings: &WarmPoolSettings,
-    ) -> Result<(Verdict, Option<String>), String> {
+        model: &str,
+        approval: &WarmConnectionApproval,
+        proxy_url: &str,
+        fresh_route: bool,
+    ) -> Result<(Verdict, ProbeCapture), String> {
         // 业务流量会并发改凭据 revision，warmer 缓存的 account 会过期→load_runtime_credential
         // 判 RevisionConflict 报 "credential"（重试第 2 次就中）。每次探针先取当前 account。
         let fresh = self
@@ -501,20 +725,26 @@ impl WarmPoolService {
             .map_err(|_| "authorization".to_owned())?;
         let cookie_header = crate::provider::build_cookie_header(&credential.cookies)
             .map_err(|_| "cookies".to_owned())?;
+        let probe_account = if proxy_url.is_empty() {
+            account.clone()
+        } else {
+            let proxy = gateway_core::account::OutboundProxy::parse(proxy_url)
+                .map_err(|_| "dedicated_proxy".to_owned())?;
+            account.clone().with_outbound_proxy(Some(proxy))
+        };
         let client = self
             .residency_free_client()
-            .for_account(account)
+            .for_account(&probe_account)
             .map_err(|_| "client".to_owned())?
             .with_authentication(&credential.authentication);
 
-        let model = self.probe_model(settings);
         let prompt = if settings.probe_prompt.trim().is_empty() {
             DEFAULT_PROBE_PROMPT
         } else {
             settings.probe_prompt.as_str()
         };
         let mut body = Map::new();
-        body.insert("model".to_owned(), Value::String(model.clone()));
+        body.insert("model".to_owned(), Value::String(model.to_owned()));
         body.insert("instructions".to_owned(), Value::String(String::new()));
         body.insert(
             "input".to_owned(),
@@ -531,6 +761,7 @@ impl WarmPoolService {
         body.insert("store".to_owned(), Value::Bool(false));
         body.insert("stream".to_owned(), Value::Bool(true));
         let mut request = CodexResponsesRequest::from_body(body);
+        request.warm_approval = Some(approval.clone());
         request.discard_mismatched_connection = !self.pins.service().settings().dry_run;
         // conversation 以保活前缀命名 → 连接落进保活 key；带下游标记 → 走 WebSocketNewChain
         // （无 fast-path 预算，强制真正建 WS 而非退回 HTTP）。
@@ -545,7 +776,11 @@ impl WarmPoolService {
             &request_id,
             Some(credential.installation_id.as_str()),
         );
-        context.cookie_header = cookie_ref;
+        context.cookie_header = if !proxy_url.is_empty() && fresh_route {
+            None
+        } else {
+            cookie_ref
+        };
 
         let timeout = settings.probe_timeout().max(MIN_PROBE_TIMEOUT);
         // pool_account_id 必须用「本地账号 id」，与业务连接池 key 对齐，业务才能领养。
@@ -557,14 +792,30 @@ impl WarmPoolService {
                 Some(local_account_id.as_str()),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(probe_transport_error)?;
         // 网关号从上游回的 __oailb（裸开的连接才会带）解出；set_cookie_headers 是响应字段，
         // 在消费 body 前先取。
-        let gateway = gateway_from_set_cookie(&response.set_cookie_headers);
+        let mut capture = ProbeCapture {
+            ticket: response.turn_state.clone(),
+            headers: response.set_cookie_headers.clone(),
+            route: crate::route_pair::RoutePairRef::issued(&response.set_cookie_headers),
+            connection_id: response.websocket_connection_id,
+        };
+        let updates = response.response_metadata_updates.clone();
         let verdict = self
-            .read_verdict(response, settings.probe_expect.as_str(), &model, timeout)
+            .read_verdict(
+                response,
+                settings.probe.then_some(settings.probe_expect.as_str()),
+                model,
+                timeout,
+            )
             .await?;
-        Ok((verdict, gateway))
+        if let Some(updates) = updates {
+            let updates = updates.lock().await;
+            capture.ticket = updates.turn_state.clone().or(capture.ticket);
+            capture.route = updates.route_pair.clone().or(capture.route);
+        }
+        Ok((verdict, capture))
     }
 
     /// 读上游 SSE 流判满血；**必须把流读到自然结束（None）**，上游 WS 连接才会被归还进连接池
@@ -573,7 +824,7 @@ impl WarmPoolService {
     async fn read_verdict(
         &self,
         response: CodexBackendStreamingResponse,
-        expect: &str,
+        expect: Option<&str>,
         probe_model: &str,
         timeout: Duration,
     ) -> Result<Verdict, String> {
@@ -684,7 +935,7 @@ impl WarmPoolService {
 
     fn judge(
         answer: &str,
-        expect: &str,
+        expect: Option<&str>,
         probe_model: &str,
         served_model: Option<String>,
         swapped: Option<String>,
@@ -696,20 +947,30 @@ impl WarmPoolService {
         let declared_matches = served_model
             .as_deref()
             .is_some_and(|model| model.eq_ignore_ascii_case(probe_model));
-        if !declared_matches || !answer_matches(answer, expect) {
+        if !declared_matches || expect.is_some_and(|expected| !answer_matches(answer, expected)) {
             return Verdict::Degraded(served_model);
         }
         Verdict::Verified(served_model)
     }
 
-    fn probe_model(&self, settings: &WarmPoolSettings) -> String {
+    fn probe_models(&self, account: &str, settings: &WarmPoolSettings) -> Vec<String> {
         if !settings.probe_model.trim().is_empty() {
-            return settings.probe_model.clone();
+            return vec![settings.probe_model.clone()];
         }
-        if let Some(first) = settings.models.first() {
-            return first.clone();
+        if !settings.models.is_empty() {
+            return settings.models.clone();
         }
-        DEFAULT_WARM_MODEL.to_owned()
+        let active = self.state.lock().ok().and_then(|mut state| {
+            state.accounts.get_mut(account).map(|entry| {
+                entry
+                    .models
+                    .retain(|_, seen| seen.elapsed() < MODEL_ACTIVITY_WINDOW);
+                entry.models.keys().cloned().collect::<Vec<_>>()
+            })
+        });
+        active
+            .filter(|models| !models.is_empty())
+            .unwrap_or_else(|| vec![DEFAULT_WARM_MODEL.to_owned()])
     }
 }
 
@@ -763,33 +1024,26 @@ fn answer_matches(answer: &str, expect: &str) -> bool {
     })
 }
 
-/// 从上游回的 Set-Cookie 列表里找 __oailb，解出网关号（unified-N）。
-/// 只在裸开（凭据里没有活的目标 pair）时上游才会下发 __oailb；否则返回 None。
-fn gateway_from_set_cookie(headers: &[String]) -> Option<String> {
-    for header in headers {
-        let first = header.split(';').next().unwrap_or(header).trim();
-        if let Some(value) = first.strip_prefix("__oailb=")
-            && let Some(gateway) = gateway_from_oailb(value)
-        {
-            return Some(gateway);
-        }
-    }
-    None
-}
-
-/// __oailb 是 JWT，载荷里有 \"host\":\"chat.gateway.unified-N.api.openai.com\"；解出 unified-N。
-fn gateway_from_oailb(oailb: &str) -> Option<String> {
-    let payload = oailb.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let text = String::from_utf8_lossy(&decoded);
-    let start = text.find("unified-")?;
-    let digits: String = text[start + "unified-".len()..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    (!digits.is_empty()).then(|| format!("unified-{digits}"))
+/// 代理或上游错误只留下受控标签，不把响应正文、认证信息或代理 URL 写进报告。
+fn probe_transport_error(error: crate::transport::CodexClientError) -> String {
+    use crate::transport::CodexClientError;
+    use crate::transport::websocket::CodexWebSocketExchangeError;
+    let status = match &error {
+        CodexClientError::Upstream { status, .. } => Some(status.as_u16()),
+        CodexClientError::WebSocket(error) => match error.classified() {
+            CodexWebSocketExchangeError::Upstream(upstream) => Some(upstream.status_code),
+            CodexWebSocketExchangeError::Connect(tungstenite::Error::Http(response))
+            | CodexWebSocketExchangeError::Transport(tungstenite::Error::Http(response)) => {
+                Some(response.status().as_u16())
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    status.map_or_else(
+        || "upstream_transport".to_owned(),
+        |status| format!("upstream_http_{status}"),
+    )
 }
 
 #[cfg(test)]
@@ -800,13 +1054,13 @@ mod judge_tests {
     fn a_right_answer_from_a_swapped_model_is_not_verified() {
         let swapped = Some("gpt-5.6-luna".to_owned());
         assert!(matches!(
-            WarmPoolService::judge("21", "21", "gpt-6-astra", swapped.clone(), swapped),
+            WarmPoolService::judge("21", Some("21"), "gpt-6-astra", swapped.clone(), swapped),
             Verdict::Degraded(Some(model)) if model == "gpt-5.6-luna"
         ));
         assert!(matches!(
             WarmPoolService::judge(
                 "**21**",
-                "21",
+                Some("21"),
                 "gpt-6-astra",
                 Some("gpt-6-astra".to_owned()),
                 None
@@ -816,7 +1070,7 @@ mod judge_tests {
         assert!(matches!(
             WarmPoolService::judge(
                 "21",
-                "21",
+                Some("21"),
                 "gpt-6-astra",
                 Some("GPT-6-ASTRA".to_owned()),
                 None
@@ -826,7 +1080,7 @@ mod judge_tests {
         assert!(matches!(
             WarmPoolService::judge(
                 "20",
-                "21",
+                Some("21"),
                 "gpt-6-astra",
                 Some("gpt-6-astra".to_owned()),
                 None
@@ -836,7 +1090,7 @@ mod judge_tests {
         assert!(matches!(
             WarmPoolService::judge(
                 "210",
-                "21",
+                Some("21"),
                 "gpt-6-astra",
                 Some("gpt-6-astra".to_owned()),
                 None
@@ -844,7 +1098,7 @@ mod judge_tests {
             Verdict::Degraded(_)
         ));
         assert!(matches!(
-            WarmPoolService::judge("21", "21", "gpt-6-astra", None, None),
+            WarmPoolService::judge("21", Some("21"), "gpt-6-astra", None, None),
             Verdict::Degraded(None)
         ));
     }

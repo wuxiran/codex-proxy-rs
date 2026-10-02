@@ -25,6 +25,7 @@ pub struct CodexWebSocketPoolKey {
     connection_profile: String,
     downstream_connection_id: String,
     egress_key: String,
+    mint_route: Option<String>,
 }
 
 impl CodexWebSocketPoolKey {
@@ -41,6 +42,7 @@ impl CodexWebSocketPoolKey {
             connection_profile: String::new(),
             downstream_connection_id: String::new(),
             egress_key: String::new(),
+            mint_route: None,
         }
     }
 
@@ -68,6 +70,17 @@ impl CodexWebSocketPoolKey {
         self
     }
 
+    pub(crate) fn with_mint_route(mut self, route: Option<&str>) -> Self {
+        self.mint_route = route.map(str::to_owned);
+        self
+    }
+
+    pub(super) fn accepts_route(&self, route: Option<&crate::route_pair::RoutePairRef>) -> bool {
+        self.mint_route
+            .as_ref()
+            .is_none_or(|expected| route.is_some_and(|actual| &actual.fingerprint == expected))
+    }
+
     pub(crate) fn conversation_id_hash(&self) -> String {
         short_sha256([self.conversation_id.as_str()])
     }
@@ -80,6 +93,7 @@ impl CodexWebSocketPoolKey {
             self.connection_profile.as_str(),
             self.downstream_connection_id.as_str(),
             self.egress_key.as_str(),
+            self.mint_route.as_deref().unwrap_or_default(),
         ])
     }
 
@@ -110,8 +124,16 @@ impl CodexWebSocketPoolKey {
             && !business.is_warm()
             && self.base_url == business.base_url
             && self.account_id == business.account_id
-            && self.egress_key == business.egress_key
             && self.connection_profile == business.connection_profile
+    }
+
+    pub(super) fn accepts_warm_egress(
+        &self,
+        business: &Self,
+        approval: &super::WarmConnectionApproval,
+    ) -> bool {
+        self.egress_key == business.egress_key
+            || approval.accepts_business_egress(&business.egress_key)
     }
 }
 
@@ -200,6 +222,7 @@ pub(crate) struct PooledWebSocketConnection {
     pub(crate) metadata: CodexWebSocketConnectionMetadata,
     pub(crate) continuation: WebSocketContinuationState,
     pub(crate) created_at: Instant,
+    pub(crate) warm_approval: Option<super::WarmConnectionApproval>,
 }
 
 /// 只随具体 WebSocket 生命周期存在的续接状态。
@@ -266,7 +289,16 @@ pub(super) fn should_close_idle_connection(
     now: Instant,
     max_age: Duration,
 ) -> bool {
-    connection.websocket.is_closed() || now.duration_since(connection.created_at) >= max_age
+    let max_age = connection
+        .warm_approval
+        .as_ref()
+        .map_or(max_age, |approval| max_age.min(approval.max_age()));
+    connection.websocket.is_closed()
+        || connection
+            .warm_approval
+            .as_ref()
+            .is_some_and(super::WarmConnectionApproval::rejected)
+        || now.duration_since(connection.created_at) >= max_age
 }
 
 fn short_sha256<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
