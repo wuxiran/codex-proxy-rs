@@ -203,7 +203,9 @@ async function providerImportDocumentsFor(
   if (mode === 'cdk') {
     if (provider !== 'openai')
       throw new Error('观澜 CDK 只能导入 OpenAI 账号')
-    return [{ provider, document: await redeemGuanlanImport(value) }]
+    // 多空间兑换时每个空间一份已签名文件，逐份导入（签名按文件计算，不能合并）。
+    const documents = await redeemGuanlanImport(value)
+    return documents.map(document => ({ provider, document }))
   }
   if (mode === 'json')
     return providerImportDocuments(parseImportJson(value), provider)
@@ -217,7 +219,7 @@ async function redeemGuanlanImport(value: string) {
   }
   catch (error) {
     if (error instanceof GuanlanCdkError && error.network)
-      return { cdks }
+      return [{ cdks }]
     throw error
   }
 }

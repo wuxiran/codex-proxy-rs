@@ -982,12 +982,13 @@ impl CodexCredentialAdminService {
         self
     }
 
+    /// 普通导入文档原样返回；`cdks` 文档兑换成观澜的已签名文件（多空间时每个空间一份）。
     async fn expand_cdk_document(
         &self,
         payload: Value,
-    ) -> Result<Value, CodexCredentialAdminError> {
+    ) -> Result<Vec<Value>, CodexCredentialAdminError> {
         let Some(codes) = extract_cdk_codes(&payload)? else {
-            return Ok(payload);
+            return Ok(vec![payload]);
         };
         let Some(cdk) = &self.cdk else {
             return Err(CodexCredentialAdminError::CdkRedeem {
@@ -1123,16 +1124,20 @@ impl CodexCredentialAdminService {
         {
             return Err(CodexCredentialAdminError::InvalidInput);
         }
-        let payload = self.expand_cdk_document(payload).await?;
-        if let Some(revive) = &self.revive
-            && let Err(error) = revive.record_signed_document(&payload)
-        {
-            tracing::warn!(
-                error = %error,
-                "signed Codex export could not be archived for 401 revive"
-            );
+        let documents = self.expand_cdk_document(payload).await?;
+        let mut candidates = Vec::new();
+        for document in &documents {
+            // 签名按文件计算：每份文档单独归档，不能合并后再归档。
+            if let Some(revive) = &self.revive
+                && let Err(error) = revive.record_signed_document(document)
+            {
+                tracing::warn!(
+                    error = %error,
+                    "signed Codex export could not be archived for 401 revive"
+                );
+            }
+            candidates.extend(parse_import_document(document, default_proxy)?);
         }
-        let candidates = parse_import_document(&payload, default_proxy)?;
         if candidates.is_empty() || candidates.len() > MAX_BATCH {
             return Err(CodexCredentialAdminError::InvalidInput);
         }
