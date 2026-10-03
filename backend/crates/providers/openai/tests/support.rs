@@ -57,6 +57,8 @@ pub(crate) struct MemoryAccountStore {
     fail_credential_writes: AtomicBool,
     credential_load_hook: Mutex<Option<Arc<CredentialLoadHook>>>,
     credential_loads: AtomicUsize,
+    // fork: account-ticket
+    ticket_expiry: Mutex<BTreeMap<ProviderAccountId, SystemTime>>,
 }
 
 impl MemoryAccountStore {
@@ -156,6 +158,30 @@ impl MemoryAccountStore {
             provider_openai::credential::CodexCredentialCodec::encode_complete(data).unwrap();
     }
 
+    // fork: account-ticket — 购买票据到期时间与额度耗尽，用来构造「已过期」账号
+    pub(crate) fn set_ticket_expiry(&self, id: &str, expires_at: SystemTime) {
+        let id = ProviderAccountId::new(id).expect("valid account ID");
+        self.ticket_expiry
+            .lock()
+            .expect("ticket lock")
+            .insert(id, expires_at);
+    }
+
+    pub(crate) fn set_quota_exhausted(&self, id: &str) {
+        let id = ProviderAccountId::new(id).expect("valid account ID");
+        let mut accounts = self.accounts.lock().expect("account store lock");
+        let stored = accounts.get_mut(&id).expect("seeded account");
+        let quota = QuotaState::exhausted(
+            gateway_core::account::QuotaEvidence::UsageLimitReached,
+            SystemTime::now(),
+            None,
+        );
+        stored.account = rebuild_account(
+            &stored.account,
+            AccountRebuild::preserving(&stored.account).with_quota(quota),
+        );
+    }
+
     pub(crate) fn set_scheduling(
         &self,
         id: &str,
@@ -232,6 +258,19 @@ impl MemoryAccountStore {
 
 #[async_trait]
 impl ProviderAccountStore for MemoryAccountStore {
+    // fork: account-ticket
+    async fn account_ticket_expires_at(
+        &self,
+        account: &ProviderAccountId,
+    ) -> Result<Option<SystemTime>, StoreError> {
+        Ok(self
+            .ticket_expiry
+            .lock()
+            .expect("ticket lock")
+            .get(account)
+            .copied())
+    }
+
     async fn create_account(&self, input: NewProviderAccount) -> Result<(), StoreError> {
         let mut accounts = self.accounts.lock().expect("account store lock");
         if accounts.contains_key(input.account.id()) {

@@ -218,7 +218,7 @@ OpenAI OAuth 账号在「票据管理 → 账号票与预热」启停票据与�
 设置字段：`ttlSeconds`（30–86400，默认 240）、`injectMode`（默认 `fill-missing` 只给没带 state 的请求补上；`always` 有模板就注入，会换掉请求自带的 state；`replace-only` 只替换受限档长度的 state）、`dryRun`、`logDecisions`、`templateLengths`、`degradedLengths`（空表 = ≥200 字节可见 ASCII 下限规则）、`servedMismatchAction`（见下文「换模型」，省略时保留现值）、`cloudMint { enabled, mode, observeOnly, relayUrl, relayKey, proxyUrl, upstreamProxyUrl, gateway, ticketLen, ticketTtlSeconds, models, transport, cooldownSeconds, maxAttempts }`。
 `mode=native`（默认）由 cpr 经 `upstreamProxyUrl` 指定的专用代理打票，每次尝试重新建立连接以支持动态出口 IP，缺配置或连接失败不回退到账号业务代理或直连，验收票长、`__oailb` 内嵌网关名与 `response.created` 的模型声明；`mode=relay` 交给 `deploy/cloud-mint/` 的 relay，中继到上游的出口由中继配置，`proxyUrl` 只控制 cpr 到中继的一跳；账号缺票时请求侧异步预热一次；票不定时续。后台每 20 秒检查最近 10 分钟有流量的账号：凭据里的路由 cookie 对缺失或剩余不足 120 秒时，不带既有 pair 裸打一次换一对新的。`mode=relay` 时 pair 缓存在 relay 进程里，续 pair 会带 `x-mint-fresh-pair: 1`，relay 删掉这条 pair 缓存并不带 cookie 重打；票缓存仍可复用。调用方显式带了 seed cookie 时仍用那对。
 
-启用专用打票后，旧的遍历业务代理自动补票任务不再同时运行。专用代理在「票据管理」页填写，读取接口与 Debug 均不回显地址或认证信息，提交 `<set>` 保留已有值，提交空字符串清除。打票不修改账号业务代理绑定，票据仍属于同一账号与模型，并随有效路由对使用。原生打票整次调用最多 24 次尝试、75 秒，单次最多 60 秒，失败后进入配置的冷却期。
+账号目录里归入「已过期」的账号（购买票据到期且已不能调度）不打票也不预热：预取、续期和手动打票统一返回「账号已过期，不打票」；票据到期但仍在正常服务的账号照常。启用专用打票后，旧的遍历业务代理自动补票任务不再同时运行。专用代理在「票据管理」页填写，读取接口与 Debug 均不回显地址或认证信息，提交 `<set>` 保留已有值，提交空字符串清除。打票不修改账号业务代理绑定，票据仍属于同一账号与模型，并随有效路由对使用。原生打票整次调用最多 24 次尝试、75 秒，单次最多 60 秒，失败后进入配置的冷却期。
 
 云端票必须有匹配的服务模型声明和完整路由对。发布时先核对账号凭据与原路由未被并发更新，再保存路由并发布绑定该路由的票；路由写入失败不会留下新票。业务请求只使用与其凭据快照路由一致的云端票，WebSocket 发送正文前还会核对连接的实际路由。旧版本保存的未绑定路由云端票不再注入，下次缺票会重新打票；被动捕获和手动遍历的模板维持原有作用域。
 

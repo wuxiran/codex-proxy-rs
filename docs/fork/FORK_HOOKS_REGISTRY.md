@@ -43,6 +43,7 @@
 | `gateway-admin/src/lib.rs` | B+A | fork 模块声明块（`mod fork;`、`ops_report`、`ticket_cipher`、`ticket_revive`、`turn_state_renewal` 及两行 `pub use`）；`AdminServices.fork`、`AdminRuntimePorts.fork` 字段及其解构、初始化；`fork::AccountsDeps::new(..)` 一个实参；`fork::attach(..)` 一行 | `gateway-admin/src/fork.rs`（fork 服务、运行目录、3 个 worker 注册、访问器 `ops_report()` / `public_import()` / `openai()`） | 取上游，补回 16 行。`attach` 要放在上游 worker 登记之后、`AdminBundle` 构造之前；它从 `services` 里取上游已建好的 proxies、account_groups、accounts、credentials |
 | `gateway-admin/src/use_case/accounts.rs` 的 `new` | B | 构造函数末尾一个 `fork: crate::fork::AccountsDeps` 形参 | `fork.rs` 的 `AccountsDeps` | 上游改构造函数签名时，保留末尾这个形参 |
 | `apps/gateway/src/bootstrap.rs` | B | `ForkRuntimePorts::under(host.runtime_data_dir())` 一行（要在 `host` 被 `initialize` 消费之前）；`fork: fork_ports` 字段；`gateway_api::initialize` 的 `turn_state` 实参 | `gateway-admin/src/fork.rs` | 取上游，补回 3 行 |
+| `gateway-core/src/account/store.rs`、`gateway-store/.../core_adapter.rs` | B | `account_ticket_expires_at` 默认方法（返回 `None`）及其 Postgres 实现（读 `account_tickets.expires_at`） | `providers/openai/src/fork_account_ticket.rs`（已过期判定） | 取上游，补回方法；测试夹具靠默认实现无需改动 |
 | `gateway-store/src/bundle.rs` | B | `AdminStorePorts::new(..)` 之后链一个 `.with_ops_report(..)` | `gateway-store/src/postgres/ops_report.rs` | 取上游，补回链式调用 |
 | `gateway-api/src/lib.rs` | B | `mod public_import;`（fork 块）；`initialize` 的 `turn_state` 形参；`ApiState.turn_state` 字段及初始化；`.merge(public_import::router())`；`SessionState::turn_state` 实现 | `gateway-api/src/public_import.rs`、`admin/turn_state.rs` | 取上游，补回 12 行 |
 | `gateway-api/src/auth.rs` | B | `SessionState::turn_state()` 默认方法（返回 `None`） | — | 取上游，补回声明读取与累积观测 |
@@ -118,6 +119,7 @@
 | `providers/openai/src/transport/websocket/pool/state.rs`、`handshake.rs` | B | `CodexWebSocketConnectionMetadata.route_pair` 字段及其 `None` 初始化 | `route_pair.rs` | 取上游，补字段 |
 | `providers/openai/src/transport/response_meta.rs` | B | `has_model_mismatch`、`event_has_model_mismatch`：所有模型头及多值分别对照 | canonical decoder、WS reducer/stream | 取上游，补回累积检查，不能只用展示用的 effective_model |
 | `providers/openai/src/transport/protocol/responses.rs`、`websocket/model.rs`、`websocket/handshake.rs`、`client_sse.rs` | B | 本地 `minted_turn_state_route`、候选审批、严格预热标志及传递；云端票路由作为独立池键约束 | `turn_state_pin.rs`、`transport/warm_connection.rs`、`websocket/coordinator.rs` | 取上游，补回控制字段与池键，不写入上游正文 |
+| `providers/openai/src/lib.rs`、`turn_state_mint.rs`、`ws_warm_pool.rs`、`admin.rs` | A | `mod fork_account_ticket;`；打票 `load_account` 与预热循环各一处 `is_expired` 跳过；`MintError::AccountExpired` 及其文案 | `fork_account_ticket.rs` | 取上游，补回声明、两处跳过和错误映射 |
 | `providers/openai/src/ws_warm_pool.rs`、`transport/websocket/pool/` | A+B | 候选审批后领养、逐模型调度、专用代理候选与条件发布、寿命及严格模式 | `transport/warm_connection.rs`、`turn_state_mint.rs` | 回池不等于验证通过，领养必须检查模型、路由及出口作用域；保留对应 worker 和真实隧道回归测试 |
 | `providers/openai/src/transport/websocket/coordinator.rs` | A | 握手后给 `metadata.route_pair` 赋值；发送正文前核对云端票路由，不符则 discard | `route_pair.rs` 的 `RoutePairRef::handshake` | 取上游，补回 |
 | `providers/openai/src/transport/websocket/exchange/mod.rs` | B | `CodexWebSocketResponseMetadataUpdate` 的 `route_pair`、`discard_connection`、`served_mismatch` 字段 | — | 取上游，补字段 |

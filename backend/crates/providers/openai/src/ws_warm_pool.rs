@@ -307,12 +307,23 @@ impl WarmPoolService {
             // 存量/未绑定号一律不碰（不 hunt、不烧动态网关、不动在用号）。
             // 用当前 account（活跃号 revision 会被业务改）判断，别用列表里的陈旧副本。
             let bound = match self.repository.store().get_account(account.id()).await {
-                Ok(Some(fresh)) => self
-                    .repository
-                    .load_runtime_credential(&fresh)
+                Ok(Some(fresh)) => {
+                    // fork: account-ticket — 已过期的账号不预热
+                    if crate::fork_account_ticket::is_expired(
+                        self.repository.store(),
+                        &fresh,
+                        SystemTime::now(),
+                    )
                     .await
-                    .map(|c| c.turn_state_pin.is_some())
-                    .unwrap_or(false),
+                    {
+                        continue;
+                    }
+                    self.repository
+                        .load_runtime_credential(&fresh)
+                        .await
+                        .map(|c| c.turn_state_pin.is_some())
+                        .unwrap_or(false)
+                }
                 _ => false,
             };
             if !bound {

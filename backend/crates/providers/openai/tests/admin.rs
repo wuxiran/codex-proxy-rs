@@ -2955,6 +2955,33 @@ mod mint_publication {
     }
 
     #[tokio::test]
+    // fork: account-ticket — 票据到期且已不能调度的账号不打票；票据到期但还在服务的照常打
+    async fn expired_account_is_not_minted_but_a_serving_one_still_is() {
+        let relay = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(minted("a", Utc::now())))
+            .mount(&relay)
+            .await;
+        let (bundle, store, _config) = fixture(&relay).await;
+        let account = ProviderAccountId::new(ACCOUNT).unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        store.set_ticket_expiry(ACCOUNT, past);
+        bundle
+            .admin_provider()
+            .mint_turn_state(&account, vec![MODEL.to_owned()])
+            .await
+            .expect("ticket expired but still schedulable: mint goes ahead");
+        store.set_quota_exhausted(ACCOUNT);
+        let error = bundle
+            .admin_provider()
+            .mint_turn_state(&account, vec![MODEL.to_owned()])
+            .await
+            .expect_err("expired account must not mint");
+        assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
+        assert_eq!(error.public_message(), Some("账号已过期，不打票"));
+    }
+
+    #[tokio::test]
     async fn observe_only_mint_does_not_publish_route_or_ticket() {
         let relay = MockServer::start().await;
         Mock::given(method("GET"))

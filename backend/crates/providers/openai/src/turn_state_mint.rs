@@ -58,6 +58,8 @@ pub(crate) enum MintError {
     InvalidProxy,
     #[error("account is not eligible for cloud mint")]
     NotEligible,
+    #[error("account has expired")]
+    AccountExpired,
     #[error("a mint for this account is already in flight")]
     Busy,
     #[error("account is cooling down after a failed mint")]
@@ -490,6 +492,16 @@ impl CloudMintService {
             || !account.enabled()
         {
             return Err(MintError::NotEligible);
+        }
+        // fork: account-ticket — 已过期的账号不打票（预取、续期、手动打票同一入口）
+        if crate::fork_account_ticket::is_expired(
+            self.repository.store(),
+            &account,
+            SystemTime::now(),
+        )
+        .await
+        {
+            return Err(MintError::AccountExpired);
         }
         Ok(account)
     }
