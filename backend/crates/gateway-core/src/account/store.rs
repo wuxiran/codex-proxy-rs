@@ -86,4 +86,12 @@ pub trait ProviderAccountStore: Send + Sync {
     ) -> Result<(), StoreError>;
 
     async fn delete_account(&self, account: &ProviderAccountId) -> Result<(), StoreError>;
+
+    // fork: account-ticket — 购买票据的到期时间（account_tickets.expires_at）；没有票据或存储不支持时为 None。
+    async fn account_ticket_expires_at(
+        &self,
+        _account: &ProviderAccountId,
+    ) -> Result<Option<std::time::SystemTime>, StoreError> {
+        Ok(None)
+    }
 }

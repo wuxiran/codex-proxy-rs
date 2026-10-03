@@ -1090,9 +1090,10 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 use crate::turn_state_mint::MintError;
                 let kind = match error {
                     MintError::Disabled => ProviderAdminErrorKind::Unsupported,
-                    MintError::NotEligible | MintError::ProxyRequired | MintError::InvalidProxy => {
-                        ProviderAdminErrorKind::Invalid
-                    }
+                    MintError::NotEligible
+                    | MintError::AccountExpired
+                    | MintError::ProxyRequired
+                    | MintError::InvalidProxy => ProviderAdminErrorKind::Invalid,
                     MintError::Busy | MintError::CoolingDown | MintError::Stale => {
                         ProviderAdminErrorKind::Conflict
                     }
@@ -1106,6 +1107,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
                     MintError::ProxyRequired => "请先在票据管理页配置专用打票代理",
                     MintError::InvalidProxy => "打票代理地址无效，请检查代理配置",
                     MintError::NotEligible => "只有已启用「固定自身 state」的 OAuth 账号能打票",
+                    MintError::AccountExpired => "账号已过期，不打票",
                     MintError::Busy => "该账号正在打票中",
                     MintError::CoolingDown => "上次打票失败，冷却中",
                     MintError::Unreachable => "打票代理或服务不可达",

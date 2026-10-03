@@ -66,6 +66,21 @@ impl ProviderAccountStore for PgProviderAccountRepository {
             .transpose()
     }
 
+    // fork: account-ticket
+    async fn account_ticket_expires_at(
+        &self,
+        account: &CoreProviderAccountId,
+    ) -> Result<Option<std::time::SystemTime>, CoreStoreError> {
+        let expires_at: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+            "select expires_at from account_tickets where provider_account_id = $1",
+        )
+        .bind(account.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::Unavailable))?;
+        Ok(expires_at.flatten().map(std::time::SystemTime::from))
+    }
+
     async fn list_accounts(&self) -> Result<Vec<CoreProviderAccount>, CoreStoreError> {
         self.list_provider_accounts(None, true)
             .await
