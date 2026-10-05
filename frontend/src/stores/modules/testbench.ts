@@ -30,6 +30,9 @@ export interface ExecutionDetails {
   ticketAttached?: boolean | null
   warmPoolUsed?: boolean | null
   warmVerified?: boolean | null
+  warmVerificationStatus?: 'fresh' | 'expired' | 'conditions_changed' | 'unchecked' | 'pending' | 'rejected' | null
+  warmVerifiedAtMs?: number | null
+  warmVerificationAgeMs?: number | null
   connectionReused?: boolean | null
   connectionId?: string | null
   transport?: string | null

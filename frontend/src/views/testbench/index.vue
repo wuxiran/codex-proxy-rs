@@ -58,6 +58,30 @@ function groupOptions() {
   ]
 }
 
+function verificationText(run: RunState) {
+  const execution = run.execution
+  switch (execution?.warmVerificationStatus) {
+    case 'fresh': {
+      const age = execution.warmVerificationAgeMs
+      return typeof age === 'number' && Number.isFinite(age) && age >= 0
+        ? `发出时探针通过（${Math.floor(age / 1000)} 秒前）`
+        : '探针通过（时间未记录）'
+    }
+    case 'expired': return '探针已过期'
+    case 'conditions_changed': return '探针条件已变化'
+    case 'unchecked': return '未做答题检查'
+    case 'pending': return '探针待验证'
+    case 'rejected': return '探针未通过'
+    default: return execution?.warmVerified === true ? '历史探针通过（时间未记录）' : '探针未记录'
+  }
+}
+
+function verificationTitle(run: RunState) {
+  const at = run.execution?.warmVerifiedAtMs
+  const time = typeof at === 'number' && Number.isFinite(at) ? `最近探针：${new Date(at).toLocaleString()}。` : ''
+  return `${time}此状态描述连接探针，不代表本次回答正确。`
+}
+
 function downloadOutput(run: RunState) {
   const blob = new Blob([run.output], { type: 'text/html;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -220,11 +244,18 @@ onMounted(() => {
               <span :class="run.execution?.ticketAttached ? 'text-emerald-600 dark:text-emerald-400' : 'text-neutral-500'">
                 {{ run.execution?.ticketAttached === true ? '已带票' : run.execution?.ticketAttached === false ? '未带票' : '带票未记录' }}
               </span>
-              <span :class="run.execution?.warmPoolUsed ? 'text-emerald-600 dark:text-emerald-400' : 'text-neutral-500'">
-                {{ run.execution?.warmPoolUsed === true ? '暖池命中' : run.execution?.warmPoolUsed === false ? '未命中暖池' : '暖池未记录' }}
+              <span class="text-cp-text-secondary">
+                {{ run.execution?.warmPoolUsed === true ? '暖池连接' : run.execution?.warmPoolUsed === false ? '未命中暖池' : '暖池未记录' }}
               </span>
               <span class="text-neutral-500" :title="run.execution?.connectionId || undefined">
                 {{ run.execution?.transport === 'http_sse' || run.execution?.transport === 'http' ? 'HTTP SSE' : run.execution?.connectionReused === true ? 'WS 已复用' : run.execution?.connectionReused === false ? 'WS 新建' : '连接未记录' }}
+              </span>
+              <span
+                v-if="run.execution?.warmPoolUsed === true"
+                :class="run.execution?.warmVerificationStatus === 'fresh' && run.execution?.warmVerified === true ? 'text-cp-success' : 'text-cp-text-secondary'"
+                :title="verificationTitle(run)"
+              >
+                {{ verificationText(run) }}
               </span>
             </div>
             <!-- 人工判定（独立于运行状态） -->

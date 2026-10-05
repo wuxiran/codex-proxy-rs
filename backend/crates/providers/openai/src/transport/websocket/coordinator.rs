@@ -157,6 +157,7 @@ pub(crate) async fn prepare_response_create_request_with_pool(
                 request.requested_model(),
                 request.require_verified_warm,
                 request.allow_warm_reuse,
+                &request.warm_verification,
             )
             .await;
         if !request.require_verified_warm || matches!(acquired, WebSocketPoolAcquire::Reused { .. })
@@ -653,11 +654,40 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         )
         .with_connection_observation(observation));
     }
+    let verification = warm_approval.as_ref().map(|approval| {
+        approval.snapshot(
+            request.requested_model(),
+            created_at.elapsed(),
+            &request.warm_verification,
+        )
+    });
+    // 选择连接与真正发正文之间也可能跨过证明期限；不能只在池锁内验一次。
+    if request.warm_approval.is_none()
+        && matches!(
+            request.continuation(),
+            WebSocketContinuationRequirement::NewChain
+        )
+        && verification.as_ref().is_some_and(|proof| {
+            proof.status != crate::transport::warm_connection::WarmVerificationStatus::Fresh
+                && (request.require_verified_warm
+                    || proof.status
+                        != crate::transport::warm_connection::WarmVerificationStatus::Unchecked)
+        })
+    {
+        let observation = websocket
+            .observation()
+            .with_exit_reason("warm_verification_unavailable");
+        discard_connection(websocket, lease, observation).await;
+        return Err(CodexWebSocketExchangeError::WarmUnavailable);
+    }
     trace.record("upstream.connection", serde_json::json!({
         "connectionId": websocket.connection_id().to_string(), "reused": reused,
         "pool": pool_decision.map_or("unpooled", WebSocketPoolDecision::kind),
         "status": metadata.diagnostics.status_code,
-        "warmVerified": warm_approval.as_ref().map(|approval| approval.checked()),
+        "warmVerified": verification.as_ref().map(|proof| proof.status == crate::transport::warm_connection::WarmVerificationStatus::Fresh),
+        "warmVerificationStatus": verification.as_ref().map(|proof| proof.status.as_str()),
+        "warmVerifiedAtMs": verification.as_ref().and_then(|proof| proof.at_ms),
+        "warmVerificationAgeMs": verification.as_ref().and_then(|proof| proof.age_ms),
         "upstreamRequestId": metadata.diagnostics.request_id,
         "headers": gateway_core::diagnostics::diagnostic_headers(metadata.diagnostics.trace_headers.iter().map(|(name, value)| (name.as_str(), value.as_str()))),
     }));

@@ -3,6 +3,150 @@
 use super::*;
 
 #[tokio::test]
+async fn adopted_connection_cannot_start_a_new_chain_after_probe_proof_expires() {
+    verification_lifecycle_case("expiry").await;
+}
+
+#[tokio::test]
+async fn adopted_connection_cannot_keep_old_verification_after_ticket_changes() {
+    verification_lifecycle_case("ticket").await;
+}
+
+#[tokio::test]
+async fn adopted_connection_cannot_keep_old_verification_after_policy_changes() {
+    verification_lifecycle_case("policy").await;
+}
+
+#[tokio::test]
+async fn proof_expiry_does_not_break_an_existing_connection_local_continuation() {
+    verification_lifecycle_case("continuation").await;
+}
+
+async fn verification_lifecycle_case(change: &str) {
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let address = listener.local_addr().unwrap();
+    let accepts = Arc::clone(&listener);
+    let continued = change == "continuation";
+    let server = tokio::spawn(async move {
+        let (stream, _) = accepts.accept().await.unwrap();
+        let mut ws = accept_codex_test_websocket(stream).await;
+        let mut received = 0;
+        while let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Text(text) => {
+                    received += 1;
+                    let id = match received {
+                        1 => "resp_lifecycle_warm",
+                        2 => "resp_lifecycle_business",
+                        3 if continued => {
+                            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(body["previous_response_id"], "resp_lifecycle_business");
+                            "resp_lifecycle_continued"
+                        }
+                        _ => panic!(
+                            "a new chain reached a connection whose verification no longer matches"
+                        ),
+                    };
+                    ws.send(Message::Text(completed_websocket_response(id, 1, 0).into()))
+                        .await
+                        .unwrap();
+                    if received == 3 {
+                        ws.close(None).await.unwrap();
+                        break;
+                    }
+                }
+                Message::Ping(bytes) => ws.send(Message::Pong(bytes)).await.unwrap(),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(received, if continued { 3 } else { 2 });
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{address}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_secs(3000))));
+    let mut warm = pooled_websocket_request("__cpr_warm__:0");
+    let approval = provider_openai::transport::WarmConnectionApproval::new(
+        warm.model().to_owned(),
+        Duration::from_secs(3000),
+    );
+    warm.warm_approval = Some(approval.clone());
+    backend
+        .create_response(
+            &warm,
+            request_context("req_lifecycle_warm", Some("fixture-account")),
+        )
+        .await
+        .unwrap();
+    approval.publish_scoped(
+        true,
+        Duration::from_secs(240),
+        Some("synthetic-a"),
+        Some([1; 32]),
+    );
+    let mut business = pooled_websocket_request("verification-lifecycle");
+    business.set_previous_response_id(None);
+    business.previous_response_scope = None;
+    business.warm_verification_policy = Some([1; 32]);
+    business.require_verified_warm = true;
+    let first = backend
+        .create_response(
+            &business,
+            request_context("req_lifecycle_first", Some("fixture-account")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.websocket_pool_decision.unwrap().kind(), "reuse");
+    match change {
+        "ticket" => business.turn_state = Some("synthetic-b".to_owned()),
+        "policy" => business.warm_verification_policy = Some([2; 32]),
+        _ => {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(241)).await;
+            tokio::time::resume();
+        }
+    }
+    if continued {
+        business.require_verified_warm = false;
+        business.set_previous_response_id(Some("resp_lifecycle_business".to_owned()));
+        business.previous_response_scope = Some(PreviousResponseScope::ConnectionLocal);
+        let response = backend
+            .create_response(
+                &business,
+                request_context("req_lifecycle_continue", Some("fixture-account")),
+            )
+            .await
+            .unwrap();
+        assert!(response.body.contains("resp_lifecycle_continued"));
+        assert_eq!(response.websocket_pool_decision.unwrap().kind(), "reuse");
+    } else {
+        let error = backend
+            .create_response(
+                &business,
+                request_context("req_lifecycle_rejected", Some("fixture-account")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CodexClientError::WebSocket(CodexWebSocketExchangeError::WarmUnavailable)
+        ));
+    }
+    timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn verified_only_request_never_opens_an_unverified_upstream_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

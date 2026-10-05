@@ -273,6 +273,10 @@ fn test_bench_defaults_to_business_and_exposes_observations_without_secrets() {
             details: AccountProbeExecution {
                 ticket_attached: Some(false),
                 warm_pool_used: Some(true),
+                warm_verified: Some(false),
+                warm_verification_status: Some("expired".to_owned()),
+                warm_verified_at_ms: Some(1700000000000),
+                warm_verification_age_ms: Some(300000),
                 connection_reused: Some(true),
                 ..Default::default()
             },
@@ -281,5 +285,9 @@ fn test_bench_defaults_to_business_and_exposes_observations_without_secrets() {
     assert_eq!(event.data["type"], "execution");
     assert_eq!(event.data["details"]["ticketAttached"], false);
     assert_eq!(event.data["details"]["warmPoolUsed"], true);
+    assert_eq!(event.data["details"]["warmVerified"], false);
+    assert_eq!(event.data["details"]["warmVerificationStatus"], "expired");
+    assert_eq!(event.data["details"]["warmVerifiedAtMs"], 1700000000000u64);
+    assert_eq!(event.data["details"]["warmVerificationAgeMs"], 300000);
     assert!(event.data["details"]["connectionId"].is_null());
 }

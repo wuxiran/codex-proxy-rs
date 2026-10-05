@@ -173,7 +173,8 @@ impl CodexWebSocketPool {
                 key.is_warm()
                     && key.account_id() == account_id
                     && matches!(slot, WebSocketPoolSlot::Idle { connection }
-                        if connection.warm_approval.as_ref().is_some_and(|approval| approval.published())
+                        if connection.warm_approval.as_ref().is_some_and(|approval|
+                            approval.published() && (!approval.was_checked() || approval.checked()))
                         && !state::should_close_idle_connection(connection, tokio::time::Instant::now(), self.config.max_age))
             })
             .count()
@@ -197,6 +198,18 @@ impl CodexWebSocketPool {
                 .flatten()
             })
             .collect()
+    }
+
+    pub(crate) fn warm_slots_due_for_reprobe(
+        &self,
+        account_id: &str,
+    ) -> std::collections::BTreeSet<usize> {
+        self.lock_state().slots.iter().filter_map(|(key, slot)| {
+            (key.is_warm() && key.account_id() == account_id
+                && matches!(slot, WebSocketPoolSlot::Idle { connection }
+                    if connection.warm_approval.as_ref().is_some_and(WarmConnectionApproval::needs_reprobe)))
+                .then(|| key.warm_slot()).flatten()
+        }).collect()
     }
 
     /// 进程内所有账号的保活连接总数（空闲的保活 slot）；`max_total_connections` 用。
@@ -269,16 +282,24 @@ impl CodexWebSocketPool {
         account_id: &str,
         slot: usize,
         approval: &WarmConnectionApproval,
-    ) {
+    ) -> Option<(uuid::Uuid, WarmConnectionApproval)> {
         let mut state = self.lock_state();
+        let mut previous = None;
+        let mut matched = 0;
         for (key, value) in &mut state.slots {
             if key.account_id() == account_id
                 && key.warm_slot() == Some(slot)
                 && let WebSocketPoolSlot::Idle { connection } = value
             {
-                connection.warm_approval = Some(approval.clone());
+                previous = connection
+                    .warm_approval
+                    .replace(approval.clone())
+                    .map(|approval| (connection.websocket.connection_id(), approval));
+                matched += 1;
             }
         }
+        // 多个历史key撞到同一slot时不猜测继承哪份票据证明。
+        (matched == 1).then_some(previous).flatten()
     }
 
     pub(crate) fn has_warm_candidate(&self, approval: &WarmConnectionApproval) -> bool {
@@ -330,6 +351,7 @@ impl CodexWebSocketPool {
         model: &str,
         require_verified: bool,
         allow_warm: bool,
+        verification: &crate::transport::warm_connection::WarmVerificationContext,
     ) -> WebSocketPoolAcquire {
         self.spawn_maintenance_task();
         let mut connections_to_close = Vec::new();
@@ -379,10 +401,25 @@ impl CodexWebSocketPool {
                         &connection,
                         tokio::time::Instant::now(),
                         self.config.max_age,
-                    ) || (require_verified
+                        // 已领用连接不插入探针；新对话遇到过期或换票的证明时重新选连接。
+                        // 带 previous_response_id 的续接沿用原连接，不因证明过期而打断链。
+                    ) || (!key.is_warm() && verification.is_new_chain() && {
+                        connection.warm_approval.as_ref().is_some_and(|approval| {
+                            approval.was_checked()
+                                && !approval.permits_request(
+                                    model,
+                                    connection.created_at.elapsed(),
+                                    verification,
+                                )
+                        })
+                    }) || (require_verified
                         && !connection.warm_approval.as_ref().is_some_and(|approval| {
                             approval.checked()
-                                && approval.permits(model, connection.created_at.elapsed())
+                                && approval.permits_request(
+                                    model,
+                                    connection.created_at.elapsed(),
+                                    verification,
+                                )
                         }));
                     let closed = connection.websocket.is_closed();
                     if !expired && !closed {
@@ -430,6 +467,7 @@ impl CodexWebSocketPool {
                     &key,
                     model,
                     require_verified,
+                    verification,
                     &mut connections_to_close,
                 )
             {
@@ -479,6 +517,7 @@ impl CodexWebSocketPool {
         key: &CodexWebSocketPoolKey,
         model: &str,
         require_verified: bool,
+        verification: &crate::transport::warm_connection::WarmVerificationContext,
         connections_to_close: &mut Vec<PooledWebSocketConnection>,
     ) -> Option<WebSocketPoolAcquire> {
         loop {
@@ -486,7 +525,7 @@ impl CodexWebSocketPool {
                 (candidate.serves_warm_target(key)
                     && matches!(slot, WebSocketPoolSlot::Idle { connection }
                         if connection.warm_approval.as_ref().is_some_and(|approval|
-                            approval.permits(model, connection.created_at.elapsed())
+                            approval.permits_request(model, connection.created_at.elapsed(), verification)
                             && (!require_verified || approval.checked())
                             && candidate.accepts_warm_egress(key, approval))
                         && key.accepts_route(connection.metadata.route_pair.as_ref())))

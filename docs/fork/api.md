@@ -231,12 +231,16 @@ OpenAI OAuth 账号在「票据管理 → 账号票与预热」启停票据与�
 `warmPool` 控制后台 WebSocket 候选，仅作用于启用 `pinTurnState` 的 OpenAI OAuth 账号
 
 - `models` 中每个模型分别建立连接，`connectionsPerAccount` 是每账号、每模型的保留数，合计受 `maxTotalConnections` 限制；模型列表留空时跟随业务，首次使用 `gpt-6-astra`
-- `probe=true` 要求完整响应、模型声明匹配且答案通过检查，期望 `21` 不接受 `210`；关闭答案检查只标记 `ready`，不标记 `verified`
+- `probe=true` 要求完整响应、模型声明匹配且完整答案等于期望值；允许首尾空白和单层强调/行内代码，期望 `21` 不接受 `210`、`21.0` 或附带解释的答案；关闭答案检查只标记 `ready`，不标记 `verified`
 - 启用专用打票且已配置代理时，候选通过该代理建立，失败后关闭连接再尝试；开启 `businessReuse` 后，候选通过才条件发布路由及新签票，业务复用同一条连接，账号保存的业务代理不改写
 - `businessReuse=false` 只建立和检查候选，预热不发布账号票或路由，也不向业务提供候选连接；普通业务继续原有路径
 - `probeRetries` 是首次之后的追加次数，`0` 表示每轮只尝试一次；失败槽位在 `cooldownSeconds` 后继续尝试，不影响其他已通过的槽位
 - `probeTimeoutSeconds` 限制探针请求阶段，已开始的发布与失败恢复会完成；`maxAgeSeconds` 限制连接寿命，`reprobeSeconds` 控制复探，池满或其他槽位冷却不阻止已有连接复探；后台每 20 秒应用设置，配置改变会重新验证候选
 - `requireVerified=true` 要求新对话使用验证通过的连接，每次账号尝试最多等待 2 秒，未就绪返回 503 和 `Retry-After: 2`；此模式须开启答案检查与业务复用，自动补票和续 pair 交由预热验证后发布；客户端自带当轮票及已有续接不改写
+
+探针证明与连接寿命分开检查：证明期限不超过复探间隔和当前票据寿命，有签发时间时还受票据剩余时间限制。请求附带不同票据、模型不符、账号票据绑定代次或探针策略改变时，原证明不能用于该请求。复探可以更新证明，但没有新票时不改变旧票的到期上限
+
+尚在暖池中的候选提前复探；已领用连接不插入探针，新对话遇到过期或条件变化的证明时重新选择连接。带 `previous_response_id` 的已有续接保留原协议路径，观测中如实标明探针过期或条件变化
 
 `requireVerified` 初始为 `false`，保留无可用候选时普通建连的行为，管理更新省略该字段时保留现值；为兼容已有设置，关闭时不序列化该字段。回滚到不支持该字段的版本前，应恢复可读取的设置备份
 
@@ -250,8 +254,10 @@ OpenAI OAuth 账号在「票据管理 → 账号票与预热」启停票据与�
 
 - `mode=business` 为默认，固定所选账号，遵守账号可用性、模型权限和并发限制，使用当前票与暖池策略
 - `mode=diagnostic` 保留原始账号诊断，跳过固定票与暖池领用，可用于对照和排查停用账号
-- SSE 的 `execution` 事件返回 `mode` 和 `details`，其中 `ticketAttached` 表示请求是否附带票，`warmPoolUsed`、`warmVerified`、`connectionReused`、`connectionId`、`transport` 来自实际执行观测
-- 未记录的事实为 `null`，页面显示未记录；仅返回布尔值和连接标识，不返回票、Cookie 或认证头
+- SSE 的 `execution` 事件返回 `mode` 和 `details`，其中 `ticketAttached` 表示请求是否附带票，`warmPoolUsed` 仅表示连接来自暖池；`connectionReused`、`connectionId`、`transport` 来自实际执行观测
+- `warmVerified` 表示请求发出时探针证明仍有效且条件匹配；`warmVerificationStatus` 为 `fresh`、`expired`、`conditions_changed`、`unchecked`、`pending` 或 `rejected`
+- `warmVerifiedAtMs` 是最近证明的服务器 Unix 毫秒时间，`warmVerificationAgeMs` 是发出请求时由服务器计算的证明年龄，不使用浏览器时钟推断
+- 未记录的事实为 `null`，旧结果没有时间信息时显示历史记录；不返回票、Cookie、认证头或证明指纹。探针通过不等于本次回答正确
 
 业务方式仍是管理员固定账号测试，不经过 Client Key 的分组选号和限额计费；完整 API 验收使用实际 Client Key。票附带状态不等于上游已接收，传输失败仍按错误结果处理
 

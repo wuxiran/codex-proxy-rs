@@ -36,6 +36,7 @@ pub struct CodexWebSocketRequest {
     pub(super) discard_mismatched_connection: bool,
     pub(super) minted_turn_state_route: Option<String>,
     pub(super) warm_approval: Option<crate::transport::WarmConnectionApproval>,
+    pub(super) warm_verification: crate::transport::warm_connection::WarmVerificationContext,
     pub(super) require_verified_warm: bool,
     pub(super) allow_warm_reuse: bool,
 }

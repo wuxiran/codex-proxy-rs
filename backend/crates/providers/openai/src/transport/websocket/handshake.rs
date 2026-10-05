@@ -106,6 +106,16 @@ impl CodexWebSocketConnection {
             discard_mismatched_connection: request.discard_mismatched_connection,
             minted_turn_state_route: request.minted_turn_state_route.clone(),
             warm_approval: request.warm_approval.clone(),
+            warm_verification: crate::transport::warm_connection::WarmVerificationContext::new(
+                request.turn_state.as_deref().or_else(|| {
+                    request
+                        .client_metadata()
+                        .and_then(|metadata| metadata.get("x-codex-turn-state"))
+                        .and_then(serde_json::Value::as_str)
+                }),
+                request.warm_verification_policy,
+            )
+            .with_continuation(request.previous_response_id().is_some()),
             require_verified_warm: request.require_verified_warm,
             // 客户端当轮票没有候选路由证明，不能把它送进另一条新领养的连接。
             allow_warm_reuse: request.allow_warm_reuse

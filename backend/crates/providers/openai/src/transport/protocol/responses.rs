@@ -83,6 +83,8 @@ pub struct CodexResponsesRequest {
     pub minted_turn_state_route: Option<String>,
     /// 仅内部预热请求持有；没有发布凭证的 warm 连接不能被业务领养。
     pub warm_approval: Option<crate::transport::WarmConnectionApproval>,
+    /// 本轮冻结的探针策略指纹，仅用于本地证明匹配，不传给上游。
+    pub warm_verification_policy: Option<[u8; 32]>,
     /// 只用于本地选择连接，不进入上游正文。
     pub require_verified_warm: bool,
     /// 请求冻结的预热复用开关，模拟运行或关闭预热时不领养候选。
@@ -541,6 +543,7 @@ impl CodexResponsesRequest {
             discard_mismatched_connection: false,
             minted_turn_state_route: None,
             warm_approval: None,
+            warm_verification_policy: None,
             require_verified_warm: false,
             allow_warm_reuse: true,
         }

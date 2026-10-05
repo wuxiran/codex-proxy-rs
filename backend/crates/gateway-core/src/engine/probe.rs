@@ -30,6 +30,9 @@ pub struct AccountProbeExecution {
     pub ticket_attached: Option<bool>,
     pub warm_pool_used: Option<bool>,
     pub warm_verified: Option<bool>,
+    pub warm_verification_status: Option<String>,
+    pub warm_verified_at_ms: Option<u64>,
+    pub warm_verification_age_ms: Option<u64>,
     pub connection_reused: Option<bool>,
     pub connection_id: Option<String>,
     pub transport: Option<String>,
@@ -53,6 +56,9 @@ impl AccountProbeExecution {
                     result.connection_id = None;
                     result.connection_reused = None;
                     result.warm_verified = None;
+                    result.warm_verification_status = None;
+                    result.warm_verified_at_ms = None;
+                    result.warm_verification_age_ms = None;
                     result.transport = data["transport"]
                         .as_str()
                         .filter(|v| matches!(*v, "websocket" | "http_sse" | "http"))
@@ -67,6 +73,22 @@ impl AccountProbeExecution {
                     result.transport = Some("websocket".to_owned());
                     result.connection_reused = data["reused"].as_bool();
                     result.warm_verified = data["warmVerified"].as_bool();
+                    result.warm_verification_status = data["warmVerificationStatus"]
+                        .as_str()
+                        .filter(|value| {
+                            matches!(
+                                *value,
+                                "fresh"
+                                    | "expired"
+                                    | "conditions_changed"
+                                    | "unchecked"
+                                    | "pending"
+                                    | "rejected"
+                            )
+                        })
+                        .map(str::to_owned);
+                    result.warm_verified_at_ms = data["warmVerifiedAtMs"].as_u64();
+                    result.warm_verification_age_ms = data["warmVerificationAgeMs"].as_u64();
                     result.warm_pool_used =
                         data.get("warmVerified").map(serde_json::Value::is_boolean);
                     result.connection_id = data["connectionId"]
@@ -278,4 +300,47 @@ pub trait AccountProbe: Send + Sync {
         request: AccountProbeRequest,
         snapshot: Option<std::sync::Arc<crate::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>>;
+}
+
+#[cfg(test)]
+mod verification_trace_tests {
+    use super::AccountProbeExecution;
+    use serde_json::json;
+
+    #[test]
+    fn warm_origin_is_separate_from_a_proof_that_no_longer_matches() {
+        let execution = AccountProbeExecution::from_trace(Some(json!({"events": [{
+            "stage": "upstream.connection", "data": {
+                "reused": true, "warmVerified": false, "warmVerificationStatus": "conditions_changed",
+                "warmVerifiedAtMs": 1700000000000u64, "warmVerificationAgeMs": 241000,
+                "connectionId": "fixture-warm"
+            }
+        }]})));
+        assert_eq!(execution.warm_pool_used, Some(true));
+        assert_eq!(execution.warm_verified, Some(false));
+        assert_eq!(
+            execution.warm_verification_status.as_deref(),
+            Some("conditions_changed")
+        );
+        assert_eq!(execution.warm_verification_age_ms, Some(241000));
+    }
+
+    #[test]
+    fn retry_or_http_exchange_cannot_inherit_a_previous_websocket_verification() {
+        for reset in [
+            json!({"stage": "attempt.started", "data": {}}),
+            json!({"stage": "upstream.exchange.started", "data": {"transport": "http_sse"}}),
+        ] {
+            let execution = AccountProbeExecution::from_trace(Some(json!({"events": [{
+                "stage": "upstream.connection", "data": {
+                    "reused": true, "warmVerified": true, "warmVerificationStatus": "fresh",
+                    "warmVerifiedAtMs": 1700000000000u64, "warmVerificationAgeMs": 8000
+                }
+            }, reset]})));
+            assert_eq!(execution.warm_verified, None);
+            assert_eq!(execution.warm_verification_status, None);
+            assert_eq!(execution.warm_verified_at_ms, None);
+            assert_eq!(execution.warm_verification_age_ms, None);
+        }
+    }
 }

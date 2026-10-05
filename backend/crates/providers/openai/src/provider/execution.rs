@@ -916,6 +916,11 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         }
         // 复用决定随请求冻结，不能等待后台轮询才关闭模拟运行中的候选领养。
         let warm_runtime = turn_state_pins.service().settings();
+        request.warm_verification_policy = Some(crate::transport::WarmConnectionApproval::policy_key(
+            &warm_runtime.warm_pool,
+            warm_runtime.ttl().min(warm_runtime.cloud_mint.ticket_ttl()),
+            lease.turn_state_pin(),
+        ));
         request.allow_warm_reuse = !warm_runtime.dry_run && warm_runtime.warm_pool.enabled && warm_runtime.warm_pool.business_reuse
             && lease.turn_state_pin().is_some() && allows_account_state_mutation && !context.is_diagnostic_required_account();
         // WS 预热：记录实际业务模型，唤醒候选补齐。

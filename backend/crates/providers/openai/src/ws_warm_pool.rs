@@ -69,8 +69,6 @@ struct AccountState {
     models: BTreeMap<String, Instant>,
     warm_models: Vec<String>,
     cooldown_until: HashMap<usize, Instant>,
-    /// 每个 slot 上一次探针通过的时间；用于低频复探。
-    verified_at: HashMap<usize, Instant>,
     in_flight: bool,
     last: Option<WarmReport>,
 }
@@ -97,6 +95,19 @@ struct ProbeCapture {
     headers: Vec<String>,
     route: Option<crate::route_pair::RoutePairRef>,
     connection_id: Option<uuid::Uuid>,
+    pin_generation: Option<String>,
+}
+
+impl ProbeCapture {
+    fn previous_approval<'a>(
+        &self,
+        previous: Option<&'a (uuid::Uuid, WarmConnectionApproval)>,
+    ) -> Option<&'a WarmConnectionApproval> {
+        // 同一槽位也可能已重连，旧票的证明只能由原连接继承。
+        previous
+            .filter(|(id, _)| self.connection_id == Some(*id))
+            .map(|(_, approval)| approval)
+    }
 }
 
 /// 取消或提前返回也撤销候选，后台维护随后回收连接，不会遗留可被领养的半成品。
@@ -284,7 +295,6 @@ impl WarmPoolService {
             } else {
                 state.policy = Some(policy);
                 for entry in state.accounts.values_mut() {
-                    entry.verified_at.clear();
                     entry.cooldown_until.clear();
                 }
                 state.accounts.keys().cloned().collect::<Vec<_>>()
@@ -341,7 +351,6 @@ impl WarmPoolService {
                 if changed {
                     entry.warm_models = models.clone();
                     entry.cooldown_until.clear();
-                    entry.verified_at.clear();
                 }
                 changed
             };
@@ -352,6 +361,7 @@ impl WarmPoolService {
             // 池是「哪些 slot 有活连接」的唯一真相（可能被业务领养/被 evict 掉）。
             // 先在池锁外取占用序号，再进 warmer 状态锁，避免同时持两把锁。
             let occupied = self.pool.warm_slots_for_account(&id);
+            let needs_reprobe = self.pool.warm_slots_due_for_reprobe(&id);
             let can_open = self.in_flight_total.load(Ordering::Acquire)
                 + self.pool.warm_len_total()
                 < settings.max_total_connections as usize
@@ -361,25 +371,13 @@ impl WarmPoolService {
             let (slot, reason) = {
                 let mut state = Self::lock_state(&self.state);
                 let entry = state.accounts.entry(id.clone()).or_default();
-                // 清理已不再占用的 slot 的复探时间戳（被领养/evict 的连接）。
-                entry.verified_at.retain(|slot, _| occupied.contains(slot));
                 if entry.in_flight {
                     continue;
                 }
                 // 复探不依赖补池成功；同时有两类任务时交替，避免较短复探间隔饿死补池。
                 let due = settings
                     .probe
-                    .then(|| {
-                        occupied
-                            .iter()
-                            .find(|slot| {
-                                entry
-                                    .verified_at
-                                    .get(slot)
-                                    .is_none_or(|at| now.duration_since(*at) >= settings.reprobe())
-                            })
-                            .copied()
-                    })
+                    .then(|| needs_reprobe.iter().next().copied())
                     .flatten();
                 let missing = can_open
                     .then(|| {
@@ -498,7 +496,7 @@ impl WarmPoolService {
                 (!proxy_url.is_empty()).then(|| business_client.pool_egress_key().to_owned()),
             );
             let _pending = PendingApproval(approval.clone());
-            self.pool.begin_warm_probe(&id, slot, &approval);
+            let previous_approval = self.pool.begin_warm_probe(&id, slot, &approval);
             let publication = if proxy_url.is_empty() || !settings.business_reuse {
                 None
             } else {
@@ -594,16 +592,52 @@ impl WarmPoolService {
                         self.pool.evict_warm_slot(&id, slot).await;
                         return;
                     }
-                    approval.publish(settings.probe);
+                    let ticket = capture
+                        .as_ref()
+                        .and_then(|evidence| evidence.ticket.as_deref());
+                    let ticket_ttl = latest.ttl().min(latest.cloud_mint.ticket_ttl());
+                    let valid_for = verification_valid_for(
+                        settings.reprobe(),
+                        ticket_ttl,
+                        ticket,
+                        report.at,
+                        SystemTime::now(),
+                    );
+                    approval.publish_rechecked(
+                        settings.probe,
+                        valid_for,
+                        ticket,
+                        ticket.map(|ticket| {
+                            verification_valid_for(
+                                ticket_ttl,
+                                ticket_ttl,
+                                Some(ticket),
+                                report.at,
+                                SystemTime::now(),
+                            )
+                        }),
+                        Some(WarmConnectionApproval::policy_key(
+                            settings,
+                            ticket_ttl,
+                            capture
+                                .as_ref()
+                                .and_then(|evidence| evidence.pin_generation.as_deref()),
+                        )),
+                        capture.as_ref().and_then(|evidence| {
+                            evidence.previous_approval(previous_approval.as_ref())
+                        }),
+                    );
+                    if !approval.published() {
+                        self.pool.evict_warm_slot(&id, slot).await;
+                        report.verdict = Some("failed");
+                        report.error = Some("verification_expired".to_owned());
+                        continue;
+                    }
                     report.verdict = Some(if settings.probe { "verified" } else { "ready" });
                     report.served_model = served_model;
                     report.gateway = gateway.clone();
                     if let Some(gw) = gateway {
                         report.tried_gateways.push(gw);
-                    }
-                    if let Ok(mut state) = self.state.lock() {
-                        let entry = state.accounts.entry(id.clone()).or_default();
-                        entry.verified_at.insert(slot, Instant::now());
                     }
                     tracing::info!(
                         target: "ws_warm",
@@ -811,6 +845,7 @@ impl WarmPoolService {
             headers: response.set_cookie_headers.clone(),
             route: crate::route_pair::RoutePairRef::issued(&response.set_cookie_headers),
             connection_id: response.websocket_connection_id,
+            pin_generation: credential.turn_state_pin.clone(),
         };
         let updates = response.response_metadata_updates.clone();
         let verdict = self
@@ -1024,15 +1059,35 @@ fn disagreeing_model(
         .map(str::to_owned)
 }
 
-/// 期望答案之后必须是结尾或非数字。`210` 不能通过期望 `21`。
+/// 只接受完整期望值；允许单层强调或行内代码，不把带解释或矛盾结论的前缀判为通过。
 fn answer_matches(answer: &str, expect: &str) -> bool {
-    let trimmed = answer.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
-    trimmed.strip_prefix(expect).is_some_and(|rest| {
-        !rest
-            .chars()
-            .next()
-            .is_some_and(|next| next.is_ascii_digit())
-    })
+    let answer = answer.trim();
+    let normalized = ["**", "__", "`", "*", "_"]
+        .into_iter()
+        .find_map(|marker| {
+            answer
+                .strip_prefix(marker)
+                .and_then(|text| text.strip_suffix(marker))
+        })
+        .unwrap_or(answer)
+        .trim();
+    normalized == expect.trim()
+}
+
+fn verification_valid_for(
+    reprobe: Duration,
+    ticket_ttl: Duration,
+    ticket: Option<&str>,
+    captured_at: SystemTime,
+    now: SystemTime,
+) -> Duration {
+    let limit = reprobe.min(ticket_ttl);
+    let Some(ticket) = ticket else { return limit };
+    turn_state::fernet::resolve_issued_at(ticket, captured_at, now, Duration::from_secs(30))
+        .ok()
+        .and_then(|issued| issued.at.checked_add(ticket_ttl))
+        .and_then(|expires| expires.duration_since(now).ok())
+        .map_or(Duration::ZERO, |remaining| remaining.min(limit))
 }
 
 /// 代理或上游错误只留下受控标签，不把响应正文、认证信息或代理 URL 写进报告。
@@ -1060,6 +1115,102 @@ fn probe_transport_error(error: crate::transport::CodexClientError) -> String {
 #[cfg(test)]
 mod judge_tests {
     use super::{Verdict, WarmPoolService};
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnecting_a_slot_cannot_transfer_the_previous_connections_ticket_proof() {
+        use super::{ProbeCapture, WarmConnectionApproval};
+        use std::time::Duration;
+
+        let lifetime = Duration::from_secs(240);
+        let previous = WarmConnectionApproval::new("model".into(), lifetime);
+        previous.publish_scoped(
+            true,
+            Duration::from_secs(30),
+            Some("synthetic-old-ticket"),
+            None,
+        );
+        let old_id = uuid::Uuid::new_v4();
+        let previous = (old_id, previous);
+        for id in [Some(old_id), Some(uuid::Uuid::new_v4()), None] {
+            let capture = ProbeCapture {
+                ticket: None,
+                headers: Vec::new(),
+                route: None,
+                connection_id: id,
+                pin_generation: None,
+            };
+            let next = WarmConnectionApproval::new("model".into(), lifetime);
+            next.publish_rechecked(
+                true,
+                lifetime,
+                None,
+                None,
+                None,
+                capture.previous_approval(Some(&previous)),
+            );
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert_eq!(next.checked(), id != Some(old_id));
+        }
+    }
+
+    #[test]
+    fn answer_must_not_contain_a_second_or_contradicting_conclusion() {
+        for answer in [
+            "21，但最终答案是29",
+            "21 or 29",
+            "21.0",
+            "21\n29",
+            "21 apples",
+            "210",
+        ] {
+            assert!(!super::answer_matches(answer, "21"), "accepted {answer:?}");
+        }
+        for answer in ["21", " **21** ", "`21`", "_21_", "\n21\n"] {
+            assert!(super::answer_matches(answer, "21"), "rejected {answer:?}");
+        }
+    }
+
+    #[test]
+    fn probe_proof_cannot_outlive_the_ticket_that_was_issued_before_the_probe_completed() {
+        use base64::Engine as _;
+        use std::time::{Duration, UNIX_EPOCH};
+        let issued = 1_700_000_000u64;
+        let mut bytes = vec![0x80];
+        bytes.extend_from_slice(&issued.to_be_bytes());
+        let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let at = UNIX_EPOCH + Duration::from_secs(issued);
+        let ttl = Duration::from_secs(240);
+        assert_eq!(
+            super::verification_valid_for(
+                Duration::from_secs(300),
+                ttl,
+                Some(&ticket),
+                at,
+                at + Duration::from_secs(80)
+            ),
+            Duration::from_secs(160)
+        );
+        assert_eq!(
+            super::verification_valid_for(
+                Duration::from_secs(300),
+                ttl,
+                Some(&ticket),
+                at,
+                at + ttl
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::verification_valid_for(
+                Duration::from_secs(300),
+                ttl,
+                Some(&ticket),
+                at,
+                at - Duration::from_secs(60)
+            ),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn a_right_answer_from_a_swapped_model_is_not_verified() {
