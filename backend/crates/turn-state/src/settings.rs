@@ -85,7 +85,7 @@ pub struct WarmPoolSettings {
     pub probe: bool,
     /// 探针题正文；空 = 用内置糖果题。
     pub probe_prompt: String,
-    /// 满血判据：答案去空白后以此开头即判满血（如 "21"）。
+    /// 验证判据：完整答案等于此值（如 "21"），允许首尾空白和单层强调。
     pub probe_expect: String,
     /// 探针用的模型；空 = 用 models 里的第一个。
     pub probe_model: String,

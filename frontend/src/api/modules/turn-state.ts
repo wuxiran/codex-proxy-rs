@@ -41,7 +41,7 @@ export interface TurnStateWarmPoolSettings {
   probe: boolean
   /** 探针题正文；空 = 内置糖果题。 */
   probePrompt: string
-  /** 满血判据：答案以此开头(如 21)。 */
+  /** 验证判据：完整答案等于此值（如 21），允许首尾空白和单层强调。 */
   probeExpect: string
   /** 旧版单模型字段；页面编辑模型列表时清除此覆盖。 */
   probeModel: string

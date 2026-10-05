@@ -601,7 +601,7 @@ onBeforeUnmount(() => {
                 <BaseSelect v-model="settings.warmPool.probeEffort" :options="effortOptions" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
-                <span class="block text-xs text-neutral-500">验证通过判据（答案开头）</span>
+                <span class="block text-xs text-neutral-500">验证通过判据（完整答案）</span>
                 <BaseInput v-model="settings.warmPool.probeExpect" placeholder="21" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="md:col-span-2">
