@@ -222,6 +222,91 @@ impl CodexWebSocketPool {
             .count()
     }
 
+    /// 在池锁内读取实际空闲候选，不使用上一次探针报告冒充当前连接库存。
+    pub(crate) fn warm_inventory(
+        &self,
+        account_id: &str,
+        policy: [u8; 32],
+        tickets: &std::collections::BTreeMap<String, [u8; 32]>,
+        route: Option<&crate::route_pair::RoutePairRef>,
+        egress: &str,
+        now_ms: u64,
+    ) -> Vec<turn_state::pool::PoolConnection> {
+        let state = self.lock_state();
+        if state.shutting_down {
+            return Vec::new();
+        }
+        state
+            .slots
+            .iter()
+            .filter_map(|(key, slot)| {
+                if !key.is_warm() || key.account_id() != account_id {
+                    return None;
+                }
+                let WebSocketPoolSlot::Idle { connection } = slot else {
+                    return None;
+                };
+                let approval = connection.warm_approval.as_ref()?;
+                let model = approval.model();
+                let context =
+                    crate::transport::warm_connection::WarmVerificationContext::from_fingerprint(
+                        tickets.get(model).copied(),
+                        policy,
+                    );
+                let snapshot = approval.snapshot(model, connection.created_at.elapsed(), &context);
+                let route_matches = route
+                    .is_none_or(|route| connection.metadata.route_pair.as_ref() == Some(route));
+                let egress_matches =
+                    key.egress_key == egress || approval.accepts_business_egress(egress);
+                let closed = state::should_close_idle_connection(
+                    connection,
+                    tokio::time::Instant::now(),
+                    self.config.max_age,
+                );
+                let remaining = self
+                    .config
+                    .max_age
+                    .min(approval.max_age())
+                    .saturating_sub(connection.created_at.elapsed());
+                let verification = if connection.websocket.is_closed() {
+                    "closed"
+                } else if snapshot.status
+                    == crate::transport::warm_connection::WarmVerificationStatus::Rejected
+                {
+                    "rejected"
+                } else if closed {
+                    "expired"
+                } else if !route_matches || !egress_matches {
+                    "conditions_changed"
+                } else {
+                    snapshot.status.as_str()
+                };
+                Some(turn_state::pool::PoolConnection {
+                    id: connection.websocket.connection_id().to_string(),
+                    model: model.to_owned(),
+                    gateway: connection
+                        .metadata
+                        .route_pair
+                        .as_ref()
+                        .and_then(|route| route.gateway.clone()),
+                    verification: verification.to_owned(),
+                    available: !closed
+                        && route_matches
+                        && egress_matches
+                        && approval.permits_request(
+                            model,
+                            connection.created_at.elapsed(),
+                            &context,
+                        ),
+                    verified_at_ms: snapshot.at_ms,
+                    verification_expires_at_ms: approval.verification_expires_at_ms(),
+                    expires_at_ms: now_ms
+                        .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)),
+                })
+            })
+            .collect()
+    }
+
     /// 关掉某账号所有空闲的保活连接（探针判降智时用，避免业务领养到降智连接）。
     /// 返回关闭的条数。正在被 canary 借用（Busy）的不动，它会在归还后由下一轮处理。
     pub(crate) async fn evict_warm_for_account(&self, account_id: &str) -> usize {

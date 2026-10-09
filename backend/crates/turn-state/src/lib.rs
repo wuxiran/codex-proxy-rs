@@ -10,6 +10,7 @@ pub mod decision;
 pub mod fernet;
 pub mod fs_util;
 pub mod observe;
+pub mod pool;
 pub mod record;
 pub mod served;
 pub mod service;

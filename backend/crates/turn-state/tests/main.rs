@@ -4,6 +4,7 @@ mod decision;
 mod fernet;
 mod fs_util;
 mod observe;
+mod pool;
 mod record;
 mod served;
 mod service;

@@ -27,6 +27,61 @@ impl SessionState for TurnStateTestState {
     }
 }
 
+struct PoolRuntimeFixture;
+
+impl ::turn_state::pool::PoolRuntime for PoolRuntimeFixture {
+    fn snapshot(&self) -> ::turn_state::pool::PoolSnapshotFuture<'_> {
+        Box::pin(async { Ok(::turn_state::pool::PoolSnapshot::new(1000, Vec::new())) })
+    }
+}
+
+#[tokio::test]
+async fn pool_snapshot_requires_admin_and_does_not_treat_missing_runtime_as_zero() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let service = TurnStateService::in_memory();
+    let router = app(TurnStateTestState(
+        fixture.services.clone(),
+        service.clone(),
+    ));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/turn-state/pool")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let request = || {
+        Request::builder()
+            .uri("/api/admin/turn-state/pool")
+            .header(header::COOKIE, "cpr_session=valid-session")
+            .header("x-request-id", "pool-snapshot")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let runtime: std::sync::Arc<dyn ::turn_state::pool::PoolRuntime> =
+        std::sync::Arc::new(PoolRuntimeFixture);
+    assert!(service.attach_pool_runtime(std::sync::Arc::downgrade(&runtime)));
+    let response = router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = get_json(&router, "/api/admin/turn-state/pool").await;
+    assert_eq!(body["data"]["totals"]["gateways"], 0);
+    assert_eq!(body["data"]["validUntilMs"], 6000);
+    drop(runtime);
+    assert_eq!(
+        router.oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
 #[test]
 fn update_request_requires_every_field_and_rejects_unknown_ones() {
     let request: UpdateTurnStateSettingsRequest = serde_json::from_str(

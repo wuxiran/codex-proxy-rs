@@ -8422,7 +8422,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
             assert_eq!(error.upstream_status(), None);
             assert_eq!(
                 error.pre_delivery_retry().is_some(),
-                capacity && !semantic_output
+                (capacity || code == "server_error") && !semantic_output
             );
             assert_eq!(
                 provider_openai::openai_failure_affects_account_score(&error),
