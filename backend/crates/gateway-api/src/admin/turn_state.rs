@@ -1,7 +1,8 @@
 //! turn-state 模板、运行设置与观测的管理接口。
 //!
-//! 服务由组合根注入（`SessionState::turn_state`），不经过 ProviderAdmin：这些接口只读写
-//! `turn_state` crate 自己的文件存储，与账号领域无关。管理路由只用 GET/POST 静态路径。
+//! 模板与设置通过组合根注入的 `SessionState::turn_state` 访问文件存储；票池总览通过
+//! 同一服务的只读端口查询 Provider 运行资源，API 不直接访问账号仓储或连接池。
+//! 管理路由只用 GET/POST 静态路径。
 
 use std::time::SystemTime;
 
@@ -161,6 +162,7 @@ where
         )
         .route("/api/admin/turn-state/observations", get(observations::<S>))
         .route("/api/admin/turn-state/buckets", get(buckets::<S>))
+        .route("/api/admin/turn-state/pool", get(pool::<S>))
         .route(
             "/api/admin/turn-state/buckets/clear",
             post(clear_buckets::<S>),
@@ -184,6 +186,23 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+async fn pool<S>(_auth: AdminAuth, State(state): State<S>) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        service(&state)?.pool_snapshot(),
+    )
+    .await
+    .map_err(|_| AdminError::service_unavailable())?
+    .map_err(|_| AdminError::service_unavailable())?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(snapshot)),
+    ))
 }
 
 async fn settings<S>(

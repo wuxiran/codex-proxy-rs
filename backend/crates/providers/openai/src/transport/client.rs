@@ -104,7 +104,10 @@ pub(super) fn build_account_http_client_with_timeout(
     Ok(clients.entry(cache_key).or_insert(client).clone())
 }
 
-fn egress_key(account_id: &str, proxy: Option<&gateway_core::account::OutboundProxy>) -> String {
+pub(crate) fn egress_key(
+    account_id: &str,
+    proxy: Option<&gateway_core::account::OutboundProxy>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(account_id.as_bytes());

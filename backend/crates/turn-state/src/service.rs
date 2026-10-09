@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, SystemTime},
 };
 
@@ -108,6 +108,7 @@ pub struct BucketSummary {
 }
 
 struct ServiceInner {
+    pool_runtime: OnceLock<Weak<dyn crate::pool::PoolRuntime>>,
     store: PinStore,
     settings: SettingsStore,
     observations: Observations,
@@ -124,6 +125,7 @@ impl TurnStateService {
     /// 纯内存实例：测试与没有运行目录的宿主用。
     pub fn in_memory() -> Self {
         Self(Arc::new(ServiceInner {
+            pool_runtime: OnceLock::new(),
             store: PinStore::in_memory(),
             settings: SettingsStore::in_memory(),
             observations: Observations::in_memory(),
@@ -135,6 +137,7 @@ impl TurnStateService {
     pub fn open(dir: &Path) -> Result<Self, TurnStateError> {
         crate::fs_util::ensure_dir(dir).map_err(|_| TurnStateError::Io)?;
         Ok(Self(Arc::new(ServiceInner {
+            pool_runtime: OnceLock::new(),
             store: PinStore::open(dir).map_err(|_| TurnStateError::Io)?,
             settings: SettingsStore::open(dir),
             observations: Observations::open(dir),
@@ -144,6 +147,68 @@ impl TurnStateService {
 
     pub fn settings(&self) -> Settings {
         self.0.settings.get()
+    }
+
+    /// 组合时登记现有运行 owner 的弱引用，避免 Provider 与模板服务形成引用环。
+    pub fn attach_pool_runtime(&self, runtime: Weak<dyn crate::pool::PoolRuntime>) -> bool {
+        self.0.pool_runtime.set(runtime).is_ok()
+    }
+
+    pub async fn pool_snapshot(
+        &self,
+    ) -> Result<crate::pool::PoolSnapshot, crate::pool::PoolUnavailable> {
+        let runtime = self
+            .0
+            .pool_runtime
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(crate::pool::PoolUnavailable)?;
+        runtime.snapshot().await
+    }
+
+    /// 沿用请求侧查票规则，但不增加命中数或缺票需求；指纹只用于本地验证匹配。
+    pub fn pool_tickets(
+        &self,
+        account: &str,
+        binding: &str,
+        egress: &str,
+        route: Option<&str>,
+        now: SystemTime,
+    ) -> Vec<(crate::pool::PoolTicket, [u8; 32])> {
+        use sha2::{Digest, Sha256};
+        self.0
+            .store
+            .status(account, binding, now, self.caps())
+            .into_iter()
+            .filter(|record| record.account_wide() && record.egress.as_deref() == Some(egress))
+            .filter_map(|record| {
+                let scope = Scope {
+                    account: account.to_owned(),
+                    binding: binding.to_owned(),
+                    model: record.model.clone(),
+                    client: None,
+                };
+                let (value, _) =
+                    self.0
+                        .store
+                        .lookup_on_route(&scope, egress, now, self.caps(), route)?;
+                if value != record.value {
+                    return None;
+                }
+                let fingerprint = Sha256::digest(value.as_bytes()).into();
+                Some((
+                    crate::pool::PoolTicket {
+                        model: record.model,
+                        gateway: record.gateway,
+                        expires_at_ms: record
+                            .expires_at
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    },
+                    fingerprint,
+                ))
+            })
+            .collect()
     }
 
     pub fn update_settings(&self, settings: Settings) -> Result<Settings, TurnStateError> {

@@ -203,6 +203,28 @@ async fn reprobe_case(case: ReprobeCase) {
     let worker_cancel = cancel.clone();
     let worker = tokio::spawn(async move { task.run(worker_cancel).await });
     wait_warm_report(&bundle, "verified", true).await;
+    let snapshot = service.pool_snapshot().await.unwrap();
+    let account = snapshot
+        .accounts
+        .iter()
+        .find(|row| row.account_id == ACCOUNT)
+        .unwrap();
+    assert!(account.participating);
+    assert_eq!(
+        account
+            .connections
+            .iter()
+            .filter(|row| row.available && row.verification == "fresh")
+            .count(),
+        1
+    );
+    assert!(
+        account
+            .connections
+            .iter()
+            .any(|row| row.model == MODEL && row.verified_at_ms.is_some())
+    );
+    assert_eq!(snapshot.totals.verified_connections, 1);
     advance_warm_clock(21).await;
     if cooling_slot {
         wait_warm_report(&bundle, "degraded", true).await;

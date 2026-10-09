@@ -908,6 +908,23 @@ OAuth start 使用：
   金额原值保持完整精度，USD 展示值
   小于 1 美元时最多保留四位小数，其余保留两位
 
+### 票池运行总览
+
+`GET /api/admin/turn-state/pool` 仅允许管理员读取，响应为统一管理信封并带 `Cache-Control: no-store`。
+`scope=current_process` 表示当前服务实例的已观察资源，不是上游全网库存或其他实例的连接数。
+未接入运行服务、账号状态读取失败或读取超过 5 秒时返回 `503`，不以空数组或零库存代替未知状态
+
+`observedAtMs`、`validUntilMs` 使用 Unix 毫秒。快照最长有效 5 秒，并在有效票据或可复用连接的
+验证期限或冷却截止更早到达时提前失效。`totals` 分别给出网关、票据、空闲连接、可复用连接、验证有效连接、
+正在准备账号及含冷却状态的账号数量。`gateways` 按网关名聚合，但每个账号和模型的验证结果仍保留
+在 `accounts[].connections` 中，不能把网关的一条成功记录解释为所有账号都已验证
+
+账号摘要包含打票／验证是否在途、冷却截止和最近尝试；有效模板只包含匹配当前凭据、路由与出口的
+账号级票据。连接列表来自实际空闲预热池，已领用或正在探测的连接不计为可供新业务领用。
+`verification` 区分 `fresh/unchecked/expired/conditions_changed/pending/rejected/closed`；`available` 另行受
+账号资格、预热及业务复用开关约束。接口不返回票值、Cookie、代理认证或凭据，也不触发打票、
+探针、冷却清除或命中计数。页面刷新失败保留上次快照，过期后显示未知；失焦暂停刷新和时钟显示
+
 ### 周/月额度预测
 
 `GET /api/admin/accounts/quota-forecast?accountId=...` 使用管理员鉴权，每次查询返回独立的预测结果。

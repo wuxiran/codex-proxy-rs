@@ -4,6 +4,7 @@ mod admin;
 mod cf_cookie_pool;
 pub mod config;
 mod fork_account_ticket;
+mod pool_overview;
 mod provider;
 mod route_pair;
 mod session_transport;
@@ -196,6 +197,8 @@ pub async fn initialize(
         profile.clone(),
         Arc::clone(&websocket_pool),
     ));
+    let pool_runtime: Arc<dyn turn_state::pool::PoolRuntime> = ws_warm_pool.clone();
+    turn_state_service.attach_pool_runtime(Arc::downgrade(&pool_runtime));
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
             selector,

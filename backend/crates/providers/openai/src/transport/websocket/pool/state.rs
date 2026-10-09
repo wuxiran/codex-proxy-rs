@@ -24,7 +24,7 @@ pub struct CodexWebSocketPoolKey {
     conversation_id: String,
     connection_profile: String,
     downstream_connection_id: String,
-    egress_key: String,
+    pub(super) egress_key: String,
     mint_route: Option<String>,
 }
 

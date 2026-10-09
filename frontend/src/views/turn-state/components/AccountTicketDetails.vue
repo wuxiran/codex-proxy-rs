@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import type { Account, OAuthStateConfiguration, TurnStateAutoHunt } from '@/api'
+import type { Account, OAuthStateConfiguration, PoolAccount, TurnStateAutoHunt } from '@/api'
 import { BaseButton, BaseModal } from '@codex-proxy/ui'
 import { ref } from 'vue'
 import { formatDateTime } from '@/utils/format'
+import AccountPoolSummary from './AccountPoolSummary.vue'
 import AccountTurnStateHistory from './AccountTurnStateHistory.vue'
 import AccountTurnStateHunt from './AccountTurnStateHunt.vue'
 
-defineProps<{ account: Account, configuration?: OAuthStateConfiguration, busy: boolean }>()
+defineProps<{ account: Account, configuration?: OAuthStateConfiguration, busy: boolean, poolAccount?: PoolAccount, poolStale: boolean, poolPaused: boolean, poolNow: number }>()
 const emit = defineEmits<{
   recapture: []
   stopAutoHunt: []
@@ -35,9 +36,10 @@ function onHuntBusy(value: boolean) {
         状态读取失败，请关闭后刷新账号
       </p>
       <template v-else>
+        <AccountPoolSummary :account="poolAccount" :stale="poolStale" :paused="poolPaused" :now="poolNow" expanded />
         <div class="grid gap-2 text-cp-sm sm:grid-cols-2">
           <span>票与预热：{{ configuration.pinTurnState ? '已启用' : '未启用' }}</span>
-          <span>可用预热连接：{{ configuration.warmPool?.held ?? '未记录' }}</span>
+          <span>可复用预热连接：{{ poolStale || !poolAccount ? '状态待刷新' : poolAccount.connections.filter(connection => connection.available).length }}</span>
         </div>
         <div v-if="configuration.turnStatePins.length" class="grid gap-2">
           <div v-for="(pin, index) in configuration.turnStatePins" :key="`${pin.model}-${index}`" class="rounded-cp bg-cp-fill-quaternary p-3 text-cp-sm">

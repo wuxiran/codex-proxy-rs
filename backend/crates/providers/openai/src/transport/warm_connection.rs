@@ -43,6 +43,13 @@ pub(crate) struct WarmVerificationContext {
 }
 
 impl WarmVerificationContext {
+    pub(crate) fn from_fingerprint(ticket: Option<[u8; 32]>, policy: [u8; 32]) -> Self {
+        Self {
+            ticket,
+            policy: Some(policy),
+            continuing: false,
+        }
+    }
     pub(crate) fn new(ticket: Option<&str>, policy: Option<[u8; 32]>) -> Self {
         Self {
             ticket: ticket.map(ticket_fingerprint),
@@ -107,6 +114,17 @@ impl PartialEq for WarmConnectionApproval {
 impl Eq for WarmConnectionApproval {}
 
 impl WarmConnectionApproval {
+    pub(crate) fn model(&self) -> &str {
+        &self.0.model
+    }
+
+    pub(crate) fn verification_expires_at_ms(&self) -> Option<u64> {
+        self.0.verification.get().map(|proof| {
+            proof
+                .at_ms
+                .saturating_add(u64::try_from(proof.valid_for.as_millis()).unwrap_or(u64::MAX))
+        })
+    }
     pub fn new(model: String, max_age: Duration) -> Self {
         Self::scoped(model, max_age, None)
     }

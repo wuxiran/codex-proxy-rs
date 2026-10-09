@@ -9,6 +9,31 @@ use crate::{fernet_token, plain_token};
 
 const EGRESS: &str = "egress-a";
 
+#[test]
+fn pool_reads_use_current_binding_and_egress_without_recording_business_hits() {
+    let service = TurnStateService::in_memory();
+    let now = SystemTime::now();
+    let binding = credential_binding("generation", "synthetic-access");
+    let token = plain_token(240);
+    service
+        .pin_account_wide(pin(&binding, &token, now))
+        .unwrap();
+    let rows = service.pool_tickets("acct", &binding, EGRESS, None, now);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0.model, "gpt-6-astra");
+    assert!(
+        service
+            .pool_tickets("acct", &binding, "other-egress", None, now)
+            .is_empty()
+    );
+    assert!(
+        service
+            .pool_tickets("acct", "other-binding", EGRESS, None, now)
+            .is_empty()
+    );
+    assert_eq!(service.status("acct", &binding, now)[0].hits, 0);
+}
+
 fn facts<'a>(
     binding: &str,
     client: &'a str,

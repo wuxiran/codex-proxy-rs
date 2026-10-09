@@ -200,3 +200,85 @@ export function clearTurnStateBucket(data: { account: string, model?: string }) 
     data,
   })
 }
+
+export interface PoolTicket {
+  model: string
+  gateway: string | null
+  expiresAtMs: number
+}
+
+export interface PoolConnection {
+  id: string
+  model: string
+  gateway: string | null
+  verification: 'fresh' | 'unchecked' | 'expired' | 'conditions_changed' | 'pending' | 'rejected' | 'closed'
+  available: boolean
+  verifiedAtMs: number | null
+  verificationExpiresAtMs: number | null
+  expiresAtMs: number
+}
+
+export interface PoolAttempt {
+  atMs: number
+  kind: 'mint' | 'verification'
+  attempts: number
+  verdict: string | null
+  error: string | null
+  gateway: string | null
+  model: string | null
+}
+
+export interface PoolActivity {
+  inFlight: boolean
+  cooldownUntilMs: number | null
+  last: PoolAttempt | null
+}
+
+export interface PoolAccount {
+  accountId: string
+  name: string
+  participating: boolean
+  schedulable: boolean
+  phase: 'inactive' | 'unavailable' | 'verifying' | 'minting' | 'ready' | 'cooling' | 'idle'
+  tickets: PoolTicket[]
+  connections: PoolConnection[]
+  mint: PoolActivity
+  warm: PoolActivity
+}
+
+export interface PoolGateway {
+  gateway: string
+  accountIds: string[]
+  models: string[]
+  tickets: number
+  connections: number
+  availableConnections: number
+  verifiedConnections: number
+  nextExpiryMs: number | null
+  latestVerifiedAtMs: number | null
+}
+
+export interface PoolSnapshot {
+  observedAtMs: number
+  validUntilMs: number
+  scope: 'current_process'
+  totals: {
+    gateways: number
+    tickets: number
+    connections: number
+    availableConnections: number
+    verifiedConnections: number
+    preparingAccounts: number
+    coolingAccounts: number
+  }
+  gateways: PoolGateway[]
+  accounts: PoolAccount[]
+}
+
+export function getTurnStatePool(options: RequestOptions = {}) {
+  return request<PoolSnapshot>({
+    url: '/api/admin/turn-state/pool',
+    method: 'GET',
+    ...options,
+  })
+}

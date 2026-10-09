@@ -20,6 +20,15 @@ import {
 } from '@/api'
 import SyncedSwitch from '@/components/SyncedSwitch.vue'
 import AccountTicketManager from './components/AccountTicketManager.vue'
+import PoolOverview from './components/PoolOverview.vue'
+import { usePoolOverview } from './composables/usePoolOverview'
+
+const pool = usePoolOverview()
+
+function refreshRuntime() {
+  void loadData()
+  void pool.refresh()
+}
 
 const MIN_LEN = 200
 const POLL_MS = 30_000
@@ -338,7 +347,8 @@ onBeforeUnmount(() => {
       正在读取设置
     </p>
 
-    <AccountTicketManager @changed="loadData" />
+    <PoolOverview :snapshot="pool.snapshot.value" :loading="pool.loading.value" :stale="pool.stale.value" :paused="pool.paused.value" :error="pool.error.value" :now="pool.now.value" @refresh="pool.refresh" />
+    <AccountTicketManager :pool-accounts="pool.accounts.value" :pool-stale="pool.stale.value" :pool-paused="pool.paused.value" :pool-now="pool.now.value" @changed="refreshRuntime" />
 
     <BaseCard v-if="settings" title="自动打票" description="用于已开启「票与预热」的账号">
       <div class="flex flex-col gap-4">

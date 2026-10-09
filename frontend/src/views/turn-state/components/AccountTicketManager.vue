@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Account, OAuthStateConfiguration, TurnStateAutoHunt } from '@/api'
+import type { Account, PoolAccount, TurnStateAutoHunt } from '@/api'
 import { BaseButton, BaseCard, BaseConfirmModal, BaseInput, BaseTable, BaseTablePagination, defineTableColumns, toast } from '@codex-proxy/ui'
 import { watchDebounced } from '@vueuse/core'
 import { computed, onMounted, ref } from 'vue'
@@ -7,9 +7,11 @@ import { getAccounts, mintAccountTurnState, updateAccountTurnState } from '@/api
 import SyncedSwitch from '@/components/SyncedSwitch.vue'
 import { useAccountConfigurations } from '@/composables/useAccountConfigurations'
 import { usePagedQuery } from '@/composables/usePagedQuery'
-import { useUiClock } from '@/composables/useUiClock'
 import { formatDateTime } from '@/utils/format'
+import AccountPoolSummary from './AccountPoolSummary.vue'
 import AccountTicketDetails from './AccountTicketDetails.vue'
+
+const props = defineProps<{ poolAccounts: Record<string, PoolAccount>, poolStale: boolean, poolPaused: boolean, poolNow: number }>()
 
 const emit = defineEmits<{ changed: [] }>()
 const search = ref('')
@@ -20,7 +22,6 @@ const query = usePagedQuery({
 const { items: accounts, loading, error } = query
 const { entries, reload: reloadConfigurations } = useAccountConfigurations(accounts)
 const pagination = computed(() => ({ currentPage: query.page.value, pageSize: query.pageSize.value, total: query.total.value }))
-const now = useUiClock()
 const busyId = ref<string | null>(null)
 const huntRunning = ref(false)
 const busy = computed(() => busyId.value !== null || huntRunning.value)
@@ -34,28 +35,31 @@ const columns = defineTableColumns<Account>([
   { key: 'participation', label: '票与预热', kind: 'custom', size: 'sm' },
   { key: 'ticketState', label: '票据', kind: 'custom', size: 'xl' },
   { key: 'warmState', label: '预热连接', kind: 'custom', size: 'lg' },
+  { key: 'runtime', label: '当前运行状态', kind: 'custom', size: 'xl' },
   { key: 'actions', label: '操作', kind: 'custom', size: 'xl' },
 ])
 
 function configuration(account: Account) {
   return entries.value[account.id]?.value
 }
-function activePins(config?: OAuthStateConfiguration) {
-  return config?.turnStatePins.filter(pin => Date.parse(pin.expiresAt) > now.value.getTime()) ?? []
+function participating(account: Account) {
+  return !props.poolStale && props.poolAccounts[account.id]
+    ? props.poolAccounts[account.id]!.participating
+    : configuration(account)?.pinTurnState === true
 }
-function ticketExpiry(config?: OAuthStateConfiguration) {
-  return activePins(config).map(pin => pin.expiresAt).sort()[0]
+function activePins(account: Account) {
+  return props.poolAccounts[account.id]?.tickets.filter(ticket => ticket.expiresAtMs > props.poolNow) ?? []
 }
-function warmText(config: OAuthStateConfiguration) {
-  if (!config.pinTurnState)
+function ticketExpiry(account: Account) {
+  return activePins(account).map(pin => pin.expiresAtMs).sort((a, b) => a - b)[0]
+}
+function warmText(account: Account) {
+  if (!participating(account))
     return '未参与'
-  if (!config.warmPool)
-    return '未记录'
-  if (!config.warmPool.enabled)
-    return '全局未启用'
-  return `可用 ${config.warmPool.held} 条`
+  if (props.poolStale || !props.poolAccounts[account.id])
+    return '状态待刷新'
+  return `可复用 ${props.poolAccounts[account.id]!.connections.filter(connection => connection.available).length} 条`
 }
-const verdictText = { verified: '最近验证通过', ready: '最近未检查答案', degraded: '最近检查未通过', failed: '最近探测失败' }
 
 async function refresh() {
   if (await query.execute())
@@ -159,16 +163,16 @@ async function afterHuntCancelled() {
         <template #participation="{ row }">
           <SyncedSwitch
             v-if="row.authenticationKind === 'oauth'"
-            :model-value="configuration(row)?.pinTurnState ?? false" :label="`${row.name} 票与预热`"
+            :model-value="participating(row)" :label="`${row.name} 票与预热`"
             :disabled="busy || !configuration(row) || entries[row.id]?.loading" @update:model-value="toggle(row, $event)"
           />
           <span v-else class="text-cp-text-secondary">不适用</span>
         </template>
         <template #ticketState="{ row }">
           <template v-if="configuration(row)">
-            <span>{{ !configuration(row)?.pinTurnState ? '未启用' : activePins(configuration(row)).length ? `有效票 ${activePins(configuration(row)).length}` : '暂无有效票' }}</span>
-            <div v-if="ticketExpiry(configuration(row))" class="text-cp-xs text-cp-text-secondary">
-              {{ formatDateTime(ticketExpiry(configuration(row))!) }} 到期
+            <span>{{ !participating(row) ? '未启用' : poolStale || !poolAccounts[row.id] ? '状态待刷新' : `有效模板 ${activePins(row).length} 张` }}</span>
+            <div v-if="!poolStale && ticketExpiry(row)" class="text-cp-xs text-cp-text-secondary">
+              {{ formatDateTime(new Date(ticketExpiry(row)!)) }} 到期
             </div>
           </template>
           <span v-else-if="row.authenticationKind !== 'oauth'">—</span>
@@ -176,11 +180,15 @@ async function afterHuntCancelled() {
         </template>
         <template #warmState="{ row }">
           <template v-if="configuration(row)">
-            <span>{{ warmText(configuration(row)!) }}</span>
-            <div v-if="configuration(row)?.pinTurnState && configuration(row)?.warmPool?.last?.verdict" class="text-cp-xs text-cp-text-secondary">
-              {{ verdictText[configuration(row)!.warmPool!.last!.verdict!] }}
+            <span>{{ warmText(row) }}</span>
+            <div v-if="!poolStale && poolAccounts[row.id]?.participating" class="text-cp-xs text-cp-text-secondary">
+              验证有效 {{ poolAccounts[row.id]!.connections.filter(connection => connection.available && connection.verification === 'fresh').length }} 条
             </div>
           </template>
+          <span v-else>—</span>
+        </template>
+        <template #runtime="{ row }">
+          <AccountPoolSummary v-if="row.authenticationKind === 'oauth'" :account="poolAccounts[row.id]" :stale="poolStale" :paused="poolPaused" :now="poolNow" />
           <span v-else>—</span>
         </template>
         <template #actions="{ row }">
@@ -199,6 +207,7 @@ async function afterHuntCancelled() {
   </BaseCard>
   <AccountTicketDetails
     v-if="selected && detailsOpen" :key="selected.id" v-model="detailsOpen" :account="selected" :configuration="selectedConfiguration"
+    :pool-account="poolAccounts[selected.id]" :pool-stale="poolStale" :pool-paused="poolPaused" :pool-now="poolNow"
     :busy="busyId !== null" @hunt-busy="huntRunning = $event" @recapture="recaptureOpen = true"
     @hunted="afterHunt" @hunt-cancelled="afterHuntCancelled" @stop-auto-hunt="setAutoHunt(null)"
   />

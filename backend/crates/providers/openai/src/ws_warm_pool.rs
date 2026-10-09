@@ -153,6 +153,51 @@ impl Drop for WarmInFlight {
 }
 
 impl WarmPoolService {
+    pub(crate) fn pool_activity(
+        &self,
+        now_ms: u64,
+    ) -> Result<BTreeMap<String, turn_state::pool::PoolActivity>, turn_state::pool::PoolUnavailable>
+    {
+        use turn_state::pool::{PoolActivity, PoolAttempt, PoolUnavailable};
+        let state = self.state.lock().map_err(|_| PoolUnavailable)?;
+        Ok(state
+            .accounts
+            .iter()
+            .map(|(id, entry)| {
+                let cooldown = entry
+                    .cooldown_until
+                    .values()
+                    .filter_map(|until| {
+                        let remaining = until.saturating_duration_since(Instant::now());
+                        (!remaining.is_zero()).then(|| {
+                            now_ms.saturating_add(
+                                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                            )
+                        })
+                    })
+                    .min();
+                (
+                    id.clone(),
+                    PoolActivity {
+                        in_flight: entry.in_flight,
+                        cooldown_until_ms: cooldown,
+                        last: entry.last.as_ref().map(|last| PoolAttempt {
+                            at_ms: last
+                                .at
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                            kind: "verification".to_owned(),
+                            attempts: u64::from(last.attempts),
+                            verdict: last.verdict.map(str::to_owned),
+                            error: last.error.clone(),
+                            gateway: last.gateway.clone(),
+                            model: Some(last.model.clone()),
+                        }),
+                    },
+                )
+            })
+            .collect())
+    }
     pub(crate) fn new(
         repository: CodexCredentialRepository,
         pins: crate::turn_state_pin::TurnStatePins,
@@ -1017,6 +1062,21 @@ impl WarmPoolService {
         active
             .filter(|models| !models.is_empty())
             .unwrap_or_else(|| vec![DEFAULT_WARM_MODEL.to_owned()])
+    }
+}
+
+impl turn_state::pool::PoolRuntime for WarmPoolService {
+    fn snapshot(&self) -> turn_state::pool::PoolSnapshotFuture<'_> {
+        Box::pin(async move {
+            crate::pool_overview::snapshot(
+                &self.repository,
+                &self.pins,
+                &self.pool,
+                self,
+                &self.mint,
+            )
+            .await
+        })
     }
 }
 

@@ -418,6 +418,42 @@ impl CloudMintService {
             .and_then(|state| state.last.get(account_id).cloned())
     }
 
+    pub(crate) fn pool_activity(
+        &self,
+        now_ms: u64,
+    ) -> Result<BTreeMap<String, turn_state::pool::PoolActivity>, turn_state::pool::PoolUnavailable>
+    {
+        use turn_state::pool::{PoolActivity, PoolAttempt, PoolUnavailable};
+        let state = self.state.lock().map_err(|_| PoolUnavailable)?;
+        let mut result = BTreeMap::<String, PoolActivity>::new();
+        for id in &state.in_flight {
+            result.entry(id.clone()).or_default().in_flight = true;
+        }
+        for (id, until) in &state.cooldown_until {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                result.entry(id.clone()).or_default().cooldown_until_ms = Some(
+                    now_ms.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)),
+                );
+            }
+        }
+        for (id, last) in &state.last {
+            result.entry(id.clone()).or_default().last = Some(PoolAttempt {
+                at_ms: last
+                    .at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                kind: "mint".to_owned(),
+                attempts: last.attempts,
+                verdict: Some(if last.ok { "ready" } else { "failed" }.to_owned()),
+                error: last.error.clone(),
+                gateway: last.gateway.clone(),
+                model: None,
+            });
+        }
+        Ok(result)
+    }
+
     /// 后台续 pair：最近有流量的账号，路由 pair 缺失或剩余不足两分钟时裸打一次换一对新的
     /// （顺带得到的票照常钉住）。票本身不在这里续。
     pub(crate) async fn renew_cycle(&self) -> usize {
