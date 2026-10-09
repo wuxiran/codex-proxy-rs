@@ -475,8 +475,11 @@ pub(super) fn schedule_authoritative_quota_refresh_after_failure(
     }));
 }
 
-pub(super) fn map_handshake_error(error: CodexClientError) -> MappedProviderFailure {
-    map_client_error(error, UpstreamSendState::Ambiguous, true)
+pub(super) fn map_handshake_error(
+    error: CodexClientError,
+    responses: bool,
+) -> MappedProviderFailure {
+    map_client_error(error, UpstreamSendState::Ambiguous, true, responses)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,7 +788,7 @@ fn continuation_replay_error_detail() -> ClientVisibleUpstreamError {
 pub(super) fn map_stream_error(error: CodexClientError) -> MappedProviderFailure {
     let allows_pre_delivery_retry = stream_transport_allows_pre_delivery_retry(&error);
     let websocket_failure = error.transport() == Some(CodexBackendTransport::WebSocket);
-    let mut failure = map_client_error(error, UpstreamSendState::Sent, false);
+    let mut failure = map_client_error(error, UpstreamSendState::Sent, false, false);
     failure.websocket_transport_retryable = allows_pre_delivery_retry && websocket_failure;
     if allows_pre_delivery_retry && !websocket_failure {
         failure.error = failure.error.with_pre_delivery_retry();
@@ -829,7 +832,31 @@ pub(super) fn map_canonical_error(
             ),
             None,
             replay_boundary,
+            true,
         ),
+    }
+}
+
+/// 临时服务故障只申请交付前换号，不把已发送请求伪装成已证明未执行。
+/// 在错误被投影为客户端消息前使用完整结构化字段，避免缺少 message 时误判未知错误。
+fn response_service_rotation(failure: &CodexUpstreamFailure) -> bool {
+    if !matches!(failure.send_phase, CodexUpstreamSendPhase::AfterPayload)
+        || !matches!(failure.category(), CodexFailureCategory::Unavailable | CodexFailureCategory::Timeout)
+        // 换号路径没有等待阶段，不能用它绕过上游明确要求的等待时间。
+        || failure.retry_after_seconds.is_some_and(|delay| delay > 0)
+        || failure.status.is_some_and(|status| !matches!(status.as_u16(), 500 | 502 | 503 | 504))
+    {
+        return false;
+    }
+    match failure
+        .code
+        .as_deref()
+        .or(failure.client_error_type.as_deref())
+    {
+        Some(reason) => ["server_error", "service_unavailable_error"]
+            .iter()
+            .any(|known| reason.trim().eq_ignore_ascii_case(known)),
+        None => failure.status.is_some(),
     }
 }
 
@@ -837,6 +864,7 @@ pub(super) fn map_client_error(
     error: CodexClientError,
     uncertain_state: UpstreamSendState,
     observe_transport: bool,
+    responses: bool,
 ) -> MappedProviderFailure {
     let local_connection_capacity = crate::transport::connection::is_admission_failure(&error);
     let diagnostic = if local_connection_capacity {
@@ -884,7 +912,12 @@ pub(super) fn map_client_error(
         .then(|| codex_error_observation(&error))
         .flatten();
     if let Some(failure) = error.upstream_failure() {
-        return map_upstream_failure(failure, observation, ReplayBoundary::BeforeSemanticOutput);
+        return map_upstream_failure(
+            failure,
+            observation,
+            ReplayBoundary::BeforeSemanticOutput,
+            responses,
+        );
     }
     let connect_retry = !local_connection_capacity
         && matches!(&error, CodexClientError::Http(error) if transient_http_connect(error));
@@ -1347,7 +1380,11 @@ pub(super) fn map_upstream_failure(
     mut failure: CodexUpstreamFailure,
     observation: Option<ProviderResponseObservation>,
     replay_boundary: ReplayBoundary,
+    responses: bool,
 ) -> MappedProviderFailure {
+    let service_rotation = responses
+        && replay_boundary.permits_provider_proof()
+        && response_service_rotation(&failure);
     let category = failure.category();
     let capacity_unavailable = category == CodexFailureCategory::CapacityUnavailable;
     let cyber_policy_failure = failure
@@ -1397,6 +1434,9 @@ pub(super) fn map_upstream_failure(
         && (failure.replay_is_safe() || cyber_policy_failure)
     {
         error = error.with_replay_safe();
+    }
+    if service_rotation {
+        error = error.with_pre_delivery_retry();
     }
     if let Some(continuation_failure) = continuation_failure {
         error = error

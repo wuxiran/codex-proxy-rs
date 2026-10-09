@@ -315,3 +315,184 @@ async fn cancelling_buffered_structural_events_does_not_release_or_offer_replay(
     release.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn transient_service_failures_offer_pre_delivery_rotation_without_replay_proof() {
+    for transport in ["http", "sse", "websocket"] {
+        for status in [500, 502, 503, 504] {
+            let store = Arc::new(MemoryAccountStore::default());
+            create_account(&store, "acct_provider_contract").await;
+            let detail = json!({"code": "server_error", "message": "temporarily unavailable", "status_code": status});
+            let failed = json!({"type": "response.failed", "status": status, "response": {"id": "resp_transient", "error": detail}});
+            let (base_url, http_server, websocket_server) = if transport == "websocket" {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base_url = format!("http://{}", listener.local_addr().unwrap());
+                let failed = failed.clone();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut ws = accept_codex_test_websocket(socket).await;
+                    ws.next().await.unwrap().unwrap();
+                    ws.send(Message::Text(failed.to_string().into()))
+                        .await
+                        .unwrap();
+                });
+                (base_url, None, Some(server))
+            } else {
+                let server = MockServer::start().await;
+                let response = if transport == "http" {
+                    ResponseTemplate::new(status).set_body_json(json!({"error": detail}))
+                } else {
+                    ResponseTemplate::new(200).set_body_raw(sse(&failed), "text/event-stream")
+                };
+                Mock::given(method("POST"))
+                    .and(path("/codex/responses"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                (server.uri(), Some(server), None)
+            };
+            let operation = if transport == "websocket" {
+                generate_operation()
+            } else {
+                http_generate_operation()
+            };
+            let mut stream = provider_with_base_url(&store, base_url)
+                .execute(
+                    planned_request("openai", operation),
+                    context("req_transient", CancellationToken::new()),
+                )
+                .await
+                .unwrap();
+            let (events, mut error) = stream_failure(&mut stream).await;
+            assert!(events.iter().all(|event| !event.has_client_event()));
+            assert_eq!(error.send_state(), UpstreamSendState::Sent);
+            assert_eq!(error.upstream_status(), Some(status));
+            assert!(
+                !error.replay_is_safe(),
+                "a service failure does not prove non-execution"
+            );
+            assert_eq!(
+                error.pre_delivery_retry(),
+                Some(PreDeliveryRetry::AccountRotation),
+                "{transport}/{status}"
+            );
+            if transport == "http" {
+                assert_eq!(
+                    error.client_visible_upstream_response().unwrap().status(),
+                    status
+                );
+            } else {
+                let wire: Vec<_> = error
+                    .take_atomic_client_events()
+                    .into_iter()
+                    .filter_map(|event| event.wire_event().map(|wire| wire.data().clone()))
+                    .collect();
+                assert_eq!(wire, vec![failed]);
+            }
+            if let Some(server) = http_server {
+                server.verify().await;
+            }
+            if let Some(server) = websocket_server {
+                server.await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn transient_service_retry_requires_explicit_evidence_and_respects_retry_after() {
+    for (status, detail, retry_after, retry) in [
+        (
+            503,
+            json!({"message": "temporarily unavailable"}),
+            None,
+            true,
+        ),
+        (
+            503,
+            json!({"type": "service_unavailable_error"}),
+            None,
+            true,
+        ),
+        (
+            503,
+            json!({"code": "unknown_error", "type": "server_error"}),
+            None,
+            false,
+        ),
+        (
+            503,
+            json!({"code": "cyber_policy", "type": "server_error"}),
+            None,
+            false,
+        ),
+        (
+            503,
+            json!({"code": "invalid_prompt", "type": "server_error"}),
+            None,
+            false,
+        ),
+        (503, json!({"code": "server_error"}), Some("30"), false),
+        (400, json!({"code": "server_error"}), None, false),
+        (501, json!({"code": "server_error"}), None, false),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_provider_contract").await;
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status).set_body_json(json!({"error": detail}));
+        if let Some(delay) = retry_after {
+            response = response.insert_header("retry-after", delay);
+        }
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut stream = provider_with_base_url(&store, server.uri())
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context("req_transient_guard", CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+        let (_, error) = stream_failure(&mut stream).await;
+        assert_eq!(
+            error.allows_pre_delivery_retry(),
+            retry,
+            "{status}/{detail}/{retry_after:?}"
+        );
+        assert!(!error.replay_is_safe());
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn transient_service_failure_after_precommit_release_keeps_the_original_stream() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let created = structural_event("response.created", 129 * 1024);
+    let failed = json!({"type": "response.failed", "response": {"id": "resp_precommit", "error": {"code": "server_error", "message": "unavailable", "status_code": 503}}});
+    let (base_url, release, _, server) =
+        paused_chunked_sse_server(sse(&created), sse(&failed)).await;
+    let mut stream = provider_with_base_url(&store, base_url)
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            context("req_transient_committed", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    let first = next_client_event(&mut stream).await;
+    assert_eq!(first.wire_event().unwrap().data(), &created);
+    release.send(()).unwrap();
+    let (events, error) = stream_failure(&mut stream).await;
+    assert!(!error.replay_is_safe());
+    assert!(error.pre_delivery_retry().is_none());
+    assert!(events.iter().any(|event| {
+        event
+            .wire_event()
+            .is_some_and(|wire| wire.data() == &failed)
+    }));
+    server.await.unwrap();
+}

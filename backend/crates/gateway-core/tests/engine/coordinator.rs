@@ -2936,6 +2936,96 @@ fn bare_atomic_response_failed_should_rotate_before_the_first_delivery() {
 }
 
 #[test]
+fn transient_service_rotation_keeps_failures_atomic_and_obeys_the_routing_budget() {
+    for succeeds in [false, true] {
+        let operation = generate_operation();
+        let route_plan = plan(&operation);
+        let failure_count = if succeeds {
+            1
+        } else {
+            route_plan.max_attempts().get()
+        };
+        let mut scripts = (1..=failure_count).map(|attempt| {
+            let wire = ProtocolWireEvent::json("openai", Some("response.failed".to_owned()), json!({
+                "type": "response.failed", "response": {"id": format!("failed-{attempt}"),
+                    "error": {"code": "server_error", "message": "unavailable", "status_code": 503}}
+            })).unwrap();
+            let error = ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)
+                .with_status(503).with_pre_delivery_retry()
+                .with_atomic_client_events(vec![ProviderEvent::wire(wire)]);
+            assert!(!error.replay_is_safe());
+            Script::ObservedStream { account_id: "acct_first", items: vec![Err(error)] }
+        }).collect::<Vec<_>>();
+        if succeeds {
+            scripts.push(Script::Stream {
+                account_id: "acct_second",
+                items: complete_stream(None),
+            });
+        }
+        let (coordinator, store, provider) = coordinator(scripts);
+        let mut session = block_on(coordinator.start(
+            model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
+            operation,
+            route_plan,
+            None,
+            None,
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let first = block_on(session.next_event()).unwrap().unwrap();
+        let events = first.into_provider_events();
+        let failures = events
+            .iter()
+            .filter_map(ProviderEvent::wire_event)
+            .filter(|wire| wire.event_type() == Some("response.failed"))
+            .collect::<Vec<_>>();
+        if succeeds {
+            assert!(failures.is_empty());
+            assert!(events.iter().flat_map(ProviderEvent::canonical_facts)
+                .any(|event| matches!(event, GatewayEvent::Started(meta) if meta.response_id() == "response-1")));
+        } else {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].data()["response"]["id"],
+                format!("failed-{failure_count}")
+            );
+        }
+        block_on(session.commit_downstream(Some(200))).unwrap();
+        if succeeds {
+            while block_on(session.next_event()).unwrap().is_some() {}
+        } else {
+            let Err(EngineError::Provider(error)) = block_on(session.next_event()) else {
+                panic!("the final original service failure must be delivered once");
+            };
+            assert_eq!(error.upstream_status(), Some(503));
+        }
+        let contexts = provider.contexts.lock().unwrap();
+        assert_eq!(
+            contexts.len(),
+            (failure_count + u32::from(succeeds)) as usize
+        );
+        assert!(
+            contexts[1]
+                .excluded_accounts()
+                .contains(&ProviderAccountId::new("acct_first").unwrap())
+        );
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.created, 1);
+        assert_eq!(state.commits, 1);
+        assert_eq!(state.intermediate_failures, contexts.len() - 1);
+        assert_eq!(state.finalizations.len(), 1);
+        assert_eq!(
+            state.finalizations[0].outcome,
+            if succeeds {
+                ExecutionOutcome::Succeeded
+            } else {
+                ExecutionOutcome::Incomplete
+            }
+        );
+    }
+}
+
+#[test]
 fn exhausted_atomic_response_failed_should_deliver_only_the_last_failure_once() {
     let operation = generate_operation();
     let route_plan = plan(&operation);
