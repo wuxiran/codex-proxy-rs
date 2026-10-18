@@ -1,4 +1,4 @@
-//! Pg 账号 repository：Core/Admin 端口实现与 admin 事务。
+//! Pg 账号 repository：Core/Admin 端口实现与 admin 事务
 
 use super::*;
 
@@ -105,7 +105,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| postgres_unavailable("load provider account"))?;
+            .map_err(|source| postgres_unavailable("load provider account", source))?;
         row.map(account_record_from_row).transpose()
     }
 
@@ -122,14 +122,14 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
             return Err(invalid("plugin account page limit must be positive"));
         }
         let rows = sqlx::query(
-            "select auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
+            "select coalesce(proxy_enabled, true) as outbound_proxy_enabled, coalesce(max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
                     upstream_account_id, plan_type, authentication_kind, credential_revision, has_refresh_token,
                     access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
                     credential_observed_at, quota_access_state, quota_evidence,
                     quota_access_observed_at, quota_reset_at,
                     quota_observed_at, last_error_reason, last_error_message, created_at, updated_at
                from provider_accounts
-               left join (select id as location_proxy_id, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
+               left join (select id as location_proxy_id, enabled as proxy_enabled, max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
                  on outbound_proxy_id = location_proxy_id
               where ($1::text is null or provider_kind = $1)
                 and ($2::text is null or id > $2)
@@ -141,7 +141,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("list plugin accounts"))?;
+        .map_err(|source| postgres_unavailable("list plugin accounts", source))?;
         rows.into_iter().map(account_summary_from_row).collect()
     }
 
@@ -151,14 +151,14 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         include_disabled: bool,
     ) -> StoreResult<Vec<ProviderAccountSummary>> {
         let rows = sqlx::query(
-            "select auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
+            "select coalesce(proxy_enabled, true) as outbound_proxy_enabled, coalesce(max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
                     upstream_account_id, plan_type, authentication_kind, credential_revision, has_refresh_token,
                     access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
                     credential_observed_at, quota_access_state, quota_evidence,
                     quota_access_observed_at, quota_reset_at,
                     quota_observed_at, last_error_reason, last_error_message, created_at, updated_at
              from provider_accounts
-             left join (select id as location_proxy_id, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
+             left join (select id as location_proxy_id, enabled as proxy_enabled, max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
                on outbound_proxy_id = location_proxy_id
              where ($1::text is null or provider_kind = $1) and ($2 or enabled)
              order by provider_kind, name, id",
@@ -167,7 +167,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(include_disabled)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("list provider accounts"))?;
+        .map_err(|source| postgres_unavailable("list provider accounts", source))?;
         rows.into_iter().map(account_summary_from_row).collect()
     }
 
@@ -178,7 +178,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
             .pool
             .begin()
             .await
-            .map_err(|_| postgres_unavailable("begin provider account insert"))?;
+            .map_err(|source| postgres_unavailable("begin provider account insert", source))?;
         let proxy_id = match account.outbound_proxy.as_ref() {
             Some(proxy) => Some(
                 super::super::proxies::ensure_proxy_for_url(&mut transaction, proxy, None)
@@ -213,7 +213,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(account.next_refresh_at)
         .bind(account.enabled)
         .bind(account.concurrency_limit.map(|limit| i64::from(limit.get())))
-        .bind(i16::try_from(account.weight.get()).map_err(|_| invalid("invalid weight"))?)
+        .bind(i16::try_from(account.weight.get()).map_err(|source| invalid("invalid weight").with_source(source))?)
         .bind(credential_state.as_str())
         .bind(account.credential_observed_at)
         .bind(account.outbound_proxy.as_ref().map(|proxy| proxy.expose_url()))
@@ -221,11 +221,11 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(account.model_access.as_ref().map(sqlx::types::Json))
         .execute(&mut *transaction)
         .await
-        .map_err(|_| postgres_unavailable("insert provider account"))?;
+        .map_err(|source| postgres_unavailable("insert provider account", source))?;
         transaction
             .commit()
             .await
-            .map_err(|_| postgres_unavailable("commit provider account insert"))?;
+            .map_err(|source| postgres_unavailable("commit provider account insert", source))?;
         Ok(())
     }
 
@@ -243,7 +243,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(account.plan_type)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("update provider account"))?;
+        .map_err(|source| postgres_unavailable("update provider account", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -279,8 +279,9 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(update.next_refresh_at)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("compare and swap provider credentials"))?
+        .map_err(|source| postgres_unavailable("compare and swap provider credentials", source))?
         .ok_or(StoreError::Conflict {
+            source: None,
             entity: ENTITY,
             id: update.account_id,
             kind: ConflictKind::StaleRevision,
@@ -311,7 +312,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(update.message.as_deref())
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("apply provider account state"))?;
+        .map_err(|source| postgres_unavailable("apply provider account state", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -324,7 +325,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(enabled)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("set provider account enabled state"))?;
+        .map_err(|source| postgres_unavailable("set provider account enabled state", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -375,7 +376,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(plan_type)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("compare and swap provider quota"))?;
+        .map_err(|source| postgres_unavailable("compare and swap provider quota", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -406,7 +407,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(state.reset_at().map(DateTime::<Utc>::from))
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("apply provider quota access"))?;
+        .map_err(|source| postgres_unavailable("apply provider quota access", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -429,7 +430,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         .bind(observed_at)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("touch provider quota observation"))?;
+        .map_err(|source| postgres_unavailable("touch provider quota observation", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -439,7 +440,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|_| postgres_unavailable("delete disabled provider account"))?;
+            .map_err(|source| postgres_unavailable("delete disabled provider account", source))?;
         Ok(result.rows_affected() == 1)
     }
 }
@@ -458,7 +459,7 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             .bind(&scope.provider_kind)
             .fetch_all(&self.pool)
             .await
-            .map_err(|_| postgres_unavailable("export provider accounts"))?;
+            .map_err(|source| postgres_unavailable("export provider accounts", source))?;
         let records = rows
             .into_iter()
             .map(account_record_from_row)
@@ -486,11 +487,9 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
         &self,
         command: ImportProviderAccounts,
     ) -> StoreResult<ProviderAccountAdminImport> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| postgres_unavailable("begin provider account admin import"))?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            postgres_unavailable("begin provider account admin import", source)
+        })?;
         let result = import_provider_accounts_in_transaction(&mut transaction, command).await;
         finish_admin_transaction(transaction, result, "provider account admin import").await
     }
@@ -499,11 +498,9 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
         &self,
         command: RotateProviderAccount,
     ) -> StoreResult<ProviderAccountAdminRotation> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| postgres_unavailable("begin provider account admin rotation"))?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            postgres_unavailable("begin provider account admin rotation", source)
+        })?;
         let result = rotate_provider_account_admin_in_transaction(&mut transaction, command).await;
         finish_admin_transaction(transaction, result, "provider account admin rotation").await
     }
@@ -516,11 +513,9 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
         if let Some(group_ids) = &command.group_ids {
             validate_batch_update_group_ids(group_ids)?;
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| postgres_unavailable("begin provider account admin state change"))?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            postgres_unavailable("begin provider account admin state change", source)
+        })?;
         let result = async {
             let revision = bump_config_revision_in_transaction(&mut transaction).await?;
             update_provider_accounts_scheduling_in_transaction(
@@ -562,11 +557,9 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
         command: RecoverProviderAccount,
     ) -> StoreResult<Revision> {
         validate_admin_account_ids(std::slice::from_ref(&command.account_id))?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| postgres_unavailable("begin provider account admin recovery"))?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            postgres_unavailable("begin provider account admin recovery", source)
+        })?;
         let result = async {
             let revision = bump_config_revision_in_transaction(&mut transaction).await?;
             let recovered = sqlx::query_scalar::<_, String>(
@@ -593,8 +586,9 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             .bind(&command.account_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|_| postgres_unavailable("recover provider account state"))?
+            .map_err(|source| postgres_unavailable("recover provider account state", source))?
             .ok_or_else(|| StoreError::NotFound {
+                source: None,
                 entity: ENTITY,
                 id: command.account_id.clone(),
             })?;
@@ -614,19 +608,10 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
     ) -> StoreResult<Revision> {
         command.scope.validate()?;
         validate_admin_account_ids(&command.account_ids)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| postgres_unavailable("begin provider account admin deletion"))?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            postgres_unavailable("begin provider account admin deletion", source)
+        })?;
         let result = async {
-            // 慢的那步（解除请求记录引用，可能几十秒）放在 bump revision 之前，
-            // 否则一路持着 runtime_settings 行锁，其他配置写操作会被 lock_timeout 打掉。
-            detach_provider_account_references_in_transaction(
-                &mut transaction,
-                &command.account_ids,
-            )
-            .await?;
             let revision = bump_config_revision_in_transaction(&mut transaction).await?;
             delete_provider_accounts_in_transaction(
                 &mut transaction,
@@ -653,7 +638,7 @@ async fn update_provider_account_notes_in_transaction(
         .bind(notes.trim())
         .execute(&mut **transaction)
         .await
-        .map_err(|_| postgres_unavailable("update provider account notes"))?;
+        .map_err(|source| postgres_unavailable("update provider account notes", source))?;
     Ok(())
 }
 
@@ -673,9 +658,10 @@ async fn replace_account_group_assignments_in_transaction(
         .bind(&group_ids)
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|_| postgres_unavailable("validate account group assignment"))?;
+        .map_err(|source| postgres_unavailable("validate account group assignment", source))?;
         if usize::try_from(known_group_count).ok() != Some(group_ids.len()) {
             return Err(StoreError::NotFound {
+                source: None,
                 entity: "account group",
                 id: "one or more group IDs".to_owned(),
             });
@@ -685,7 +671,7 @@ async fn replace_account_group_assignments_in_transaction(
         .bind(account_ids)
         .execute(&mut **transaction)
         .await
-        .map_err(|_| postgres_unavailable("clear account group assignments"))?;
+        .map_err(|source| postgres_unavailable("clear account group assignments", source))?;
     if group_ids.is_empty() {
         return Ok(());
     }
@@ -700,7 +686,7 @@ async fn replace_account_group_assignments_in_transaction(
     .bind(account_ids)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("assign accounts to groups"))?;
+    .map_err(|source| postgres_unavailable("assign accounts to groups", source))?;
     Ok(())
 }
 
@@ -774,7 +760,7 @@ pub(crate) async fn upsert_provider_account_in_transaction(
     .bind(account.next_refresh_at)
     .bind(account.enabled)
     .bind(account.concurrency_limit.map(|limit| i64::from(limit.get())))
-    .bind(i16::try_from(account.weight.get()).map_err(|_| invalid("invalid weight"))?)
+    .bind(i16::try_from(account.weight.get()).map_err(|source| invalid("invalid weight").with_source(source))?)
     .bind(credential_state.as_str())
     .bind(account.credential_observed_at)
     .bind(account.outbound_proxy.as_ref().map(|proxy| proxy.expose_url()))
@@ -788,15 +774,17 @@ pub(crate) async fn upsert_provider_account_in_transaction(
             .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
         {
             StoreError::Conflict {
+                source: Some(error.into()),
                 entity: ENTITY,
                 id: account.id.clone(),
                 kind: ConflictKind::InvalidTransition,
             }
         } else {
-            postgres_unavailable("upsert provider account in admin transaction")
+            postgres_unavailable("upsert provider account in admin transaction", error)
         }
     })?
     .ok_or_else(|| StoreError::Conflict {
+        source: None,
         entity: ENTITY,
         id: account.id.clone(),
         kind: ConflictKind::InvalidTransition,
@@ -815,7 +803,7 @@ pub(crate) async fn rotate_provider_account_in_transaction(
     let upstream_user_id = replacement_identity.map(ProviderAccountIdentity::upstream_user_id);
     let upstream_account_id =
         replacement_identity.and_then(ProviderAccountIdentity::upstream_account_id);
-    // 事务时间可能早于应用写入的额度观测，保留既有时间下界，避免轮换破坏时间约束。
+    // 事务时间可能早于应用写入的额度观测，保留既有时间下界，避免轮换破坏时间约束
     let next = sqlx::query_scalar::<_, i64>(
         "update provider_accounts
          set name = case when $14 then name else $4 end,
@@ -867,15 +855,17 @@ pub(crate) async fn rotate_provider_account_in_transaction(
             .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
         {
             StoreError::Conflict {
+                source: Some(error.into()),
                 entity: ENTITY,
                 id: update.account_id.clone(),
                 kind: ConflictKind::InvalidTransition,
             }
         } else {
-            postgres_unavailable("rotate provider account in admin transaction")
+            postgres_unavailable("rotate provider account in admin transaction", error)
         }
     })?
     .ok_or_else(|| StoreError::Conflict {
+        source: None,
         entity: ENTITY,
         id: update.account_id.clone(),
         kind: ConflictKind::StaleRevision,
@@ -910,7 +900,7 @@ pub(crate) async fn update_provider_accounts_scheduling_in_transaction(
     .bind(account_ids)
     .bind(enabled)
     .bind(concurrency_limit.flatten().map(|limit| i64::from(limit.get())))
-    .bind(weight.map(|weight| i16::try_from(weight.get())).transpose().map_err(|_| invalid("invalid weight"))?)
+    .bind(weight.map(|weight| i16::try_from(weight.get())).transpose().map_err(|source| invalid("invalid weight").with_source(source))?)
     .bind(outbound_proxy.is_some())
     .bind(proxy.as_ref().map(gateway_core::account::OutboundProxy::expose_url))
     .bind(proxy_id)
@@ -918,7 +908,7 @@ pub(crate) async fn update_provider_accounts_scheduling_in_transaction(
     .bind(concurrency_limit.is_some())
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("set provider accounts state in admin transaction"))?
+    .map_err(|source| postgres_unavailable("set provider accounts state in admin transaction", source))?
     .into_iter()
     .collect::<BTreeSet<_>>();
     let expected = account_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -926,6 +916,7 @@ pub(crate) async fn update_provider_accounts_scheduling_in_transaction(
         Ok(())
     } else {
         Err(StoreError::NotFound {
+            source: None,
             entity: ENTITY,
             id: "one or more provider account IDs".to_owned(),
         })
@@ -946,9 +937,8 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
     .bind(&scope.provider_kind)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|error| {
-        tracing::warn!(error = %error, "provider account deletion failed");
-        postgres_unavailable("delete provider account in admin transaction")
+    .map_err(|source| {
+        postgres_unavailable("delete provider account in admin transaction", source)
     })?;
     let deleted = deleted.into_iter().collect::<BTreeSet<_>>();
     let expected = account_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -959,47 +949,6 @@ pub(crate) async fn delete_provider_accounts_in_transaction(
             "all deleted accounts must exist and match Provider scope",
         ))
     }
-}
-
-/// 删账号前先把 model_requests / ops_events 里的外键集合式置空（外键是 on delete set null）。
-///
-/// 外键触发器按被删行逐个 UPDATE，账号请求多时（现网一号一天数千行、表上十几个索引）
-/// 一批就超出连接级 30s statement_timeout，整个事务回滚、后台「无法删除」。这里一次置空
-/// 并放宽本事务的语句超时（SET LOCAL 仅作用于本事务）。**必须在 bump config revision
-/// 之前调用**：这步可能跑几十秒，不能一路持着 runtime_settings 的行锁（lock_timeout 5s
-/// 会把其他管理写操作和 worker 全部打成「依赖服务暂不可用」）。
-pub(crate) async fn detach_provider_account_references_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    account_ids: &[String],
-) -> StoreResult<()> {
-    sqlx::query("set local statement_timeout = '600s'")
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "set provider account deletion statement timeout");
-            postgres_unavailable("prepare provider account admin deletion")
-        })?;
-    for (table, label) in [
-        (
-            "model_requests",
-            "detach provider account from model requests",
-        ),
-        ("ops_events", "detach provider account from ops events"),
-    ] {
-        // 表名来自上面的固定列表，不含外部输入。
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "update {table} set provider_account_id = null
-              where provider_account_id = any($1::text[])"
-        )))
-        .bind(account_ids)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, table, "provider account deletion detach failed");
-            postgres_unavailable(label)
-        })?;
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_credential_update(update: &ProviderCredentialUpdate) -> StoreResult<()> {
@@ -1073,20 +1022,20 @@ pub(crate) async fn finish_admin_transaction<T>(
             transaction
                 .commit()
                 .await
-                .map_err(|_| postgres_unavailable(operation))?;
+                .map_err(|source| postgres_unavailable(operation, source))?;
             Ok(value)
         }
         Err(error) => {
-            transaction
-                .rollback()
-                .await
-                .map_err(|_| postgres_unavailable(operation))?;
+            let error = match transaction.rollback().await {
+                Ok(()) => error,
+                Err(cleanup) => error.with_cleanup(cleanup),
+            };
             Err(error)
         }
     }
 }
 
-// 授权回执与账号写入需要共享事务；常规导入、刷新和轮换复用同一写入合同。
+// 授权回执与账号写入需要共享事务；常规导入、刷新和轮换复用同一写入合同
 pub(super) async fn import_provider_accounts_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     command: ImportProviderAccounts,
@@ -1101,6 +1050,7 @@ pub(super) async fn import_provider_accounts_in_transaction(
         .await?;
         if current.as_ref() != Some(&binding.proxy) {
             return Err(StoreError::Conflict {
+                source: None,
                 entity: "outbound proxy",
                 id: binding.id.clone(),
                 kind: ConflictKind::StaleRevision,
@@ -1183,7 +1133,7 @@ pub(super) async fn rotate_provider_account_admin_in_transaction(
         &command.credential,
     )
     .await?;
-    // 凭据 CAS、普通设置和审计共享事务，任何设置失败都回滚凭据更新。
+    // 凭据 CAS、普通设置和审计共享事务，任何设置失败都回滚凭据更新
     if let Some(settings) = &command.settings {
         let ids = std::slice::from_ref(&settings.account_id);
         update_provider_accounts_scheduling_in_transaction(

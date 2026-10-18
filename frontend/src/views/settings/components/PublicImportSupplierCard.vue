@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { AccountGroup, PublicImportConfig } from '@/api'
-import { BaseButton, BaseConfirmModal, BaseFormItem, BaseIconButton, BaseInput, BaseSegmented, toast } from '@codex-proxy/ui'
+import type { AccountGroupRef, PublicImportConfig } from '@/api'
+import { ZButton, ZConfirmDialog, ZFormItem, ZIconButton, ZInput, ZNotification, ZSegmented } from '@codex-proxy/ui'
 import { Copy, RefreshCw, Save, Trash2 } from '@lucide/vue'
 
 import { computed, ref, shallowRef, watch } from 'vue'
@@ -9,11 +9,11 @@ import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import SyncedSwitch from '@/components/SyncedSwitch.vue'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useCopyText } from '@/composables/useCopyText'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
 
 const props = defineProps<{
   config: PublicImportConfig
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
 }>()
 const emit = defineEmits<{
@@ -104,7 +104,7 @@ async function save() {
     })
     apply(updated)
     emit('saved', updated)
-    toast.success('已保存')
+    ZNotification.success({ message: '已保存' })
   })
 }
 
@@ -113,7 +113,7 @@ async function rotate() {
     const updated = await rotatePublicImportToken(props.config.id)
     apply(updated)
     emit('saved', updated)
-    toast.success('已更换链接，旧链接立即失效')
+    ZNotification.success({ message: '已更换链接，旧链接立即失效' })
   })
 }
 
@@ -122,7 +122,7 @@ async function remove() {
     await deletePublicImportConfig(props.config.id)
     showDeleteModal.value = false
     emit('deleted', props.config.id)
-    toast.success('已删除该号商')
+    ZNotification.success({ message: '已删除该号商' })
   })
 }
 </script>
@@ -137,45 +137,45 @@ async function remove() {
         <span v-else-if="!enabled" class="text-cp-xs text-cp-text-tertiary">未开启</span>
       </div>
       <div class="flex items-center gap-2">
-        <BaseButton variant="secondary" size="sm" :disabled="busy" @click="rotate">
+        <ZButton size="small" :disabled="busy" @click="rotate">
           <template #icon>
             <RefreshCw class="size-4" />
           </template>
           更换链接
-        </BaseButton>
-        <BaseButton variant="primary" size="sm" :loading="saveAction.loading.value" :disabled="!canSave" @click="save">
+        </ZButton>
+        <ZButton type="primary" size="small" :loading="saveAction.loading.value" :disabled="!canSave" @click="save">
           <template #icon>
             <Save class="size-4" />
           </template>
           保存
-        </BaseButton>
-        <BaseIconButton label="删除号商" :disabled="busy" @click="showDeleteModal = true">
+        </ZButton>
+        <ZIconButton aria-label="删除号商" :disabled="busy" @click="showDeleteModal = true">
           <Trash2 class="size-4 text-cp-error-text" />
-        </BaseIconButton>
+        </ZIconButton>
       </div>
     </div>
 
     <div class="grid gap-4 md:grid-cols-2">
-      <BaseFormItem label="号商名称" required :error="nameError" description="导入的账号会以此为备注，方便追溯是哪个号商丢的号">
-        <BaseInput v-model="name" maxlength="60" :disabled="busy" aria-label="号商名称" placeholder="例如：迷茫" />
-      </BaseFormItem>
-      <BaseFormItem label="开启入口" description="关闭后该号商链接立即不可用，对外表现与链接错误一致">
+      <ZFormItem label="号商名称" required :error="nameError" description="导入的账号会以此为备注，方便追溯是哪个号商丢的号">
+        <ZInput v-model="name" maxlength="60" :disabled="busy" aria-label="号商名称" placeholder="例如：迷茫" />
+      </ZFormItem>
+      <ZFormItem label="开启入口" description="关闭后该号商链接立即不可用，对外表现与链接错误一致">
         <SyncedSwitch v-model="enabled" label="开启免登录导入入口" :disabled="busy" />
-      </BaseFormItem>
+      </ZFormItem>
     </div>
 
-    <BaseFormItem label="目标分组" required :error="groupError" description="通过该链接导入的账号会启用并加入这些分组">
+    <ZFormItem label="目标分组" required :error="groupError" description="通过该链接导入的账号会启用并加入这些分组">
       <AccountGroupCheckboxGrid v-model="groupIds" :groups="groups" :loading="groupsLoading" :disabled="busy" />
-    </BaseFormItem>
+    </ZFormItem>
 
-    <BaseFormItem label="自动启用票与预热" description="导入后为 OAuth 账号启用，后续在票据管理页维护，API Key 账号跳过">
+    <ZFormItem label="自动启用票与预热" description="导入后为 OAuth 账号启用，后续在票据管理页维护，API Key 账号跳过">
       <SyncedSwitch v-model="pinTurnState" label="导入后启用票与预热" :disabled="busy" />
-    </BaseFormItem>
+    </ZFormItem>
 
-    <BaseFormItem label="链接有效期" :error="expiryError" :description="`${expiryText}。预设时长从点击保存时起算；到期后链接自动失效，更换链接不会重置有效期`">
+    <ZFormItem label="链接有效期" :error="expiryError" :description="`${expiryText}。预设时长从点击保存时起算；到期后链接自动失效，更换链接不会重置有效期`">
       <div class="grid gap-2">
-        <BaseSegmented v-model="validity" label="链接有效期" :options="validityOptions" :disabled="busy" />
-        <BaseInput
+        <ZSegmented v-model="validity" aria-label="链接有效期" :options="validityOptions" :disabled="busy" />
+        <ZInput
           v-if="validity === 'custom'"
           v-model="customExpiry"
           type="datetime-local"
@@ -184,20 +184,20 @@ async function remove() {
           :disabled="busy"
         />
       </div>
-    </BaseFormItem>
+    </ZFormItem>
 
-    <BaseFormItem label="导入链接" description="出站代理从已通过测试的代理中逐账号随机选择，文件自带的代理会被忽略。持有链接即可导入，请只发给这个号商">
+    <ZFormItem label="导入链接" description="出站代理从已通过测试的代理中逐账号随机选择，文件自带的代理会被忽略。持有链接即可导入，请只发给这个号商">
       <div class="flex min-w-0 items-center gap-2">
         <code class="min-w-0 flex-1 rounded-cp bg-cp-fill-quaternary px-3 py-2.5 font-mono text-cp-sm leading-normal font-emphasis break-all text-cp-text">
           {{ link }}
         </code>
-        <BaseIconButton size="md" label="复制链接" :disabled="!link" @click="copyText(link, { successText: '已复制链接' })">
+        <ZIconButton size="default" aria-label="复制链接" :disabled="!link" @click="copyText(link, { successText: '已复制链接' })">
           <Copy class="size-4" />
-        </BaseIconButton>
+        </ZIconButton>
       </div>
-    </BaseFormItem>
+    </ZFormItem>
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showDeleteModal"
       title="删除号商"
       :description="`删除「${config.name || '未命名号商'}」后，它的导入链接立即失效，已发出去的链接不可再用`"
@@ -209,6 +209,6 @@ async function remove() {
       <p class="m-0">
         确定要删除这个号商吗？
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
   </div>
 </template>

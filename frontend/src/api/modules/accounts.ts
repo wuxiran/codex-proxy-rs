@@ -1,6 +1,6 @@
 import type { RequestOptions } from '../request'
-import type { AccountGroupRef } from './account-groups'
-import { API_BASE_URL } from '../constants'
+import type { AccountGroupRef } from './groups'
+import { API_BASE_URL } from '../constants' // fork: turn-state SSE 地址
 import request from '../request'
 
 /** 前五态来自后端调度状态；`expired` 是 fork 追加的目录状态：票据到期且已不能调度，默认列表隐藏。 */
@@ -30,14 +30,22 @@ export interface AccountQuotaWindow {
   resetAtDisplay: string
 }
 
+export interface AccountQuotaCredits {
+  hasCredits: boolean
+  unlimited: boolean
+  balance: string | null
+}
+
 export interface AccountQuota {
   refreshedAtDisplay: string
   limitReached: boolean
   // 429 临时限流（Redis 冷却）到期时间；非限流中为 null。
   rateLimitedUntil: string | null
+  rateLimitRecoveryDisplay: string | null
   rateLimitReason: 'upstream_rate_limit' | 'capacity_freeze' | null
   recoveryProbeRequired: boolean
   windows: AccountQuotaWindow[]
+  credits: AccountQuotaCredits | null
 }
 
 export interface AccountCurrencyCost {
@@ -74,8 +82,8 @@ export interface AccountModelUsage {
   inputTokensDisplay: string
   outputTokens: number | null
   outputTokensDisplay: string
-  cachedTokens: number | null
-  cachedTokensDisplay: string
+  cachedInputTokens: number | null
+  cachedInputTokensDisplay: string
   imageInputTokens: number | null
   imageInputTokensDisplay: string
   imageOutputTokens: number | null
@@ -95,6 +103,7 @@ export interface AccountModelUsage {
   costs: AccountCurrencyCost[]
   lastUsedAt: string
   lastUsedAtDisplay: string
+  lastUsedAtFullDisplay: string | null
 }
 
 export interface AccountUsage {
@@ -108,10 +117,10 @@ export interface AccountUsage {
   inputTokensDisplay: string
   outputTokens: number | null
   outputTokensDisplay: string
-  cachedTokens: number | null
-  cachedTokensDisplay: string
-  reasoningTokens: number | null
-  reasoningTokensDisplay: string
+  cachedInputTokens: number | null
+  cachedInputTokensDisplay: string
+  reasoningOutputTokens: number | null
+  reasoningOutputTokensDisplay: string
   imageInputTokens: number | null
   imageInputTokensDisplay: string
   imageOutputTokens: number | null
@@ -122,12 +131,11 @@ export interface AccountUsage {
   imageRequestFailedCountDisplay: string
   totalTokens: number | null
   totalTokensDisplay: string
-  createdTokens: number | null
-  createdTokensDisplay: string
-  readTokens: number | null
-  readTokensDisplay: string
+  cacheWriteInputTokens: number | null
+  cacheWriteInputTokensDisplay: string
   lastUsedAt: string | null
   lastUsedAtDisplay: string
+  lastUsedAtFullDisplay: string | null
   costEstimateStatus: string
   knownCostCount: number | null
   partialCostCount: number | null
@@ -207,6 +215,7 @@ export interface Account {
   accessTokenExpiresAtDisplay: string | null
   refreshTokenExpiresAt: string | null
   nextRefreshAt: string | null
+  nextRefreshAtDisplay: string | null
   addedAt: string
   addedAtDisplay: string
   updatedAt: string
@@ -340,14 +349,23 @@ export interface AccountProfileActivityInsights {
 
 export interface AccountSubscription {
   startsAt: string | null
+  startsAtDisplay: string | null
   expiresAt: string
+  expiresAtDisplay: string
   willRenew: boolean | null
   billingPeriod: string | null
   billingCurrency: string | null
   observedAt: string
+  observedAtDisplay: string
+}
+
+export interface ProfileActivityCalendar {
+  rangeLabel: string
+  weeks: Array<{ key: string, monthLabel: string | null, cells: Array<{ date: string, dateDisplay: string, tokens: number, isFuture: boolean }> }>
 }
 
 export interface AccountProfileStatisticsResponse {
+  activityCalendar: ProfileActivityCalendar | null
   displayName: string | null
   username: string | null
   imageUrl: string | null
@@ -368,6 +386,7 @@ export interface AccountResetCredit {
   status: string | null
   title: string | null
   expiresAt: string | null
+  expiresAtDisplay: string | null
   resetType: string | null
 }
 
@@ -402,7 +421,9 @@ export type ImportItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 
 export interface AccountImportTask {
   taskId: string
   createdAt: string
+  createdAtDisplay: string
   finishedAt: string | null
+  finishedAtDisplay: string | null
   stopRequested: boolean
   total: number
   counts: Record<ImportItemStatus, number> & { importedAccounts: number }
@@ -504,7 +525,7 @@ export interface AccountImportSettings {
   groupIds: string[]
 }
 
-interface AccountImportParam {
+export interface AccountImportParam {
   outboundProxyId?: string
   settings?: AccountImportSettings
   provider: string
@@ -550,7 +571,7 @@ export function getAccounts(data: AccountListParams, options: RequestOptions = {
 }
 
 export function exportAccounts(data: AccountExportParam) {
-  return request<unknown>({
+  return request<{ exportedAt: string, fileName: string, documents: unknown[] }>({
     url: '/api/admin/accounts/export',
     method: 'GET',
     params: data,
@@ -967,6 +988,62 @@ export function reviveGuanlanAccount(data: AccountIdParam) {
 export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
   return request<{ account: Account, credentialConfiguration?: Record<string, unknown> }>({
     url: '/api/admin/accounts/detail',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export interface AccountResetCreditAutomation {
+  enabled: boolean
+  leadMinutes: number
+  nextDiscoveryAtDisplay: string | null
+  nextConsumeAtDisplay: string | null
+  lastResult: string | null
+}
+
+export function getAccountResetCreditAutomation(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountResetCreditAutomation>({
+    url: '/api/admin/accounts/reset-credits/automation',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function setAccountResetCreditAutomation(data: AccountIdParam & { enabled: boolean }, options: RequestOptions = {}) {
+  return request<AccountResetCreditAutomation>({
+    url: '/api/admin/accounts/reset-credits/automation',
+    method: 'POST',
+    data,
+    ...options,
+  })
+}
+
+export interface AccountConcurrencyEntry {
+  leaseId: string
+  requestId: string | null
+  clientKeyId: string | null
+  clientKeyName: string | null
+  model: string | null
+  clientIp: string | null
+  startedAt: string | null
+  startedAtDisplay: string | null
+  occupiedMs: number | null
+}
+
+export interface AccountConcurrencyPage {
+  accountId: string
+  entries: AccountConcurrencyEntry[]
+  total: number
+  page: number
+  pageSize: number
+  observedAt: string
+}
+
+export function getAccountConcurrency(data: { accountId: string, page: number, pageSize: number }, options: RequestOptions = {}) {
+  return request<AccountConcurrencyPage>({
+    url: '/api/admin/accounts/concurrency',
     method: 'GET',
     params: data,
     ...options,

@@ -1,32 +1,34 @@
 <script setup lang="ts">
-import type { AccountRow } from '../constants'
-import { BaseButton, BaseIconButton, BaseMenuItem, BasePopover } from '@codex-proxy/ui'
+import type { Account } from '@/api'
+
+import { ZButton, ZIconButton, ZMenuItem, ZPopover } from '@codex-proxy/ui'
 
 import { Download, KeyRound, MoreHorizontal, Pencil, Power, ReceiptText, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 import { computed } from 'vue'
 
 const props = defineProps<{
-  account: AccountRow
+  account: Account
   deleting: boolean
   downloadingCatalog: boolean
   recovering: boolean
   refreshing: boolean
   testing: boolean
+  // fork: guanlan 复活
   guanlanReviveAvailable?: boolean
   reviving?: boolean
   togglingScheduling: boolean
 }>()
 const emit = defineEmits<{
-  edit: [account: AccountRow]
-  delete: [account: AccountRow]
+  edit: [account: Account]
+  delete: [account: Account]
   recover: [accountId: string]
-  test: [account: AccountRow]
+  test: [account: Account]
   refresh: [accountId: string]
-  reauthorize: [account: AccountRow]
-  revive: [accountId: string]
-  ticket: [account: AccountRow]
-  downloadModelCatalog: [account: AccountRow]
-  toggleScheduling: [account: AccountRow]
+  reauthorize: [account: Account]
+  revive: [accountId: string] // fork: guanlan 复活
+  ticket: [account: Account] // fork: 成本与票据
+  downloadModelCatalog: [account: Account]
+  toggleScheduling: [account: Account]
 }>()
 
 const credentialEligible = computed(() => props.account.authenticationKind === 'oauth')
@@ -34,45 +36,44 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
 
 <template>
   <div class="relative flex items-center justify-start gap-1">
-    <BaseButton
+    <!-- fork: guanlan 复活 -->
+    <ZButton
       v-if="guanlanReviveAvailable"
-      size="sm"
+      size="small"
       :loading="reviving"
       :disabled="reviving || refreshing || recovering"
       @click.stop="emit('revive', account.id)"
     >
       <RotateCcw class="size-3.5" />
       guanlan 复活
-    </BaseButton>
-    <BaseIconButton
-      variant="ghost"
-      size="sm"
-      label="编辑账号"
+    </ZButton>
+    <ZIconButton
+      size="small"
+      aria-label="编辑账号"
       @click.stop="emit('edit', account)"
     >
       <Pencil class="size-3.5 text-cp-link" />
-    </BaseIconButton>
+    </ZIconButton>
 
-    <BaseIconButton
-      variant="ghost"
-      size="sm"
-      label="删除账号"
+    <ZIconButton
+      size="small"
+      aria-label="删除账号"
       :disabled="deleting"
       @click.stop="emit('delete', account)"
     >
       <Trash2 class="size-3.5 text-cp-error" />
-    </BaseIconButton>
+    </ZIconButton>
 
-    <BasePopover placement="bottom-end">
-      <template #trigger="{ open }">
-        <BaseIconButton variant="ghost" size="sm" label="更多操作" :pressed="open">
+    <ZPopover placement="bottom-end">
+      <template #reference="{ open }">
+        <ZIconButton size="small" aria-label="更多操作" :pressed="open">
           <MoreHorizontal class="size-4" />
-        </BaseIconButton>
+        </ZIconButton>
       </template>
 
       <template #default="{ close }">
         <div class="w-40 p-1.5">
-          <BaseMenuItem
+          <ZMenuItem
             :loading="testing"
             :disabled="testing"
             @click.stop="(close(), emit('test', account))"
@@ -81,8 +82,8 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
               <Wifi class="size-3.5 text-cp-text-quaternary" />
             </template>
             测试连接
-          </BaseMenuItem>
-          <BaseMenuItem
+          </ZMenuItem>
+          <ZMenuItem
             :loading="togglingScheduling"
             :disabled="togglingScheduling"
             @click.stop="(close(), emit('toggleScheduling', account))"
@@ -91,8 +92,8 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
               <Power class="size-3.5 text-cp-text-quaternary" />
             </template>
             {{ account.enabled ? '停用调度' : '启用调度' }}
-          </BaseMenuItem>
-          <BaseMenuItem
+          </ZMenuItem>
+          <ZMenuItem
             v-if="credentialEligible"
             :loading="refreshing"
             :disabled="refreshing"
@@ -105,20 +106,21 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
               <RefreshCw class="size-3.5 text-cp-text-quaternary" />
             </template>
             刷新令牌
-          </BaseMenuItem>
-          <BaseMenuItem v-if="credentialEligible" @click.stop="(close(), emit('reauthorize', account))">
+          </ZMenuItem>
+          <ZMenuItem v-if="credentialEligible" @click.stop="(close(), emit('reauthorize', account))">
             <template #icon>
               <KeyRound class="size-3.5 text-cp-text-quaternary" />
             </template>
             重新授权
-          </BaseMenuItem>
-          <BaseMenuItem @click.stop="(close(), emit('ticket', account))">
+          </ZMenuItem>
+          <!-- fork: 成本与票据 -->
+          <ZMenuItem @click.stop="(close(), emit('ticket', account))">
             <template #icon>
               <ReceiptText class="size-3.5 text-cp-text-quaternary" />
             </template>
             成本与票据
-          </BaseMenuItem>
-          <BaseMenuItem
+          </ZMenuItem>
+          <ZMenuItem
             v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'"
             :loading="downloadingCatalog"
             :disabled="downloadingCatalog"
@@ -131,8 +133,8 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
               <Download class="size-3.5 text-cp-text-quaternary" />
             </template>
             下载模型目录
-          </BaseMenuItem>
-          <BaseMenuItem
+          </ZMenuItem>
+          <ZMenuItem
             :loading="recovering"
             :disabled="recovering"
             @click.stop="(close(), emit('recover', account.id))"
@@ -141,9 +143,9 @@ const credentialEligible = computed(() => props.account.authenticationKind === '
               <RotateCcw class="size-3.5 text-cp-text-quaternary" />
             </template>
             恢复状态
-          </BaseMenuItem>
+          </ZMenuItem>
         </div>
       </template>
-    </BasePopover>
+    </ZPopover>
   </div>
 </template>

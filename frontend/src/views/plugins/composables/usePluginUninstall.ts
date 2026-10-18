@@ -1,9 +1,10 @@
 import type { InstalledPlugin } from '../utils/catalog'
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { shallowRef } from 'vue'
 import { deletePluginArtifact, deletePluginInstance, disablePluginInstance, getPluginArtifacts, getPluginInstances } from '@/api'
+import { notifyPluginError } from '../utils/actions'
 
-export function usePluginUninstall(refresh: () => Promise<void>, notifyError: (title: string, cause: unknown) => void) {
+export function usePluginUninstall(refresh: () => Promise<void>) {
   const open = shallowRef(false)
   const pending = shallowRef<InstalledPlugin | null>(null)
   const acknowledged = shallowRef(false)
@@ -51,17 +52,18 @@ export function usePluginUninstall(refresh: () => Promise<void>, notifyError: (t
       if ((await getPluginArtifacts(options)).some(artifact => artifact.metadata.pluginId === plugin.id))
         throw new Error('已删除确认范围，但还有新安装的版本，请关闭并重新确认剩余内容')
       open.value = false
-      toast.success('插件已卸载，相关数据与来源设置已清理')
+      ZNotification.success({ message: '插件已卸载，相关数据与来源设置已清理' })
       await refresh()
     }
     catch (cause) {
       // 卸载不是跨请求事务，刷新已完成的步骤后提示失败原因，可从剩余部分重试。
       await refresh()
-      notifyError('卸载尚未完成，可重试剩余步骤', cause)
+      notifyPluginError('卸载尚未完成，可重试剩余步骤', cause)
     }
     finally {
       busy.value = false
-      progress.value = ''
+      if (open.value)
+        progress.value = ''
     }
   }
   return { open, pending, acknowledged, busy, progress, request, confirm }

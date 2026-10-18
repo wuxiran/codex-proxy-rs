@@ -42,7 +42,9 @@ impl PgOpsReportSource {
             .map(|url| {
                 let options = url
                     .parse::<PgConnectOptions>()
-                    .map_err(|_| postgres_unavailable("parse sub2api report connection options"))?
+                    .map_err(|source| {
+                        postgres_unavailable("parse sub2api report connection options", source)
+                    })?
                     .application_name("codex-proxy-rs:ops-report")
                     .options([
                         ("default_transaction_read_only", "on"),
@@ -197,12 +199,15 @@ impl OpsReportSource for PgOpsReportSource {
         let (new_account_ids, purchases, cpr) =
             self.cpr_facts(start, end).await.map_err(|error| {
                 tracing::warn!(target: "ops_report", error = %error, "cpr report query failed");
-                admin_store_error(ENTITY, postgres_unavailable("load cpr daily report"))
+                admin_store_error(ENTITY, postgres_unavailable("load cpr daily report", error))
             })?;
         let sub2api = match &self.sub2api {
             Some(pool) => Some(sub2api_facts(pool, start, end).await.map_err(|error| {
                 tracing::warn!(target: "ops_report", error = %error, "sub2api report query failed");
-                admin_store_error(ENTITY, postgres_unavailable("load sub2api daily report"))
+                admin_store_error(
+                    ENTITY,
+                    postgres_unavailable("load sub2api daily report", error),
+                )
             })?),
             None => None,
         };
@@ -230,7 +235,7 @@ impl OpsReportSource for PgOpsReportSource {
             tracing::warn!(target: "ops_report", error = %error, "purchase ticket query failed");
             admin_store_error(
                 ENTITY,
-                postgres_unavailable("load ops report purchase tickets"),
+                postgres_unavailable("load ops report purchase tickets", error),
             )
         })?;
         rows.into_iter()
@@ -246,10 +251,10 @@ impl OpsReportSource for PgOpsReportSource {
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(|_| {
+            .map_err(|source| {
                 admin_store_error(
                     ENTITY,
-                    postgres_unavailable("decode ops report purchase tickets"),
+                    postgres_unavailable("decode ops report purchase tickets", source),
                 )
             })
     }

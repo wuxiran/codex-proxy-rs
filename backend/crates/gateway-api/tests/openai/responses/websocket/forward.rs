@@ -1,3 +1,5 @@
+//! Responses WebSocket 事件转发、错误去重与连接恢复测试
+
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex,
@@ -17,7 +19,7 @@ use gateway_core::error::{
     ClientVisibleUpstreamError, ClientVisibleUpstreamResponse, ProviderError, ProviderErrorKind,
 };
 use gateway_core::event::{ProtocolWireEvent, ProviderEvent, ProviderResponseHeader};
-use gateway_core::runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
+use gateway_core::routing::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::upstream::{OpaqueUpstreamValue, UpstreamSendState};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -31,7 +33,7 @@ use crate::openai::{api_router, authenticated_client};
 
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-// 全部使用合成响应事实和真实 API 路由，不读取账号、日志或请求转储。
+// 全部使用合成响应事实和真实 API 路由，不读取账号、日志或请求转储
 struct TestServer(tokio::task::JoinHandle<()>);
 
 impl Drop for TestServer {
@@ -104,10 +106,18 @@ async fn next_error(socket: &mut TestSocket) -> Value {
 }
 
 async fn assert_no_duplicate_failure(socket: &mut TestSocket) {
-    // 后续入站帧只会在本轮收敛后处理，比固定等待窗口更可靠地检查没有重复失败终态。
-    socket.send(Message::Text("{".into())).await.unwrap();
+    // 无效创建帧仍走串行队列，以本地业务校验作为本轮收敛后的屏障
+    socket
+        .send(Message::Text(
+            json!({"type":"response.create","model":"model-a","stream":false})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
     let error = next_event(socket).await;
-    assert_eq!(error["error"]["code"], "invalid_json");
+    assert_eq!(error["error"]["code"], "invalid_value");
+    assert_eq!(error["error"]["param"], "stream");
     assert_eq!(error["status"], 400);
     assert_eq!(error["headers"]["x-request-id"], error["request_id"]);
     assert_eq!(
@@ -209,7 +219,7 @@ async fn initial_failure_retains_execution_until_request_middleware_returns() {
 
 #[tokio::test]
 async fn initial_http_or_opening_failure_preserves_status_and_structured_error() {
-    // 分类故意都用 Unavailable：不能把收到的 401/429/500 等按网关分类改成 502。
+    // 分类故意都用 Unavailable：不能把收到的 401/429/500 等按网关分类改成 502
     for status in [302, 400, 401, 403, 429, 500, 502, 503] {
         let provider = upstream_failure(
             status,
@@ -460,7 +470,7 @@ async fn opening_ids_stay_in_metadata_but_do_not_identify_initial_failures() {
         )
         .await;
         send_request(&mut socket).await;
-        // metadata 仍交付原会话观测；opening ID 不能因此成为当前失败的请求身份。
+        // metadata 仍交付原会话观测；opening ID 不能因此成为当前失败的请求身份
         assert_eq!(
             next_event(&mut socket).await,
             json!({

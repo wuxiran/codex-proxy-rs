@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import type { AccountRow } from '../constants'
+import type { Account } from '@/api'
 import type { AccountTicket } from '@/api/modules/accounts'
-import { BaseButton, BaseFormItem, BaseInput, BaseModal, BaseSegmented, BaseTextarea, toast } from '@codex-proxy/ui'
-import dayjs from 'dayjs'
+import { ZButton, ZDialog, ZFormItem, ZInput, ZNotification, ZSegmented, ZTextarea } from '@codex-proxy/ui'
 
 import { computed, shallowRef, watch } from 'vue'
 import { restoreAccountFromTicket, updateAccountTicket } from '@/api'
+import { formatDateTimeLocalInput } from '@/utils/format.fork'
 import { errorMessage } from '@/utils/operation'
 
-const props = defineProps<{ account: AccountRow | null }>()
+const props = defineProps<{ account: Account | null }>()
 const emit = defineEmits<{ changed: [] }>()
 const open = defineModel<boolean>({ default: false })
 
@@ -29,7 +29,7 @@ const busy = computed(() => saving.value || restoring.value)
 const oauth = computed(() => props.account?.provider === 'openai' && props.account.authenticationKind === 'oauth')
 
 function toLocalInput(value: string | null) {
-  return value ? dayjs(value).format('YYYY-MM-DDTHH:mm') : ''
+  return formatDateTimeLocalInput(value)
 }
 
 function toIso(value: string) {
@@ -66,11 +66,11 @@ async function save(options: { clearTicket?: boolean } = {}) {
       clearTicket: options.clearTicket,
     })
     ticketLine.value = ''
-    toast.success(options.clearTicket ? '已删除票据' : '已保存')
+    ZNotification.success({ message: options.clearTicket ? '已删除票据' : '已保存' })
     emit('changed')
   }
   catch (error: unknown) {
-    toast.error(errorMessage(error, '保存失败'))
+    ZNotification.error({ message: errorMessage(error, '保存失败') })
   }
   finally {
     saving.value = false
@@ -83,11 +83,11 @@ async function restore() {
   restoring.value = true
   try {
     await restoreAccountFromTicket({ accountId: props.account.id })
-    toast.success('已用票据重新登录并写回令牌')
+    ZNotification.success({ message: '已用票据重新登录并写回令牌' })
     emit('changed')
   }
   catch (error: unknown) {
-    toast.error(errorMessage(error, '票据恢复失败'), { duration: 8000 })
+    ZNotification.error({ message: errorMessage(error, '票据恢复失败'), duration: 8000 })
   }
   finally {
     restoring.value = false
@@ -96,36 +96,36 @@ async function restore() {
 </script>
 
 <template>
-  <BaseModal v-model="open" title="成本与票据" size="md" :dismissible="!busy">
+  <ZDialog v-model="open" title="成本与票据" width="36rem" :show-close="!busy" :close-on-click-modal="!busy" :close-on-press-escape="!busy">
     <div v-if="account" class="grid gap-4">
       <p class="m-0 text-cp-sm text-cp-text-secondary">
         {{ account.email ?? account.name }}
       </p>
 
-      <BaseFormItem label="买入价" description="留空表示不记录成本；「已刷」按买入时间起的模型价格计费累计">
+      <ZFormItem label="买入价" description="留空表示不记录成本；「已刷」按买入时间起的模型价格计费累计">
         <div class="flex flex-wrap items-center gap-2">
-          <BaseInput v-model="amount" class="max-w-40" inputmode="decimal" placeholder="例如 55" aria-label="买入价" :disabled="busy" />
-          <BaseSegmented v-model="currency" label="币种" :options="currencyOptions" :disabled="busy" />
+          <ZInput v-model="amount" class="max-w-40" inputmode="decimal" placeholder="例如 55" aria-label="买入价" :disabled="busy" />
+          <ZSegmented v-model="currency" aria-label="币种" :options="currencyOptions" :disabled="busy" />
         </div>
-      </BaseFormItem>
+      </ZFormItem>
 
       <div class="grid gap-4 sm:grid-cols-2">
-        <BaseFormItem label="买入时间">
-          <BaseInput v-model="purchasedAt" type="datetime-local" aria-label="买入时间" :disabled="busy" />
-        </BaseFormItem>
-        <BaseFormItem label="到期时间" description="例如车主说 23:20 踢人；列表显示倒计时">
-          <BaseInput v-model="expiresAt" type="datetime-local" aria-label="到期时间" :disabled="busy" />
-        </BaseFormItem>
+        <ZFormItem label="买入时间">
+          <ZInput v-model="purchasedAt" type="datetime-local" aria-label="买入时间" :disabled="busy" />
+        </ZFormItem>
+        <ZFormItem label="到期时间" description="例如车主说 23:20 踢人；列表显示倒计时">
+          <ZInput v-model="expiresAt" type="datetime-local" aria-label="到期时间" :disabled="busy" />
+        </ZFormItem>
       </div>
 
-      <BaseFormItem
+      <ZFormItem
         v-if="oauth"
         label="登录票据"
         :description="current?.hasTicket
           ? `已保存（${current.ticketHint}）。粘贴新票据可替换；票据加密存储，保存后不再显示明文`
           : '一行：邮箱----密码----2FA密钥。加密存储，保存后不再显示明文'"
       >
-        <BaseTextarea
+        <ZTextarea
           v-model="ticketLine"
           :rows="2"
           autocomplete="off"
@@ -133,18 +133,18 @@ async function restore() {
           placeholder="name@example.com----password----BASE32SECRET"
           :disabled="busy"
         />
-      </BaseFormItem>
+      </ZFormItem>
 
       <section v-if="oauth && current?.hasTicket" class="grid gap-2 rounded-cp bg-cp-fill-quaternary p-3">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <span class="text-cp-sm text-cp-text-secondary">账号掉线或令牌失效时，用票据经服务端重新登录（走该账号绑定的出口）并写回。</span>
           <div class="flex items-center gap-2">
-            <BaseButton size="sm" variant="secondary" :disabled="busy" @click="save({ clearTicket: true })">
+            <ZButton size="small" :disabled="busy" @click="save({ clearTicket: true })">
               删除票据
-            </BaseButton>
-            <BaseButton size="sm" variant="primary" :loading="restoring" :disabled="busy" @click="restore">
+            </ZButton>
+            <ZButton size="small" type="primary" :loading="restoring" :disabled="busy" @click="restore">
               用票据恢复
-            </BaseButton>
+            </ZButton>
           </div>
         </div>
         <p v-if="restoring" role="status" class="m-0 text-cp-xs text-cp-text-tertiary">
@@ -154,12 +154,12 @@ async function restore() {
     </div>
 
     <template #footer>
-      <BaseButton variant="secondary" :disabled="busy" @click="open = false">
+      <ZButton :disabled="busy" @click="open = false">
         关闭
-      </BaseButton>
-      <BaseButton variant="primary" :loading="saving" :disabled="busy || !account" @click="save()">
+      </ZButton>
+      <ZButton type="primary" :loading="saving" :disabled="busy || !account" @click="save()">
         保存
-      </BaseButton>
+      </ZButton>
     </template>
-  </BaseModal>
+  </ZDialog>
 </template>

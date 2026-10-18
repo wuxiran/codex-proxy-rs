@@ -1,9 +1,10 @@
-//! 宿主进程替换与容器内关闭语义。
+//! 宿主进程替换与容器内关闭语义
 
 use std::env;
 use std::fs;
 use std::process::{Command, Stdio};
 
+use super::config::environment_value;
 use super::{OperationError, SystemUpdateConfig, internal};
 
 const RESTART_DELAY_ENV: &str = "CPR_RESTART_DELAY_MS";
@@ -58,11 +59,4 @@ pub(crate) fn spawn_replacement(config: &SystemUpdateConfig) -> Result<(), Opera
         .spawn()
         .map(|_| ())
         .map_err(|error| internal(format!("failed to schedule replacement process: {error}")))
-}
-
-pub(crate) fn environment_value(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }

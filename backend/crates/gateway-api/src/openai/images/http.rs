@@ -1,4 +1,4 @@
-//! Codex Images 非流式 HTTP adapter。
+//! Codex Images 非流式 HTTP adapter
 
 use std::net::SocketAddr;
 
@@ -28,7 +28,7 @@ use crate::openai::{
 const OPENAI_PROTOCOL: &str = "openai";
 const IMAGE_TURN_ID_CONTEXT_KEY: &str = "image_turn_id";
 
-/// `POST /v1/images/generations`。
+/// `POST /v1/images/generations`
 pub(crate) async fn image_generations(
     State(state): State<ApiState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -46,7 +46,7 @@ pub(crate) async fn image_generations(
     .await
 }
 
-/// `POST /v1/images/edits`。
+/// `POST /v1/images/edits`
 pub(crate) async fn image_edits(
     State(state): State<ApiState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -100,12 +100,17 @@ async fn handle_image_request(
     .await
 }
 
-fn image_operation(
+async fn image_operation(
     body: Bytes,
-    headers: &HeaderMap,
+    mut headers: HeaderMap,
     kind: ImageRequestKind,
 ) -> Result<Operation, GatewayError> {
-    let mut context = OpenAiRequestHeaders::from_headers(headers).session_context();
+    let body = if kind == ImageRequestKind::Edit {
+        super::request::normalize_edit_body(body, &mut headers).await?
+    } else {
+        body
+    };
+    let mut context = OpenAiRequestHeaders::from_headers(&headers).session_context();
     if let Some(turn_id) = headers
         .get("x-codex-image-turn-id")
         .and_then(|value| value.to_str().ok())

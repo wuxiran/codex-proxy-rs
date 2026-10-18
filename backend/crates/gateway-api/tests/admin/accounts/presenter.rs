@@ -1,3 +1,5 @@
+//! 验证账号额度预测与原生模型目录的展示投影
+
 use bytes::Bytes;
 use gateway_admin::model::{
     provider_credentials::{AccountUsagePeriod, ProviderModelCatalogDocument},
@@ -40,11 +42,14 @@ fn quota_forecast_projection_only_exposes_capacity_and_preserves_null_zero() {
     monthly.target_seconds = 30 * 86_400;
     monthly.estimated_tokens = Some(0);
     monthly.estimated_usd = Some(0.0);
-    let view = AccountQuotaForecastData::from(AccountQuotaForecastReport {
-        account_id: "acct_forecast".to_owned(),
-        generated_at: now,
-        forecasts: [forecast, monthly],
-    });
+    let view = AccountQuotaForecastData::from((
+        AccountQuotaForecastReport {
+            account_id: "acct_forecast".to_owned(),
+            generated_at: now,
+            forecasts: [forecast, monthly],
+        },
+        gateway_api::TimePresenter::new(Default::default()),
+    ));
     let value = serde_json::to_value(view).unwrap();
     assert_eq!(value["accountId"], "acct_forecast");
     assert_eq!(value["generatedAt"], "2026-09-12T08:00:00+08:00");
@@ -92,7 +97,7 @@ fn quota_forecast_projection_only_exposes_capacity_and_preserves_null_zero() {
 #[test]
 fn model_catalog_projection_keeps_upstream_document_and_rejects_non_codex_wire() {
     let observed_at = "2026-09-12T08:00:00Z".parse().unwrap();
-    // 上游原生对象里的元数据必须原样到达客户端文件，否则 Codex 读不到推理强度和上下文窗口。
+    // 上游原生对象里的元数据必须原样到达客户端文件，否则 Codex 读不到推理强度和上下文窗口
     let body = serde_json::json!({
         "models": [{
             "slug": "gpt-5.6-luna",
@@ -111,9 +116,9 @@ fn model_catalog_projection_keeps_upstream_document_and_rejects_non_codex_wire()
     .expect("codex catalog is projectable");
     assert_eq!(data.model_count, 1);
     assert_eq!(data.catalog, body);
-    assert_eq!(data.observed_at, "2026-09-12T16:00:00+08:00");
+    assert_eq!(data.observed_at, "2026-09-12T08:00:00+00:00");
 
-    // 只有模型 ID 的 API 目录拼不出合法的 model_catalog_json，不能降格返回给客户端。
+    // 只有模型 ID 的 API 目录拼不出合法的 model_catalog_json，不能降格返回给客户端
     let adapted = RawJsonPayload::new("openai", Bytes::from_static(br#"{"models":[]}"#))
         .expect("openai payload");
     assert_eq!(

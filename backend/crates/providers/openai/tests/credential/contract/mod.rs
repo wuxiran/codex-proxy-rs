@@ -1,3 +1,5 @@
+//! OpenAI 凭据合同测试入口，以及凭据编码、持久化与选号约束测试
+
 mod capacity;
 mod fork_route_pair; // fork: served-mismatch
 
@@ -24,7 +26,6 @@ use gateway_core::lifecycle::CancellationToken;
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     ProviderCooldownPort, ProviderLeasePort, ProviderSessionAffinityKey,
-    ProviderSessionAffinityPort,
 };
 use gateway_core::routing::{
     ClientRoutingScope, FrozenAccountScope, ProviderKind, RuntimeAccount, RuntimeAccountDirectory,
@@ -118,7 +119,6 @@ fn round_robin_attempt() -> AttemptContext {
         AccountSelectionPolicy::new(
             RotationStrategy::RoundRobin,
             NonZeroU32::new(2).expect("concurrency"),
-            Duration::ZERO,
         ),
         AccountAttemptContext::new(BTreeSet::new(), None, None)
             .with_account_scope(contract_account_scope()),
@@ -145,59 +145,46 @@ async fn smart_reselection_respects_native_and_required_account_boundaries() {
     let selector =
         selector_with_affinity(&store, Arc::new(TestLeaseCoordinator::default()), affinity);
     let request_url = Url::parse(OFFICIAL_CODEX_BASE_URL).unwrap();
-    for enabled in [false, true] {
-        for binding in ["soft", "required", "native"] {
-            let continuation = (binding == "native").then(|| {
-                ContinuationBinding::Pinned(NativeContinuationPin::new(
-                    PreviousResponseId::new("client_response"),
-                    PreviousResponseId::new("upstream_response"),
-                    ClientApiKeyId::new("key_codex_contract").unwrap(),
-                    provider.clone(),
-                    original_id.clone(),
-                ))
-            });
-            let attempt = AttemptContext::new(
-                RequestAttemptContext::new(
-                    ModelRequestId::new("req_smart_scope").unwrap(),
-                    ClientApiKeyId::new("key_codex_contract").unwrap(),
-                ),
-                NonZeroU32::new(1).unwrap(),
-                SystemTime::now() + Duration::from_secs(30),
-                account_policy().with_smart_scheduling(
-                    gateway_core::account::SmartSchedulingConfig::new(
-                        [1.0, 0.8, 1.0, 0.5, 1.0, 1.0],
-                        enabled,
-                    )
+    for binding in ["soft", "required", "native"] {
+        let continuation = (binding == "native").then(|| {
+            ContinuationBinding::Pinned(NativeContinuationPin::new(
+                PreviousResponseId::new("client_response"),
+                PreviousResponseId::new("upstream_response"),
+                ClientApiKeyId::new("key_codex_contract").unwrap(),
+                provider.clone(),
+                original_id.clone(),
+            ))
+        });
+        let attempt = AttemptContext::new(
+            RequestAttemptContext::new(
+                ModelRequestId::new("req_smart_scope").unwrap(),
+                ClientApiKeyId::new("key_codex_contract").unwrap(),
+            ),
+            NonZeroU32::new(1).unwrap(),
+            SystemTime::now() + Duration::from_secs(30),
+            account_policy().with_smart_scheduling(
+                gateway_core::account::SmartSchedulingConfig::new([1.0, 0.8, 1.0, 0.5, 1.0, 1.0])
                     .unwrap(),
-                ),
-                AccountAttemptContext::new(
-                    BTreeSet::new(),
-                    (binding == "required").then(|| original_id.clone()),
-                    None,
-                )
-                .with_account_scope(contract_account_scope()),
-                continuation,
-                CancellationToken::new(),
-            );
-            let selected = selector
-                .select(&SelectCodexCredential {
-                    upstream_model: "gpt-5.4",
-                    request_url: &request_url,
-                    attempt: &attempt,
-                    session_affinity_key: Some(&key),
-                })
-                .await
-                .unwrap();
-            assert_eq!(
-                selected.account_id().as_str(),
-                if enabled && binding == "soft" {
-                    "acct_primary"
-                } else {
-                    "acct_original"
-                },
-                "{binding}, switchback={enabled}"
-            );
-        }
+            ),
+            AccountAttemptContext::new(
+                BTreeSet::new(),
+                (binding == "required").then(|| original_id.clone()),
+                None,
+            )
+            .with_account_scope(contract_account_scope()),
+            continuation,
+            CancellationToken::new(),
+        );
+        let selected = selector
+            .select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url: &request_url,
+                attempt: &attempt,
+                session_affinity_key: Some(&key),
+            })
+            .await
+            .unwrap();
+        assert_eq!(selected.account_id().as_str(), "acct_original", "{binding}");
     }
 }
 
@@ -459,7 +446,6 @@ fn selector_uses_frozen_global_account_policy_for_lease() {
         lease.account().revision()
     );
     assert_eq!(requests[0].max_concurrent().get(), 2);
-    assert_eq!(requests[0].request_interval(), Duration::from_millis(10));
     assert_eq!(requests[0].deadline(), attempt.deadline());
 }
 
@@ -537,15 +523,64 @@ fn selector_reloads_quota_snapshot_before_acquiring_the_only_lease() {
         selected.account(),
         &store.account("acct_primary").expect("current account")
     );
-    assert_eq!(store.credential_loads(), 2);
+    assert_eq!(
+        store.credential_loads(),
+        1,
+        "observation-only quota updates must not restart selection"
+    );
     let requests = leases.requests.lock().expect("lease requests");
     assert_eq!(
         requests.len(),
         1,
-        "conflicted snapshots must never consume capacity or request interval"
+        "conflicted snapshots must never consume capacity"
     );
     assert_eq!(requests[0].max_concurrent().get(), 1);
-    assert_eq!(requests[0].request_interval(), Duration::from_millis(10));
+}
+
+#[test]
+fn selector_rejects_quota_exhaustion_observed_after_selection() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_primary", "at-primary");
+    let original = store.account("acct_primary").expect("account");
+    block_on(store.apply_quota_access(QuotaAccessChange {
+        account_id: original.id().clone(),
+        expected_revision: original.revision(),
+        state: QuotaState::allowed(SystemTime::now()),
+    }))
+    .expect("initial quota observation");
+    store.on_credential_load(Arc::new(|store, id, count| {
+        Box::pin(async move {
+            if count == 1 {
+                let account = store.account(id.as_str()).expect("account");
+                store
+                    .apply_quota_access(QuotaAccessChange {
+                        account_id: id.clone(),
+                        expected_revision: account.revision(),
+                        state: QuotaState::exhausted(
+                            QuotaEvidence::UsageLimitReached,
+                            SystemTime::now(),
+                            None,
+                        ),
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+    }));
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let selector = selector(&store, Arc::clone(&leases));
+    let attempt = attempt(BTreeSet::new());
+    let error = block_on(selector.select(&SelectCodexCredential {
+        upstream_model: "gpt-5.4",
+        request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses").expect("URL"),
+        attempt: &attempt,
+        session_affinity_key: None,
+    }))
+    .expect_err("quota exhaustion must still invalidate the selected snapshot");
+
+    assert!(matches!(error, CredentialSelectionError::QuotaExhausted));
+    assert_eq!(store.credential_loads(), 1);
+    assert!(leases.requests.lock().expect("lease requests").is_empty());
 }
 
 #[test]
@@ -674,7 +709,7 @@ fn selector_does_not_retry_credential_store_unavailability() {
     }))
     .expect_err("unavailability is not an account snapshot conflict");
 
-    assert!(matches!(error, CredentialSelectionError::Store));
+    assert!(matches!(error, CredentialSelectionError::Store(_)));
     assert_eq!(store.credential_loads(), 1);
     assert!(leases.requests.lock().expect("lease requests").is_empty());
 }
@@ -704,7 +739,10 @@ fn selector_does_not_retry_invalid_credential_data() {
     }))
     .expect_err("invalid data is not an account snapshot conflict");
 
-    assert!(matches!(error, CredentialSelectionError::InvalidCredential));
+    assert!(matches!(
+        error,
+        CredentialSelectionError::InvalidCredential(_)
+    ));
     assert_eq!(store.credential_loads(), 1);
     assert!(leases.requests.lock().expect("lease requests").is_empty());
 }
@@ -792,9 +830,7 @@ async fn record_success_should_not_overwrite_a_newer_session_winner() {
         .await
         .expect("seed newer affinity");
 
-    selector
-        .record_success(&first, Some(&key), first.id())
-        .await;
+    selector.record_success(&first).await;
 
     assert_eq!(
         affinity
@@ -829,9 +865,7 @@ async fn selector_should_reuse_and_renew_the_account_bound_to_the_same_session()
         })
         .await
         .expect("select first account");
-    selector
-        .record_success(first.account(), Some(&key), first.account_id())
-        .await;
+    selector.record_success(first.account()).await;
     let first_account = first.account_id().clone();
 
     let second_attempt = attempt(BTreeSet::new());
@@ -864,7 +898,7 @@ async fn selector_should_reuse_and_renew_the_account_bound_to_the_same_session()
     assert_eq!(
         affinity.renewal_ttls(),
         vec![Duration::from_secs(24 * 60 * 60); 2],
-        "successful response and next selection both renew the binding"
+        "initial admission and next selection both renew the binding"
     );
 }
 
@@ -901,9 +935,7 @@ async fn selector_should_replace_a_busy_affinity_binding_after_the_fallback_succ
         })
         .await
         .expect("select fallback account");
-    selector
-        .record_success(selected.account(), Some(&key), &bound)
-        .await;
+    selector.record_success(selected.account()).await;
 
     assert_eq!(
         (
@@ -1327,7 +1359,7 @@ fn rate_limited_failure_does_not_consult_stale_quota_snapshot() {
             .credential_state(),
         CredentialState::Ready
     );
-    // 429 临时限流写入 Redis 冷却，不读写 quota JSON。
+    // 429 临时限流写入 Redis 冷却，不读写 quota JSON
     assert_eq!(store.quota_reads(), 0);
     let cooldown = block_on(cooldowns.read(account.id())).expect("read cooldown");
     assert!(
@@ -1377,7 +1409,7 @@ fn successful_upstream_response_recovers_non_quota_terminal_states() {
         let current = store.account("acct_primary").expect("stale account");
         let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
 
-        block_on(selector.record_success(&current, None, current.id()));
+        block_on(selector.record_success(&current));
 
         assert_eq!(
             store
@@ -1656,7 +1688,7 @@ fn cloudflare_challenge_does_not_change_persisted_account_facts() {
             .credential_state(),
         CredentialState::Ready
     );
-    block_on(selector.record_success(lease.account(), None, lease.account_id()));
+    block_on(selector.record_success(lease.account()));
 }
 
 #[test]
@@ -1797,6 +1829,41 @@ fn cloudflare_path_block_deletes_provider_owned_cookies() {
 }
 
 #[test]
+fn stale_response_cookie_capture_reports_revision_conflict_and_preserves_newer_cookie() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_primary", "at-primary");
+    let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
+    let origin = Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
+    let stale = store.account("acct_primary").unwrap();
+    block_on(selector.capture_response_cookies(
+        &stale,
+        &origin,
+        &["cf_clearance=newer; Path=/; Secure; Max-Age=3600".to_owned()],
+    ))
+    .unwrap();
+    let current = store.account("acct_primary").unwrap();
+
+    let error = block_on(selector.capture_response_cookies(
+        &stale,
+        &origin,
+        &["cf_clearance=older; Path=/; Secure; Max-Age=3600".to_owned()],
+    ))
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CredentialSelectionError::RevisionConflict(_)
+    ));
+    assert_eq!(error.to_string(), "Codex credential revision conflict");
+    assert_eq!(
+        store.account("acct_primary").unwrap().revision(),
+        current.revision()
+    );
+    let data = block_on(store.repository().load_complete_data(&current)).unwrap();
+    assert_eq!(data.cookies()[0].value, "newer");
+}
+
+#[test]
 fn response_cookie_rotation_returns_a_current_account_for_later_fenced_writes() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_primary", "at-primary");
@@ -1845,22 +1912,15 @@ fn queued_attempt(timeout: Duration) -> AttemptContext {
         ),
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(5),
-        AccountSelectionPolicy::new(
-            RotationStrategy::Smart,
-            NonZeroU32::new(2).unwrap(),
-            Duration::ZERO,
-        )
-        .with_queue(gateway_core::concurrency::ConcurrencyQueuePolicy {
-            max_waiting: 1,
-            timeout,
-        })
-        .with_smart_scheduling(
-            gateway_core::account::SmartSchedulingConfig::new(
-                [1.0, 0.8, 1.0, 0.5, 1.0, 1.0],
-                false,
-            )
-            .unwrap(),
-        ),
+        AccountSelectionPolicy::new(RotationStrategy::Smart, NonZeroU32::new(2).unwrap())
+            .with_queue(gateway_core::concurrency::ConcurrencyQueuePolicy {
+                max_waiting: 1,
+                timeout,
+            })
+            .with_smart_scheduling(
+                gateway_core::account::SmartSchedulingConfig::new([1.0, 0.8, 1.0, 0.5, 1.0, 1.0])
+                    .unwrap(),
+            ),
         AccountAttemptContext::new(BTreeSet::new(), None, None)
             .with_account_scope(contract_account_scope()),
         None,
@@ -1908,10 +1968,14 @@ fn smart_queue_weight_changes_the_selected_wait_queue() {
                         timeout: Duration::from_secs(2),
                     })
                     .with_smart_scheduling(
-                        gateway_core::account::SmartSchedulingConfig::new(
-                            [0.0, 0.0, 1.0, 0.0, 0.0, queue_weight],
-                            false,
-                        )
+                        gateway_core::account::SmartSchedulingConfig::new([
+                            0.0,
+                            0.0,
+                            1.0,
+                            0.0,
+                            0.0,
+                            queue_weight,
+                        ])
                         .unwrap(),
                     ),
                 AccountAttemptContext::new(BTreeSet::new(), required, None)
@@ -1976,10 +2040,9 @@ fn smart_queue_keeps_native_and_required_account_pins_when_another_account_is_fr
                     timeout: Duration::from_secs(2),
                 })
                 .with_smart_scheduling(
-                    gateway_core::account::SmartSchedulingConfig::new(
-                        [1.0, 0.8, 1.0, 0.5, 10.0, 10.0],
-                        true,
-                    )
+                    gateway_core::account::SmartSchedulingConfig::new([
+                        1.0, 0.8, 1.0, 0.5, 10.0, 10.0,
+                    ])
                     .unwrap(),
                 ),
             AccountAttemptContext::new(BTreeSet::new(), (!native).then(|| original.clone()), None)

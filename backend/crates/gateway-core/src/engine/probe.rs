@@ -1,4 +1,4 @@
-//! 管理端账号连通性测试的真实执行链端口。
+//! 管理端账号连通性测试的真实执行链端口
 
 use std::fmt;
 
@@ -39,7 +39,8 @@ pub struct AccountProbeExecution {
 }
 
 impl AccountProbeExecution {
-    pub(crate) fn from_trace(trace: Option<serde_json::Value>) -> Self {
+    #[doc(hidden)]
+    pub fn from_trace(trace: Option<serde_json::Value>) -> Self {
         let mut result = Self::default();
         let Some(trace) = trace else { return result };
         for event in trace
@@ -125,9 +126,9 @@ pub struct AccountProbeResult {
     pub response_headers: Vec<ProviderResponseHeader>,
 }
 
-/// 仅供当前管理端连接测试展示的原始上游失败响应。
+/// 仅供当前管理端连接测试展示的原始上游失败响应
 ///
-/// 正文不进入 `Debug`、日志或持久化；Core 只在探测终态从原始 Provider 错误显式复制。
+/// 正文不进入 `Debug`、日志或持久化；Core 只在探测终态从原始 Provider 错误显式复制
 #[derive(PartialEq, Eq)]
 pub struct AccountProbeUpstreamResponse {
     status: u16,
@@ -174,7 +175,7 @@ impl fmt::Debug for AccountProbeUpstreamResponse {
     }
 }
 
-/// 连接测试失败发生的稳定责任边界。
+/// 连接测试失败发生的稳定责任边界
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountProbeErrorSource {
     Gateway,
@@ -183,7 +184,7 @@ pub enum AccountProbeErrorSource {
 }
 
 impl AccountProbeErrorSource {
-    /// 返回管理端 wire 使用的稳定值。
+    /// 返回管理端 wire 使用的稳定值
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -194,33 +195,35 @@ impl AccountProbeErrorSource {
     }
 }
 
-/// 管理端连接测试的终态错误。
+/// 管理端连接测试的终态错误
 ///
-/// `gateway` 保留稳定分类，`upstream_response` 只面向本次认证管理请求展示源响应。
+/// `gateway` 保留稳定分类，`upstream_response` 只面向本次认证管理请求展示源响应
 #[derive(Debug)]
 pub struct AccountProbeError {
     gateway: GatewayError,
     source: AccountProbeErrorSource,
     send_state: Option<UpstreamSendState>,
-    upstream_response: Option<AccountProbeUpstreamResponse>,
+    upstream_response: Option<Box<AccountProbeUpstreamResponse>>,
+    // fork: 管理端连接测试的 Provider 原始失败分类与执行事实
     provider_kind: Option<ProviderErrorKind>,
-    execution: Option<AccountProbeExecution>,
+    // 执行事实装箱，避免把探测错误（Result 的 Err 侧）撑大
+    execution: Option<Box<AccountProbeExecution>>,
 }
 
 impl AccountProbeError {
     #[must_use]
     pub fn with_execution(mut self, execution: AccountProbeExecution) -> Self {
-        self.execution = Some(execution);
+        self.execution = Some(Box::new(execution));
         self
     }
 
     #[must_use]
     pub fn execution(&self) -> Option<&AccountProbeExecution> {
-        self.execution.as_ref()
+        self.execution.as_deref()
     }
 
     #[must_use]
-    pub const fn new(
+    pub fn new(
         gateway: GatewayError,
         source: AccountProbeErrorSource,
         send_state: Option<UpstreamSendState>,
@@ -230,7 +233,7 @@ impl AccountProbeError {
             gateway,
             source,
             send_state,
-            upstream_response,
+            upstream_response: upstream_response.map(Box::new),
             provider_kind: None,
             execution: None,
         }
@@ -282,8 +285,8 @@ impl AccountProbeError {
     }
 
     #[must_use]
-    pub const fn upstream_response(&self) -> Option<&AccountProbeUpstreamResponse> {
-        self.upstream_response.as_ref()
+    pub fn upstream_response(&self) -> Option<&AccountProbeUpstreamResponse> {
+        self.upstream_response.as_deref()
     }
 }
 
@@ -294,53 +297,10 @@ impl From<GatewayError> for AccountProbeError {
 }
 
 pub trait AccountProbe: Send + Sync {
-    /// 插件管理操作传入其冻结快照；其他调用可使用当前发布视图。
+    /// 插件管理操作传入其冻结快照；其他调用可使用当前发布视图
     fn probe(
         &self,
         request: AccountProbeRequest,
         snapshot: Option<std::sync::Arc<crate::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>>;
-}
-
-#[cfg(test)]
-mod verification_trace_tests {
-    use super::AccountProbeExecution;
-    use serde_json::json;
-
-    #[test]
-    fn warm_origin_is_separate_from_a_proof_that_no_longer_matches() {
-        let execution = AccountProbeExecution::from_trace(Some(json!({"events": [{
-            "stage": "upstream.connection", "data": {
-                "reused": true, "warmVerified": false, "warmVerificationStatus": "conditions_changed",
-                "warmVerifiedAtMs": 1700000000000u64, "warmVerificationAgeMs": 241000,
-                "connectionId": "fixture-warm"
-            }
-        }]})));
-        assert_eq!(execution.warm_pool_used, Some(true));
-        assert_eq!(execution.warm_verified, Some(false));
-        assert_eq!(
-            execution.warm_verification_status.as_deref(),
-            Some("conditions_changed")
-        );
-        assert_eq!(execution.warm_verification_age_ms, Some(241000));
-    }
-
-    #[test]
-    fn retry_or_http_exchange_cannot_inherit_a_previous_websocket_verification() {
-        for reset in [
-            json!({"stage": "attempt.started", "data": {}}),
-            json!({"stage": "upstream.exchange.started", "data": {"transport": "http_sse"}}),
-        ] {
-            let execution = AccountProbeExecution::from_trace(Some(json!({"events": [{
-                "stage": "upstream.connection", "data": {
-                    "reused": true, "warmVerified": true, "warmVerificationStatus": "fresh",
-                    "warmVerifiedAtMs": 1700000000000u64, "warmVerificationAgeMs": 8000
-                }
-            }, reset]})));
-            assert_eq!(execution.warm_verified, None);
-            assert_eq!(execution.warm_verification_status, None);
-            assert_eq!(execution.warm_verified_at_ms, None);
-            assert_eq!(execution.warm_verification_age_ms, None);
-        }
-    }
 }

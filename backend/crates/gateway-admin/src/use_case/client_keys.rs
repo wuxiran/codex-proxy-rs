@@ -1,4 +1,4 @@
-//! Client API Key 管理用例。
+//! Client API Key 管理用例
 
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use crate::{
 
 use super::{map_store_error, publish_committed};
 
-/// API 消费的 Client Key 管理服务。
+/// API 消费的 Client Key 管理服务
 #[async_trait]
 pub trait ClientKeyService: Send + Sync {
     async fn get(&self, id: &ClientApiKeyId) -> Result<ClientKeyRecord, AdminError>;
@@ -157,6 +157,8 @@ impl ClientKeyService for DefaultClientKeyService {
         context: &MutationContext,
         command: CreateClientKey,
     ) -> Result<CreatedClientKey, AdminError> {
+        crate::model::client_keys::validate_group_ids(&command.group_ids)
+            .map_err(|_| AdminError::invalid("Client API Key 分组不合法"))?;
         for (provider, profile) in &command.request_profile_overrides {
             self.providers
                 .require(provider)
@@ -199,6 +201,8 @@ impl ClientKeyService for DefaultClientKeyService {
         context: &MutationContext,
         command: UpdateClientKey,
     ) -> Result<ClientKeyMutation, AdminError> {
+        crate::model::client_keys::validate_group_ids(&command.group_ids)
+            .map_err(|_| AdminError::invalid("Client API Key 分组不合法"))?;
         for (provider, profile) in &command.request_profile_override_updates {
             if let Some(profile) = profile {
                 self.providers
@@ -300,7 +304,7 @@ fn validate_cursor(query: &ClientKeyListQuery) -> Result<(), AdminError> {
     }
 }
 
-// 原生与插件创建共用相同的密钥生成规则。
+// 原生与插件创建共用相同的密钥生成规则
 pub(super) fn generate_key() -> String {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);

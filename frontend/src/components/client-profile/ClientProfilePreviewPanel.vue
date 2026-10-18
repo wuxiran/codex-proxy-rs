@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import type { ClientProfilePreview } from '@/api/modules/client-profiles'
-import { BaseSkeleton } from '@codex-proxy/ui'
-import { formatDateTime } from '@/utils/format'
+import type { ClientProfilePreview } from '@/api/modules/settings/profiles'
+import { ZSkeleton } from '@codex-proxy/ui'
 
 defineProps<{
-  preview?: Pick<ClientProfilePreview, 'userAgent' | 'versionSource' | 'checkedAt' | 'error'>
+  preview?: Pick<ClientProfilePreview, 'userAgent' | 'versionSource' | 'checkedAtDisplay' | 'error'> & { versionLag?: number | null }
   previewing: boolean
   needsVersionInput: boolean
   error: string
@@ -26,10 +25,10 @@ defineProps<{
   >
     <template v-if="previewing">
       <div class="flex h-lh items-center text-cp-sm" role="status" aria-label="正在解析客户端身份">
-        <BaseSkeleton shape="text" class="w-4/5" aria-hidden="true" />
+        <ZSkeleton shape="text" class="w-4/5" aria-hidden="true" />
       </div>
       <div class="flex h-lh items-center text-cp-xs" aria-hidden="true">
-        <BaseSkeleton shape="text" class="w-52 max-w-full" />
+        <ZSkeleton shape="text" class="w-52 max-w-full" />
       </div>
     </template>
     <template v-else-if="preview">
@@ -37,7 +36,10 @@ defineProps<{
       <p class="m-0 text-cp-xs text-cp-text-tertiary">
         {{ preview.versionSource === 'custom' ? '固定身份' : '自动更新' }}
         <template v-if="preview.versionSource === 'official'">
-          · {{ preview.checkedAt ? `检查于 ${formatDateTime(preview.checkedAt)}` : '待检查' }}
+          <template v-if="preview.versionLag">
+            · 滞后 {{ preview.versionLag }} 版
+          </template>
+          · {{ preview.checkedAtDisplay ? `检查于 ${preview.checkedAtDisplay}` : '待检查' }}
         </template>
       </p>
       <p v-if="preview.error && preview.versionSource !== 'custom'" :title="preview.error" class="m-0 text-cp-sm text-cp-warning">

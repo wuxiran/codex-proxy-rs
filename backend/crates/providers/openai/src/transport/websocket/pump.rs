@@ -1,17 +1,19 @@
-//! 常驻后台的 WebSocket 泵（对齐官方 Codex CLI 的连接管理）。
+//! 常驻后台的 WebSocket 泵（对齐官方 Codex CLI 的连接管理）
 //!
 //! 每条上游 WebSocket 连接都由一个后台 pump 任务独占：
-//!   - 持续读取 socket：一旦观察到 `Close` / EOF / 传输错误，立即把连接标记为 `closed`。
-//!   - 自动回应上游 `Ping`，并按 `ping_interval` 主动 `Ping`；收到任意入站帧即解除本次心跳 deadline。
-//!   - 可选 `liveness_timeout`：长时间无任何入站活动时判定连接失活并退出。
+//! - 持续读取 socket：一旦观察到 `Close` / EOF / 传输错误，立即把连接标记为 `closed`
+//! - 自动回应上游 `Ping`，并按 `ping_interval` 主动 `Ping`；收到非关闭入站帧即解除本次心跳 deadline
+//! - 可选 `liveness_timeout`：长时间无任何入站活动时判定连接失活并退出
 //!
 //! 因此空闲连接的“死没死”在后台被实时感知；复用方只需零成本读取 [`PumpedWebSocket::is_closed`]，
-//! 无需在请求路径上做同步探活 ping（消除“复用到静默死连接才卡住超时”的长尾）。
+//! 无需在请求路径上做同步探活 ping（消除“复用到静默死连接才卡住超时”的长尾）
 //!
 //! 收发都通过 channel 与 pump 任务交互：
-//!   - 发送：`send` 走 command channel，等待 pump 回执。
-//!   - 接收：`next` 从 message channel 取出 pump 转发的入站帧（`Ping`/`Pong` 已被 pump 吞掉）。
-//!   - 入站缓冲满时暂停读取 socket 和主动探活，仅继续处理发送/关闭命令；消费恢复后按原顺序继续转发。
+//! - 发送：`send` 走 command channel，等待 pump 回执
+//! - 接收：`next` 从 message channel 取出 pump 转发的入站帧（`Ping`/`Pong` 已被 pump 吞掉）
+//! - 入站缓冲满时暂停读取 socket 和主动探活，仅继续处理发送/关闭命令；消费恢复后按原顺序继续转发
+
+use gateway_core::engine::response_control::{ResponseControl, ResponseControlTransport};
 
 use std::sync::{
     Arc, Mutex,
@@ -21,16 +23,19 @@ use std::time::Duration;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::CodexWebSocketCloseError;
+use super::{
+    CodexWebSocketCloseError, CodexWebSocketExchangeError,
+    control::{PumpCommand, PumpControl, SharedMessages, send_message},
+};
 
-/// 底层 tungstenite WebSocket 流。
+/// 底层 tungstenite WebSocket 流
 pub(crate) trait WebSocketIo:
     Stream<Item = Result<Message, tungstenite::Error>>
     + Sink<Message, Error = tungstenite::Error>
@@ -51,7 +56,7 @@ pub(crate) type RawWsStream = Box<dyn WebSocketIo>;
 
 const PUMP_COMMAND_BUFFER: usize = 32;
 
-/// pump 日志的账号级关联上下文；空闲连接被上游重置等场景用于回溯归属。
+/// pump 日志的账号级关联上下文；空闲连接被上游重置等场景用于回溯归属
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PumpLogContext {
     pub(crate) account_id: Option<String>,
@@ -67,19 +72,19 @@ impl PumpLogContext {
     }
 }
 
-/// pump 保活策略。
+/// pump 保活策略
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PumpKeepalive {
-    /// 主动 `Ping` 间隔；`None` 表示 pump 不主动 ping（仅被动读取 + 回应上游 ping）。
+    /// 主动 `Ping` 间隔；`None` 表示 pump 不主动 ping（仅被动读取 + 回应上游 ping）
     pub(crate) ping_interval: Option<Duration>,
-    /// 主动 `Ping` 发出后等待任意入站帧的 deadline；`None` 表示不校验响应。
+    /// 主动 `Ping` 发出后等待任意入站帧的 deadline；`None` 表示不校验响应
     pub(crate) ping_timeout: Option<Duration>,
-    /// 无入站活动多久后判定失活；`None` 表示只靠显式 close/传输错误发现死亡。
+    /// 无入站活动多久后判定失活；`None` 表示只靠显式 close/传输错误发现死亡
     pub(crate) liveness_timeout: Option<Duration>,
 }
 
 impl PumpKeepalive {
-    /// 不做主动保活（用于即用即弃的非池化连接）。
+    /// 不做主动保活（用于即用即弃的非池化连接）
     pub(crate) fn disabled() -> Self {
         Self {
             ping_interval: None,
@@ -87,13 +92,6 @@ impl PumpKeepalive {
             liveness_timeout: None,
         }
     }
-}
-
-enum PumpCommand {
-    Send {
-        message: Message,
-        ack: oneshot::Sender<Result<(), tungstenite::Error>>,
-    },
 }
 
 const PUMP_MESSAGE_BUFFER: usize = 64;
@@ -280,11 +278,12 @@ impl PumpLifecycleState {
     }
 }
 
-/// 由后台 pump 任务托管的 WebSocket 连接句柄。
+/// 由后台 pump 任务托管的 WebSocket 连接句柄
 pub(crate) struct PumpedWebSocket {
     connection_id: Uuid,
     tx_command: mpsc::Sender<PumpCommand>,
-    rx_message: mpsc::Receiver<Result<Message, tungstenite::Error>>,
+    rx_message: SharedMessages,
+    control: Option<Arc<dyn ResponseControlTransport>>,
     closed: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<PumpLifecycleState>>,
     pump: Option<JoinHandle<()>>,
@@ -299,12 +298,19 @@ impl std::fmt::Debug for PumpedWebSocket {
     }
 }
 
+// 字段按声明顺序析构，先释放物理 socket，再归还代理名额
+struct PumpSocket {
+    stream: RawWsStream,
+    _proxy_permit: Option<super::pool::ProxyConnectionPermit>,
+}
+
 impl PumpedWebSocket {
-    /// 用底层流启动一个 pump 任务并返回句柄。
+    /// 用底层流启动一个 pump 任务并返回句柄
     pub(crate) fn new(
         inner: RawWsStream,
         keepalive: PumpKeepalive,
         context: PumpLogContext,
+        proxy_permit: Option<super::pool::ProxyConnectionPermit>,
     ) -> Self {
         let (tx_command, rx_command) = mpsc::channel::<PumpCommand>(PUMP_COMMAND_BUFFER);
         let (tx_message, rx_message) = mpsc::channel(PUMP_MESSAGE_BUFFER);
@@ -319,6 +325,10 @@ impl PumpedWebSocket {
             exit_reason: None,
         }));
         let lifecycle_for_task = Arc::clone(&lifecycle);
+        let inner = PumpSocket {
+            stream: inner,
+            _proxy_permit: proxy_permit,
+        };
         let pump = tokio::spawn(async move {
             pump_loop(
                 connection_id,
@@ -335,37 +345,43 @@ impl PumpedWebSocket {
         Self {
             connection_id,
             tx_command,
-            rx_message,
+            rx_message: Arc::new(tokio::sync::Mutex::new(rx_message)),
+            control: None,
             closed,
             lifecycle,
             pump: Some(pump),
         }
     }
 
-    /// 通过 pump 发送一帧，返回底层 `send` 的结果。
-    pub(crate) async fn send(&self, message: Message) -> Result<(), tungstenite::Error> {
-        let (ack, rx_ack) = oneshot::channel();
-        if self
-            .tx_command
-            .send(PumpCommand::Send { message, ack })
-            .await
-            .is_err()
-        {
-            return Err(tungstenite::Error::ConnectionClosed);
+    /// 通过 pump 发送一帧，区分未开始发送与底层传输失败
+    pub(crate) async fn send(&self, message: Message) -> Result<(), CodexWebSocketExchangeError> {
+        if self.is_closed() {
+            return Err(CodexWebSocketExchangeError::SendNotStarted);
         }
-        rx_ack
-            .await
-            .unwrap_or(Err(tungstenite::Error::ConnectionClosed))
+        send_message(&self.tx_command, message).await
     }
 
-    /// 取出下一帧入站消息（`Ping`/`Pong` 已被 pump 处理，不会到达这里）。
+    /// 每轮发送后替换控制 owner，旧执行的弱引用不能控制下一轮连接
+    pub(crate) fn bind_control(&mut self, control: Option<&ResponseControl>) {
+        self.control = control.map(|control| {
+            let transport: Arc<dyn ResponseControlTransport> = Arc::new(PumpControl {
+                tx_command: self.tx_command.clone(),
+                rx_message: Arc::clone(&self.rx_message),
+            });
+            control.bind(&transport);
+            transport
+        });
+    }
+
+    /// 取出下一帧入站消息（`Ping`/`Pong` 已被 pump 处理，不会到达这里）
     ///
-    /// 返回 `None` 表示连接已结束（pump 已退出且缓冲已排空）。
+    /// 返回 `None` 表示连接已结束（pump 已退出且缓冲已排空）
     pub(crate) async fn next(&mut self) -> Option<Result<Message, tungstenite::Error>> {
-        self.rx_message.recv().await
+        self.rx_message.lock().await.recv().await
     }
 
-    /// 连接是否已被后台 pump 判定关闭/失活。零成本，用于复用前探活。
+    /// 连接是否已被后台 pump 判定关闭/失活
+    /// 零成本，用于复用前探活
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire) || self.tx_command.is_closed()
     }
@@ -389,7 +405,16 @@ impl PumpedWebSocket {
             .observation(self.connection_id, Instant::now())
     }
 
-    /// 主动关闭连接（best-effort 发送 Close 帧）。
+    pub(crate) async fn close_and_wait(mut self) {
+        self.close().await;
+        if let Some(pump) = self.pump.as_mut() {
+            // 沿用 Drop 的停止语义，并等待 socket 析构完成后再让容量等待者继续
+            pump.abort();
+            let _ = pump.await;
+        }
+    }
+
+    /// 主动关闭连接（best-effort 发送 Close 帧）
     pub(crate) async fn close(&self) {
         if !self.is_closed() {
             let _ = self.send(Message::Close(None)).await;
@@ -411,7 +436,7 @@ impl Drop for PumpedWebSocket {
 )]
 async fn pump_loop(
     connection_id: Uuid,
-    mut inner: RawWsStream,
+    mut inner: PumpSocket,
     mut rx_command: mpsc::Receiver<PumpCommand>,
     tx_message: mpsc::Sender<Result<Message, tungstenite::Error>>,
     keepalive: PumpKeepalive,
@@ -428,7 +453,7 @@ async fn pump_loop(
     let liveness_timeout = keepalive.liveness_timeout.filter(|d| !d.is_zero());
     let mut ping_ticker = ping_interval.map(|d| {
         // 首个 tick 推迟一整个间隔：tokio::time::interval 默认会让首个 tick 立即就绪，
-        // 否则连接一建立就会立刻发一帧 Ping，与首个请求 Text 抢跑、打乱帧序。
+        // 否则连接一建立就会立刻发一帧 Ping，与首个请求 Text 抢跑、打乱帧序
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + d, d);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker
@@ -453,15 +478,14 @@ async fn pump_loop(
                     if let Some(reason) = pending.exit_reason {
                         break 'pump reason;
                     }
-                    // 背压期间无法读取 socket，不能把这段本地下游阻塞误算成上游静默。
+                    // 背压期间无法读取 socket，不能把这段本地下游阻塞误算成上游静默
                     last_activity = Instant::now();
-                    record_activity(&lifecycle, last_activity);
                 }
                 command = rx_command.recv() => {
                     let Some(command) = command else {
                         break 'pump PumpExitReason::CommandChannelClosed;
                     };
-                    if let Some(reason) = handle_command(&mut inner, command).await {
+                    if let Some(reason) = handle_command(&mut inner.stream, command, closed.load(Ordering::Acquire)).await {
                         break 'pump reason;
                     }
                 }
@@ -476,20 +500,23 @@ async fn pump_loop(
                 let Some(command) = command else {
                     break 'pump PumpExitReason::CommandChannelClosed;
                 };
-                if let Some(reason) = handle_command(&mut inner, command).await {
+                if let Some(reason) = handle_command(&mut inner.stream, command, closed.load(Ordering::Acquire)).await {
                     break 'pump reason;
                 }
             }
-            message = inner.next() => {
+            message = inner.stream.next() => {
                 match message {
                     None => break 'pump PumpExitReason::UpstreamEof,
                     Some(Ok(message)) => {
-                        last_activity = Instant::now();
-                        record_activity(&lifecycle, last_activity);
-                        observe_inbound(connection_id, &mut pending_ping, &message);
+                        // Close 是终止信号，不能刷新链路健康时间或抹掉关闭前的静默时长
+                        if !matches!(message, Message::Close(_)) {
+                            last_activity = Instant::now();
+                            record_activity(&lifecycle, last_activity);
+                            observe_inbound(connection_id, &mut pending_ping, &message);
+                        }
                         match message {
                             Message::Ping(payload) => {
-                                if let Err(error) = inner.send(Message::Pong(payload)).await {
+                                if let Err(error) = inner.stream.send(Message::Pong(payload)).await {
                                     break 'pump PumpExitReason::KeepaliveTransportError {
                                         message: error.to_string(),
                                         metric_reason: transport_metric_reason(&error),
@@ -509,6 +536,9 @@ async fn pump_loop(
                                     }),
                                     _ => None,
                                 };
+                                if let Some(reason) = &terminal_reason {
+                                    record_closed(&closed, &lifecycle, reason);
+                                }
                                 if let Some(reason) = enqueue_inbound(
                                     &tx_message,
                                     &mut pending_inbound,
@@ -529,6 +559,7 @@ async fn pump_loop(
                             message: err.to_string(),
                             metric_reason: transport_metric_reason(&err),
                         };
+                        record_closed(&closed, &lifecycle, &terminal_reason);
                         if let Some(reason) = enqueue_inbound(
                             &tx_message,
                             &mut pending_inbound,
@@ -547,7 +578,7 @@ async fn pump_loop(
             _ = tick(&mut ping_ticker) => {
                 if pending_ping.is_none() {
                     match send_keepalive_ping(
-                        &mut inner,
+                        &mut inner.stream,
                         &mut ping_sequence,
                         ping_timeout,
                     ).await {
@@ -569,15 +600,17 @@ async fn pump_loop(
         }
     };
 
-    closed.store(true, Ordering::Release);
+    record_closed(&closed, &lifecycle, &reason);
+    // 排队命令尚未进入底层发送，关闭握手前即回绝，避免调用方等待或误判为已发送
+    rx_command.close();
+    while let Ok(PumpCommand::Send { ack, .. }) = rx_command.try_recv() {
+        let _ = ack.send(Err(CodexWebSocketExchangeError::SendNotStarted));
+    }
     let observation = {
-        let closed_at = Instant::now();
-        let mut lifecycle = lifecycle
+        let lifecycle = lifecycle
             .lock()
             .expect("WebSocket pump lifecycle lock poisoned");
-        lifecycle.closed_at = Some(closed_at);
-        lifecycle.exit_reason = Some(reason.clone());
-        lifecycle.observation(connection_id, closed_at)
+        lifecycle.observation(connection_id, Instant::now())
     };
     log_pump_exit(
         connection_id,
@@ -588,7 +621,7 @@ async fn pump_loop(
     );
 
     if reason.should_send_close() {
-        let _ = inner.send(Message::Close(None)).await;
+        let _ = inner.stream.send(Message::Close(None)).await;
     }
 }
 
@@ -618,15 +651,27 @@ fn enqueue_inbound(
     }
 }
 
-async fn handle_command(inner: &mut RawWsStream, command: PumpCommand) -> Option<PumpExitReason> {
+async fn handle_command(
+    inner: &mut RawWsStream,
+    command: PumpCommand,
+    closed: bool,
+) -> Option<PumpExitReason> {
     let PumpCommand::Send { message, ack } = command;
+    // 发送超时或取消后，尚在队列里的业务帧不应继续打到上游
+    if ack.is_closed() {
+        return None;
+    }
+    if closed {
+        let _ = ack.send(Err(CodexWebSocketExchangeError::SendNotStarted));
+        return None;
+    }
     let is_close = matches!(message, Message::Close(_));
     let result = inner.send(message).await;
     let transport_error = result
         .as_ref()
         .err()
         .map(|error| (error.to_string(), transport_metric_reason(error)));
-    let _ = ack.send(result);
+    let _ = ack.send(result.map_err(CodexWebSocketExchangeError::Transport));
     match transport_error {
         Some((message, metric_reason)) => Some(PumpExitReason::OutboundTransportError {
             message,
@@ -649,7 +694,7 @@ fn observe_inbound(connection_id: Uuid, pending_ping: &mut Option<PendingPing>, 
             "Responses WebSocket pump received a non-matching Pong"
         );
     }
-    // 匹配 Pong 是探针的直接回执；其他入站帧同样证明上游链路仍可达。
+    // 匹配 Pong 是探针的直接回执；其他入站帧同样证明上游链路仍可达
     *pending_ping = None;
 }
 
@@ -658,6 +703,22 @@ fn record_activity(lifecycle: &Mutex<PumpLifecycleState>, observed_at: Instant) 
         .lock()
         .expect("WebSocket pump lifecycle lock poisoned")
         .last_activity = observed_at;
+}
+
+fn record_closed(
+    closed: &AtomicBool,
+    lifecycle: &Mutex<PumpLifecycleState>,
+    reason: &PumpExitReason,
+) {
+    let mut lifecycle = lifecycle
+        .lock()
+        .expect("WebSocket pump lifecycle lock poisoned");
+    // 先记录已观察到的终止事实，再通知复用方；入站背压不能延迟连接失效
+    if lifecycle.closed_at.is_none() {
+        lifecycle.closed_at = Some(Instant::now());
+        lifecycle.exit_reason = Some(reason.clone());
+    }
+    closed.store(true, Ordering::Release);
 }
 
 pub(crate) fn transport_metric_reason(error: &tungstenite::Error) -> &'static str {
@@ -670,7 +731,7 @@ pub(crate) fn transport_metric_reason(error: &tungstenite::Error) -> &'static st
             std::io::ErrorKind::TimedOut => "transport_timeout",
             _ => "transport_error",
         },
-        // 未收到关闭握手只能证明连接异常结束，不能据此认定收到 TCP RST。
+        // 未收到关闭握手只能证明连接异常结束，不能据此认定收到 TCP RST
         tungstenite::Error::Protocol(
             tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
         ) => "reset_without_closing_handshake",
@@ -709,7 +770,7 @@ fn log_pump_exit(
     observation: &WebSocketConnectionObservation,
     backpressure_events: u64,
 ) {
-    let detail = reason.detail().unwrap_or_default();
+    let detail = reason.metric_reason();
     let account_id = context.account_id.as_deref().unwrap_or("unknown");
     let conversation_id_hash = context.conversation_id_hash.as_deref().unwrap_or("unknown");
     if reason.is_unexpected() {
@@ -727,9 +788,6 @@ fn log_pump_exit(
         );
     } else if matches!(reason, PumpExitReason::UpstreamCloseFrame { .. }) {
         let upstream_close = reason.upstream_close();
-        let upstream_error_raw = upstream_close
-            .and_then(CodexWebSocketCloseError::reason)
-            .unwrap_or_default();
         tracing::info!(
             websocket_connection_id = %connection_id,
             account_id = %account_id,
@@ -740,7 +798,7 @@ fn log_pump_exit(
             connection_idle_ms = observation.idle_ms(),
             pump_exit_detail = detail,
             upstream_close_code = ?upstream_close.and_then(CodexWebSocketCloseError::code),
-            upstream_error_raw,
+            upstream_close_reason_bytes = upstream_close.and_then(CodexWebSocketCloseError::reason).map_or(0, str::len),
             upstream_error_raw_present = upstream_close.is_some_and(|close| close.reason().is_some()),
             backpressure_events,
             "Responses WebSocket pump received close frame"
@@ -761,7 +819,7 @@ fn log_pump_exit(
     }
 }
 
-/// 等待 ping ticker；`None` 时永远挂起，让 `select!` 分支实际禁用。
+/// 等待 ping ticker；`None` 时永远挂起，让 `select!` 分支实际禁用
 async fn tick(ticker: &mut Option<tokio::time::Interval>) {
     match ticker {
         Some(ticker) => {
@@ -771,7 +829,7 @@ async fn tick(ticker: &mut Option<tokio::time::Interval>) {
     }
 }
 
-/// 等待可选 deadline；`None` 时永远挂起，让 `select!` 分支实际禁用。
+/// 等待可选 deadline；`None` 时永远挂起，让 `select!` 分支实际禁用
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,

@@ -1,3 +1,5 @@
+//! 验证宿主兼容性声明与静态制品检查的协议版本约束
+
 use gateway_admin::{
     model::plugins::PluginHostCompatibility, ports::plugins::PluginPackageInspector as _,
 };
@@ -41,7 +43,12 @@ fn host_compatibility_requires_the_trusted_middleware_contract() {
             .expect("compatibility JSON");
     assert!(!compatibility.supports_capability("middleware", 1));
     assert!(!compatibility.supports_capability("middleware", 2));
-    assert!(compatibility.supports_capability("middleware", 3));
+    assert!(!compatibility.supports_capability("middleware", 3));
+    assert!(!compatibility.supports_capability("middleware", 4));
+    assert!(compatibility.supports_capability("middleware", 5));
+    assert!(!compatibility.supports_capability("upstream_adapter", 1));
+    assert!(!compatibility.supports_capability("upstream_adapter", 2));
+    assert!(compatibility.supports_capability("upstream_adapter", 3));
     assert!(!compatibility.supports_capability("openai", 1));
 }
 
@@ -72,5 +79,87 @@ async fn package_inspector_returns_static_requirements_without_starting_the_plug
         requirements.protocol_version,
         gateway_plugin_sdk::PROTOCOL_VERSION
     );
-    assert_eq!(requirements.capabilities, vec![("middleware".into(), 3)]);
+    assert_eq!(requirements.capabilities, vec![("middleware".into(), 5)]);
+}
+
+#[tokio::test]
+async fn retired_contracts_remain_loadable_with_compatibility_warnings() {
+    for legacy in [false, true] {
+        let mut middleware = crate::support::contribution(
+            Capability::Middleware,
+            vec![Stage::Request],
+            vec!["openai".into()],
+            vec!["openai".into()],
+        );
+        let mut upstream = crate::support::contribution(
+            Capability::UpstreamAdapter,
+            vec![Stage::Upstream],
+            vec!["openai".into()],
+            vec!["openai".into()],
+        );
+        if legacy {
+            middleware.1.version = 3;
+            upstream.1.version = 1;
+        }
+        let archive = crate::support::package_with_contributions(
+            b"not-an-executable",
+            Contributions::from([middleware, upstream]),
+        );
+        let inspector =
+            PackageInspector::new(PackageLimits::default(), semver::Version::new(1, 0, 0));
+        let artifact = inspector.inspect(archive.clone(), None).await.unwrap();
+        let notices = inspector.api_deprecations(&artifact.metadata).unwrap();
+        assert!(notices.is_empty());
+        let warning = inspector
+            .compatibility_warning(archive, artifact.metadata.sha256)
+            .await
+            .unwrap();
+        if legacy {
+            let warning = warning.expect("retired contracts must remain visible");
+            assert!(warning.contains("middleware v3"));
+            assert!(warning.contains("upstream_adapter v1"));
+        } else {
+            assert!(warning.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_and_capability_version_mismatches_are_warnings_only() {
+    let mut declaration = crate::support::contribution(
+        Capability::Middleware,
+        vec![Stage::Request],
+        vec!["openai".into()],
+        vec!["openai".into()],
+    );
+    declaration.1.version = 99;
+    let archive =
+        crate::support::package_with_contributions(b"fixture", Contributions::from([declaration]));
+    let inspector = PackageInspector::new(PackageLimits::default(), semver::Version::new(3, 19, 0));
+    let artifact = inspector.inspect(archive.clone(), None).await.unwrap();
+    let warning = inspector
+        .compatibility_warning(archive, artifact.metadata.sha256)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(warning.contains("middleware v99"));
+    assert!(warning.contains("3.19.0"));
+}
+
+#[tokio::test]
+async fn compatibility_warning_rejects_invalid_packages_and_digest_mismatches() {
+    let inspector = PackageInspector::new(PackageLimits::default(), semver::Version::new(1, 0, 0));
+    let archive = crate::support::package_with_contributions(b"fixture", Contributions::new());
+    let error = inspector
+        .compatibility_warning(archive, "0".repeat(64))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
+    let invalid: std::sync::Arc<[u8]> = b"invalid archive".as_slice().into();
+    let digest = hex::encode(Sha256::digest(invalid.as_ref()));
+    let error = inspector
+        .compatibility_warning(invalid, digest)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
 }

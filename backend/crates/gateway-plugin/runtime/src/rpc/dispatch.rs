@@ -1,8 +1,11 @@
+//! 插件 RPC 帧的异步读写循环与入站消息分派
+
 use std::sync::Arc;
 
 use gateway_plugin_sdk::{
     ErrorCode, Frame, Message, PluginFault,
-    client::{read_frame, validate_frame, write_frame},
+    call::middleware::NEXT_METHOD,
+    client::{EncodedFrame, read_frame},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -14,8 +17,8 @@ use super::session::{CallbackHandler, RpcError, RpcReply, Shared};
 pub(super) fn start<W, R>(
     writer: W,
     reader: R,
-    data: mpsc::Receiver<Frame>,
-    control: mpsc::Receiver<Frame>,
+    data: mpsc::Receiver<EncodedFrame>,
+    control: mpsc::Receiver<EncodedFrame>,
     shared: Arc<Shared>,
     callbacks: Arc<dyn CallbackHandler>,
 ) where
@@ -28,8 +31,8 @@ pub(super) fn start<W, R>(
 
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut writer: W,
-    mut data: mpsc::Receiver<Frame>,
-    mut control: mpsc::Receiver<Frame>,
+    mut data: mpsc::Receiver<EncodedFrame>,
+    mut control: mpsc::Receiver<EncodedFrame>,
     shared: Arc<Shared>,
 ) {
     let mut stopped = shared.stopped.subscribe();
@@ -44,15 +47,15 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             frame = data.recv() => frame,
         };
         let Some(frame) = frame else {
-            shared.fail(RpcError::Closed);
+            shared.fail(RpcError::Closed(None));
             return;
         };
-        // 撤销尚未发送的调用时丢弃排队帧；已开始写入的 Call 必须先于 Cancel。
-        if let Message::Call { id, .. } = &frame.message {
+        // 撤销尚未发送的调用时丢弃排队帧；已开始写入的 Call 必须先于 Cancel
+        if let Message::Call { id, .. } = frame.message() {
             if !shared.mark_transmitted(*id) {
                 continue;
             }
-        } else if let Message::Credit { id, .. } = &frame.message
+        } else if let Message::Credit { id, .. } = frame.message()
             && shared.context(*id).is_none()
         {
             continue;
@@ -60,10 +63,12 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         let written = tokio::select! {
             biased;
             _ = stopped.changed() => return,
-            result = write_frame(&mut writer, &frame) => result,
+            result = frame.write(&mut writer) => result,
         };
-        if written.is_err() {
-            shared.fail(RpcError::Closed);
+        if let Err(source) = written {
+            shared.fail(RpcError::Closed(Some(
+                gateway_core::error::ErrorSource::new(source),
+            )));
             return;
         }
     }
@@ -85,9 +90,14 @@ async fn read_loop<R: AsyncRead + Unpin>(
             _ = stopped.changed() => return,
             frame = read_frame(&mut reader) => frame,
         };
-        let Ok(frame) = frame else {
-            shared.fail(RpcError::Closed);
-            return;
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(source) => {
+                shared.fail(RpcError::Closed(Some(
+                    gateway_core::error::ErrorSource::new(source),
+                )));
+                return;
+            }
         };
         let result = match frame.message {
             Message::Cancelled { id } if frame.payload.is_empty() => {
@@ -112,20 +122,30 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 params,
             } => {
                 if id == 0 || id % 2 != 0 || id <= last_callback {
-                    Err(RpcError::Protocol)
+                    Err(RpcError::Protocol(None))
                 } else if let Some(context) = shared.context(parent_id) {
                     last_callback = id;
-                    if let Some(permit) = shared.try_callback_slot() {
+                    if let Some(permit) = shared.try_callback_slot(&method) {
                         let handler = Arc::clone(&callbacks);
                         let response = Arc::clone(&shared);
                         let (ready, started) = oneshot::channel();
+                        let pause = (method == NEXT_METHOD)
+                            .then(|| shared.pause_next(parent_id))
+                            .flatten();
                         let task = tokio::spawn(async move {
-                            // 先把任务归属登记到父调用，再允许执行宿主操作。
+                            // 先把任务归属登记到父调用，再允许执行宿主操作
                             if started.await.is_err() {
                                 return;
                             }
                             let result = handler.call(context, method, params, frame.payload).await;
-                            let mut reply = match result {
+                            if pause.is_some()
+                                && let Err(error) = response.resume_next(parent_id).await
+                            {
+                                response.cancel(parent_id, error);
+                                return;
+                            }
+                            drop(pause);
+                            let reply = match result {
                                 Ok(reply) => Frame {
                                     message: Message::Result {
                                         id,
@@ -135,17 +155,17 @@ async fn read_loop<R: AsyncRead + Unpin>(
                                 },
                                 Err(error) => Frame::control(Message::Error { id, error }),
                             };
-                            // 宿主回调的局部编码错误只能结束该调用，不能关闭共享写通道。
-                            if validate_frame(&reply).is_err() {
-                                reply = Frame::control(Message::Error {
+                            // 宿主回调的局部编码错误只能结束该调用，不能关闭共享写通道
+                            match EncodedFrame::new(reply) {
+                                Ok(reply) => response.send_encoded_control(reply),
+                                Err(_) => response.send_control(Frame::control(Message::Error {
                                     id,
                                     error: PluginFault::new(
                                         ErrorCode::Fault,
                                         "host callback response cannot be encoded",
                                     ),
-                                });
+                                })),
                             }
-                            response.send_control(reply);
                             drop(permit);
                         });
                         if shared.track_callback(parent_id, task.abort_handle()) {
@@ -169,10 +189,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     }));
                     Ok(())
                 } else {
-                    Err(RpcError::Protocol)
+                    Err(RpcError::Protocol(None))
                 }
             }
-            _ => Err(RpcError::Protocol),
+            _ => Err(RpcError::Protocol(None)),
         };
         if let Err(error) = result {
             shared.fail(error);

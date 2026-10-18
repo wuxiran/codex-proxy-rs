@@ -1,3 +1,5 @@
+//! 管理控制面测试入口，以及通用分页、版本与查询值对象测试
+
 use std::str::FromStr as _;
 
 use chrono::{TimeDelta, Utc};
@@ -22,6 +24,7 @@ use gateway_admin::{
 mod backup;
 mod model;
 mod ops_report;
+mod ticket_cipher; // fork: ticket cipher
 mod use_case;
 
 #[test]
@@ -67,12 +70,6 @@ fn request_outcome_filter_should_preserve_known_and_bounded_other_values() {
     assert!(RequestOutcome::new("").is_err());
     assert!(RequestOutcome::new("a".repeat(RequestOutcome::MAX_BYTES + 1)).is_err());
     assert!(RequestOutcome::new("future\nstate").is_err());
-}
-
-#[test]
-fn time_range_should_accept_exactly_366_days() {
-    let end = Utc::now();
-    assert!(TimeRange::new(end - TimeDelta::days(366), end).is_ok());
 }
 
 #[test]
@@ -130,6 +127,7 @@ fn provider_document_debug_should_not_expose_opaque_material() {
 #[test]
 fn representative_quota_should_prefer_short_window_and_highest_usage() {
     let quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -151,6 +149,7 @@ fn representative_quota_should_prefer_account_wide_window_over_model_specific_wi
     let mut model_specific = quota_window("shortTerm", Some(18_000), Some(64.0));
     model_specific.local_usage_attribution = QuotaLocalUsageAttribution::Unavailable;
     let quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -174,9 +173,9 @@ fn usage_window_should_not_use_daily_rolling_usage_for_weekly_statistics() {
         success_count: 5,
         input_tokens: Some(100),
         output_tokens: Some(20),
-        cached_tokens: Some(80),
-        cache_write_tokens: Some(0),
-        reasoning_tokens: Some(0),
+        cached_input_tokens: Some(80),
+        cache_write_input_tokens: Some(0),
+        reasoning_output_tokens: Some(0),
         image_input_tokens: Some(0),
         image_output_tokens: Some(0),
         image_request_count: 0,
@@ -189,6 +188,7 @@ fn usage_window_should_not_use_daily_rolling_usage_for_weekly_statistics() {
         models: Vec::new(),
     };
     let quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -217,6 +217,7 @@ fn usage_window_should_not_use_daily_rolling_usage_for_weekly_statistics() {
 #[test]
 fn exhausted_quota_should_project_full_usage_to_only_the_representative_window() {
     let mut quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -245,6 +246,7 @@ fn exhausted_quota_should_preserve_the_provider_identified_reached_window() {
     let mut reached = quota_window("monthly", Some(2_592_000), Some(98.0));
     reached.limit_reached = true;
     let mut quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,

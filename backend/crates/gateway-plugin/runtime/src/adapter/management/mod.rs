@@ -1,3 +1,5 @@
+//! 插件管理页面资源读取、请求转发与响应解码
+
 mod callback;
 mod registration;
 mod validation;
@@ -21,6 +23,7 @@ pub(crate) use registration::prepare;
 
 pub(crate) const MAXIMUM_BODY_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone)]
 pub(crate) struct ManagementEntry {
     pub(crate) view: PluginManagementView,
     routes: Vec<ManagementRoute>,
@@ -96,10 +99,11 @@ impl ManagementEntry {
         let mut context = self
             .session
             .context(Stage::Management, limits.maximum_call_timeout);
+        context.request = crate::adapter::request_context(request.request_context.as_deref());
         context.request_id = Some(request.request_id);
         let _scope = self
             .callbacks
-            .prepare_management(&context, None)
+            .prepare_management(&context, None, request.request_context)
             .map_err(|_| AdminError::invalid("插件管理回调范围无效"))?;
         let reply = self
             .session
@@ -108,11 +112,13 @@ impl ManagementEntry {
             .map_err(|_| {
                 AdminError::unavailable("插件管理调用未完成；副作用可能已发生，请查询后再重试")
             })?;
-        decode_response(reply, &route.response_content_types, limits)
+        decode_response(reply, &route.response_content_types, limits).inspect_err(|_| {
+            self.session.invalid_response(Stage::Management);
+        })
     }
 }
 
-// 管理 API 与公开回调共用类型和正文预算校验，完整响应头由 HTTP 入口解码。
+// 管理 API 与公开回调共用类型和正文预算校验，完整响应头由 HTTP 入口解码
 fn decode_response(
     reply: RpcReply,
     allowed_content_types: &[String],

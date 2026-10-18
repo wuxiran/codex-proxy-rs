@@ -29,6 +29,7 @@ interface SystemUpdateEvent {
   level: string
   message: string
   at: string
+  atDisplay: string
   step?: string
   terminal?: boolean
 }
@@ -451,7 +452,7 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
     setPhase({ kind: 'failed' })
   }
 
-  async function restartNow(confirmation?: SystemRestartPlan) {
+  async function restartNow(confirmation: SystemRestartPlan) {
     if (restarting.value)
       return
 

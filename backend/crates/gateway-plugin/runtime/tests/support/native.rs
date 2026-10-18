@@ -1,3 +1,5 @@
+//! 插件集成测试使用的原生 Provider 与执行事件替身
+
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
@@ -127,7 +129,7 @@ impl Provider for NativeProvider {
     }
 }
 
-// 仅测试 Core / Runtime / Store 组合；真实 Provider 的凭据解释由各自合同测试验证。
+// 仅测试 Core / Runtime / Store 组合；真实 Provider 的凭据解释由各自合同测试验证
 struct FixtureConnection(ProviderAccountId);
 
 impl gateway_core::engine::upstream_adapter::UpstreamAccountConnection for FixtureConnection {
@@ -186,6 +188,22 @@ impl NativeAdmin {
 
 #[async_trait]
 impl ProviderAdmin for NativeAdmin {
+    fn evaluate_usage_pricing(
+        &self,
+        _: &gateway_admin::ports::provider::ProviderUsagePricingInput,
+        _: Option<&gateway_core::metering::ModelPriceOverride>,
+    ) -> Result<Option<gateway_core::metering::CalculatedCostBreakdown>, ProviderAdminError> {
+        use gateway_core::metering::*;
+        let zero = Money::new(Decimal::ZERO, CurrencyCode::new("USD").unwrap());
+        let total = Money::new("1.25".parse().unwrap(), CurrencyCode::new("USD").unwrap());
+        Ok(Some(CalculatedCostBreakdown::new(
+            CalculatedCostAmounts::new(total, zero, zero, zero, total, total),
+            CalculatedCostRates::new(total, zero, zero, zero),
+            None,
+            100,
+        )))
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.0
     }

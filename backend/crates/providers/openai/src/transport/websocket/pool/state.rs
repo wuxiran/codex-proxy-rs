@@ -1,4 +1,4 @@
-//! WebSocket 连接池状态和值对象。
+//! WebSocket 连接池状态和值对象
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -16,20 +16,22 @@ use super::super::super::{
 use super::super::pump::{PumpedWebSocket, WebSocketConnectionObservation};
 use super::lease::WebSocketPoolConnectOutcome;
 
-/// WebSocket 连接池 key。
+/// WebSocket 连接池 key
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CodexWebSocketPoolKey {
     base_url: String,
     account_id: String,
     conversation_id: String,
     connection_profile: String,
-    downstream_connection_id: String,
+    pub(super) downstream_connection_id: String,
     pub(super) egress_key: String,
+    pub(super) proxy_capacity_key: String,
+    /// fork: turn-state-pin。云端票路由作为独立池键约束
     mint_route: Option<String>,
 }
 
 impl CodexWebSocketPoolKey {
-    /// 构造连接池 key。
+    /// 构造连接池 key
     pub fn new(
         base_url: impl Into<String>,
         account_id: impl Into<String>,
@@ -42,17 +44,18 @@ impl CodexWebSocketPoolKey {
             connection_profile: String::new(),
             downstream_connection_id: String::new(),
             egress_key: String::new(),
+            proxy_capacity_key: String::new(),
             mint_route: None,
         }
     }
 
-    /// 区分实际 WebSocket opening 画像，防止复用旧 UA 或不同握手语义的连接。
+    /// 区分实际 WebSocket opening 画像，防止复用旧 UA 或不同握手语义的连接
     pub(crate) fn with_connection_profile(mut self, connection_profile: impl Into<String>) -> Self {
         self.connection_profile = connection_profile.into();
         self
     }
 
-    /// 隔离同一逻辑会话中由不同下游 WebSocket 驱动的并发响应链。
+    /// 隔离同一逻辑会话中由不同下游 WebSocket 驱动的并发响应链
     pub(crate) fn with_downstream_connection_id(
         mut self,
         connection_id: impl Into<String>,
@@ -70,11 +73,21 @@ impl CodexWebSocketPoolKey {
         self
     }
 
+    pub(crate) fn with_outbound_proxy(
+        mut self,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+    ) -> Self {
+        self.proxy_capacity_key = super::proxy_capacity_key(proxy);
+        self
+    }
+
+    /// fork: turn-state-pin。云端票路由作为独立池键约束
     pub(crate) fn with_mint_route(mut self, route: Option<&str>) -> Self {
         self.mint_route = route.map(str::to_owned);
         self
     }
 
+    /// fork: turn-state-pin。连接实际握手路由是否满足池键要求的云端票路由
     pub(super) fn accepts_route(&self, route: Option<&crate::route_pair::RoutePairRef>) -> bool {
         self.mint_route
             .as_ref()
@@ -225,7 +238,7 @@ pub(crate) struct PooledWebSocketConnection {
     pub(crate) warm_approval: Option<super::WarmConnectionApproval>,
 }
 
-/// 只随具体 WebSocket 生命周期存在的续接状态。
+/// 只随具体 WebSocket 生命周期存在的续接状态
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WebSocketContinuationState {
     latest_response_id: Option<String>,
@@ -244,6 +257,7 @@ impl WebSocketContinuationState {
 pub(super) enum WebSocketPoolSlot {
     Idle {
         connection: Box<PooledWebSocketConnection>,
+        idle_since: Instant,
     },
     Busy(WebSocketPoolReservation),
     Connecting(WebSocketPoolConnecting),
@@ -274,7 +288,7 @@ pub(super) struct WebSocketPoolReservation {
 }
 
 pub(super) async fn close_pooled_connection(connection: PooledWebSocketConnection) {
-    connection.websocket.close().await;
+    connection.websocket.close_and_wait().await;
 }
 
 pub(super) async fn close_pooled_connections(connections: Vec<PooledWebSocketConnection>) {
@@ -283,7 +297,7 @@ pub(super) async fn close_pooled_connections(connections: Vec<PooledWebSocketCon
     }
 }
 
-/// idle 连接是否应从池中摘除：被后台 pump 标记死亡，或已超过 `max_age`。
+/// idle 连接是否应从池中摘除：被后台 pump 标记死亡，或已超过 `max_age`
 pub(super) fn should_close_idle_connection(
     connection: &PooledWebSocketConnection,
     now: Instant,

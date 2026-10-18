@@ -1,13 +1,101 @@
+//! 验证 WebSocket 各轮次刷新身份与设置时保留握手中间件覆盖
+
 use super::*;
 use bytes::Bytes;
-use gateway_core::{
-    engine::middleware::{
-        FrozenMiddlewarePlan, MiddlewareContext, MiddlewareError, MiddlewareNext, MiddlewarePlan,
-        MiddlewareRequest, MiddlewareResponse,
-    },
-    middleware::{http as http_contract, websocket as core},
-    runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference},
-};
+use gateway_core::engine::middleware::FrozenMiddlewarePlan;
+use gateway_core::engine::middleware::MiddlewareContext;
+use gateway_core::engine::middleware::MiddlewareError;
+use gateway_core::engine::middleware::MiddlewareNext;
+use gateway_core::engine::middleware::MiddlewarePlan;
+use gateway_core::engine::middleware::MiddlewareRequest;
+use gateway_core::engine::middleware::MiddlewareResponse;
+use gateway_core::engine::middleware::http as http_contract;
+use gateway_core::engine::middleware::websocket as core;
+use gateway_core::routing::extensions::ExtensionSetId;
+use gateway_core::routing::extensions::ExtensionSetLease;
+use gateway_core::routing::extensions::ExtensionSetReference;
+
+#[tokio::test(start_paused = true)]
+async fn client_close_does_not_flush_a_retained_sender_with_an_inflight_write() {
+    #[derive(Default)]
+    struct RetainedSenderPlan(Mutex<Option<Arc<dyn core::Sender>>>);
+    impl fmt::Debug for RetainedSenderPlan {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("RetainedSenderPlan")
+        }
+    }
+    impl MiddlewarePlan for RetainedSenderPlan {
+        fn has_websocket(&self) -> bool {
+            true
+        }
+        fn handle_websocket(
+            &self,
+            context: core::Context,
+            message: core::Message,
+            next: core::Next,
+        ) -> BoxFuture<'static, Result<Option<core::Message>, MiddlewareError>> {
+            *self.0.lock().unwrap() = Some(context.sender);
+            next.run(message)
+        }
+        fn handle(
+            &self,
+            _: MiddlewareContext,
+            request: MiddlewareRequest,
+            next: MiddlewareNext,
+        ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+            next.run(request)
+        }
+    }
+
+    let plan = Arc::new(RetainedSenderPlan::default());
+    let frozen = FrozenMiddlewarePlan::new(
+        plan.clone(),
+        ExtensionSetReference::new(
+            ExtensionSetId::new("retained-writer".into()).unwrap(),
+            Arc::new(Lease),
+        ),
+    );
+    let (incoming, received) = unbounded_channel();
+    let (written, mut output) = unbounded_channel();
+    let flush_started = Arc::new(AtomicBool::new(false));
+    let socket = TestSocket {
+        incoming: received,
+        written,
+        stall_writes: true,
+        flush_started: flush_started.clone(),
+        dropped: Arc::new(AtomicBool::new(false)),
+    };
+    let mut connection = spawn_connection(
+        socket,
+        Arc::from("retained-writer"),
+        CancellationToken::new(),
+        ConnectionConfig::PRODUCTION,
+        Some(frozen),
+        Arc::from([]),
+    );
+    incoming.send(Ok(Message::Text("capture".into()))).unwrap();
+    assert!(matches!(
+        connection.next_event().await,
+        Some(ConnectionEvent::Text(_))
+    ));
+    let sender = plan.0.lock().unwrap().clone().unwrap();
+    let mut write = sender.send(core::Message {
+        kind: core::Kind::Text,
+        payload: Bytes::from_static(b"pending"),
+    });
+    assert!(futures::poll!(write.as_mut()).is_pending());
+    // 写 future 在 pump 的 select 之外持锁，而且暂不继续 poll 以响应取消
+    incoming.send(Ok(Message::Close(None))).unwrap();
+    let reason = tokio::time::timeout(Duration::from_millis(50), connection.wait_for_exit())
+        .await
+        .expect("peer close must not wait for a retained sender");
+    assert_eq!(reason, PumpExitReason::ClientClose);
+    assert!(!flush_started.load(Ordering::Acquire));
+    assert!(write.await.is_err());
+    assert!(matches!(output.try_recv(), Err(TryRecvError::Empty)));
+    plan.0.lock().unwrap().take();
+}
+
 #[derive(Debug, Default)]
 struct Plan {
     block_terminal: bool,
@@ -104,7 +192,7 @@ impl MiddlewarePlan for Plan {
         request: MiddlewareRequest,
         next: MiddlewareNext,
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
-        // 统一计划延续到连接内的模型调用，没有模型绑定时直接委托。
+        // 统一计划延续到连接内的模型调用，没有模型绑定时直接委托
         next.run(request)
     }
 }
@@ -133,7 +221,7 @@ async fn turns_refresh_host_settings_and_key_identity_while_preserving_handshake
                 .unwrap();
             let baseline = settings.runtime.as_ref().unwrap();
             let mut values = serde_json::to_value(baseline.values()).unwrap();
-            values["request_interval_ms"] = json!(0);
+            values["max_account_rotations"] = json!(0);
             settings.runtime = Some(
                 baseline
                     .replace(serde_json::from_value(values).unwrap(), "handshake")
@@ -163,6 +251,7 @@ async fn turns_refresh_host_settings_and_key_identity_while_preserving_handshake
         Arc::new(crate::openai::UnusedAdmissions),
         Arc::new(crate::openai::UnusedContinuation),
         Arc::new(crate::openai::IgnoredClientApiKeyUsage),
+        Arc::new(crate::support::RecordingDiagnostics::default()),
     ));
     let admin = crate::admin::AdminTestFixture::new().await;
     let plan = Arc::new(SettingsPlan::default());
@@ -186,6 +275,7 @@ async fn turns_refresh_host_settings_and_key_identity_while_preserving_handshake
         vec![],
         Arc::new(crate::openai::EmptyWorkerHealth),
         Arc::new(crate::openai::TestLifecycle::default()),
+        Arc::new(crate::support::RecordingDiagnostics::default()),
     )
     .unwrap()
     .with_middleware(move |_| Some(frozen.clone()))
@@ -203,7 +293,7 @@ async fn turns_refresh_host_settings_and_key_identity_while_preserving_handshake
     for round in 0..3 {
         if round == 1 {
             let mut settings = serde_json::to_value(initial.settings()).unwrap();
-            settings["request_interval_ms"] = json!(50);
+            settings["max_account_rotations"] = json!(5);
             settings["responses_max_decompressed_body_bytes"] = json!(2048);
             snapshots.publish(
                 initial
@@ -248,8 +338,8 @@ async fn turns_refresh_host_settings_and_key_identity_while_preserving_handshake
             observed[1]["runtime"]["responses_max_decompressed_body_bytes"],
             2048
         );
-        assert_eq!(observed[0]["runtime"]["request_interval_ms"], 0);
-        assert_eq!(observed[1]["runtime"]["request_interval_ms"], 0);
+        assert_eq!(observed[0]["runtime"]["max_account_rotations"], 0);
+        assert_eq!(observed[1]["runtime"]["max_account_rotations"], 0);
     }
     socket.close(None).await.unwrap();
     server.abort();
@@ -267,7 +357,7 @@ async fn rewrite_upgrade_and_control_active_response_keep_http_context_until_con
     );
     let (trace, mut socket, server) =
         start_active_response_with_middleware(Some(frozen), "/custom/websocket").await;
-    // 升级后的默认会话仍持有入口上下文；101 正文结束不再提前取消它。
+    // 升级后的默认会话仍持有入口上下文；101 正文结束不再提前取消它
     assert!(
         !plan
             .http_cancellation
@@ -353,7 +443,7 @@ async fn input_plugin_runs_while_a_real_socket_write_is_blocked() {
     let (trace, mut socket, server) =
         start_active_response_with_middleware(Some(frozen), "/custom/websocket").await;
     trace.release_terminal.notify_one();
-    // 客户端不读取 64 MiB 输出，真实 TCP 写入将受接收窗口背压。
+    // 客户端不读取 64 MiB 输出，真实 TCP 写入将受接收窗口背压
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!trace.finalized.load(Ordering::SeqCst));
     socket

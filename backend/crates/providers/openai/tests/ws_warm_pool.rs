@@ -915,3 +915,167 @@ async fn dynamic_candidate_case(reset_first: bool, require_verified: bool) {
         "normal egress must not receive a fresh business connection"
     );
 }
+
+// fork: 以下为从 src/ws_warm_pool.rs 搬出的判决与证明寿命单测，走 lib.rs 的 doc(hidden) 再导出。
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_a_slot_cannot_transfer_the_previous_connections_ticket_proof() {
+    use provider_openai::{inherited_approval, transport::WarmConnectionApproval};
+
+    let lifetime = Duration::from_secs(240);
+    let previous = WarmConnectionApproval::new("model".into(), lifetime);
+    previous.publish_scoped(
+        true,
+        Duration::from_secs(30),
+        Some("synthetic-old-ticket"),
+        None,
+    );
+    let old_id = uuid::Uuid::new_v4();
+    let previous = (old_id, previous);
+    for id in [Some(old_id), Some(uuid::Uuid::new_v4()), None] {
+        let next = WarmConnectionApproval::new("model".into(), lifetime);
+        next.publish_rechecked(
+            true,
+            lifetime,
+            None,
+            None,
+            None,
+            inherited_approval(id, Some(&previous)),
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(next.checked(), id != Some(old_id));
+    }
+}
+
+#[test]
+fn answer_must_not_contain_a_second_or_contradicting_conclusion() {
+    use provider_openai::answer_matches;
+
+    for answer in [
+        "21，但最终答案是29",
+        "21 or 29",
+        "21.0",
+        "21\n29",
+        "21 apples",
+        "210",
+    ] {
+        assert!(!answer_matches(answer, "21"), "accepted {answer:?}");
+    }
+    for answer in ["21", " **21** ", "`21`", "_21_", "\n21\n"] {
+        assert!(answer_matches(answer, "21"), "rejected {answer:?}");
+    }
+}
+
+#[test]
+fn probe_proof_cannot_outlive_the_ticket_that_was_issued_before_the_probe_completed() {
+    use provider_openai::verification_valid_for;
+    use std::time::UNIX_EPOCH;
+
+    let issued = 1_700_000_000u64;
+    let mut bytes = vec![0x80];
+    bytes.extend_from_slice(&issued.to_be_bytes());
+    let ticket = URL_SAFE_NO_PAD.encode(bytes);
+    let at = UNIX_EPOCH + Duration::from_secs(issued);
+    let ttl = Duration::from_secs(240);
+    assert_eq!(
+        verification_valid_for(
+            Duration::from_secs(300),
+            ttl,
+            Some(&ticket),
+            at,
+            at + Duration::from_secs(80)
+        ),
+        Duration::from_secs(160)
+    );
+    assert_eq!(
+        verification_valid_for(Duration::from_secs(300), ttl, Some(&ticket), at, at + ttl),
+        Duration::ZERO
+    );
+    assert_eq!(
+        verification_valid_for(
+            Duration::from_secs(300),
+            ttl,
+            Some(&ticket),
+            at,
+            at - Duration::from_secs(60)
+        ),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn a_right_answer_from_a_swapped_model_is_not_verified() {
+    use provider_openai::{WarmPoolService, WarmPoolVerdict as Verdict};
+
+    let swapped = Some("gpt-5.6-luna".to_owned());
+    assert!(matches!(
+        WarmPoolService::judge("21", Some("21"), "gpt-6-astra", swapped.clone(), swapped),
+        Verdict::Degraded(Some(model)) if model == "gpt-5.6-luna"
+    ));
+    assert!(matches!(
+        WarmPoolService::judge(
+            "**21**",
+            Some("21"),
+            "gpt-6-astra",
+            Some("gpt-6-astra".to_owned()),
+            None
+        ),
+        Verdict::Verified(_)
+    ));
+    assert!(matches!(
+        WarmPoolService::judge(
+            "21",
+            Some("21"),
+            "gpt-6-astra",
+            Some("GPT-6-ASTRA".to_owned()),
+            None
+        ),
+        Verdict::Verified(_)
+    ));
+    assert!(matches!(
+        WarmPoolService::judge(
+            "20",
+            Some("21"),
+            "gpt-6-astra",
+            Some("gpt-6-astra".to_owned()),
+            None
+        ),
+        Verdict::Degraded(_)
+    ));
+    assert!(matches!(
+        WarmPoolService::judge(
+            "210",
+            Some("21"),
+            "gpt-6-astra",
+            Some("gpt-6-astra".to_owned()),
+            None
+        ),
+        Verdict::Degraded(_)
+    ));
+    assert!(matches!(
+        WarmPoolService::judge("21", Some("21"), "gpt-6-astra", None, None),
+        Verdict::Degraded(None)
+    ));
+}
+
+#[test]
+fn a_header_model_disagrees_even_when_the_body_matches() {
+    use provider_openai::{disagreeing_model, event_declared_models};
+
+    let event = json!({
+        "type": "response.created",
+        "response": {
+            "model": "gpt-6-astra",
+            "headers": {"openai-model": "gpt-5.6-luna"}
+        }
+    });
+    let (header, body) = event_declared_models(&event);
+    assert_eq!(
+        disagreeing_model(header.as_deref(), body.as_deref(), "gpt-6-astra").as_deref(),
+        Some("gpt-5.6-luna")
+    );
+    let header_only = json!({"headers": {"x-openai-model": ["gpt-6-astra"]}});
+    let (header, body) = event_declared_models(&header_only);
+    assert_eq!(header.as_deref(), Some("gpt-6-astra"));
+    assert!(body.is_none());
+}

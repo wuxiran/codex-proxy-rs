@@ -1,4 +1,4 @@
-//! 插件改写后的 OpenAI Responses 投递协议复核。
+//! 插件改写后的 OpenAI Responses 投递协议复核
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 const MAX_TRACKED_OUTPUT_ITEMS: usize = 4_096;
 const MAX_IDENTIFIER_BYTES: usize = 1_024;
 
-/// 插件输出不能安全投递为 OpenAI Responses 协议。
+/// 插件输出不能安全投递为 OpenAI Responses 协议
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ResponseValidationError;
 
@@ -31,7 +31,7 @@ struct ExpectedResponseFacts {
     invalid: bool,
 }
 
-/// 仅保存最终协议复核所需的响应 ID 与终态类别，不缓存流正文。
+/// 仅保存最终协议复核所需的响应 ID 与终态类别，不缓存流正文
 #[derive(Clone, Default)]
 pub(super) struct ResponseValidationFacts(Arc<Mutex<ExpectedResponseFacts>>);
 
@@ -145,7 +145,7 @@ impl ExpectedResponseFacts {
     }
 }
 
-/// 只复核中间件确实改写过的完整 JSON；未经改写的原生快路保持原行为。
+/// 只复核中间件确实改写过的完整 JSON；未经改写的原生快路保持原行为
 pub(super) fn validate_buffered_response(
     facts: &ResponseValidationFacts,
     modified: &[u8],
@@ -171,10 +171,10 @@ pub(super) fn validate_buffered_response(
     validate_terminal_response(&modified, response_id, terminal)
 }
 
-/// 持有实际已交付给客户端的 Responses 流状态。
+/// 持有实际已交付给客户端的 Responses 流状态
 ///
 /// 原始前缀只旁路构建状态；直到插件首次改写或丢弃正文才启用严格拒绝，避免给
-/// 无策略原生热路增加新的兼容性条件。
+/// 无策略原生热路增加新的兼容性条件
 #[derive(Debug, Default)]
 pub(super) struct ResponsesDeliveryValidator {
     active: bool,
@@ -183,7 +183,7 @@ pub(super) struct ResponsesDeliveryValidator {
 }
 
 impl ResponsesDeliveryValidator {
-    /// 复核实际交付帧；只有宿主标记为已改写时才激活严格模式。
+    /// 复核实际交付帧；只有宿主标记为已改写时才激活严格模式
     pub(super) fn validate_frame(
         &mut self,
         delivered: &[u8],
@@ -193,7 +193,7 @@ impl ResponsesDeliveryValidator {
         self.validate_parsed(ParsedFrame::parse(delivered), transformed, facts)
     }
 
-    /// WebSocket JSON message 与 SSE 共用同一响应顺序和关联校验。
+    /// WebSocket JSON message 与 SSE 共用同一响应顺序和关联校验
     pub(super) fn validate_websocket_frame(
         &mut self,
         delivered: &[u8],
@@ -209,6 +209,11 @@ impl ResponsesDeliveryValidator {
         transformed: bool,
         facts: &ResponseValidationFacts,
     ) -> Result<(), ResponseValidationError> {
+        // 未改写的未知载荷不参与本地关联判断，不能因旁路解析失败截断原流
+        // 插件实际改写的载荷仍须满足交付合同
+        if parsed.is_err() && !transformed {
+            return Ok(());
+        }
         if !self.active && !transformed {
             if parsed.and_then(|frame| self.state.apply(frame)).is_err() {
                 self.invalid_prefix = true;
@@ -253,7 +258,7 @@ impl ResponsesDeliveryValidator {
                     return Err(ResponseValidationError);
                 }
             }
-            ParsedFrame::Event { .. } | ParsedFrame::Done => {}
+            ParsedFrame::Event { .. } | ParsedFrame::Done | ParsedFrame::NonEvent => {}
         }
         self.state.apply(parsed)
     }
@@ -292,6 +297,7 @@ impl ResponsesDeliveryValidator {
 enum ParsedFrame {
     Event { event_type: String, value: Value },
     Done,
+    NonEvent,
 }
 
 impl ParsedFrame {
@@ -301,6 +307,10 @@ impl ParsedFrame {
             return Ok(Self::Done);
         }
         let mut events = parse_sse_events(frame).map_err(|_| ResponseValidationError)?;
+        // 注释和仅含 SSE 元数据的帧不承载响应业务事实
+        if events.is_empty() {
+            return Ok(Self::NonEvent);
+        }
         if events.len() != 1 {
             return Err(ResponseValidationError);
         }
@@ -363,6 +373,9 @@ struct DeliveryState {
 
 impl DeliveryState {
     fn apply(&mut self, frame: ParsedFrame) -> Result<(), ResponseValidationError> {
+        if matches!(frame, ParsedFrame::NonEvent) {
+            return Ok(());
+        }
         if self.done {
             return Err(ResponseValidationError);
         }

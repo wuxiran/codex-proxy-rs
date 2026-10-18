@@ -1,3 +1,5 @@
+//! 验证 OpenAI 事件的模型、用量、额度与重试信息提取
+
 use gateway_protocol::openai::events::{
     RateLimitKeySource, RateLimitWindow, TokenUsage, billable_usage_is_complete, extract_sse_usage,
     extract_usage, is_codex_quota_header_name, is_rate_limit_header_name, parse_rate_limit_headers,
@@ -163,9 +165,9 @@ fn extract_usage_should_read_codex_usage_shape() {
         Some(TokenUsage {
             input_tokens: 12,
             output_tokens: 5,
-            cached_tokens: 3,
-            cache_write_tokens: 4,
-            reasoning_tokens: 0,
+            cached_input_tokens: 3,
+            cache_write_input_tokens: 4,
+            reasoning_output_tokens: 0,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 17,
@@ -189,9 +191,9 @@ fn extract_usage_should_read_openai_usage_shape() {
         Some(TokenUsage {
             input_tokens: 8,
             output_tokens: 4,
-            cached_tokens: 2,
-            cache_write_tokens: 0,
-            reasoning_tokens: 3,
+            cached_input_tokens: 2,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 3,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 12,
@@ -215,9 +217,9 @@ fn extract_usage_should_preserve_explicit_total_and_reasoning_tokens() {
         Some(TokenUsage {
             input_tokens: 12,
             output_tokens: 8,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 6,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 6,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 20,
@@ -246,9 +248,9 @@ fn extract_usage_should_keep_image_tool_usage_separate_from_model_total() {
         Some(TokenUsage {
             input_tokens: 12,
             output_tokens: 5,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
             image_input_tokens: 31,
             image_output_tokens: 9,
             total_tokens: 17,
@@ -276,9 +278,9 @@ fn extract_sse_usage_should_prefer_completed_response_usage() {
         Some(TokenUsage {
             input_tokens: 3,
             output_tokens: 5,
-            cached_tokens: 1,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            cached_input_tokens: 1,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 8,
@@ -300,9 +302,9 @@ fn extract_sse_usage_should_fall_back_to_last_visible_usage() {
         Some(TokenUsage {
             input_tokens: 4,
             output_tokens: 6,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 10,
@@ -322,9 +324,9 @@ fn extract_sse_usage_should_preserve_completed_image_tool_usage() {
         Some(TokenUsage {
             input_tokens: 12,
             output_tokens: 5,
-            cached_tokens: 3,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            cached_input_tokens: 3,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
             image_input_tokens: 31,
             image_output_tokens: 9,
             total_tokens: 17,
@@ -346,9 +348,9 @@ fn extract_sse_usage_should_ignore_non_json_control_events() {
         Some(TokenUsage {
             input_tokens: 2,
             output_tokens: 3,
-            cached_tokens: 0,
-            cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
             image_input_tokens: 0,
             image_output_tokens: 0,
             total_tokens: 5,
@@ -393,6 +395,19 @@ fn retry_after_should_read_string_reset_timestamp() {
 }
 
 #[test]
+fn retry_after_should_ignore_elapsed_reset_timestamps_and_keep_later_advice() {
+    for reset_at in [json!(1), json!("1")] {
+        let mut body = json!({
+            "error": {"type": "usage_limit_reached", "resets_at": reset_at}
+        });
+        assert_eq!(retry_after_seconds_from_body(&body.to_string()), None);
+
+        body["retry_after_seconds"] = json!(7);
+        assert_eq!(retry_after_seconds_from_body(&body.to_string()), Some(7));
+    }
+}
+
+#[test]
 fn retry_after_should_read_nested_error_delay() {
     let body = json!({
         "type": "error",
@@ -404,14 +419,14 @@ fn retry_after_should_read_nested_error_delay() {
 }
 
 #[test]
-fn retry_after_should_read_case_insensitive_header_array() {
+fn retry_after_should_ignore_header_arrays() {
     let body = json!({
         "type": "error",
         "headers": {"Retry-After": ["37"]}
     })
     .to_string();
 
-    assert_eq!(retry_after_seconds_from_body(&body), Some(37));
+    assert_eq!(retry_after_seconds_from_body(&body), None);
 }
 
 #[test]
@@ -460,6 +475,71 @@ fn retry_after_should_not_infer_retry_from_unrelated_error_message() {
 #[test]
 fn retry_after_should_reject_malformed_json() {
     assert_eq!(retry_after_seconds_from_body("not-json"), None);
+}
+
+#[test]
+fn retry_after_should_prioritize_nested_headers_over_other_advice() {
+    for header in [json!(30), json!("30")] {
+        for wrap_response in [false, true] {
+            let error = json!({
+                "code": "rate_limit_exceeded", "message": "Try again in 2s",
+                "retry_after_seconds": 10, "headers": {"ReTrY-AfTeR": header}
+            });
+            let body = if wrap_response {
+                json!({"type":"response.failed", "response":{"error":error}, "headers":{"retry-after":"20"}})
+            } else {
+                json!({"type":"error", "error":error, "headers":{"retry-after":"20"}})
+            };
+            assert_eq!(retry_after_seconds_from_body(&body.to_string()), Some(30));
+        }
+    }
+}
+
+#[test]
+fn retry_after_should_validate_http_values_before_resolving_duplicates() {
+    for (headers, expected) in [
+        (json!("invalid"), 12),
+        (json!({"retry-after":"\n5\n"}), 12),
+        (json!({"retry-after":"\t5\t"}), 5),
+        (json!({"Retry-After":"5", "retry-after":"30"}), 30),
+        (json!({"Retry-After":"5", "retry-after":"invalid"}), 12),
+        (json!({"Retry-After":"5", "retry-after":"\n30\n"}), 5),
+        (json!({"Retry-After":"5", "retry-after":["30"]}), 5),
+        (json!({"Retry-After":"5", "retry-after":false}), 12),
+    ] {
+        for wrap_response in [false, true] {
+            let error = json!({"code":"rate_limit_exceeded", "headers":headers});
+            let body = if wrap_response {
+                json!({"type":"response.failed", "response":{"error":error}, "headers":{"retry-after":"12"}})
+            } else {
+                json!({"type":"error", "error":error, "headers":{"retry-after":"12"}})
+            };
+            assert_eq!(
+                retry_after_seconds_from_body(&body.to_string()),
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn retry_after_should_keep_zero_advice_and_fall_back_only_for_invalid_headers() {
+    for (header, expected) in [
+        (json!("0"), 0),
+        (json!(0), 0),
+        (json!("Sun, 06 Nov 1994 08:49:37 GMT"), 0),
+        (json!("invalid"), 2),
+        (json!({"seconds":30}), 2),
+    ] {
+        let body = json!({"type":"response.failed", "response":{"error":{
+            "code":"rate_limit_exceeded", "message":"Try again in 2s",
+            "headers":{"Retry-After":header}
+        }}});
+        assert_eq!(
+            retry_after_seconds_from_body(&body.to_string()),
+            Some(expected)
+        );
+    }
 }
 
 #[test]

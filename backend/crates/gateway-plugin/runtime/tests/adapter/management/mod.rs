@@ -1,3 +1,5 @@
+//! 验证插件管理调用的身份持有、版本绑定与权限撤销
+
 mod callback;
 mod registration;
 
@@ -54,7 +56,7 @@ async fn install(environment: &Environment, config: Value) -> PluginInstance {
         "manifestVersion":2,"name":"example","displayName":"管理示例","publisher":"management","version":"1.0.0",
         "engines":{"codex-proxy-rs":">=1.0.0, <2.0.0"},"main":"bin/worker","author":"test","description":"管理测试","license":"MIT",
         "runtime":"trustedProcess","resources":{"ui/index.html":"text/html","ui/app.js":"text/javascript","ui/public.svg":"image/svg+xml"},
-        "contributes":{"management":{"id":"management.example.management","version":1,"stages":["management"],"inputFormats":[],"outputFormats":[]}},
+        "contributes":{"management":{"id":"management.example.management","version":2,"stages":["management"],"inputFormats":[],"outputFormats":[]}},
         "package":{"protocolVersion":gateway_plugin_sdk::PROTOCOL_VERSION,"target":{"os":std::env::consts::OS,"architecture":std::env::consts::ARCH},"files":digests},
     });
     files.insert("plugin.json".into(), serde_json::to_vec(&manifest).unwrap());
@@ -92,6 +94,7 @@ async fn install(environment: &Environment, config: Value) -> PluginInstance {
 
 fn request() -> PluginManagementRequest {
     PluginManagementRequest {
+        request_context: None,
         headers: Vec::new(),
         method: "POST".into(),
         path: "echo".into(),
@@ -281,6 +284,71 @@ async fn management_model_stream_retains_selected_identity_until_completion_and_
 }
 
 #[tokio::test]
+async fn invalid_management_responses_fail_the_call_without_stopping_the_plugin() {
+    for (response, invalid) in [
+        (
+            json!({"status":"invalid","content_type":"application/octet-stream"}),
+            true,
+        ),
+        (
+            json!({"status":429,"content_type":"application/octet-stream"}),
+            false,
+        ),
+    ] {
+        let Some(environment) = Environment::create().await else {
+            return;
+        };
+        install(
+            &environment,
+            json!({"management_registration":registration(),"management_response":response}),
+        )
+        .await;
+        let (runtime, core) = environment.runtime().await;
+        let service = PluginManagementService::new(
+            runtime.clone(),
+            environment.store.admin_ports().plugins(),
+            core.snapshots(),
+        );
+        let views = service.views().await.unwrap();
+        let result = service.handle(&views[0].target, request()).await;
+        if invalid {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap().status, 429);
+        }
+        assert!(
+            core.snapshots()
+                .acquire()
+                .unwrap()
+                .extensions()
+                .unwrap()
+                .is_ready()
+        );
+        for probe in core.health_probes() {
+            assert!(matches!(
+                probe.check().await,
+                gateway_core::health::HealthState::Healthy
+            ));
+        }
+        assert!(
+            environment
+                .store
+                .admin_ports()
+                .plugins()
+                .load_instances()
+                .await
+                .unwrap()
+                .instances[0]
+                .enabled
+        );
+        drop(service);
+        drop(core);
+        drop(runtime);
+        environment.close().await;
+    }
+}
+
+#[tokio::test]
 async fn management_resources_and_raw_calls_are_version_bound_and_revocation_removes_pages() {
     let Some(environment) = Environment::create().await else {
         eprintln!("SKIP: plugin integration environment absent");
@@ -382,7 +450,7 @@ async fn management_resources_and_raw_calls_are_version_bound_and_revocation_rem
         .save_instance(instance, snapshot.config_revision, &mutation())
         .await
         .unwrap();
-    // 模拟持久撤销已提交但旧发布视图仍存在；页面与资源都不能继续使用旧权限。
+    // 模拟持久撤销已提交但旧发布视图仍存在；页面与资源都不能继续使用旧权限
     assert!(service.views().await.unwrap().is_empty());
     assert!(service.handle(target, request()).await.is_err());
     assert!(

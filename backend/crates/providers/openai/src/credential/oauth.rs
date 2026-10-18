@@ -1,4 +1,4 @@
-//! Codex Authorization Code + PKCE/OIDC 管理流。
+//! Codex Authorization Code + PKCE/OIDC 管理流
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -76,17 +76,17 @@ pub struct CompleteCodexOAuthAuthorization {
     pub callback_url: SecretString,
 }
 
-/// OAuth exchange 后返回的 Provider prepared credential 及其原始事务信封。
+/// OAuth exchange 后返回的 Provider prepared credential 及其原始事务信封
 pub struct CompletedCodexOAuthAuthorization<T> {
     pub mutation: PendingAuthorizationMutation,
     pub credential: T,
     authorization_guard: Box<dyn AuthorizationCommitGuard>,
 }
 
-/// OAuth exchange 后唯一的 credential preparation 结果。
+/// OAuth exchange 后唯一的 credential preparation 结果
 pub enum CompletedCodexOAuthCredential {
-    Create(NewProviderAccount),
-    Reauthorize(PreparedCodexCredentialRotation),
+    Create(Box<NewProviderAccount>),
+    Reauthorize(Box<PreparedCodexCredentialRotation>),
 }
 
 impl fmt::Debug for CompletedCodexOAuthCredential {
@@ -542,7 +542,7 @@ impl CodexOAuthAdminService {
             .map_err(|_| CodexOAuthAdminError::TokenRejected)?;
         secret.id_token = Some(id_token);
         let credential = if let Some(current) = current {
-            CompletedCodexOAuthCredential::Reauthorize(
+            CompletedCodexOAuthCredential::Reauthorize(Box::new(
                 self.credentials
                     .prepare_refreshed_oauth_rotation(
                         current,
@@ -551,7 +551,7 @@ impl CodexOAuthAdminService {
                         None,
                     )
                     .map_err(map_admin_error)?,
-            )
+            ))
         } else {
             let account_id = format!("acct_{}", Uuid::now_v7().simple());
             let prepared = self
@@ -567,13 +567,15 @@ impl CodexOAuthAdminService {
                     enabled: true,
                 })
                 .map_err(map_admin_error)?;
-            CompletedCodexOAuthCredential::Create(gateway_core::account::NewProviderAccount {
-                model_access: Default::default(),
-                account: prepared
-                    .account
-                    .with_outbound_proxy(mutation.outbound_proxy().cloned()),
-                credential: prepared.credential,
-            })
+            CompletedCodexOAuthCredential::Create(Box::new(
+                gateway_core::account::NewProviderAccount {
+                    model_access: Default::default(),
+                    account: prepared
+                        .account
+                        .with_outbound_proxy(mutation.outbound_proxy().cloned()),
+                    credential: prepared.credential,
+                },
+            ))
         };
         Ok((mutation, credential))
     }
@@ -806,7 +808,7 @@ fn callback_parts(value: &str) -> Result<(SecretString, SecretString), CodexOAut
             "code" => set_unique_callback_parameter(&mut code, value.into_owned())?,
             "state" => set_unique_callback_parameter(&mut state, value.into_owned())?,
             // 回调地址只承载 query 参数；安全绑定由唯一的 code/state、
-            // 服务端保存的 state 和 PKCE token exchange 共同完成。
+            // 服务端保存的 state 和 PKCE token exchange 共同完成
             _ => {}
         }
     }

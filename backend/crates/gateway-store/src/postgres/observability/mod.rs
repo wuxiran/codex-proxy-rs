@@ -1,4 +1,4 @@
-//! 从 `model_requests`、`ops_events` 与账号公共投影读取观测事实。
+//! 从 `model_requests`、`ops_events` 与账号公共投影读取观测事实
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -11,7 +11,7 @@ use gateway_admin::{
     model::observability as admin_observability,
     ports::store::{AdminStoreResult, ObservabilityStore as AdminObservabilityStore},
 };
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, QueryBuilder, Row};
 
 use crate::{
     DecimalAmount, StoreError, StoreResult, admin_store_error, postgres_unavailable,
@@ -24,12 +24,18 @@ use super::{
 };
 
 mod admin_adapter;
+mod analytics;
 mod mapping;
 mod model;
 mod queries;
 mod query_budget;
 
 pub use admin_adapter::*;
+pub(crate) use analytics::accounts::{
+    account_group_usage, account_usage_sort_values, account_usage_windows,
+};
+pub(crate) use analytics::{AGGREGATE_COLLECTION, AnalyticsSnapshot};
+pub use analytics::{AnalyticsMaintenance, AnalyticsStatus, PgRequestAnalyticsRepository};
 pub(crate) use mapping::*;
 pub use model::*;
 pub(crate) use queries::*;

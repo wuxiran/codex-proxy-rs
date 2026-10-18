@@ -2,14 +2,14 @@
 // 经营日报：后台任务每 10 分钟按北京时间自然日汇总 CPR 号池投入与 sub2api 消费、收款。
 // 平台 1 元 = 1 刀；英雄套餐订阅按 1/5 折算为「调整后」。毛利 = Codex 经 CPR 调整后消费 − 当天人民币买入成本。
 import type { EChartsOption } from 'echarts'
-import { BaseButton, BaseCard, BaseEmpty, BasePageHeader, BaseSelect } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZEmpty, ZPageHeader, ZSelect } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 import request from '@/api/request'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
 
 interface Slice { requests: number, standard: number, adjusted: number }
 interface Sub2api {
@@ -137,17 +137,17 @@ const option = computed<EChartsOption>(() => {
 
 <template>
   <div class="w-full">
-    <BasePageHeader title="经营日报" description="按北京时间自然日汇总号池投入、sub2api 消费与收款（1 元 = 1 刀，英雄套餐 ÷5）">
+    <ZPageHeader title="经营日报" description="按北京时间自然日汇总号池投入、sub2api 消费与收款（1 元 = 1 刀，英雄套餐 ÷5）">
       <template #actions>
-        <BaseSelect v-model="range" :options="rangeOptions" class="w-34" @update:model-value="load" />
-        <BaseButton :loading="loading" @click="load">
+        <ZSelect v-model="range" :options="rangeOptions" class="w-34" @update:model-value="load" />
+        <ZButton :loading="loading" @click="load">
           <template #icon>
             <RefreshCw class="size-4" />
           </template>
           刷新
-        </BaseButton>
+        </ZButton>
       </template>
-    </BasePageHeader>
+    </ZPageHeader>
 
     <p v-if="error" role="alert" class="mt-4 mb-0 text-cp-sm text-cp-error">
       {{ error }}
@@ -156,7 +156,7 @@ const option = computed<EChartsOption>(() => {
       未配置 sub2api 只读数据源（store.ops_report.sub2api_database_url），只显示 CPR 自身数据。
     </p>
 
-    <BaseEmpty
+    <ZEmpty
       v-if="report && !days.length"
       title="还没有日报数据"
       description="后台任务启动后几分钟内生成今天的数据，并逐步回填最近 30 天"
@@ -165,7 +165,7 @@ const option = computed<EChartsOption>(() => {
 
     <template v-if="days.length">
       <div class="mt-5 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        <BaseCard v-for="card in cards" :key="card.label">
+        <ZCard v-for="card in cards" :key="card.label">
           <div class="text-cp-xs text-cp-text-tertiary">
             {{ card.label }}
           </div>
@@ -175,14 +175,14 @@ const option = computed<EChartsOption>(() => {
           <div class="mt-1 text-cp-xs text-cp-text-quaternary">
             {{ card.hint }}
           </div>
-        </BaseCard>
+        </ZCard>
       </div>
 
-      <BaseCard class="mt-5" title="趋势" :description="today ? `更新于 ${formatDateTime(today.refreshedAt)}，每 10 分钟刷新` : undefined">
+      <ZCard class="mt-5" title="趋势" :description="today ? `更新于 ${formatDateTime(today.refreshedAt)}，每 10 分钟刷新` : undefined">
         <BaseChart :option="option" :height="300" />
-      </BaseCard>
+      </ZCard>
 
-      <BaseCard class="mt-5" padding="none" title="每日明细">
+      <ZCard class="mt-5" padding="none" title="每日明细">
         <div class="overflow-x-auto">
           <table class="w-full min-w-[1100px] border-collapse text-cp-sm tabular-nums">
             <thead>
@@ -263,7 +263,7 @@ const option = computed<EChartsOption>(() => {
             </tbody>
           </table>
         </div>
-      </BaseCard>
+      </ZCard>
     </template>
   </div>
 </template>

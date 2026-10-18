@@ -1,9 +1,9 @@
-//! 每次消息调用拥有自己的续体和正文句柄，发送端由连接 owner 持有。
+//! 每次消息调用拥有自己的续体和正文句柄，发送端由连接 owner 持有
 use super::MiddlewareCallback;
 use crate::RpcReply;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use gateway_core::middleware::websocket as core;
+use gateway_core::engine::middleware::websocket as core;
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
     call::middleware::{

@@ -1,6 +1,7 @@
-//! 使用与 Provider 请求一致的显式代理协议，执行有超时和响应大小限制的出口测试。
+//! 使用与 Provider 请求一致的显式代理或直连路径，执行有超时和响应大小限制的出口测试
 //!
-//! 探测目标只来自编译期常量或组合根注入，从不接受请求传入的地址。
+//! fork：探测目标只来自编译期常量或组合根注入，从不接受请求传入的地址；
+//! 在上游出口检测之上叠加出口地理（尽力而为）与上游目标质量检测。
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -70,7 +71,7 @@ type ProxyClientBuilder =
 
 impl Default for HttpProxyProbe {
     fn default() -> Self {
-        // 分别向 IPv4/IPv6 专用端点并发探测，得到真实双栈出口；再叠加地区与质量检测。
+        // 分别向 IPv4 和 IPv6 专用端点并发探测，以获取真实的双栈出口地址
         Self::new_dual(
             "https://api.ipify.org?format=json",
             "https://api6.ipify.org?format=json",
@@ -136,7 +137,7 @@ impl HttpProxyProbe {
         self
     }
 
-    /// 由组合根注入与 Provider 请求一致的证书信任策略。
+    /// 由组合根注入与 Provider 请求一致的证书信任策略
     #[must_use]
     pub fn with_client_builder<E>(
         mut self,
@@ -148,26 +149,29 @@ impl HttpProxyProbe {
         self
     }
 
+    /// 未指定代理时走服务器直连出口；两种路径都不继承进程代理环境变量
     fn client(
         &self,
-        proxy: &OutboundProxy,
+        proxy: Option<&OutboundProxy>,
         timeout: Duration,
     ) -> Result<reqwest::Client, &'static str> {
-        let proxy = reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?;
-        let builder = reqwest::Client::builder()
-            // 不继承环境代理，也不跟随重定向：结论必须只反映指定代理到指定目标。
+        let mut builder = reqwest::Client::builder()
+            // 不继承环境代理，也不跟随重定向：结论必须只反映指定出口到指定目标
             .no_proxy()
-            .proxy(proxy)
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());
+        if let Some(proxy) = proxy {
+            builder = builder
+                .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?);
+        }
         (self.build_client)(builder)
     }
 
-    /// 经指定代理请求指定出口检测端点；策略层用来分别探测 v4/v6。
+    /// 经指定出口请求指定出口检测端点；策略层用来分别探测 v4/v6
     async fn exit_ip_at(
         &self,
-        proxy: &OutboundProxy,
+        proxy: Option<&OutboundProxy>,
         endpoint: &str,
     ) -> Result<IpAddr, &'static str> {
         let client = self.client(proxy, Duration::from_secs(12))?;
@@ -181,9 +185,9 @@ impl HttpProxyProbe {
     ) -> Result<IpAddr, &'static str> {
         let response = client.get(endpoint).send().await.map_err(|error| {
             if error.is_timeout() {
-                "代理连接超时"
+                "出口连接超时"
             } else {
-                "代理连接失败，请检查地址、认证和网络"
+                "出口连接失败，请检查网络或代理配置"
             }
         })?;
         if !response.status().is_success() {
@@ -210,7 +214,7 @@ impl HttpProxyProbe {
             .map_err(|_| "出口检测响应不合法")
     }
 
-    /// 地区只是展示信息：任何失败都返回空，不改变连通性结论，也不计入耗时。
+    /// fork：地区只是展示信息，任何失败都返回空，不改变连通性结论，也不计入耗时
     async fn exit_geo(&self, client: &reqwest::Client) -> Option<ProxyExitGeo> {
         let endpoint = self.geo_endpoint.as_deref()?;
         let request = async {
@@ -227,11 +231,11 @@ impl HttpProxyProbe {
             .flatten()
     }
 
-    /// 按策略探测出口 IP：单栈返回 v4 或 v6；双栈并发探测得到真实 v4+v6。
-    /// 返回 (成功, exit_ip, exit_ipv4, exit_ipv6, 结论文案)，供 base() 叠加地区/耗时。
+    /// 按策略探测出口 IP：单栈返回 v4 或 v6；双栈并发探测得到真实 v4+v6
+    /// 返回 (成功, exit_ip, exit_ipv4, exit_ipv6, 结论文案)，供 base() 叠加地区/耗时
     async fn probe_exit(
         &self,
-        proxy: &OutboundProxy,
+        proxy: Option<&OutboundProxy>,
     ) -> (
         bool,
         Option<IpAddr>,
@@ -244,7 +248,7 @@ impl HttpProxyProbe {
             ProbeStrategy::Single(endpoint) => {
                 let result = tokio::time::timeout(timeout_limit, self.exit_ip_at(proxy, endpoint))
                     .await
-                    .unwrap_or(Err("代理连接超时"));
+                    .unwrap_or(Err("出口连接超时"));
                 match result {
                     Ok(ip) => {
                         let (v4, v6) = match ip {
@@ -304,22 +308,26 @@ impl HttpProxyProbe {
                             let message = res_v4
                                 .err()
                                 .or(res_v6.err())
-                                .unwrap_or("代理连接失败")
+                                .unwrap_or("出口连接失败")
                                 .to_owned();
                             (false, None, None, None, message)
                         }
                     }
-                    Err(_) => (false, None, None, None, "代理连接超时".to_owned()),
+                    Err(_) => (false, None, None, None, "出口连接超时".to_owned()),
                 }
             }
         }
     }
 
-    async fn base(&self, proxy: &OutboundProxy) -> (ProxyTestResult, Option<reqwest::Client>) {
+    /// 出口检测 + fork 的尽力而为地区；返回的客户端供质量检测复用同一条出口配置
+    async fn base(
+        &self,
+        proxy: Option<&OutboundProxy>,
+    ) -> (ProxyTestResult, Option<reqwest::Client>) {
         let started = Instant::now();
         let (success, exit_ip, exit_ipv4, exit_ipv6, message) = self.probe_exit(proxy).await;
         let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        // 地区/质量复用一个新客户端（与出口探测端点无关，只需相同代理配置）；失败则不查地区。
+        // 地区/质量复用一个新客户端（与出口探测端点无关，只需相同出口配置）；失败则不查地区
         let client = success
             .then(|| self.client(proxy, Duration::from_secs(12)).ok())
             .flatten();
@@ -525,7 +533,7 @@ pub fn is_cloudflare_challenge(
 }
 
 impl HttpProxyProbe {
-    /// 显式注入地理位置服务地址，便于部署适配与隔离网络验证。
+    /// 显式注入地理位置服务地址，便于部署适配与隔离网络验证
     #[must_use]
     pub fn with_location_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.location_endpoint = endpoint.into();
@@ -534,17 +542,17 @@ impl HttpProxyProbe {
 
     async fn location_for_ip(
         &self,
-        proxy: &OutboundProxy,
+        proxy: Option<&OutboundProxy>,
         ip: IpAddr,
     ) -> Result<RequestLocation, &'static str> {
-        // 出口 IP 已由代理探测确认；按这个固定 IP 从服务端查询位置，避免代理出口屏蔽位置服务。
-        // 部署环境无法直连位置服务时仍尝试原代理路径。
+        // 出口 IP 已由探测确认；按这个固定 IP 从服务端查询位置，避免代理出口屏蔽位置服务
+        // 部署环境无法直连位置服务时仍尝试原代理路径
         match self.lookup_location(ip, None).await {
             Ok(location) => Ok(location),
-            Err(direct_error) => self
-                .lookup_location(ip, Some(proxy))
-                .await
-                .or(Err(direct_error)),
+            Err(direct_error) if proxy.is_some() => {
+                self.lookup_location(ip, proxy).await.or(Err(direct_error))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -568,7 +576,7 @@ impl HttpProxyProbe {
                 .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?);
         }
         let client = (self.build_client)(builder)?;
-        // 查询已检测到的具体出口，不能再次查询“我的 IP”，轮换代理可能换到另一个出口。
+        // 查询已检测到的具体出口，不能再次查询“我的 IP”，轮换代理可能换到另一个出口
         let url = format!("{}/{ip}", self.location_endpoint.trim_end_matches('/'));
         let mut response = client
             .get(url)
@@ -625,7 +633,7 @@ impl HttpProxyProbe {
 
     async fn detect_location(
         &self,
-        proxy: &OutboundProxy,
+        proxy: Option<&OutboundProxy>,
         result: &ProxyTestResult,
     ) -> ProxyLocationDetection {
         let lookup = async |ip: Option<IpAddr>| match ip {
@@ -655,8 +663,8 @@ impl HttpProxyProbe {
 
 #[async_trait]
 impl ProxyProbe for HttpProxyProbe {
-    async fn test(&self, proxy: &OutboundProxy, detect_location: bool) -> ProxyTestResult {
-        let mut result = self.base(proxy).await.0;
+    async fn test(&self, proxy: Option<&OutboundProxy>, detect_location: bool) -> ProxyTestResult {
+        let mut result = self.base(proxy).await.0; // fork: 出口检测叠加地区
         if detect_location {
             result.location = if result.success {
                 tokio::time::timeout(Duration::from_secs(7), self.detect_location(proxy, &result))
@@ -673,16 +681,17 @@ impl ProxyProbe for HttpProxyProbe {
         result
     }
 
+    // fork: proxy quality —— 质量检测只针对已保存的代理，不做直连版本
     async fn quality(&self, proxy: &OutboundProxy) -> ProxyQualityProbe {
-        let (base, _) = self.base(proxy).await;
+        let (base, _) = self.base(Some(proxy)).await;
         if !base.success {
             return ProxyQualityProbe {
                 base,
                 items: Vec::new(),
             };
         }
-        // 各目标相互独立，并发执行把单次检测控制在一个目标超时之内。
-        let items = match self.client(proxy, QUALITY_TIMEOUT) {
+        // 各目标相互独立，并发执行把单次检测控制在一个目标超时之内
+        let items = match self.client(Some(proxy), QUALITY_TIMEOUT) {
             Ok(client) => {
                 futures::future::join_all(
                     self.quality_targets

@@ -1,3 +1,5 @@
+//! OpenAI 用量解析、模型价格匹配与费用明细计算
+
 use gateway_core::metering::{
     CalculatedCost, CalculatedCostAmounts, CalculatedCostBreakdown, CalculatedCostRates,
     CurrencyCode, Decimal, Money,
@@ -18,13 +20,13 @@ const WEB_SEARCH_CALL_TICKS: u128 = 100_000_000;
 const WEB_SEARCH_PREVIEW_NON_REASONING_CALL_TICKS: u128 = 250_000_000;
 const FILE_SEARCH_CALL_TICKS: u128 = 25_000_000;
 
-/// OpenAI 公开 Token 价格计算所需的单次用量事实。
+/// OpenAI 公开 Token 价格计算所需的单次用量事实
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenAiBillingUsage {
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
-    cache_write_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
     image_input_tokens: u64,
     image_output_tokens: u64,
     web_search_calls: u64,
@@ -33,19 +35,19 @@ pub struct OpenAiBillingUsage {
 }
 
 impl OpenAiBillingUsage {
-    /// 构造不含托管工具费用的 Token 用量。
+    /// 构造不含托管工具费用的 Token 用量
     #[must_use]
     pub const fn new(
         input_tokens: u64,
         output_tokens: u64,
-        cached_tokens: u64,
-        cache_write_tokens: u64,
+        cached_input_tokens: u64,
+        cache_write_input_tokens: u64,
     ) -> Self {
         Self {
             input_tokens,
             output_tokens,
-            cached_tokens,
-            cache_write_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
             image_input_tokens: 0,
             image_output_tokens: 0,
             web_search_calls: 0,
@@ -75,8 +77,8 @@ impl From<TokenUsage> for OpenAiBillingUsage {
         Self {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cached_tokens: usage.cached_tokens,
-            cache_write_tokens: usage.cache_write_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
             image_input_tokens: usage.image_input_tokens,
             image_output_tokens: usage.image_output_tokens,
             web_search_calls: 0,
@@ -113,7 +115,7 @@ struct TokenRates {
 impl TokenRates {
     const ZERO: Self = Self::new(0, 0, 0);
 
-    /// 参数单位为 USD / 1M Token 的万分之一，数值也恰好等于单 Token 的 USD ticks。
+    /// 参数单位为 USD / 1M Token 的万分之一，数值也恰好等于单 Token 的 USD ticks
     const fn new(input_ticks: u128, output_ticks: u128, cache_read_ticks: u128) -> Self {
         Self {
             input_ticks,
@@ -137,9 +139,11 @@ struct ModelPricing {
     standard: TokenRates,
     flex: TokenRates,
     fast: TokenRates,
+    ultrafast: TokenRates,
     long_standard: TokenRates,
     long_flex: TokenRates,
     long_fast: TokenRates,
+    long_ultrafast: TokenRates,
     cache_write_percent: u32,
     unpriced_long_context: bool,
 }
@@ -150,9 +154,11 @@ impl ModelPricing {
             standard: TokenRates::new(input, output, cache_read),
             flex: TokenRates::ZERO,
             fast: TokenRates::ZERO,
+            ultrafast: TokenRates::ZERO,
             long_standard: TokenRates::ZERO,
             long_flex: TokenRates::ZERO,
             long_fast: TokenRates::ZERO,
+            long_ultrafast: TokenRates::ZERO,
             cache_write_percent: 0,
             unpriced_long_context: false,
         }
@@ -165,6 +171,11 @@ impl ModelPricing {
 
     const fn with_fast(mut self, input: u128, output: u128, cache_read: u128) -> Self {
         self.fast = TokenRates::new(input, output, cache_read);
+        self
+    }
+
+    const fn with_ultrafast(mut self, input: u128, output: u128, cache_read: u128) -> Self {
+        self.ultrafast = TokenRates::new(input, output, cache_read);
         self
     }
 
@@ -183,6 +194,11 @@ impl ModelPricing {
         self
     }
 
+    const fn with_long_ultrafast(mut self, input: u128, output: u128, cache_read: u128) -> Self {
+        self.long_ultrafast = TokenRates::new(input, output, cache_read);
+        self
+    }
+
     const fn with_cache_write(mut self, percent: u32) -> Self {
         self.cache_write_percent = percent;
         self
@@ -197,17 +213,18 @@ impl ModelPricing {
         if long_context && self.unpriced_long_context {
             return None;
         }
-        // Only models with a published long-context column switch at the threshold.
-        // A dash in that column is not a second, unavailable price tier for models
-        // whose entire supported context is covered by the short-context price.
+        // 只有公布长上下文价格的模型才在阈值处切换费率
+        // 若短上下文价格覆盖全部支持范围，长上下文栏的横线不代表额外的不可用档位
         let uses_long_rates = long_context && self.long_standard.is_configured();
         let rates = match (tier, uses_long_rates) {
             (PricingTier::Standard, false) => self.standard,
             (PricingTier::Flex, false) => self.flex,
             (PricingTier::Fast, false) => self.fast,
+            (PricingTier::Ultrafast, false) => self.ultrafast,
             (PricingTier::Standard, true) => self.long_standard,
             (PricingTier::Flex, true) => self.long_flex,
             (PricingTier::Fast, true) => self.long_fast,
+            (PricingTier::Ultrafast, true) => self.long_ultrafast,
         };
         rates.is_configured().then_some(rates)
     }
@@ -218,6 +235,7 @@ enum PricingTier {
     Standard,
     Flex,
     Fast,
+    Ultrafast,
 }
 
 #[derive(Clone, Copy)]
@@ -226,23 +244,26 @@ struct PricingRule {
     pricing: ModelPricing,
 }
 
-// 价格来源：https://developers.openai.com/api/docs/pricing。
-// 只登记已核验的常规价格及服务档位；临时优惠不写入内置价目。
-// 原有规则于 2026-09-09 核验，GPT-6.1 Sol 于 2026-09-29 核验，其余新增型号见对应条目。
+// 价格来源：https://developers.openai.com/api/docs/pricing
+// 只登记已核验的常规价格及服务档位；临时优惠不写入内置价目
+// 原有规则于 2026-09-09 核验，GPT-6.1 Sol 于 2026-09-29 核验，其余新增型号见对应条目
+// Astra 与 GPT-6.1 Sol 的 Ultrafast 档位于 2026-10-12 对照官方价目表核验
 // 已按 https://developers.openai.com/api/docs/deprecations 核验至 2026-09-13，
-// 移除已关闭的型号；仅宣布弃用但尚未到关闭日期的型号继续保留。
+// 移除已关闭的型号；仅宣布弃用但尚未到关闭日期的型号继续保留
 const PRICING_RULES: &[PricingRule] = &[
     // Astra：https://developers.openai.com/api/docs/models/gpt-6-astra
-    // 已于 2026-09-09 对照官方价目表核验。
+    // 已于 2026-09-09 对照官方价目表核验
     PricingRule {
         model: "gpt-6-astra",
         pricing: ModelPricing::new(100_000, 500_000, 10_000)
             .with_cache_write(125)
             .with_flex(50_000, 250_000, 5_000)
             .with_fast(200_000, 1_000_000, 20_000)
+            .with_ultrafast(600_000, 3_000_000, 60_000)
             .with_long(200_000, 750_000, 20_000)
             .with_long_flex(100_000, 375_000, 10_000)
-            .with_long_fast(400_000, 1_500_000, 40_000),
+            .with_long_fast(400_000, 1_500_000, 40_000)
+            .with_long_ultrafast(1_200_000, 4_500_000, 120_000),
     },
     PricingRule {
         model: "gpt-6.1-sol",
@@ -250,11 +271,13 @@ const PRICING_RULES: &[PricingRule] = &[
             .with_cache_write(125)
             .with_flex(10_000, 50_000, 500)
             .with_fast(40_000, 200_000, 2_000)
+            .with_ultrafast(120_000, 600_000, 6_000)
             .with_long(40_000, 150_000, 2_000)
             .with_long_flex(20_000, 75_000, 1_000)
-            .with_long_fast(80_000, 300_000, 4_000),
+            .with_long_fast(80_000, 300_000, 4_000)
+            .with_long_ultrafast(240_000, 900_000, 12_000),
     },
-    // https://developers.openai.com/api/docs/models/gpt-6-sol，核验日期 2026-09-24。
+    // https://developers.openai.com/api/docs/models/gpt-6-sol，核验日期 2026-09-24
     PricingRule {
         model: "gpt-6-sol",
         pricing: ModelPricing::new(20_000, 100_000, 2_000)
@@ -265,7 +288,7 @@ const PRICING_RULES: &[PricingRule] = &[
             .with_long_flex(20_000, 75_000, 2_000)
             .with_long_fast(80_000, 300_000, 8_000),
     },
-    // https://developers.openai.com/api/docs/models/gpt-6-luna，核验日期 2026-09-24。
+    // https://developers.openai.com/api/docs/models/gpt-6-luna，核验日期 2026-09-24
     PricingRule {
         model: "gpt-6-luna",
         pricing: ModelPricing::new(1_000, 5_000, 100)
@@ -467,8 +490,8 @@ const PRICING_RULES: &[PricingRule] = &[
         model: "gpt-3.5-turbo",
         pricing: ModelPricing::new(5_000, 15_000, 0),
     },
-    // 各变体独立采用已公开的价格与档位，不能继承父型号的所有档位。
-    // Cyber 长上下文的官方来源存在差异，该区间暂不估价。
+    // 各变体独立采用已公开的价格与档位，不能继承父型号的所有档位
+    // Cyber 长上下文的官方来源存在差异，该区间暂不估价
     PricingRule {
         model: "gpt-5.6-cyber",
         pricing: ModelPricing::new(125_000, 750_000, 12_500)
@@ -494,7 +517,7 @@ struct TokenAmounts {
     total_ticks: u128,
 }
 
-/// 按 OpenAI Provider 当前受控价格规则计算费用明细。
+/// 按 OpenAI Provider 当前受控价格规则计算费用明细
 #[must_use]
 pub fn openai_billing_breakdown(
     model: &str,
@@ -510,7 +533,7 @@ pub fn openai_billing_breakdown(
     )
 }
 
-/// 使用请求开始时冻结的价格覆盖，不读取管理存储。
+/// 使用请求开始时冻结的价格覆盖，不读取管理存储
 #[must_use]
 pub fn openai_billing_breakdown_with_override(
     model: &str,
@@ -534,7 +557,10 @@ fn openai_billing_breakdown_with_context(
     long_context: bool,
     custom: Option<&gateway_core::metering::ModelPriceOverride>,
 ) -> Option<CalculatedCostBreakdown> {
-    if usage.cached_tokens.checked_add(usage.cache_write_tokens)? > usage.input_tokens
+    if usage
+        .cached_input_tokens
+        .checked_add(usage.cache_write_input_tokens)?
+        > usage.input_tokens
         || usage.image_input_tokens > 0
         || usage.image_output_tokens > 0
     {
@@ -555,16 +581,16 @@ fn openai_billing_breakdown_with_context(
         cache_write_percent,
         usage.input_tokens,
         usage.output_tokens,
-        usage.cached_tokens,
-        usage.cache_write_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
     )?;
     let mut selected = token_amounts(
         selected_rates,
         cache_write_percent,
         usage.input_tokens,
         usage.output_tokens,
-        usage.cached_tokens,
-        usage.cache_write_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
     )?;
     standard.total_ticks = standard.total_ticks.checked_add(tool_ticks)?;
     selected.total_ticks = selected.total_ticks.checked_add(tool_ticks)?;
@@ -604,6 +630,7 @@ fn effective_rates(
         PricingTier::Standard => "long_standard",
         PricingTier::Fast => "long_fast",
         PricingTier::Flex => "long_flex",
+        PricingTier::Ultrafast => "long_ultrafast",
     };
     let uses_long = long_context
         && (default.is_some_and(|p| p.long_standard.is_configured() || p.unpriced_long_context)
@@ -612,9 +639,11 @@ fn effective_rates(
         (PricingTier::Standard, false) => "standard",
         (PricingTier::Fast, false) => "fast",
         (PricingTier::Flex, false) => "flex",
+        (PricingTier::Ultrafast, false) => "ultrafast",
         (PricingTier::Standard, true) => "long_standard",
         (PricingTier::Fast, true) => "long_fast",
         (PricingTier::Flex, true) => "long_flex",
+        (PricingTier::Ultrafast, true) => "long_ultrafast",
     };
     if let Some(rates) = custom.and_then(|p| p.bands.get(band)) {
         return Some((
@@ -652,9 +681,11 @@ pub(crate) fn pricing_catalog()
             let bands = [
                 ("standard", pricing.standard),
                 ("fast", pricing.fast),
+                ("ultrafast", pricing.ultrafast),
                 ("flex", pricing.flex),
                 ("long_standard", pricing.long_standard),
                 ("long_fast", pricing.long_fast),
+                ("long_ultrafast", pricing.long_ultrafast),
                 ("long_flex", pricing.long_flex),
             ]
             .into_iter()
@@ -670,8 +701,8 @@ pub(crate) fn pricing_catalog()
                         } else {
                             rates.cache_read_ticks
                         })?,
-                        // 内置表没有独立缓存写入费时，这部分 Token 原本按输入计费。
-                        // 管理页复制来源档位不能把它改成显式免费。
+                        // 内置表没有独立缓存写入费时，这部分 Token 原本按输入计费
+                        // 管理页复制来源档位不能把它改成显式免费
                         cache_write: price(if pricing.cache_write_percent == 0 {
                             rates.input_ticks
                         } else {
@@ -727,7 +758,7 @@ const IMAGE_MODELS: &[&str] = &[
 const IMAGE_TEXT_RATES: TokenRates = TokenRates::new(50_000, 0, 12_500);
 const IMAGE_TOKEN_RATES: TokenRates = TokenRates::new(80_000, 300_000, 20_000);
 
-/// 独立 Images 端点按公开标准 API 单价估算；不是 ChatGPT 账号实际扣费。
+/// 独立 Images 端点按公开标准 API 单价估算；不是 ChatGPT 账号实际扣费
 pub(crate) fn image_calculated_cost(
     request_body: &[u8],
     usage: &Value,
@@ -737,7 +768,7 @@ pub(crate) fn image_calculated_cost(
     struct ImageModel {
         model: String,
     }
-    // 只读取模型，跳过编辑请求中可能很大的 base64 图片。
+    // 只读取模型，跳过编辑请求中可能很大的 base64 图片
     let request = serde_json::from_slice::<ImageModel>(request_body).ok()?;
     let custom = prices
         .get("openai")
@@ -770,7 +801,7 @@ pub(crate) fn image_calculated_cost(
     {
         return None;
     }
-    // 此模型仅输出图片；上游如报告其他输出模态，不能套用图片单价。
+    // 此模型仅输出图片；上游如报告其他输出模态，不能套用图片单价
     if let Some(details) = usage.get("output_tokens_details")
         && (details.get("image_tokens")?.as_u64()? != output
             || details.get("text_tokens")?.as_u64()? != 0)
@@ -784,7 +815,7 @@ pub(crate) fn image_calculated_cost(
     if cached > input {
         return None;
     }
-    // 缓存只给总量时，混合输入无法判定应套用哪种缓存单价。
+    // 缓存只给总量时，混合输入无法判定应套用哪种缓存单价
     let (cached_text, cached_image) = match (text_input, image_input, cached) {
         (_, _, 0) => (0, 0),
         (_, 0, cached) => (cached, 0),
@@ -792,9 +823,9 @@ pub(crate) fn image_calculated_cost(
         (_, _, cached) if cached == input => (text_input, image_input),
         _ => return None,
     };
-    // 价格来源：https://developers.openai.com/api/docs/pricing，核验日期 2026-09-09。
-    // GPT Image 2 和两个 2.5 型号按相同的 token 单价计费，不使用按张估价。
-    // 每百万 token 的美元单价：文本 5 / 缓存 1.25；图片 8 / 缓存 2 / 输出 30。
+    // 价格来源：https://developers.openai.com/api/docs/pricing，核验日期 2026-09-09
+    // GPT Image 2 和两个 2.5 型号按相同的 token 单价计费，不使用按张估价
+    // 每百万 token 的美元单价：文本 5 / 缓存 1.25；图片 8 / 缓存 2 / 输出 30
     let text = token_amounts(text_rates, 0, text_input, 0, cached_text, 0)?;
     let image = token_amounts(image_rates, 0, image_input, output, cached_image, 0)?;
     let total = usd_money(text.total_ticks.checked_add(image.total_ticks)?)?;
@@ -818,7 +849,7 @@ pub(crate) fn image_calculated_cost(
     )
     .with_image(gateway_core::metering::ImageCostBreakdown {
         input_tokens: image_input,
-        cached_tokens: cached_image,
+        cached_input_tokens: cached_image,
         input_amount: usd_money(image.input_ticks)?,
         cache_read_amount: usd_money(image.cache_read_ticks)?,
         input_price_per_million: usd_price_per_million(image_rates.input_ticks)?,
@@ -852,9 +883,8 @@ pub(crate) fn web_search_pricing(model: &str, tools: Option<&[Value]>) -> Option
         }
     }
     match (standard, preview) {
-        // These two models bill non-preview search content as a fixed 8K input block.
-        // The response does not expose enough detail to replace that block without
-        // double-counting ordinary input, so leave the request unpriced.
+        // 这两个模型将非预览搜索内容按固定 8K 输入块计费
+        // 响应缺少足够明细，无法排除与普通输入重复计费，因此保留为未定价
         (true, false) if fixed_block_web_search_model(model) => None,
         (true, false) => Some(WebSearchPricing::Standard),
         (false, true) if reasoning_model(model) => Some(WebSearchPricing::Standard),
@@ -888,6 +918,7 @@ fn pricing_tier(service_tier: Option<&str>) -> Option<PricingTier> {
         None | Some("default" | "standard") => Some(PricingTier::Standard),
         Some("flex") => Some(PricingTier::Flex),
         Some("fast" | "priority") => Some(PricingTier::Fast),
+        Some("ultrafast") => Some(PricingTier::Ultrafast),
         Some(_) => None,
     }
 }
@@ -904,20 +935,20 @@ fn token_amounts(
     cache_write_percent: u32,
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
-    cache_write_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
 ) -> Option<TokenAmounts> {
-    if cached_tokens.checked_add(cache_write_tokens)? > input_tokens {
+    if cached_input_tokens.checked_add(cache_write_input_tokens)? > input_tokens {
         return None;
     }
     let billed_cache_read = if rates.explicit_cache || rates.cache_read_ticks > 0 {
-        cached_tokens
+        cached_input_tokens
     } else {
         0
     };
     let cache_write_rate = cache_write_rate(rates, cache_write_percent)?;
     let billed_cache_write = if rates.explicit_cache || cache_write_rate > 0 {
-        cache_write_tokens
+        cache_write_input_tokens
     } else {
         0
     };
@@ -973,7 +1004,7 @@ fn normalize_model_name(model: &str) -> String {
 }
 
 // 仅已核验的别名和快照可以共用价格；未知后缀、未来日期和微调模型
-// 不得直接继承父型号的价格。
+// 不得直接继承父型号的价格
 fn pricing_model_name(model: &str) -> &str {
     match model {
         "gpt-3.5-turbo-0125" => "gpt-3.5-turbo",
@@ -1014,7 +1045,7 @@ fn model_matches_rule(model: &str, rule: &str) -> bool {
     pricing_model_name(model) == rule
 }
 
-/// 规范化请求或响应携带的服务档位，供观测与计费共用。
+/// 规范化请求或响应携带的服务档位，供观测与计费共用
 pub(crate) fn normalize_service_tier(service_tier: Option<&str>) -> Option<String> {
     service_tier
         .map(str::trim)
@@ -1042,11 +1073,11 @@ fn usd_price_per_million(per_token_ticks: u128) -> Option<Money> {
     usd_money(per_token_ticks.checked_mul(1_000_000)?)
 }
 
-/// 单次 Codex usage 响应允许保留和解析的最大字节数。
+/// 单次 Codex usage 响应允许保留和解析的最大字节数
 pub const MAX_CODEX_USAGE_BODY_BYTES: usize = 1024 * 1024;
 
 impl CodexBackendClient {
-    /// 获取 Codex usage JSON。
+    /// 获取 Codex usage JSON
     pub async fn fetch_usage(&self, context: CodexRequestContext<'_>) -> CodexClientResult<Value> {
         let headers = self.account_request_headers(context)?;
         let request = |base_url| {

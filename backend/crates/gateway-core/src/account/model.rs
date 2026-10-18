@@ -1,4 +1,4 @@
-//! Provider 账号、明文 credential 与持久状态值对象。
+//! Provider 账号、明文 credential 与持久状态值对象
 
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
@@ -11,30 +11,30 @@ use crate::validation::{IdentifierError, validate_text};
 
 use super::CredentialError;
 
-/// `provider_accounts.id` 的核心值对象。
+/// `provider_accounts.id` 的核心值对象
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderAccountId(String);
 
 impl ProviderAccountId {
-    /// 校验并创建账号 ID。
+    /// 校验并创建账号 ID
     ///
     /// # Errors
     ///
-    /// ID 缺少 `acct_` 前缀或不满足通用文本约束时返回错误。
+    /// ID 缺少 `acct_` 前缀或不满足通用文本约束时返回错误
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
         let value = value.into();
         validate_text(&value, 128, false, Some("acct_"))?;
         Ok(Self(value))
     }
 
-    /// 返回数据库 ID 文本。
+    /// 返回数据库 ID 文本
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// Per-account scheduling concurrency override.
+/// 单个账号的调度并发覆盖值
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountConcurrencyLimit(NonZeroU32);
 
@@ -58,7 +58,7 @@ impl AccountConcurrencyLimit {
     }
 }
 
-/// 账号继承默认值或应用独立覆盖后的实际并发约束。
+/// 账号继承默认值或应用独立覆盖后的实际并发约束
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountConcurrency {
     Unlimited,
@@ -66,7 +66,7 @@ pub enum AccountConcurrency {
 }
 
 impl AccountConcurrency {
-    /// 配置值零表示不限制；账号独立覆盖仍只接受正数。
+    /// 配置值零表示不限制；账号独立覆盖仍只接受正数
     #[must_use]
     pub const fn new(value: u32) -> Self {
         match NonZeroU32::new(value) {
@@ -98,7 +98,7 @@ impl From<NonZeroU32> for AccountConcurrency {
     }
 }
 
-/// Relative scheduling priority for an account.
+/// 账号的相对调度优先级
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountWeight(NonZeroU16);
 
@@ -132,7 +132,7 @@ impl fmt::Display for ProviderAccountId {
     }
 }
 
-/// credential 轮换时可选替换的上游账号身份。
+/// credential 轮换时可选替换的上游账号身份
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAccountIdentity {
     upstream_user_id: String,
@@ -172,33 +172,33 @@ impl ProviderAccountIdentity {
     }
 }
 
-/// `provider_accounts.credential_revision` 的正数 CAS revision。
+/// `provider_accounts.credential_revision` 的正数 CAS revision
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CredentialRevision(NonZeroU64);
 
 impl CredentialRevision {
-    /// 创建正数 revision。
+    /// 创建正数 revision
     ///
     /// # Errors
     ///
-    /// `value` 为零时返回错误。
+    /// `value` 为零时返回错误
     pub fn new(value: u64) -> Result<Self, CredentialError> {
         NonZeroU64::new(value)
             .map(Self)
             .ok_or(CredentialError::InvalidRevision)
     }
 
-    /// 返回 revision 数值。
+    /// 返回 revision 数值
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
     }
 
-    /// 返回下一个 revision；溢出时返回错误。
+    /// 返回下一个 revision；溢出时返回错误
     ///
     /// # Errors
     ///
-    /// 当前 revision 已是 `u64::MAX` 时返回错误。
+    /// 当前 revision 已是 `u64::MAX` 时返回错误
     pub fn next(self) -> Result<Self, CredentialError> {
         self.get()
             .checked_add(1)
@@ -208,26 +208,26 @@ impl CredentialRevision {
     }
 }
 
-/// Provider-owned 的明文 credential JSON。
+/// Provider-owned 的明文 credential JSON
 ///
-/// Core 只保证顶层是 object，绝不读取其中的 AT、RT、Cookie 或 Provider key。
+/// Core 只保证顶层是 object，绝不读取其中的 AT、RT、Cookie 或 Provider key
 #[derive(Clone, PartialEq)]
 pub struct PlaintextCredential(Map<String, Value>);
 
 impl PlaintextCredential {
-    /// 接受由具体 Provider 完整校验后的 JSON object。
+    /// 接受由具体 Provider 完整校验后的 JSON object
     #[must_use]
     pub const fn new(value: Map<String, Value>) -> Self {
         Self(value)
     }
 
-    /// 将明文 object 借给对应 Provider adapter。
+    /// 将明文 object 借给对应 Provider adapter
     #[must_use]
     pub const fn expose_to_provider(&self) -> &Map<String, Value> {
         &self.0
     }
 
-    /// 将明文 object 交给 Store adapter 持久化。
+    /// 将明文 object 交给 Store adapter 持久化
     #[must_use]
     pub fn into_inner(self) -> Map<String, Value> {
         self.0
@@ -244,7 +244,7 @@ impl fmt::Debug for PlaintextCredential {
     }
 }
 
-/// Provider-owned 的任意 JSON object；公共层只搬运、不读取内部 key。
+/// Provider-owned 的任意 JSON object；公共层只搬运、不读取内部 key
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct OpaqueProviderData(Map<String, Value>);
@@ -276,10 +276,11 @@ impl fmt::Debug for OpaqueProviderData {
     }
 }
 
-/// 已持久化的凭据/账号身份状态。
+/// 已持久化的凭据/账号身份状态
 ///
-/// 这里只保存凭据与账号身份事实。额度耗尽属于 [`QuotaState`]，临时 429 属于
-/// 运行时冷却；二者都不得写入此枚举。
+/// 这里只保存凭据与账号身份事实
+/// 额度耗尽属于 [`QuotaState`]，临时 429 属于
+/// 运行时冷却；二者都不得写入此枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CredentialState {
     Unknown,
@@ -290,7 +291,7 @@ pub enum CredentialState {
 }
 
 impl CredentialState {
-    /// 返回数据库稳定值。
+    /// 返回数据库稳定值
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -302,7 +303,7 @@ impl CredentialState {
         }
     }
 
-    /// 返回该凭据状态对应的稳定错误原因。
+    /// 返回该凭据状态对应的稳定错误原因
     #[must_use]
     pub const fn error_reason(self) -> Option<AccountErrorReason> {
         match self {
@@ -314,7 +315,7 @@ impl CredentialState {
         }
     }
 
-    /// 解析数据库稳定值。
+    /// 解析数据库稳定值
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -328,7 +329,7 @@ impl CredentialState {
     }
 }
 
-/// 额度访问结论；百分比和余额等展示值不进入此枚举。
+/// 额度访问结论；百分比和余额等展示值不进入此枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuotaAccessState {
     Unknown,
@@ -357,7 +358,7 @@ impl QuotaAccessState {
     }
 }
 
-/// 权威额度耗尽证据。
+/// 权威额度耗尽证据
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuotaEvidence {
     ProviderDenied,
@@ -389,7 +390,7 @@ impl QuotaEvidence {
     }
 }
 
-/// 可审计的额度访问事实。
+/// 可审计的额度访问事实
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaState {
     access: QuotaAccessState,
@@ -449,7 +450,7 @@ impl QuotaState {
         }
     }
 
-    /// 从持久化列恢复额度状态；非法组合返回 `None`。
+    /// 从持久化列恢复额度状态；非法组合返回 `None`
     #[must_use]
     pub const fn from_persisted(
         access: QuotaAccessState,
@@ -506,17 +507,17 @@ impl QuotaState {
         self.reset_at
     }
 
-    /// 返回当前已确认的额度耗尽结论。
+    /// 返回当前已确认的额度耗尽结论
     ///
-    /// `reset_at` 只表示何时应重新向 Provider 求证；时间到期本身不是额度恢复证据。
+    /// `reset_at` 只表示何时应重新向 Provider 求证；时间到期本身不是额度恢复证据
     #[must_use]
     pub fn is_exhausted(self) -> bool {
         self.access == QuotaAccessState::Exhausted
     }
 
-    /// 判断已耗尽额度是否到达 Provider 的下一次复核时间。
+    /// 判断已耗尽额度是否到达 Provider 的下一次复核时间
     ///
-    /// 有明确 `reset_at` 时严格等待该时刻；没有时由 Provider 传入自己的保守复核周期。
+    /// 有明确 `reset_at` 时严格等待该时刻；没有时由 Provider 传入自己的保守复核周期
     #[must_use]
     pub fn exhaustion_refresh_due(self, now: SystemTime, fallback_interval: Duration) -> bool {
         if !self.is_exhausted() {
@@ -529,7 +530,7 @@ impl QuotaState {
         due_at.is_none_or(|due_at| due_at <= now)
     }
 
-    /// 合并一次额度访问观察；`Unknown` 不能擦除已经确认的访问结论。
+    /// 合并一次额度访问观察；`Unknown` 不能擦除已经确认的访问结论
     #[must_use]
     pub fn merge_observation(self, observation: Self) -> Self {
         if observation.access == QuotaAccessState::Unknown
@@ -542,7 +543,7 @@ impl QuotaState {
     }
 }
 
-/// 对外唯一的五态账号状态。
+/// 对外唯一的五态账号状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountStatus {
     Normal,
@@ -575,21 +576,9 @@ impl AccountStatus {
             _ => None,
         }
     }
-
-    /// 管理页稳定业务排序：正常、限流、耗尽、错误、停用。
-    #[must_use]
-    pub const fn sort_rank(self) -> u8 {
-        match self {
-            Self::Normal => 0,
-            Self::RateLimited => 1,
-            Self::QuotaExhausted => 2,
-            Self::Error => 3,
-            Self::Disabled => 4,
-        }
-    }
 }
 
-/// `error` 状态下的稳定原因码。
+/// `error` 状态下的稳定原因码
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountErrorReason {
     AccountUnverified,
@@ -624,15 +613,15 @@ impl AccountErrorReason {
     }
 }
 
-/// 账号冷却的原因与恢复方式。
+/// 账号冷却的原因与恢复方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountCooldownKind {
-    /// 上游 429 临时限流；默认类别，兼容升级前未标记的存量 key。
+    /// 上游 429 临时限流；默认类别，兼容升级前未标记的存量 key
     #[default]
     RateLimit,
-    /// 容量类错误高频触发后由熔断策略写入的自动冻结。
+    /// 容量类错误高频触发后由熔断策略写入的自动冻结
     CapacityFreeze,
-    /// 到期后仍阻止调度，必须由恢复探测成功或管理员恢复解除。
+    /// 到期后仍阻止调度，必须由恢复探测成功或管理员恢复解除
     CapacityFreezeProbe,
 }
 
@@ -667,7 +656,7 @@ impl AccountCooldownKind {
     }
 }
 
-/// 账号级冷却投影；探测冻结的 until 是下次探测时间，不是自动放行时间。
+/// 账号级冷却投影；探测冻结的 until 是下次探测时间，不是自动放行时间
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountCooldown {
     pub until: SystemTime,
@@ -690,7 +679,7 @@ impl From<SystemTime> for AccountCooldown {
     }
 }
 
-/// 唯一状态解析器的完整输入事实。
+/// 唯一状态解析器的完整输入事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStatusFacts {
     pub enabled: bool,
@@ -702,17 +691,17 @@ pub struct AccountStatusFacts {
     pub last_error_message: Option<String>,
 }
 
-/// 唯一状态解析器的输出。
+/// 唯一状态解析器的输出
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStatusProjection {
     pub status: AccountStatus,
     pub error_reason: Option<AccountErrorReason>,
     pub error_message: Option<String>,
-    /// 仅 `rate_limited` 状态携带仍有效的运行时冷却事实。
+    /// 仅 `rate_limited` 状态携带仍有效的运行时冷却事实
     pub cooldown: Option<AccountCooldown>,
 }
 
-/// 从独立事实派生唯一、互斥的对外状态。
+/// 从独立事实派生唯一、互斥的对外状态
 #[must_use]
 pub fn resolve_account_status(
     facts: &AccountStatusFacts,
@@ -761,12 +750,40 @@ const fn status_projection(status: AccountStatus) -> AccountStatusProjection {
     }
 }
 
-/// 账号持久事实；代理认证信息只通过显式 secret accessor 读取。
+/// 选中账号时冻结的历史展示事实，不包含凭据与运行状态
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountHistorySnapshot {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub authentication_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type_snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes_snapshot: Option<String>,
+}
+
+impl AccountHistorySnapshot {
+    #[must_use]
+    pub fn from_account(account: &crate::account::ProviderAccount) -> Self {
+        Self {
+            name: account.name().to_owned(),
+            email: account.email().map(str::to_owned),
+            authentication_kind: account.authentication_kind().to_owned(),
+            plan_type_snapshot: account.plan_type().map(str::to_owned),
+            notes_snapshot: account.notes().map(str::to_owned),
+        }
+    }
+}
+
+/// 账号持久事实；代理认证信息只通过显式 secret accessor 读取
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccount {
     id: ProviderAccountId,
     provider: ProviderKind,
     name: String,
+    notes: Option<String>,
     email: Option<String>,
     upstream_user_id: Option<String>,
     upstream_account_id: Option<String>,
@@ -789,7 +806,7 @@ pub struct ProviderAccount {
 }
 
 impl ProviderAccount {
-    /// 创建账号快照。
+    /// 创建账号快照
     #[must_use]
     pub const fn new(
         id: ProviderAccountId,
@@ -804,6 +821,7 @@ impl ProviderAccount {
             id,
             provider,
             name,
+            notes: None,
             email: None,
             upstream_user_id,
             upstream_account_id: None,
@@ -824,6 +842,17 @@ impl ProviderAccount {
             outbound_proxy: None,
             request_location: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_notes(mut self, notes: Option<String>) -> Self {
+        self.notes = notes;
+        self
+    }
+
+    #[must_use]
+    pub fn notes(&self) -> Option<&str> {
+        self.notes.as_deref()
     }
 
     #[must_use]
@@ -852,7 +881,7 @@ impl ProviderAccount {
 
     #[must_use]
     pub fn with_outbound_proxy(mut self, proxy: Option<super::OutboundProxy>) -> Self {
-        // 出口变化后不能沿用旧出口的位置；存储投影应在绑定出口后设置位置。
+        // 出口变化后不能沿用旧出口的位置；存储投影应在绑定出口后设置位置
         self.request_location = None;
         self.outbound_proxy = proxy;
         self
@@ -884,7 +913,7 @@ impl ProviderAccount {
         last_error_message: Option<String>,
     ) -> Self {
         self.enabled = enabled;
-        // 凭据是否可用由 Provider 判断；API Key 等认证不要求上游用户身份。
+        // 凭据是否可用由 Provider 判断；API Key 等认证不要求上游用户身份
         self.credential_state = credential_state;
         self.quota = quota;
         self.last_error_reason = last_error_reason;
@@ -903,10 +932,10 @@ impl ProviderAccount {
         self
     }
 
-    /// 设置 RT 存在性与失败后的最早重试时刻。
+    /// 设置 RT 存在性与失败后的最早重试时刻
     ///
     /// 正常 OAuth 预刷新由 worker 使用 AT 原始过期时间与当前运行时策略动态判断，
-    /// 不应把提前量物化到 `next_refresh_at`。
+    /// 不应把提前量物化到 `next_refresh_at`
     #[must_use]
     pub const fn with_refresh_schedule(
         mut self,
@@ -1011,7 +1040,7 @@ impl ProviderAccount {
         self.access_token_expires_at
     }
 
-    /// 返回瞬态 OAuth 刷新失败后的最早重试时刻；正常账号为 `None`。
+    /// 返回瞬态 OAuth 刷新失败后的最早重试时刻；正常账号为 `None`
     #[must_use]
     pub const fn next_refresh_at(&self) -> Option<SystemTime> {
         self.next_refresh_at
@@ -1022,7 +1051,7 @@ impl ProviderAccount {
         self.has_refresh_token
     }
 
-    /// 组合持久事实与请求级冷却，交给唯一解析器派生状态。
+    /// 组合持久事实与请求级冷却，交给唯一解析器派生状态
     #[must_use]
     pub fn status_projection(
         &self,
@@ -1044,17 +1073,17 @@ impl ProviderAccount {
     }
 }
 
-/// Store 读出的账号与 Provider-owned 明文 credential。
+/// Store 读出的账号与 Provider-owned 明文 credential
 #[derive(Clone, PartialEq)]
 pub struct LoadedCredential {
     pub account: ProviderAccount,
     pub credential: PlaintextCredential,
 }
 
-/// Provider 已计算好时间边界的有界 OAuth refresh 候选查询。
+/// Provider 已计算好时间边界的有界 OAuth refresh 候选查询
 ///
-/// Store 只负责按持久事实筛选和稳定排序，不拥有提前量或恢复窗口语义。
-/// 调度启停不影响凭据续期；停用账号仍按 Provider 的凭据状态与时间边界刷新。
+/// Store 只负责按持久事实筛选和稳定排序，不拥有提前量或恢复窗口语义
+/// 调度启停不影响凭据续期；停用账号仍按 Provider 的凭据状态与时间边界刷新
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRefreshQuery {
     provider: ProviderKind,
@@ -1115,7 +1144,7 @@ impl ProviderRefreshQuery {
         self.limit
     }
 
-    /// 判断内存 Store 中的账号是否满足与 PostgreSQL 相同的候选谓词。
+    /// 判断内存 Store 中的账号是否满足与 PostgreSQL 相同的候选谓词
     #[must_use]
     pub fn contains(&self, account: &ProviderAccount) -> bool {
         account.provider() == &self.provider
@@ -1135,11 +1164,11 @@ impl ProviderRefreshQuery {
     }
 }
 
-/// Admin/Provider import 创建账号时的一次性明文输入。
+/// Admin/Provider import 创建账号时的一次性明文输入
 #[derive(Clone, PartialEq)]
 pub struct NewProviderAccount {
     pub account: ProviderAccount,
-    /// 导入时显式提供的政策；省略时保留已有账号设置。
+    /// 导入时显式提供的政策；省略时保留已有账号设置
     pub model_access: Option<super::AccountModelAccess>,
     pub credential: PlaintextCredential,
 }
@@ -1154,7 +1183,7 @@ impl fmt::Debug for NewProviderAccount {
     }
 }
 
-/// 不改 credential revision 的管理字段更新。
+/// 不改 credential revision 的管理字段更新
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountUpdate {
     pub account_id: ProviderAccountId,
@@ -1173,7 +1202,7 @@ impl fmt::Debug for LoadedCredential {
     }
 }
 
-/// 与 credential revision CAS 同事务提交的账号错误事实。
+/// 与 credential revision CAS 同事务提交的账号错误事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialStateWrite {
     pub credential_state: CredentialState,
@@ -1182,7 +1211,7 @@ pub struct CredentialStateWrite {
     pub message: Option<String>,
 }
 
-/// [`CredentialCasUpdate`] 跨 store 边界的命名字段。
+/// [`CredentialCasUpdate`] 跨 store 边界的命名字段
 pub struct CredentialCasUpdateParts {
     pub account_id: ProviderAccountId,
     pub expected_revision: CredentialRevision,
@@ -1195,7 +1224,7 @@ pub struct CredentialCasUpdateParts {
     pub account_state: Option<Box<CredentialStateWrite>>,
 }
 
-/// 刷新后的完整 CAS 写回。
+/// 刷新后的完整 CAS 写回
 #[derive(Clone, PartialEq)]
 pub struct CredentialCasUpdate {
     account_id: ProviderAccountId,
@@ -1227,11 +1256,11 @@ impl fmt::Debug for CredentialCasUpdate {
 }
 
 impl CredentialCasUpdate {
-    /// 创建同一账号 revision fence 下的完整 credential + 普通投影写回。
+    /// 创建同一账号 revision fence 下的完整 credential + 普通投影写回
     ///
     /// # Errors
     ///
-    /// profile 与 credential 指向不同账号，或无 RT 却声明下次刷新时间时失败。
+    /// profile 与 credential 指向不同账号，或无 RT 却声明下次刷新时间时失败
     pub fn new(
         account_id: ProviderAccountId,
         expected_revision: CredentialRevision,
@@ -1260,14 +1289,14 @@ impl CredentialCasUpdate {
         })
     }
 
-    /// 仅轮换凭据，保留提交时的账号资料，避免覆盖并发额度观测更新的套餐。
+    /// 仅轮换凭据，保留提交时的账号资料，避免覆盖并发额度观测更新的套餐
     #[must_use]
     pub const fn preserving_profile(mut self) -> Self {
         self.preserve_profile = true;
         self
     }
 
-    /// 将刷新调度与账号错误事实放入同一个 revision CAS。
+    /// 将刷新调度与账号错误事实放入同一个 revision CAS
     #[must_use]
     pub fn with_account_state(
         mut self,
@@ -1342,24 +1371,24 @@ impl CredentialCasUpdate {
     }
 }
 
-/// CAS 写回结果。
+/// CAS 写回结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialCasOutcome {
     Updated(CredentialRevision),
     Conflict,
 }
 
-/// Provider quota 的一次完整观察结果。
+/// Provider quota 的一次完整观察结果
 #[derive(Clone, PartialEq)]
 pub struct QuotaObservation {
     pub account_id: ProviderAccountId,
     pub expected_revision: CredentialRevision,
     pub quota: OpaqueProviderData,
-    /// Provider 确认的账号套餐，与额度原子写入；`None` 保留已有套餐。
+    /// Provider 确认的账号套餐，与额度原子写入；`None` 保留已有套餐
     pub plan_type: Option<String>,
-    /// Provider 原始 quota document 的观察时间；不代表访问结论发生变化。
+    /// Provider 原始 quota document 的观察时间；不代表访问结论发生变化
     pub observed_at: SystemTime,
-    /// Provider 已从私有 JSON 归一化出的额度访问事实。
+    /// Provider 已从私有 JSON 归一化出的额度访问事实
     pub state: QuotaState,
 }
 
@@ -1383,7 +1412,7 @@ pub enum QuotaWriteOutcome {
     Conflict,
 }
 
-/// 只推进 Provider quota 文档的最后成功查询时间。
+/// 只推进 Provider quota 文档的最后成功查询时间
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaObservationTouch {
     pub account_id: ProviderAccountId,
@@ -1391,7 +1420,7 @@ pub struct QuotaObservationTouch {
     pub observed_at: SystemTime,
 }
 
-/// 不改 Provider 原始 quota JSON 的额度访问事实写入。
+/// 不改 Provider 原始 quota JSON 的额度访问事实写入
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaAccessChange {
     pub account_id: ProviderAccountId,
@@ -1399,19 +1428,19 @@ pub struct QuotaAccessChange {
     pub state: QuotaState,
 }
 
-/// 账号状态的 revision-fenced 写入。
+/// 账号状态的 revision-fenced 写入
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStateChange {
     pub account_id: ProviderAccountId,
     pub expected_revision: CredentialRevision,
     pub credential_state: CredentialState,
     pub observed_at: SystemTime,
-    /// 受控错误原因；无失败事实的 Ready 写入必须清空。
+    /// 受控错误原因；无失败事实的 Ready 写入必须清空
     ///
     /// Ready 凭据可以在 AT 过期后继续 RT 恢复，此时允许保留最近一次
-    /// 刷新失败原因，供错误状态投影展示。
+    /// 刷新失败原因，供错误状态投影展示
     pub error_reason: Option<AccountErrorReason>,
-    /// 供管理端展示的错误消息；结构化上游失败应保留原始 message，不能写入整个正文。
-    /// 刷新成功或其他无失败事实的 Ready 写入必须清空。
+    /// 供管理端展示的错误消息；结构化上游失败应保留原始 message，不能写入整个正文
+    /// 刷新成功或其他无失败事实的 Ready 写入必须清空
     pub message: Option<String>,
 }

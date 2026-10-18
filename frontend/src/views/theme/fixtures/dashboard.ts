@@ -16,9 +16,10 @@ interface PreviewUsageRecordOptions {
   reasoningEffort: string
   inputTokens: number
   outputTokens: number
-  cachedTokens: number
+  cachedInputTokens: number
   firstTokenMs: number
   latencyMs: number
+  upstreamResponseMs?: number
   estimatedCost: string
   createdAt: string
   createdAtDisplay: string
@@ -57,7 +58,7 @@ const requestSeries = [
 function previewTrendPoint(requestsValue: number, index: number): DashboardTrendPoint {
   const inputTokensValue = requestsValue * (58 + (index % 4) * 4)
   const outputTokensValue = requestsValue * (18 + (index % 3) * 3)
-  const cachedTokensValue = Math.round(inputTokensValue * (0.36 + (index % 5) * 0.035))
+  const cachedInputTokensValue = Math.round(inputTokensValue * (0.36 + (index % 5) * 0.035))
   const errorsValue = index % 7 === 0 ? Math.max(2, Math.round(requestsValue * 0.012)) : 0
   const hour = String(index).padStart(2, '0')
   const successRateValue = ((requestsValue - errorsValue) / requestsValue) * 100
@@ -72,9 +73,9 @@ function previewTrendPoint(requestsValue: number, index: number): DashboardTrend
     inputTokensValue,
     outputTokens: outputTokensValue.toLocaleString('zh-CN'),
     outputTokensValue,
-    cachedTokens: cachedTokensValue.toLocaleString('zh-CN'),
-    cachedTokensValue,
-    cacheHitRateValue: cachedTokensValue / inputTokensValue,
+    cachedInputTokens: cachedInputTokensValue.toLocaleString('zh-CN'),
+    cachedInputTokensValue,
+    cacheHitRateValue: cachedInputTokensValue / inputTokensValue,
     tokensValue: inputTokensValue + outputTokensValue,
     errors: errorsValue.toLocaleString('zh-CN'),
     errorsValue,
@@ -106,11 +107,14 @@ function previewHealthStatus(index: number): DashboardHealthStatus {
 
 function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord {
   const totalTokens = options.inputTokens + options.outputTokens
-  const reasoningTokens = Math.round(options.outputTokens * 0.32)
+  const reasoningOutputTokens = Math.round(options.outputTokens * 0.32)
   const stream = options.clientTransport !== 'http_json'
 
   return {
     id: options.id,
+    logicalOutcome: 'succeeded',
+    errorCode: null,
+    errorMessage: null,
     clientApiKeyName: '演示 Key',
     provider: options.provider,
     authenticationKind: options.authenticationKind,
@@ -135,17 +139,17 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
     tokenDetails: {
       inputTokens: options.inputTokens,
       outputTokens: options.outputTokens,
-      cachedTokens: options.cachedTokens,
-      cacheWriteTokens: 0,
-      reasoningTokens,
+      cachedInputTokens: options.cachedInputTokens,
+      cacheWriteInputTokens: 0,
+      reasoningOutputTokens,
       imageInputTokens: 0,
       imageOutputTokens: 0,
       totalTokens,
       inputTokensDisplay: options.inputTokens.toLocaleString('zh-CN'),
       outputTokensDisplay: options.outputTokens.toLocaleString('zh-CN'),
-      cachedTokensDisplay: options.cachedTokens.toLocaleString('zh-CN'),
-      cacheWriteTokensDisplay: '0',
-      reasoningTokensDisplay: reasoningTokens.toLocaleString('zh-CN'),
+      cachedInputTokensDisplay: options.cachedInputTokens.toLocaleString('zh-CN'),
+      cacheWriteInputTokensDisplay: '0',
+      reasoningOutputTokensDisplay: reasoningOutputTokens.toLocaleString('zh-CN'),
       imageInputTokensDisplay: '0',
       imageOutputTokensDisplay: '0',
       totalTokensDisplay: totalTokens.toLocaleString('zh-CN'),
@@ -166,12 +170,12 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
       multiplierDisplay: '1.0x',
     },
     latencyDetails: {
+      upstreamResponseMs: options.upstreamResponseMs,
       transportDecisionWaitMs: 4,
       upstreamHeadersMs: Math.max(24, options.firstTokenMs - 36),
       firstEventMs: options.firstTokenMs,
       firstReasoningMs: options.firstTokenMs + 18,
       firstTextMs: options.firstTokenMs + 64,
-      firstTokenMs: options.firstTokenMs,
       openaiProcessingMs: options.provider === 'openai' ? options.latencyMs - 72 : undefined,
     },
     firstTokenLatencyMs: options.firstTokenMs,
@@ -183,7 +187,24 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
   }
 }
 
+const themeAnalytics: DashboardSummaryResponse['analytics'] = {
+  coverageStart: '2026-08-22T16:00:00Z',
+  coverageStartDisplay: '2026-08-23 00:00:00',
+  coverageEnd: '2026-08-23T02:30:00Z',
+  coverageEndDisplay: '2026-08-23 10:30:00',
+  generatedAt: '2026-08-23T02:30:00Z',
+  generatedAtDisplay: '2026-08-23 10:30:00',
+  lagSeconds: 0,
+  state: 'ready',
+  percentilesApproximate: true,
+  schemaVersion: 1,
+  histogramVersion: 1,
+}
+
 export const themeDashboardSummary: DashboardSummaryResponse = {
+  analytics: themeAnalytics,
+  asOf: '2026-08-23T10:30:00+08:00',
+  asOfDisplay: '2026-08-23 10:30:00',
   cards: {
     credentials: {
       total: '52',
@@ -211,11 +232,12 @@ export const themeDashboardSummary: DashboardSummaryResponse = {
       todayHitRateValue: 0.438,
       yesterdayHitRateValue: 0.397,
       totalHitRate: '41.2%',
-      totalCachedTokens: '86.4M',
+      totalCachedInputTokens: '86.4M',
       averageFirstTokenLatencyMs: '486 ms',
     },
   },
   trend: {
+    analytics: themeAnalytics,
     kind: 'usage',
     points: requestSeries.map(previewTrendPoint),
     summary: [],
@@ -237,6 +259,7 @@ export const themeDashboardSummary: DashboardSummaryResponse = {
       const failedRequests = status === 'unstable' ? 18 : status === 'low_sample' ? 2 : index % 11
 
       return {
+        bucketStart: `2026-09-14T${hour}:${minute}:00Z`,
         time: `${hour}:${minute}`,
         status,
         reliabilityDisplay: status === 'unstable' ? '94.8%' : status === 'low_sample' ? '98.2%' : '99.8%',
@@ -338,6 +361,7 @@ export const themeDashboardSummary: DashboardSummaryResponse = {
       requestBuckets: requestSeries.slice(-12).map((requestCount, index) => ({
         bucketStart: `2026-08-23T${String(index + 12).padStart(2, '0')}:00:00+08:00`,
         requestCount: Math.round(requestCount / 3),
+        label: `08-23 ${index + 12}:00–${index + 13}:00 · ${Math.round(requestCount / 3)} 次请求`,
       })),
       quotaUsedPercent: null,
       metricLabel: '次数',
@@ -361,6 +385,7 @@ export const themeDashboardSummary: DashboardSummaryResponse = {
           requestBuckets: requestSeries.slice(-12).map((requestCount, index) => ({
             bucketStart: `2026-08-23T${String(index + 12).padStart(2, '0')}:00:00+08:00`,
             requestCount: Math.round(requestCount / 3),
+            label: `08-23 ${index + 12}:00–${index + 13}:00 · ${Math.round(requestCount / 3)} 次请求`,
           })),
         },
       },
@@ -397,16 +422,16 @@ export const themeDashboardSummary: DashboardSummaryResponse = {
     },
   ],
   usageRecords: [
-    previewUsageRecord({ id: 'preview-01', accountEmail: 'relay@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'high', inputTokens: 18_420, outputTokens: 3_860, cachedTokens: 8_192, firstTokenMs: 486, latencyMs: 3_280, estimatedCost: '$0.0618', createdAt: '2026-08-23T14:42:16+08:00', createdAtDisplay: '14:42:16', clientIp: '10.24.8.16', userAgent: 'codex-cli/0.34.0' }),
-    previewUsageRecord({ id: 'preview-02', accountEmail: 'gateway@example.com', provider: 'xai', authenticationKind: 'oauth', model: 'grok-code-fast-1', clientTransport: 'websocket', upstreamTransport: 'http_sse', reasoningEffort: 'medium', inputTokens: 12_760, outputTokens: 2_140, cachedTokens: 4_096, firstTokenMs: 318, latencyMs: 2_460, estimatedCost: '$0.0286', createdAt: '2026-08-23T14:39:52+08:00', createdAtDisplay: '14:39:52', clientIp: '10.24.8.21', userAgent: 'grok-cli/0.7.3' }),
-    previewUsageRecord({ id: 'preview-03', accountEmail: 'control@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.5', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'xhigh', inputTokens: 32_840, outputTokens: 6_720, cachedTokens: 16_384, firstTokenMs: 572, latencyMs: 5_840, estimatedCost: '$0.1042', createdAt: '2026-08-23T14:35:08+08:00', createdAtDisplay: '14:35:08', clientIp: '10.24.9.11', userAgent: 'codex-desktop/26.818.41705', compact: true }),
-    previewUsageRecord({ id: 'preview-04', accountEmail: 'batch@example.com', provider: 'openai', authenticationKind: 'api_key', model: 'gpt-5.2', clientTransport: 'http_json', upstreamTransport: 'http_sse', reasoningEffort: 'low', inputTokens: 4_860, outputTokens: 920, cachedTokens: 0, firstTokenMs: 264, latencyMs: 1_180, estimatedCost: '$0.0124', createdAt: '2026-08-23T14:31:44+08:00', createdAtDisplay: '14:31:44', clientIp: '10.24.12.9', userAgent: 'openai-node/6.4.0' }),
-    previewUsageRecord({ id: 'preview-05', accountEmail: 'analysis@example.com', provider: 'xai', authenticationKind: 'api_key', model: 'grok-4.20', clientTransport: 'http_sse', upstreamTransport: 'http_sse', reasoningEffort: 'high', inputTokens: 21_640, outputTokens: 4_380, cachedTokens: 7_168, firstTokenMs: 426, latencyMs: 4_120, estimatedCost: '$0.0731', createdAt: '2026-08-23T14:28:19+08:00', createdAtDisplay: '14:28:19', clientIp: '10.24.15.32', userAgent: 'curl/8.14.1' }),
-    previewUsageRecord({ id: 'preview-06', accountEmail: 'scheduler@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'websocket', upstreamTransport: 'websocket', reasoningEffort: 'medium', inputTokens: 9_760, outputTokens: 1_840, cachedTokens: 3_072, firstTokenMs: 296, latencyMs: 2_020, estimatedCost: '$0.0248', createdAt: '2026-08-23T14:24:03+08:00', createdAtDisplay: '14:24:03', clientIp: '10.24.4.18', userAgent: 'codex-cli/0.34.0' }),
-    previewUsageRecord({ id: 'preview-07', accountEmail: 'review@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.5', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'high', inputTokens: 15_280, outputTokens: 3_120, cachedTokens: 6_144, firstTokenMs: 448, latencyMs: 3_740, estimatedCost: '$0.0527', createdAt: '2026-08-23T14:18:37+08:00', createdAtDisplay: '14:18:37', clientIp: '10.24.18.7', userAgent: 'codex-desktop/26.818.41705' }),
-    previewUsageRecord({ id: 'preview-08', accountEmail: 'fallback@example.com', provider: 'xai', authenticationKind: 'oauth', model: 'grok-code-fast-1', clientTransport: 'websocket', upstreamTransport: 'http_sse', reasoningEffort: 'medium', inputTokens: 7_940, outputTokens: 1_460, cachedTokens: 2_048, firstTokenMs: 342, latencyMs: 1_920, estimatedCost: '$0.0194', createdAt: '2026-08-23T14:13:25+08:00', createdAtDisplay: '14:13:25', clientIp: '10.24.6.23', userAgent: 'grok-cli/0.7.3' }),
-    previewUsageRecord({ id: 'preview-09', accountEmail: 'desktop@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'xhigh', inputTokens: 28_420, outputTokens: 5_940, cachedTokens: 12_288, firstTokenMs: 618, latencyMs: 5_260, estimatedCost: '$0.0925', createdAt: '2026-08-23T14:07:11+08:00', createdAtDisplay: '14:07:11', clientIp: '10.24.7.40', userAgent: 'codex-desktop/26.818.41705', compact: true }),
-    previewUsageRecord({ id: 'preview-10', accountEmail: 'api@example.com', provider: 'openai', authenticationKind: 'api_key', model: 'gpt-5.2', clientTransport: 'http_json', upstreamTransport: 'http_sse', reasoningEffort: 'low', inputTokens: 3_620, outputTokens: 680, cachedTokens: 0, firstTokenMs: 238, latencyMs: 980, estimatedCost: '$0.0091', createdAt: '2026-08-23T13:58:46+08:00', createdAtDisplay: '13:58:46', clientIp: '10.24.3.14', userAgent: 'openai-python/1.99.0' }),
+    previewUsageRecord({ id: 'preview-01', accountEmail: 'relay@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'high', inputTokens: 18_420, outputTokens: 3_860, cachedInputTokens: 8_192, firstTokenMs: 486, latencyMs: 3_280, upstreamResponseMs: 3_000, estimatedCost: '$0.0618', createdAt: '2026-08-23T14:42:16+08:00', createdAtDisplay: '14:42:16', clientIp: '10.24.8.16', userAgent: 'codex-cli/0.34.0' }),
+    previewUsageRecord({ id: 'preview-02', accountEmail: 'gateway@example.com', provider: 'xai', authenticationKind: 'oauth', model: 'grok-code-fast-1', clientTransport: 'websocket', upstreamTransport: 'http_sse', reasoningEffort: 'medium', inputTokens: 12_760, outputTokens: 2_140, cachedInputTokens: 4_096, firstTokenMs: 318, latencyMs: 2_460, estimatedCost: '$0.0286', createdAt: '2026-08-23T14:39:52+08:00', createdAtDisplay: '14:39:52', clientIp: '10.24.8.21', userAgent: 'grok-cli/0.7.3' }),
+    previewUsageRecord({ id: 'preview-03', accountEmail: 'control@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.5', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'xhigh', inputTokens: 32_840, outputTokens: 6_720, cachedInputTokens: 16_384, firstTokenMs: 572, latencyMs: 5_840, upstreamResponseMs: 5_000, estimatedCost: '$0.1042', createdAt: '2026-08-23T14:35:08+08:00', createdAtDisplay: '14:35:08', clientIp: '10.24.9.11', userAgent: 'codex-desktop/26.818.41705', compact: true }),
+    previewUsageRecord({ id: 'preview-04', accountEmail: 'batch@example.com', provider: 'openai', authenticationKind: 'api_key', model: 'gpt-5.2', clientTransport: 'http_json', upstreamTransport: 'http_sse', reasoningEffort: 'low', inputTokens: 4_860, outputTokens: 920, cachedInputTokens: 0, firstTokenMs: 264, latencyMs: 1_180, upstreamResponseMs: 1_000, estimatedCost: '$0.0124', createdAt: '2026-08-23T14:31:44+08:00', createdAtDisplay: '14:31:44', clientIp: '10.24.12.9', userAgent: 'openai-node/6.4.0' }),
+    previewUsageRecord({ id: 'preview-05', accountEmail: 'analysis@example.com', provider: 'xai', authenticationKind: 'api_key', model: 'grok-4.20', clientTransport: 'http_sse', upstreamTransport: 'http_sse', reasoningEffort: 'high', inputTokens: 21_640, outputTokens: 4_380, cachedInputTokens: 7_168, firstTokenMs: 426, latencyMs: 4_120, estimatedCost: '$0.0731', createdAt: '2026-08-23T14:28:19+08:00', createdAtDisplay: '14:28:19', clientIp: '10.24.15.32', userAgent: 'curl/8.14.1' }),
+    previewUsageRecord({ id: 'preview-06', accountEmail: 'scheduler@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'websocket', upstreamTransport: 'websocket', reasoningEffort: 'medium', inputTokens: 9_760, outputTokens: 1_840, cachedInputTokens: 3_072, firstTokenMs: 296, latencyMs: 2_020, upstreamResponseMs: 2_000, estimatedCost: '$0.0248', createdAt: '2026-08-23T14:24:03+08:00', createdAtDisplay: '14:24:03', clientIp: '10.24.4.18', userAgent: 'codex-cli/0.34.0' }),
+    previewUsageRecord({ id: 'preview-07', accountEmail: 'review@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.5', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'high', inputTokens: 15_280, outputTokens: 3_120, cachedInputTokens: 6_144, firstTokenMs: 448, latencyMs: 3_740, estimatedCost: '$0.0527', createdAt: '2026-08-23T14:18:37+08:00', createdAtDisplay: '14:18:37', clientIp: '10.24.18.7', userAgent: 'codex-desktop/26.818.41705' }),
+    previewUsageRecord({ id: 'preview-08', accountEmail: 'fallback@example.com', provider: 'xai', authenticationKind: 'oauth', model: 'grok-code-fast-1', clientTransport: 'websocket', upstreamTransport: 'http_sse', reasoningEffort: 'medium', inputTokens: 7_940, outputTokens: 1_460, cachedInputTokens: 2_048, firstTokenMs: 342, latencyMs: 1_920, estimatedCost: '$0.0194', createdAt: '2026-08-23T14:13:25+08:00', createdAtDisplay: '14:13:25', clientIp: '10.24.6.23', userAgent: 'grok-cli/0.7.3' }),
+    previewUsageRecord({ id: 'preview-09', accountEmail: 'desktop@example.com', provider: 'openai', authenticationKind: 'oauth', model: 'gpt-5.6-codex', clientTransport: 'http_sse', upstreamTransport: 'websocket', reasoningEffort: 'xhigh', inputTokens: 28_420, outputTokens: 5_940, cachedInputTokens: 12_288, firstTokenMs: 618, latencyMs: 5_260, upstreamResponseMs: 5_000, estimatedCost: '$0.0925', createdAt: '2026-08-23T14:07:11+08:00', createdAtDisplay: '14:07:11', clientIp: '10.24.7.40', userAgent: 'codex-desktop/26.818.41705', compact: true }),
+    previewUsageRecord({ id: 'preview-10', accountEmail: 'api@example.com', provider: 'openai', authenticationKind: 'api_key', model: 'gpt-5.2', clientTransport: 'http_json', upstreamTransport: 'http_sse', reasoningEffort: 'low', inputTokens: 3_620, outputTokens: 680, cachedInputTokens: 0, firstTokenMs: 238, latencyMs: 980, upstreamResponseMs: 1_000, estimatedCost: '$0.0091', createdAt: '2026-08-23T13:58:46+08:00', createdAtDisplay: '13:58:46', clientIp: '10.24.3.14', userAgent: 'openai-python/1.99.0' }),
   ],
   poolSummary: {
     total: 52,

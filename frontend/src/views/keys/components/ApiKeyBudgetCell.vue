@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import type { ApiKey } from '@/api'
-import { BasePopover } from '@codex-proxy/ui'
+import { ZPopover } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import { formatDateTime } from '@/utils/format'
 
 const props = defineProps<{ apiKey: ApiKey }>()
 const windows = computed(() => [
-  { label: '日', heading: '日用量', used: props.apiKey.dailyUsedUsd, limit: props.apiKey.dailyLimitUsd, reset: props.apiKey.dailyResetsAt },
-  { label: '周', heading: '周用量', used: props.apiKey.weeklyUsedUsd, limit: props.apiKey.weeklyLimitUsd, reset: props.apiKey.weeklyResetsAt },
+  { label: '日', heading: '日用量', used: props.apiKey.dailyUsedUsd, limit: props.apiKey.dailyLimitUsd, reset: props.apiKey.dailyResetsAt, resetDisplay: props.apiKey.dailyResetsAtDisplay },
+  { label: '周', heading: '周用量', used: props.apiKey.weeklyUsedUsd, limit: props.apiKey.weeklyLimitUsd, reset: props.apiKey.weeklyResetsAt, resetDisplay: props.apiKey.weeklyResetsAtDisplay },
 ])
 function amount(value: string) {
   // 列表最多显示两位小数，不补末尾零；明细保留原始金额的全部精度。
@@ -16,8 +15,8 @@ function amount(value: string) {
 </script>
 
 <template>
-  <BasePopover class="w-full min-w-0" trigger="hover-click" placement="right" :hover-delay="240">
-    <template #trigger="{ open }">
+  <ZPopover class="w-full min-w-0" trigger="hover-click" placement="right" :hover-delay="240">
+    <template #reference="{ open }">
       <button
         type="button"
         class="grid w-full min-w-0 cursor-pointer gap-1 rounded-sm border-0 bg-transparent p-0 text-left text-xs tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline"
@@ -44,11 +43,11 @@ function amount(value: string) {
           </span>
         </div>
         <div class="flex items-baseline justify-between gap-3 text-cp-xs text-cp-text-tertiary">
-          <span class="shrink-0">{{ window.reset ? '重置（北京时间）' : '重置' }}</span>
-          <time v-if="window.reset" :datetime="window.reset" class="text-right font-mono tabular-nums">{{ formatDateTime(window.reset, '—', 'Asia/Shanghai') }}</time>
+          <span class="shrink-0">重置</span>
+          <time v-if="window.reset" :datetime="window.reset" class="text-right font-mono tabular-nums">{{ window.resetDisplay ?? '—' }}</time>
           <span v-else>下次使用时确定</span>
         </div>
       </div>
     </section>
-  </BasePopover>
+  </ZPopover>
 </template>

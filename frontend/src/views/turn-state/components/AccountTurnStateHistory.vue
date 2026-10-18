@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import type { TurnStateHistoryRow } from '../utils/turnStateHistory'
-import { BaseButton, BaseEmpty, BaseTable, defineTableColumns } from '@codex-proxy/ui'
+import { defineTableColumns, ZButton, ZEmpty, ZTable } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed, ref, watch } from 'vue'
-import { getUsageRecordDetail, getUsageRecords } from '@/api'
+import { getRequestTrace, getUsageRecordDetail, getUsageRecords } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
 import { turnStateHistoryRow } from '../utils/turnStateHistory'
 
@@ -42,12 +42,20 @@ async function load() {
     // 上限十条、每批三项，避免一次点击产生无界的诊断查询。
     for (let offset = 0; offset < records.length; offset += 3) {
       const batch = records.slice(offset, offset + 3)
-      const details = await Promise.allSettled(batch.map(record => getUsageRecordDetail({ id: record.id }, { signal, silent: true })))
+      // 详情给出归属账号与结果；trace 自上游 #447 起只在诊断导出包里，按 requestId 另取一次。
+      const details = await Promise.allSettled(batch.map(async (record) => {
+        const detail = await getUsageRecordDetail({ id: record.id }, { signal, silent: true })
+        const trace = detail.accountId === accountId
+          ? await getRequestTrace(detail.requestId, { signal, silent: true }).catch(() => null)
+          : null
+        return { detail, trace }
+      }))
       if (!request.isCurrent(requestId))
         return
       rows.value.push(...details.map((result, index) => turnStateHistoryRow(
         batch[index]!,
-        result.status === 'fulfilled' ? result.value : null,
+        result.status === 'fulfilled' ? result.value.detail : null,
+        result.status === 'fulfilled' ? result.value.trace : null,
         accountId,
       )))
     }
@@ -72,15 +80,15 @@ watch(() => props.accountId, () => {
         上游票据记录
       </h4>
       <div class="flex gap-2">
-        <BaseButton variant="soft" size="sm" :loading="loading" @click="load">
+        <ZButton type="primary" variant="plain" size="small" :loading="loading" @click="load">
           <template #icon>
             <RefreshCw :size="14" />
           </template>
           刷新记录
-        </BaseButton>
-        <BaseButton variant="ghost" size="sm" @click="emit('close')">
+        </ZButton>
+        <ZButton variant="text" size="small" @click="emit('close')">
           收起
-        </BaseButton>
+        </ZButton>
       </div>
     </div>
     <p class="mt-2 mb-1 text-cp-xs leading-relaxed text-cp-text-secondary">
@@ -95,9 +103,9 @@ watch(() => props.accountId, () => {
     <p v-else-if="loading" class="my-3 text-cp-sm text-cp-text-secondary" role="status">
       正在读取上游票据记录记录…
     </p>
-    <BaseEmpty v-else-if="!rows.length" title="最近 24 小时暂无请求记录" description="有新请求后可刷新查看" size="sm" surface="none" />
+    <ZEmpty v-else-if="!rows.length" title="最近 24 小时暂无请求记录" description="有新请求后可刷新查看" size="small" surface="none" />
     <div v-if="rows.length" class="mt-2 h-64 min-w-0">
-      <BaseTable :columns="columns" :rows="rows" density="compact" class="h-full" empty-text="暂无票据记录">
+      <ZTable :columns="columns" :data="rows" size="small" class="h-full" empty-text="暂无票据记录">
         <template #lengths="{ row }">
           <span class="font-mono font-heavy">{{ row.lengths.join(' / ') || '—' }}</span>
         </template>
@@ -107,7 +115,7 @@ watch(() => props.accountId, () => {
             <span v-if="row.partial" class="block text-cp-text-secondary">诊断记录不完整</span>
           </div>
         </template>
-      </BaseTable>
+      </ZTable>
     </div>
   </section>
 </template>

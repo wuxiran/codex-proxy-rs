@@ -16,7 +16,7 @@
 | `feat/<主题>`、`fix/<主题>` | 单个功能或修复，从 `dev` 拉出，做完合回 `dev` | 自己的分支随意 |
 | `release/<版本>` | 准备发版时从 `dev` 拉出，只收修复，不收新功能 | 发版负责人 |
 | `hotfix/<主题>` | 线上紧急修复，从 `main` 拉出 | 发版负责人 |
-| `sync/upstream-v<上游版本>` | 合并上游 zyycn/codex-proxy-rs，从 `dev` 拉出，做完合回 `dev` | 合并负责人 |
+| `sync/upstream-<上游版本或日期>` | 合并上游 zyycn/codex-proxy-rs，从 `dev` 拉出，做完合回 `dev`；目标不是标签时用日期命名，并在 `docs/fork/UPSTREAM_SYNC.md` 写明上游提交哈希 | 合并负责人 |
 
 本仓库的 `remote.origin.fetch` 只配了 `main`，新检出先执行一次
 `git remote set-branches --add origin dev`，否则 `origin/dev` 拉不下来
@@ -24,7 +24,8 @@
 ## 版本号
 
 - 格式是四段：`上游版本.fork 修订号`，例如 `3.18.3.2` 表示基于上游 `v3.18.3` 的第 2 个 fork 版本
-- 上游版本不变时，每次发布第四段加 1。合并了新的上游版本后，前三段跟上游，第四段从 1 重新开始（`3.19.0.1`）
+- 上游版本不变时，每次发布第四段加 1。合并了新的上游版本后，前三段跟上游 `release/version.yaml` 的三段版本，
+  第四段从 1 重新开始（基于 `v3.29.1` 之后提交的第一个 fork 版本是 `3.29.1.1`）
 - fork 版本号只记在 `release/fork-version.yaml`。`dev` 上是下一个要发的版本，`main` 上是已发布的版本
 - `release/version.yaml` 是上游文件，保持上游的三段版本，合并上游时直接取上游。它会编进二进制并参与插件的
   semver 兼容判断，四段版本号写进去会解析失败，所以 fork 修订号不写在这里
@@ -44,7 +45,8 @@ git push -u origin feat/<主题>
 
 - 一个分支只做一件事。先提交再构建：镜像只能从已提交的代码构建，工作区有未提交改动时不打镜像
 - 合并前先把 `dev` 合进来或 rebase 到 `origin/dev`，解决冲突后再合
-- worktree 固定在 WSL 侧建，用完在同一侧 `git worktree remove`；两侧都不要跑 `git worktree prune`
+- worktree 建在哪一侧就只在那一侧操作 git：WSL 侧建的用 WSL，Windows 侧建的用 Git Bash（WSL 的 git 读不了
+  Windows 工作树的 `.git` 指针）；用完在同一侧 `git worktree remove`；两侧都不要跑 `git worktree prune`
 
 ## 发版
 
@@ -70,9 +72,8 @@ git push -u origin feat/<主题>
 
 流程见 [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md)。同步分支从 `dev` 拉出，合并完成后合回 `dev`，随下一次发版上线
 
-## 当前状态（2026-10-03）
+## 查看当前版本
 
-- `main`：`3.18.3.2`，tag `fork-v3.18.3.2`，89 在跑这个版本
-- `dev`：`3.18.3.3` 开发中
-- `3.18.3.2` 的线上镜像是 `ticket-center-20261003-ef4067a7dc6b`，在本流程生效前从工作区构建；运行时源码与 tag 逐文件一致，
-  只差本文等流程文件。下一版起镜像按上文的标签规则从 `main` 的提交构建
+- `dev` 正在开发的版本看 `release/fork-version.yaml`；已发布的版本看 `main` 上的 `fork-v*` tag
+- 89 在跑的镜像用 `deploy/rollout.py status` 查看，不以文档里的记录为准
+- `3.18.3.2` 之前的镜像在本流程生效前从工作区构建，标签不符合上文规则；之后的镜像都从 `main` 的提交构建

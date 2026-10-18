@@ -1,4 +1,5 @@
 import type { RequestOptions } from '../request'
+import type { AnalyticsMetadata } from './analytics'
 import type { DashboardHealthTimeline } from './dashboard'
 import type { UsageBilling, UsageLatencyDetails, UsageTokenDetails } from './usage'
 import request from '../request'
@@ -17,9 +18,9 @@ export interface KeyUsageMetrics {
   requests: number
   inputTokens: number
   outputTokens: number
-  cachedTokens: number
-  cacheWriteTokens: number
-  reasoningTokens: number
+  cachedInputTokens: number
+  cacheWriteInputTokens: number
+  reasoningOutputTokens: number
   totalTokens: number
   costUsd: string | null
   costIncomplete: boolean
@@ -33,18 +34,23 @@ export interface KeyUsageBudget {
   dailyLimitUsd: string
   dailyUsedUsd: string
   dailyResetsAt: string | null
+  dailyResetsAtDisplay: string | null
   weeklyLimitUsd: string
   weeklyUsedUsd: string
   weeklyResetsAt: string | null
+  weeklyResetsAtDisplay: string | null
 }
 
 export interface KeyUsageTrendPoint extends KeyUsageMetrics {
   time: string
   bucketSeconds: number
+  label: string
 }
 
 export interface KeyUsageOverview {
+  analytics: AnalyticsMetadata
   asOf: string
+  asOfDisplay: string
   startTime: string
   endTime: string
   key: KeyUsageBudget
@@ -53,11 +59,12 @@ export interface KeyUsageOverview {
   healthTimeline: DashboardHealthTimeline
 }
 
-export type KeyUsageRecordKind = 'success' | 'error'
+export type KeyUsageRecordKind = 'success' | 'error' | 'all'
 
 export interface KeyUsageRecord {
   id: string
   createdAt: string
+  createdAtDisplay: string
   model: string | null
   route: string | null
   reasoningEffort: string | null
@@ -70,7 +77,7 @@ export interface KeyUsageRecord {
   latencyDetails: Pick<UsageLatencyDetails, 'firstEventMs' | 'firstReasoningMs' | 'firstTextMs'>
   clientIp: string | null
   userAgent: string | null
-  status: KeyUsageRecordKind
+  status: 'success' | 'error' | 'incomplete' | 'cancelled' | 'running' | 'unknown'
   statusCode: number | null
 }
 
@@ -82,8 +89,8 @@ export interface KeyUsagePage {
 }
 
 export interface KeyUsageQuery {
-  startTime: string
-  endTime: string
+  period: 'today' | '7d' | '30d'
+  asOf: number
   model?: string
 }
 

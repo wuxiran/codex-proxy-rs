@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+//! 验证账号分组聚合、Key 绑定与分组策略的持久化
+
+use std::{collections::BTreeMap, time::Duration};
 
 use gateway_admin::{
     model::{
@@ -12,10 +14,13 @@ use gateway_admin::{
     ports::store::{AccountGroupStore, AdminStoreErrorKind, ClientKeyStore},
 };
 use gateway_core::{
+    account::FastMode,
     policy::{ClientApiKeyId, RateLimits},
     routing::AccountGroupId,
 };
-use gateway_store::postgres::{PgAccountGroupRepository, PgAdminClientKeyStore};
+use gateway_store::postgres::{
+    ObservabilityQueryBudget, PgAccountGroupRepository, PgAdminClientKeyStore,
+};
 
 use super::TestDatabase;
 
@@ -23,10 +28,45 @@ const MIXED_GROUP: &str = "grp_00000000000000000000000000000001";
 const EMPTY_GROUP: &str = "grp_00000000000000000000000000000002";
 
 #[tokio::test]
+async fn fast_mode_migration_preserves_existing_group_choices() {
+    let Some(database) = TestDatabase::create_through("group_fast_mode_upgrade", 21).await else {
+        return;
+    };
+    for (id, disabled) in [(MIXED_GROUP, true), (EMPTY_GROUP, false)] {
+        sqlx::query("insert into account_groups (id, name, color, disable_fast, created_at, updated_at) values ($1, $1, '#2563EBFF', $2, now(), now())")
+            .bind(id)
+            .bind(disabled)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let groups = sqlx::query_as::<_, (String, String)>(
+        "select id, fast_mode from account_groups order by id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        groups,
+        vec![
+            (MIXED_GROUP.to_owned(), "disabled".to_owned()),
+            (EMPTY_GROUP.to_owned(), "default".to_owned())
+        ]
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multiplication() {
     let Some(database) = TestDatabase::create("account_group_aggregate").await else {
         return;
     };
+    // 显式固定继承上限，让分组聚合断言不依赖安装时的初始设置
+    sqlx::query("update runtime_settings set max_concurrent_per_account = 3 where id = 1")
+        .execute(&database.pool)
+        .await
+        .expect("set inherited account concurrency");
     seed_account(
         &database.pool,
         "acct_group_openai",
@@ -42,14 +82,19 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
     .await
     .expect("set account concurrency override");
 
-    let groups = PgAccountGroupRepository::new(database.pool.clone());
+    let groups = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap(),
+    );
     let keys = PgAdminClientKeyStore::new(database.pool.clone());
     let mixed_group = group_id(MIXED_GROUP);
     let empty_group = group_id(EMPTY_GROUP);
     groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                allow_image_generation: true,
+                fast_mode: FastMode::Default,
                 id: mixed_group.clone(),
                 name: "Mixed Production".to_owned(),
                 description: Some("cross-provider".to_owned()),
@@ -62,7 +107,8 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
     groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                allow_image_generation: true,
+                fast_mode: FastMode::Default,
                 id: empty_group.clone(),
                 name: "Empty Pool".to_owned(),
                 description: None,
@@ -89,7 +135,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
             .await
             .expect("create scoped client key");
     }
-    // 多分组 Key 的请求费用只计入实际承接账号所属的分组，Key 绑定的其他分组不重复计费。
+    // 多分组 Key 的请求费用只计入实际承接账号所属的分组，Key 绑定的其他分组不重复计费
     seed_group_cost_snapshot(
         &database.pool,
         "req_dual_group_key",
@@ -98,7 +144,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
         "1.5",
     )
     .await;
-    // 归属跟随完成请求的账号，而不是 Client Key 绑定的分组快照。
+    // 归属跟随完成请求的账号，而不是 Client Key 绑定的分组快照
     seed_group_cost_snapshot(
         &database.pool,
         "req_account_attribution",
@@ -142,7 +188,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
         BTreeMap::from([("openai".to_owned(), 1), ("xai".to_owned(), 1)])
     );
     assert_eq!(mixed.client_key_count, 2);
-    // PostgreSQL 返回持久页与 member facts；实时状态/容量由 Admin query service 投影。
+    // PostgreSQL 返回持久页与 member facts；实时状态/容量由 Admin query service 投影
     assert_eq!(mixed.account_summary.available, 0);
     assert_eq!(mixed.account_summary.limited, 0);
     assert_eq!(mixed.account_summary.total, 0);
@@ -256,6 +302,92 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
 }
 
 #[tokio::test]
+async fn group_options_should_avoid_aggregate_tables_and_page_filtered_empty_groups() {
+    let Some(database) = TestDatabase::create("account_group_options").await else {
+        return;
+    };
+    for (id, name, enabled, created_at) in [
+        (MIXED_GROUP, "Production Pool", true, "2026-01-01T00:00:00Z"),
+        (EMPTY_GROUP, "Disabled Pool", false, "2026-01-02T00:00:00Z"),
+        (
+            "grp_00000000000000000000000000000003",
+            "Unrelated",
+            true,
+            "2026-01-03T00:00:00Z",
+        ),
+    ] {
+        sqlx::query(
+            "insert into account_groups (id, name, color, enabled, created_at, updated_at)
+             values ($1, $2, '#2563EBFF', $3, $4::text::timestamptz, $4::text::timestamptz)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(enabled)
+        .bind(created_at)
+        .execute(&database.pool)
+        .await
+        .expect("seed account group option");
+    }
+    let groups = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap(),
+    );
+
+    let mut locked_tables = database.pool.begin().await.expect("begin table lock");
+    sqlx::query(
+        "lock table account_group_accounts, client_api_key_groups, model_requests
+         in access exclusive mode",
+    )
+    .execute(&mut *locked_tables)
+    .await
+    .expect("lock aggregate source tables");
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        groups.list_account_group_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(1).expect("page size"),
+            search: Some("pool".to_owned()),
+            enabled: None,
+        }),
+    )
+    .await
+    .expect("options query must not wait for aggregate source tables")
+    .expect("list first account group option page");
+    assert_eq!(first.total, 2);
+    assert_eq!(first.items[0].id.as_str(), EMPTY_GROUP);
+    assert!(!first.items[0].enabled);
+
+    let second = groups
+        .list_account_group_options(AccountGroupListQuery {
+            page: 2,
+            page_size: PageSize::new(1).expect("page size"),
+            search: Some("POOL".to_owned()),
+            enabled: None,
+        })
+        .await
+        .expect("list second account group option page");
+    assert_eq!(second.items[0].id.as_str(), MIXED_GROUP);
+
+    let disabled = groups
+        .list_account_group_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("list disabled account group options");
+    assert_eq!(disabled.total, 1);
+    assert_eq!(disabled.items[0].id.as_str(), EMPTY_GROUP);
+
+    locked_tables.rollback().await.expect("release table locks");
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn group_costs_should_include_statusless_websocket_but_reject_statusless_http() {
     let Some(database) = TestDatabase::create("account_group_statusless_websocket_cost").await
     else {
@@ -268,11 +400,16 @@ async fn group_costs_should_include_statusless_websocket_but_reject_statusless_h
         "Statusless Account",
     )
     .await;
-    let groups = PgAccountGroupRepository::new(database.pool.clone());
+    let groups = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap(),
+    );
     groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                allow_image_generation: true,
+                fast_mode: FastMode::Default,
                 id: group_id(EMPTY_GROUP),
                 name: "Statusless Costs".to_owned(),
                 description: None,
@@ -413,20 +550,19 @@ async fn seed_group_cost_snapshot(
         .collect();
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           upstream_send_state, downstream_committed_at, outcome, client_status_code,
-           upstream_status_code, total_tokens, cost_source, cost_amount, cost_currency,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, downstream_committed_at, outcome, client_status_code, upstream_status_code, total_tokens, cost_source, cost_amount, cost_currency, started_at, recovery_lease_expires_at, completed_at, request_observation_json
          ) values (
-           $1, 'key-group-history', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'gpt-group', 'openai', $2, $2, 'gpt-group', 'http_sse', 1,
-           'sent', now(), 'succeeded', 200, 200, 10,
-           'provider_reported', $4::numeric, 'USD', now() - interval '1 minute',
-           now() + interval '5 minutes', now(),
-           'groups', $3::text[], to_jsonb($3::text[])
+           $1, 'key-group-history', 'responses', 'http_sse', 'gpt-group', 'openai', $2, 'gpt-group', 'http_sse', 1, 'sent', now(), 'succeeded', 200, 200, 10, 'provider_reported', $4::numeric, 'USD', now() - interval '1 minute', now() + interval '5 minutes', now(),
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'groups',
+             'groupRefs', $3::text[],
+             'groupNamesSnapshot', to_jsonb($3::text[]))))
          )",
     )
     .bind(request_id)
@@ -456,42 +592,54 @@ async fn audit_count(pool: &sqlx::PgPool) -> u64 {
 }
 
 #[tokio::test]
-async fn disable_fast_group_updates_preserve_omitted_values_and_publish_snapshot_facts() {
+async fn fast_mode_group_updates_preserve_omitted_values_and_publish_snapshot_facts() {
     use gateway_admin::model::account_groups::UpdateAccountGroup;
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
-    let Some(database) = TestDatabase::create("disable_fast_group").await else {
+    let Some(database) = TestDatabase::create("fast_mode_group").await else {
         return;
     };
-    let repository = PgAccountGroupRepository::new(database.pool.clone());
+    let repository = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap(),
+    );
     let id = group_id(MIXED_GROUP);
     repository
         .create_account_group(
             NewAccountGroup {
+                allow_image_generation: true,
                 id: id.clone(),
                 name: "Fast policy".to_owned(),
                 description: None,
                 color: group_color("#2563EBFF"),
-                disable_fast: true,
+                fast_mode: FastMode::Disabled,
             },
             &context("create-fast"),
         )
         .await
         .unwrap();
-    for (value, expected) in [(None, true), (Some(false), false), (Some(true), true)] {
+    for (value, expected) in [
+        (None, FastMode::Disabled),
+        (Some(FastMode::Enabled), FastMode::Enabled),
+        (None, FastMode::Enabled),
+        (Some(FastMode::Default), FastMode::Default),
+        (Some(FastMode::Disabled), FastMode::Disabled),
+    ] {
         let mutation = repository
             .update_account_group(
                 UpdateAccountGroup {
+                    allow_image_generation: None,
                     id: id.clone(),
                     name: "Renamed policy".to_owned(),
                     description: None,
                     color: group_color("#2563EBFF"),
-                    disable_fast: value,
+                    fast_mode: value,
                 },
                 &context("update-fast"),
             )
             .await
             .unwrap();
-        assert_eq!(mutation.record.unwrap().disable_fast, expected);
+        assert_eq!(mutation.record.unwrap().fast_mode, expected);
         let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
             .load_runtime_snapshot()
             .await
@@ -506,9 +654,206 @@ async fn disable_fast_group_updates_preserve_omitted_values_and_publish_snapshot
                 .iter()
                 .find(|group| group.id == id)
                 .unwrap()
-                .disable_fast,
+                .fast_mode,
             expected
         );
     }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn group_costs_follow_current_members_and_pending_source_replacements() {
+    let Some(database) = TestDatabase::create("group_cost_current_members").await else {
+        return;
+    };
+    seed_account(
+        &database.pool,
+        "acct_group_move",
+        "openai",
+        "Movable Account",
+    )
+    .await;
+    let budget =
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap();
+    let groups = PgAccountGroupRepository::new(database.pool.clone(), budget.clone());
+    for id in [MIXED_GROUP, EMPTY_GROUP] {
+        groups
+            .create_account_group(
+                NewAccountGroup {
+                    allow_image_generation: true,
+                    fast_mode: FastMode::Default,
+                    id: group_id(id),
+                    name: id.to_owned(),
+                    description: None,
+                    color: group_color("#2563EBFF"),
+                },
+                &context("create-group-move-fixture"),
+            )
+            .await
+            .unwrap();
+    }
+    assign_accounts(&database.pool, MIXED_GROUP, &["acct_group_move"]).await;
+    seed_group_cost_snapshot(
+        &database.pool,
+        "req_group_move",
+        "acct_group_move",
+        &[MIXED_GROUP],
+        "3.25",
+    )
+    .await;
+    sqlx::query(
+        "update model_requests set started_at=now()-interval '2 hours' where id='req_group_move'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let worker =
+        gateway_store::postgres::PgRequestAnalyticsRepository::new(database.pool.clone(), budget);
+    let mut ready = false;
+    for _ in 0..100 {
+        worker.maintain(1000).await.unwrap();
+        let status = worker.status().await.unwrap();
+        if !status.building && status.pending_requests == 0 && status.pending_buckets == 0 {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "group fixture must publish rollups");
+    let costs = load_retained_group_costs(&groups).await;
+    assert_eq!(costs[MIXED_GROUP], "3.25");
+    assert_eq!(costs[EMPTY_GROUP], "0");
+
+    sqlx::query("update account_group_accounts set account_group_id=$1 where provider_account_id='acct_group_move'")
+        .bind(EMPTY_GROUP).execute(&database.pool).await.unwrap();
+    let costs = load_retained_group_costs(&groups).await;
+    assert_eq!(
+        costs[MIXED_GROUP], "0",
+        "moving an account reattributes retained usage"
+    );
+    assert_eq!(costs[EMPTY_GROUP], "3.25");
+
+    // 未再次运行 Worker，当前源费用和模型仍必须原子替换旧汇总贡献
+    sqlx::query("update model_requests set cost_amount=7.5,upstream_model_id='updated-model' where id='req_group_move'")
+        .execute(&database.pool).await.unwrap();
+    let costs = load_retained_group_costs(&groups).await;
+    assert_eq!(costs[EMPTY_GROUP], "7.5");
+    sqlx::query("delete from model_requests where id='req_group_move'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let costs = load_retained_group_costs(&groups).await;
+    assert_eq!(
+        costs[EMPTY_GROUP], "0",
+        "pending deletion must withdraw the old projected amount"
+    );
+    database.close().await;
+}
+
+async fn load_retained_group_costs(groups: &PgAccountGroupRepository) -> BTreeMap<String, String> {
+    groups
+        .list_account_groups(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).unwrap(),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|group| {
+            (
+                group.id.to_string(),
+                group.usage.retained_total_usd.to_string(),
+            )
+        })
+        .collect()
+}
+#[tokio::test]
+async fn image_generation_group_updates_preserve_omitted_values_and_publish_snapshot_facts() {
+    use gateway_admin::model::account_groups::UpdateAccountGroup;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("image_generation_group").await else {
+        return;
+    };
+    let repository = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        ObservabilityQueryBudget::try_new(4, Duration::from_secs(10), Duration::from_secs(10))
+            .unwrap(),
+    );
+    let id = group_id(MIXED_GROUP);
+    repository
+        .create_account_group(
+            NewAccountGroup {
+                allow_image_generation: false,
+                id: id.clone(),
+                name: "Fast policy".to_owned(),
+                description: None,
+                color: group_color("#2563EBFF"),
+                fast_mode: FastMode::Disabled,
+            },
+            &context("create-fast"),
+        )
+        .await
+        .unwrap();
+    for (value, expected) in [
+        (None, false),
+        (Some(true), true),
+        (None, true),
+        (Some(false), false),
+    ] {
+        let mutation = repository
+            .update_account_group(
+                UpdateAccountGroup {
+                    allow_image_generation: value,
+                    id: id.clone(),
+                    name: "Renamed policy".to_owned(),
+                    description: None,
+                    color: group_color("#2563EBFF"),
+                    fast_mode: None,
+                },
+                &context("update-fast"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation.record.unwrap().allow_image_generation, expected);
+        let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+            .load_runtime_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.config_revision.get(),
+            mutation.config_revision.get()
+        );
+        assert_eq!(
+            snapshot
+                .account_groups
+                .iter()
+                .find(|group| group.id == id)
+                .unwrap()
+                .allow_image_generation,
+            expected
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn image_generation_migration_allows_existing_and_default_groups() {
+    let Some(database) = TestDatabase::create_through("group_image_upgrade", 31).await else {
+        return;
+    };
+    sqlx::query("insert into account_groups (id, name, color, created_at, updated_at) values ($1, $1, '#2563EBFF', now(), now())")
+        .bind(MIXED_GROUP).execute(&database.pool).await.unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    sqlx::query("insert into account_groups (id, name, color, created_at, updated_at) values ($1, $1, '#2563EBFF', now(), now())")
+        .bind(EMPTY_GROUP).execute(&database.pool).await.unwrap();
+    let allowed =
+        sqlx::query_scalar::<_, bool>("select allow_image_generation from account_groups")
+            .fetch_all(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(allowed, vec![true, true]);
     database.close().await;
 }

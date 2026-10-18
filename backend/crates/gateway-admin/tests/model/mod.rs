@@ -1,8 +1,12 @@
-//! 模型模块测试：镜像 src/model/ 中带逻辑的模块。
+//! 模型模块测试：镜像 src/model/ 中带逻辑的模块
 
+mod account_groups;
+mod account_tickets; // fork: account tickets
 mod audit;
 mod backup;
-mod ops_report;
+mod client_keys;
+mod observability;
+mod ops_report; // fork: ops report
 mod plugins;
 mod provider_credentials;
 mod proxies;

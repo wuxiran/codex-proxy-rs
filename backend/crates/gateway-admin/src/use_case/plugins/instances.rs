@@ -1,6 +1,11 @@
+//! 插件实例的配置、停用、删除与私有状态迁移编排
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use gateway_core::{policy::ClientApiKeyId, routing::AccountGroupId};
+use gateway_core::{
+    policy::ClientApiKeyId,
+    routing::{AccountGroupId, extensions::ExtensionSetReference},
+};
 use secrecy::ExposeSecret;
 
 use super::PluginsService;
@@ -17,11 +22,17 @@ use crate::{
     use_case::{map_store_error, publish_committed},
 };
 
+#[derive(Clone, Default)]
+pub(super) struct PackageStatus {
+    warning: Option<String>,
+    load_error: Option<String>,
+}
+
 impl PluginsService {
-    /// 只校验固定包体，不启动插件；停用的旧版本仍需向管理端说明不能启用的原因。
-    async fn compatibility_warning(&self, digest: &str) -> Result<Option<String>, AdminError> {
-        // 运行宿主和摘要固定，缓存纯静态结论，避免管理页轮询反复解包。
-        // 只缓存有限数量的确定结果，暂时性错误仍可重试。
+    /// 只校验固定包体，不启动插件；停用实例也需区分兼容性提醒与加载错误
+    async fn package_status(&self, digest: &str) -> Result<PackageStatus, AdminError> {
+        // 运行宿主和摘要固定，缓存纯静态结论，避免管理页轮询反复解包
+        // 只缓存有限数量的确定结果，暂时性错误仍可重试
         let mut cache = self.compatibility.lock().await;
         if let Some(warning) = cache.get(digest) {
             return Ok(warning.clone());
@@ -33,13 +44,17 @@ impl PluginsService {
             .map_err(|error| map_store_error(error, "plugin"))?;
         let warning = match self
             .inspector
-            .inspect(artifact.archive, Some(digest.to_owned()))
+            .compatibility_warning(artifact.archive, digest.to_owned())
             .await
         {
-            Ok(_) => None,
-            Err(error) if error.kind() == AdminErrorKind::Invalid => {
-                Some(error.message().to_owned())
-            }
+            Ok(warning) => PackageStatus {
+                warning,
+                load_error: None,
+            },
+            Err(error) if error.kind() == AdminErrorKind::Invalid => PackageStatus {
+                warning: None,
+                load_error: Some(error.message().to_owned()),
+            },
             Err(error) => return Err(error),
         };
         if cache.len() < 128 {
@@ -82,10 +97,8 @@ impl PluginsService {
             let metadata = artifacts
                 .get(&instance.artifact_sha256)
                 .ok_or_else(|| AdminError::not_found("插件制品不存在"))?;
-            let compatibility_warning = self
-                .compatibility_warning(&instance.artifact_sha256)
-                .await?;
-            let configuration_required = compatibility_warning.is_none()
+            let package_status = self.package_status(&instance.artifact_sha256).await?;
+            let configuration_required = package_status.load_error.is_none()
                 && !self
                     .preparation
                     .configuration_ready(instance.clone(), metadata)
@@ -109,8 +122,14 @@ impl PluginsService {
                 }
             });
             views.push(PluginInstanceView {
+                api_deprecations: if package_status.load_error.is_none() {
+                    self.inspector.api_deprecations(metadata)?
+                } else {
+                    Vec::new()
+                },
                 configuration_required,
-                compatibility_warning,
+                compatibility_warning: package_status.warning,
+                load_error: package_status.load_error,
                 running: runtime.status == PluginInstanceRuntimeStatus::Running,
                 published_revision,
                 runtime,
@@ -198,7 +217,10 @@ impl PluginsService {
             return Err(AdminError::invalid("请先安装并接受该版本声明的权限"));
         }
         if input.enabled
-            && let Some(warning) = self.compatibility_warning(&input.artifact_sha256).await?
+            && let Some(warning) = self
+                .package_status(&input.artifact_sha256)
+                .await?
+                .load_error
         {
             return Err(AdminError::invalid(format!(
                 "{warning}，无法启动，请安装兼容版本"
@@ -346,25 +368,8 @@ impl PluginsService {
             )
             .await
             .map_err(|e| map_store_error(e, "plugin"))?;
-        let prepared = if result.config_revision == candidate_revision
-            && result.instance.revision == candidate_revision
-        {
-            prepared
-        } else {
-            snapshot.config_revision = result.config_revision;
-            snapshot
-                .instances
-                .retain(|item| item.id != result.instance.id);
-            snapshot.instances.push(result.instance.clone());
-            apply_replacements(&mut snapshot, &replacements);
-            self.preparation.prepare(snapshot).await?
-        };
-        self.preparation
-            .activate_state(&prepared, &result.instance)
+        self.publish_instance(snapshot, prepared, &result, &replacements)
             .await?;
-        // prepared 的强引用跨过提交与唯一发布入口，防止候选在被读取之前回收。
-        publish_committed(self.snapshots.as_ref(), result.config_revision).await?;
-        drop(prepared);
         Ok(result)
     }
 
@@ -379,7 +384,7 @@ impl PluginsService {
     ) -> Result<PluginInstanceMutation, AdminError> {
         let previous_state = self.preparation.validate(previous.clone()).await?;
         let original_revision = snapshot.config_revision;
-        // 即使最终保持停用，迁移也必须由目标制品的受控候选执行。
+        // 即使最终保持停用，迁移也必须由目标制品的受控候选执行
         let mut migration_instance = target.clone();
         migration_instance.enabled = true;
         snapshot.config_revision = migration_instance.revision;
@@ -441,48 +446,45 @@ impl PluginsService {
                     .await);
             }
         };
-        if let Err(error) = self
-            .preparation
-            .migrate_state(&migration_prepared, transition.clone())
-            .await
-        {
-            return Err(self
-                .recover_failed_state_transition(
-                    Some(&transition.id),
-                    &previous,
-                    &previous_state,
-                    disabled_revision,
+        // 迁移开始后的所有提交前失败都走同一恢复出口；提交成功后不再回滚旧配置
+        let committed = async {
+            self.preparation
+                .migrate_state(&migration_prepared, transition.clone())
+                .await?;
+            let mut current = self
+                .store
+                .load_instances()
+                .await
+                .map_err(|error| map_store_error(error, "plugin"))?;
+            if current.config_revision != expected_revision {
+                return Err(AdminError::conflict("迁移期间插件配置已发生变化"));
+            }
+            let candidate_revision = next_revision(expected_revision)?;
+            target.revision = candidate_revision;
+            current.instances.retain(|item| item.id != target.id);
+            current.instances.push(target.clone());
+            current.config_revision = candidate_revision;
+            apply_replacements(&mut current, replacements);
+            let prepared = self.preparation.prepare(current.clone()).await?;
+            let result = self
+                .store
+                .save_instance_replacing(
+                    target,
+                    expected_revision,
+                    PluginStateCommit {
+                        configuration: target_state,
+                        transition_id: Some(transition.id.clone()),
+                    },
+                    replacements,
                     context,
-                    error,
                 )
-                .await);
+                .await
+                .map_err(|error| map_store_error(error, "plugin"))?;
+            Ok((current, prepared, result))
         }
-
-        let mut current = self
-            .store
-            .load_instances()
-            .await
-            .map_err(|error| map_store_error(error, "plugin"))?;
-        if current.config_revision != expected_revision {
-            return Err(self
-                .recover_failed_state_transition(
-                    Some(&transition.id),
-                    &previous,
-                    &previous_state,
-                    disabled_revision,
-                    context,
-                    AdminError::conflict("迁移期间插件配置已发生变化"),
-                )
-                .await);
-        }
-        let candidate_revision = next_revision(expected_revision)?;
-        target.revision = candidate_revision;
-        current.instances.retain(|item| item.id != target.id);
-        current.instances.push(target.clone());
-        current.config_revision = candidate_revision;
-        apply_replacements(&mut current, replacements);
-        let prepared = match self.preparation.prepare(current.clone()).await {
-            Ok(prepared) => prepared,
+        .await;
+        let (current, prepared, result) = match committed {
+            Ok(committed) => committed,
             Err(error) => {
                 return Err(self
                     .recover_failed_state_transition(
@@ -496,53 +498,9 @@ impl PluginsService {
                     .await);
             }
         };
-        let result = match self
-            .store
-            .save_instance_replacing(
-                target,
-                expected_revision,
-                PluginStateCommit {
-                    configuration: target_state,
-                    transition_id: Some(transition.id.clone()),
-                },
-                replacements,
-                context,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(self
-                    .recover_failed_state_transition(
-                        Some(&transition.id),
-                        &previous,
-                        &previous_state,
-                        disabled_revision,
-                        context,
-                        map_store_error(error, "plugin"),
-                    )
-                    .await);
-            }
-        };
-        let prepared = if result.config_revision == candidate_revision
-            && result.instance.revision == candidate_revision
-        {
-            prepared
-        } else {
-            current.config_revision = result.config_revision;
-            current
-                .instances
-                .retain(|item| item.id != result.instance.id);
-            current.instances.push(result.instance.clone());
-            apply_replacements(&mut current, replacements);
-            self.preparation.prepare(current).await?
-        };
-        self.preparation
-            .activate_state(&prepared, &result.instance)
+        self.publish_instance(current, prepared, &result, replacements)
             .await?;
-        publish_committed(self.snapshots.as_ref(), result.config_revision).await?;
         drop(migration_prepared);
-        drop(prepared);
         Ok(result)
     }
 
@@ -593,22 +551,8 @@ impl PluginsService {
                 )
                 .await
                 .map_err(|error| map_store_error(error, "plugin"))?;
-            let prepared = if mutation.config_revision == candidate_revision
-                && mutation.instance.revision == candidate_revision
-            {
-                prepared
-            } else {
-                snapshot.config_revision = mutation.config_revision;
-                snapshot
-                    .instances
-                    .retain(|item| item.id != mutation.instance.id);
-                snapshot.instances.push(mutation.instance.clone());
-                self.preparation.prepare(snapshot).await?
-            };
-            self.preparation
-                .activate_state(&prepared, &mutation.instance)
+            self.publish_instance(snapshot, prepared, &mutation, &[])
                 .await?;
-            publish_committed(self.snapshots.as_ref(), mutation.config_revision).await?;
             Ok::<(), AdminError>(())
         }
         .await;
@@ -622,6 +566,35 @@ impl PluginsService {
                 AdminError::conflict("状态迁移失败；为避免覆盖并发配置，插件实例已保持停用")
             }
         }
+    }
+
+    /// 以事务返回的版本激活并发布，候选强引用必须覆盖整个提交后阶段
+    async fn publish_instance(
+        &self,
+        mut snapshot: PluginInstanceSnapshot,
+        prepared: ExtensionSetReference,
+        mutation: &PluginInstanceMutation,
+        replacements: &[PluginInstanceReplacement],
+    ) -> Result<(), AdminError> {
+        let prepared = if mutation.config_revision == snapshot.config_revision
+            && mutation.instance.revision == snapshot.config_revision
+        {
+            prepared
+        } else {
+            snapshot.config_revision = mutation.config_revision;
+            snapshot
+                .instances
+                .retain(|item| item.id != mutation.instance.id);
+            snapshot.instances.push(mutation.instance.clone());
+            apply_replacements(&mut snapshot, replacements);
+            self.preparation.prepare(snapshot).await?
+        };
+        self.preparation
+            .activate_state(&prepared, &mutation.instance)
+            .await?;
+        publish_committed(self.snapshots.as_ref(), mutation.config_revision).await?;
+        drop(prepared);
+        Ok(())
     }
 
     pub async fn delete_instance(
@@ -651,7 +624,7 @@ impl PluginsService {
         Ok(revision)
     }
 
-    /// 紧急管理修复不要求损坏插件成功准备；提交后沿用现有发布与暂停合同。
+    /// 紧急管理修复不要求损坏插件成功准备；提交后沿用现有发布与暂停合同
     pub async fn disable_instance(
         &self,
         id: &str,

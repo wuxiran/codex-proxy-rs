@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import type { ConfigurePluginInstanceRequest, PluginArtifact, PluginInstance, PluginVersionPlan } from '@/api'
-import { BaseButton, BaseModal, BaseSegmented, toast } from '@codex-proxy/ui'
+import { ZButton, ZDialog, ZNotification, ZSegmented } from '@codex-proxy/ui'
 import { Blocks, Save, Settings2, ShieldCheck } from '@lucide/vue'
+import { cloneDeep } from 'es-toolkit'
 import { computed, nextTick, ref, shallowRef, useTemplateRef, watch } from 'vue'
-import { cloneJsonValue, pluginContributionForCapability, pluginRequestBindingEntries } from '../utils/model'
+import { pluginRequestBindingEntries } from '../utils/model'
 import PluginBindingEditor from './PluginBindingEditor.vue'
 import PluginConfigurationFields from './PluginConfigurationFields.vue'
 import PluginFrontendAuthenticationEditor from './PluginFrontendAuthenticationEditor.vue'
@@ -29,12 +30,12 @@ const configurationFields = useTemplateRef<{ focusInvalid: () => Promise<unknown
 const authenticationEditor = useTemplateRef<{ validationError: string }>('authenticationEditor')
 const existingSecretFields = computed(() => props.draft?.secretFields ?? props.instance?.secretFields ?? [])
 const versionChanged = computed(() => Boolean(props.instance && props.artifact && props.instance.artifactSha256 !== props.artifact.metadata.sha256))
-const authenticationContribution = computed(() => props.artifact && pluginContributionForCapability(props.artifact.metadata, 'frontend_authentication'))
+const authenticationContribution = computed(() => props.artifact && props.artifact.metadata.contributes.frontend_authentication)
 const authenticationBinding = computed({
   get: () => bindings.value.find(binding => binding.contribution === authenticationContribution.value?.id) ?? null,
   set: (binding) => {
     const others = bindings.value.filter(value => value.contribution !== authenticationContribution.value?.id)
-    bindings.value = binding ? [...others, cloneJsonValue(binding)] : others
+    bindings.value = binding ? [...others, cloneDeep(binding)] : others
   },
 })
 const hasRequestBindings = computed(() => props.artifact && pluginRequestBindingEntries(props.artifact.metadata).length > 0)
@@ -62,38 +63,38 @@ async function submit() {
   if (!instance || !artifact)
     return
   if (!configurationValid.value) {
-    toast.warning(configurationFields.value?.validationMessage || '请检查插件参数')
+    ZNotification.warning({ message: configurationFields.value?.validationMessage || '请检查插件参数' })
     await focusConfigurationInvalid()
     return
   }
   if (!bindingsValid.value) {
     section.value = 'requests'
-    toast.warning('请设置请求范围，或勾选“应用于所有请求”')
+    ZNotification.warning({ message: '请设置请求范围，或勾选“应用于所有请求”' })
     return
   }
   if (!authenticationValid.value) {
     section.value = 'authentication'
-    toast.warning(authenticationEditor.value?.validationError || '请检查客户端认证身份映射')
+    ZNotification.warning({ message: authenticationEditor.value?.validationError || '请检查客户端认证身份映射' })
     return
   }
   const input: ConfigurePluginInstanceRequest = {
     name: instance.name,
     artifactSha256: artifact.metadata.sha256,
     enabled: instance.enabled || (!versionChanged.value && instance.configurationRequired),
-    configuration: cloneJsonValue(configuration.value),
-    bindings: cloneJsonValue(bindings.value),
+    configuration: cloneDeep(configuration.value),
+    bindings: cloneDeep(bindings.value),
   }
   if (secretMode.value !== 'preserve')
-    input.secrets = secretMode.value === 'clear' ? {} : cloneJsonValue(secretValues.value)
+    input.secrets = secretMode.value === 'clear' ? {} : cloneDeep(secretValues.value)
   emit('save', input)
 }
 
 watch(open, async (value) => {
-  secretValues.value = {}
   if (!value)
     return
-  configuration.value = cloneJsonValue(props.draft?.configuration ?? props.instance?.configuration ?? {})
-  bindings.value = cloneJsonValue(props.draft?.bindings ?? props.instance?.bindings ?? [])
+  secretValues.value = {}
+  configuration.value = cloneDeep(props.draft?.configuration ?? props.instance?.configuration ?? {})
+  bindings.value = cloneDeep(props.draft?.bindings ?? props.instance?.bindings ?? [])
   secretMode.value = existingSecretFields.value.length ? 'preserve' : 'replace'
   configurationValid.value = true
   authenticationValid.value = true
@@ -102,22 +103,26 @@ watch(open, async (value) => {
   if (props.instance?.configurationRequired)
     await focusConfigurationInvalid()
 }, { immediate: true })
+
+function clearSecrets() {
+  secretValues.value = {}
+}
 </script>
 
 <template>
-  <BaseModal v-model="open" :title="versionChanged ? `切换至 ${artifact?.metadata.version}` : '插件设置'" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" size="lg" :dismissible="!saving">
+  <ZDialog v-model="open" :title="versionChanged ? `切换至 ${artifact?.metadata.version}` : '插件设置'" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" width="48rem" :show-close="!saving" :close-on-click-modal="!saving" :close-on-press-escape="!saving" @closed="clearSecrets">
     <div v-if="artifact && instance" class="grid gap-5">
       <div v-if="error" role="alert" class="grid gap-1 text-cp-sm text-cp-warning-text">
         <span>{{ error }}</span>
         <span class="text-cp-xs text-cp-text-secondary">当前版本保持不变，修改后再应用</span>
       </div>
-      <BaseSegmented v-if="sections.length > 1" v-model="section" :options="sections" label="插件设置分区" :disabled="saving" class="w-fit max-w-full" />
+      <ZSegmented v-if="sections.length > 1" v-model="section" :options="sections" aria-label="插件设置分区" :disabled="saving" class="w-fit max-w-full" />
       <div v-show="section === 'general'" class="grid gap-5">
-        <BaseSegmented
+        <ZSegmented
           v-if="existingSecretFields.length"
           v-model="secretMode"
           :options="secretModes"
-          label="敏感配置保存方式"
+          aria-label="敏感配置保存方式"
           :disabled="saving"
           class="w-full sm:w-auto"
         />
@@ -134,10 +139,12 @@ watch(open, async (value) => {
         />
       </div>
       <PluginBindingEditor
-        v-if="open && hasRequestBindings"
+        v-if="hasRequestBindings"
         v-show="section === 'requests'"
+        :key="`${instance.id}:${artifact.metadata.sha256}`"
         v-model="bindings"
         :metadata="artifact.metadata"
+        :active="open"
         :disabled="saving"
         @validity-change="bindingsValid = $event"
       />
@@ -153,15 +160,15 @@ watch(open, async (value) => {
       />
     </div>
     <template #footer>
-      <BaseButton variant="secondary" :disabled="saving" @click="open = false">
+      <ZButton :disabled="saving" @click="open = false">
         取消
-      </BaseButton>
-      <BaseButton variant="primary" :loading="saving" :disabled="!instance || !artifact" @click="submit">
+      </ZButton>
+      <ZButton type="primary" :loading="saving" :disabled="!instance || !artifact" @click="submit">
         <template #icon>
           <Save class="size-4" />
         </template>
         {{ primaryLabel }}
-      </BaseButton>
+      </ZButton>
     </template>
-  </BaseModal>
+  </ZDialog>
 </template>

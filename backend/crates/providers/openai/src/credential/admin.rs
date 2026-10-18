@@ -1,14 +1,14 @@
-//! Codex Admin 输入的 Provider-owned 验证与明文 command preparation。
+//! Codex Admin 输入的 Provider-owned 验证与明文 command preparation
 //!
 //! 本模块不读写 Store；应用层负责把已验证的 Core command 映射到
-//! 持久层的原子配置 revision + audit 事务。
+//! 持久层的原子配置 revision + audit 事务
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 use gateway_core::account::{
     AccountErrorReason, CredentialCasUpdate, CredentialRevision, CredentialState, LoadedCredential,
     NewProviderAccount, ProviderAccount, ProviderAccountId, ProviderAccountIdentity,
@@ -51,10 +51,11 @@ pub struct ImportCodexOAuthCredential {
     pub enabled: bool,
 }
 
-/// OAuth credential 的最小创建输入。
+/// OAuth credential 的最小创建输入
 ///
 /// OAuth metadata 来自 ID token/access token 的本地 payload 解析；PAT metadata
-/// 来自 auth whoami 验证。两者均不从导入文档信任身份字段。
+/// 来自 auth whoami 验证
+/// 两者均不从导入文档信任身份字段
 pub(crate) struct UnresolvedCodexOAuthCredential {
     pub(crate) account_id: String,
     pub(crate) name: String,
@@ -96,7 +97,7 @@ impl std::fmt::Debug for ImportCodexOAuthCredential {
     }
 }
 
-/// Provider-owned 文档归一后的唯一 Core 写入批次。
+/// Provider-owned 文档归一后的唯一 Core 写入批次
 pub struct PreparedCodexAccountImport {
     accounts: Vec<NewProviderAccount>,
 }
@@ -171,9 +172,9 @@ impl fmt::Debug for ParsedCodexImportAccount {
     }
 }
 
-/// Store 公共行事实与 Core 明文 credential 的导出输入。
+/// Store 公共行事实与 Core 明文 credential 的导出输入
 ///
-/// 时间必须由 App 从 `provider_accounts` 原行机械传入；Provider 不伪造时间。
+/// 时间必须由 App 从 `provider_accounts` 原行机械传入；Provider 不伪造时间
 pub struct ExportManagedCodexCredential {
     pub current: LoadedCredential,
     pub added_at: DateTime<Utc>,
@@ -192,7 +193,7 @@ impl fmt::Debug for ExportManagedCodexCredential {
     }
 }
 
-/// CPR canonical 账号导出文档；只允许显式序列化，Debug 永不输出 credential secret。
+/// CPR canonical 账号导出文档；只允许显式序列化，Debug 永不输出 credential secret
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexCprExportDocument {
@@ -273,7 +274,7 @@ struct CodexCprOAuthExportAccount {
     access_token_expires_at: Option<String>,
 }
 
-/// App 已从 Store 读取的当前账号、revision 与明文 Provider JSON。
+/// App 已从 Store 读取的当前账号、revision 与明文 Provider JSON
 pub struct RotateManagedCodexCredential {
     pub current: LoadedCredential,
     pub secret: CodexOAuthSecret,
@@ -293,7 +294,7 @@ impl std::fmt::Debug for RotateManagedCodexCredential {
     }
 }
 
-/// Provider 验证后的 rotation；App 只做 Core -> Store command 的机械映射。
+/// Provider 验证后的 rotation；App 只做 Core -> Store command 的机械映射
 pub struct PreparedCodexCredentialRotation {
     pub profile: ProviderAccountUpdate,
     pub credential: CredentialCasUpdate,
@@ -322,7 +323,7 @@ impl std::fmt::Debug for PreparedCodexCredentialRotation {
 }
 
 impl PreparedCodexCredentialRotation {
-    /// 将 command 与 lease 一起交给 App；App 必须让返回的 guard 活到 CAS 提交结束。
+    /// 将 command 与 lease 一起交给 App；App 必须让返回的 guard 活到 CAS 提交结束
     #[must_use]
     pub fn into_parts(
         self,
@@ -341,7 +342,7 @@ impl PreparedCodexCredentialRotation {
     }
 }
 
-/// 手工刷新从 token exchange 到数据库 CAS 完成期间持有的 Redis lease。
+/// 手工刷新从 token exchange 到数据库 CAS 完成期间持有的 Redis lease
 pub struct PreparedCodexCredentialRotationGuard(Option<ProviderRefreshGuards>);
 
 impl fmt::Debug for PreparedCodexCredentialRotationGuard {
@@ -416,7 +417,7 @@ impl From<CodexCdkError> for CodexCredentialAdminError {
     }
 }
 
-/// 无状态的 Codex Admin command preparer。
+/// 无状态的 Codex Admin command preparer
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CodexCredentialAdmin;
 
@@ -603,9 +604,9 @@ impl CodexCredentialAdmin {
         })
     }
 
-    /// 为已取得 OAuth access token、但资料尚未补全的账号创建最小记录。
+    /// 为已取得 OAuth access token、但资料尚未补全的账号创建最小记录
     ///
-    /// 接受调用方已取得的身份投影；本方法不发起 usage/profile 请求。
+    /// 接受调用方已取得的身份投影；本方法不发起 usage/profile 请求
     pub(crate) fn prepare_unresolved_oauth(
         &self,
         input: UnresolvedCodexOAuthCredential,
@@ -664,7 +665,7 @@ impl CodexCredentialAdmin {
         })
     }
 
-    /// 严格输出可被 CPR 导入逻辑直接读取的 canonical 文档。
+    /// 严格输出可被 CPR 导入逻辑直接读取的 canonical 文档
     pub fn format_cpr_export(
         &self,
         items: Vec<ExportManagedCodexCredential>,
@@ -693,8 +694,8 @@ impl CodexCredentialAdmin {
                 label: Some(account.name().to_owned()),
                 plan_type: account.plan_type().map(str::to_owned),
                 status: cpr_status(&account),
-                added_at: china_rfc3339(item.added_at),
-                updated_at: china_rfc3339(item.updated_at),
+                added_at: item.added_at.to_rfc3339(),
+                updated_at: item.updated_at.to_rfc3339(),
                 outbound_proxy_url: account
                     .outbound_proxy()
                     .map(|proxy| proxy.expose_url().to_owned()),
@@ -793,10 +794,10 @@ impl CodexCredentialAdmin {
         self.prepare_oauth_rotation(input, false)
     }
 
-    /// 构建一次成功 RT exchange 的 CAS 写入，保留已存账号身份资料。
+    /// 构建一次成功 RT exchange 的 CAS 写入，保留已存账号身份资料
     ///
     /// Refresh endpoint 已经完成本次 token 交换的授权；这里不对新 access
-    /// token 重新执行身份验证。
+    /// token 重新执行身份验证
     pub(crate) fn prepare_refreshed_oauth_rotation(
         &self,
         current: LoadedCredential,
@@ -916,13 +917,16 @@ impl CodexCredentialAdmin {
     }
 }
 
-/// 有状态的 Codex 手工刷新边界；消费调用方刚读取的当前 credential 并准备 CAS。
+/// 有状态的 Codex 手工刷新边界；消费调用方刚读取的当前 credential 并准备 CAS
 pub struct CodexCredentialAdminService {
     refresher: Arc<dyn TokenRefresher>,
     personal_access_token_client: Option<Arc<OpenAiTokenClient>>,
     leases: Arc<dyn ProviderLeasePort>,
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+    diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
+    /// fork: revive —— 签名导出 401 复活服务
     revive: Option<Arc<CodexReviveService>>,
+    /// fork: guanlan-cdk —— 观澜 CDK 兑换客户端
     cdk: Option<Arc<CodexCdkClient>>,
 }
 
@@ -948,24 +952,27 @@ impl CodexCredentialAdminService {
         refresher: Arc<dyn TokenRefresher>,
         leases: Arc<dyn ProviderLeasePort>,
         runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+        diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
     ) -> Self {
         Self {
             refresher,
             personal_access_token_client: None,
             leases,
             runtime_policy,
+            diagnostics,
             revive: None,
             cdk: None,
         }
     }
 
-    /// 在生产组装时复用 OAuth auth client，为 at- 导入启用上游身份验证。
+    /// 在生产组装时复用 OAuth auth client，为 at- 导入启用上游身份验证
     #[must_use]
     pub fn with_personal_access_token_client(mut self, client: Arc<OpenAiTokenClient>) -> Self {
         self.personal_access_token_client = Some(client);
         self
     }
 
+    // fork: revive / guanlan-cdk 服务注入与 CDK 文档展开
     #[must_use]
     pub fn with_revive_exports(mut self, revive: Arc<CodexReviveService>) -> Self {
         self.revive = Some(revive);
@@ -998,7 +1005,7 @@ impl CodexCredentialAdminService {
         Ok(cdk.redeem_export(&codes).await?)
     }
 
-    /// 官方 RT exchange；结果由 App 在同一 revision/audit 事务中提交。
+    /// 官方 RT exchange；结果由 App 在同一 revision/audit 事务中提交
     pub async fn manual_refresh(
         &self,
         current: LoadedCredential,
@@ -1055,9 +1062,20 @@ impl CodexCredentialAdminService {
                 refresh_token.expose_secret(),
                 current.account.outbound_proxy(),
             )
-            .await
-            .inspect_err(|error| log_manual_refresh_failure(&account_id, error))
-            .map_err(map_refresh_failure)?;
+            .await;
+        let tokens = match tokens {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                super::diagnostics::record_refresh_failure(
+                    self.diagnostics.as_ref(),
+                    &current.account,
+                    "manual_refresh",
+                    &error,
+                )
+                .await;
+                return Err(map_refresh_failure(error));
+            }
+        };
         let access_token_expires_at = match tokens.access_token.as_deref() {
             Some(access_token) => parse_access_token_expiration(access_token),
             None => current
@@ -1085,7 +1103,7 @@ impl CodexCredentialAdminService {
             &secret,
         );
         // 正常预刷新由 worker 读取当时的 runtime policy 动态判断；这里仅清除
-        // 之前瞬态失败留下的 retry-not-before。
+        // 之前瞬态失败留下的 retry-not-before
         let next_refresh_at = None;
         let mut prepared = CodexCredentialAdmin.prepare_refreshed_oauth_rotation(
             current,
@@ -1100,18 +1118,11 @@ impl CodexCredentialAdminService {
         Ok(prepared)
     }
 
-    /// 归一导入 OAuth 凭据到唯一 `NewProviderAccount` 写入路径。
+    /// 归一导入 OAuth 凭据到唯一 `NewProviderAccount` 写入路径
     ///
     /// OAuth 导入先取得 access token（直接提供或 RT exchange），再按官方
-    /// `parse_chatgpt_jwt_claims` 从 ID token/access token 本地投影账号资料。
-    /// at- PAT 使用 whoami 取得身份，并丢弃不适用的 RT、ID token 和刷新计划。
-    pub async fn prepare_import_document(
-        &self,
-        payload: Value,
-    ) -> Result<PreparedCodexAccountImport, CodexCredentialAdminError> {
-        self.prepare_import_document_with_proxy(payload, None).await
-    }
-
+    /// `parse_chatgpt_jwt_claims` 从 ID token/access token 本地投影账号资料
+    /// at- PAT 使用 whoami 取得身份，并丢弃不适用的 RT、ID token 和刷新计划
     pub async fn prepare_import_document_with_proxy(
         &self,
         payload: Value,
@@ -1194,7 +1205,7 @@ impl CodexCredentialAdminService {
                 access_token_expires_at = None;
                 metadata
             } else {
-                // 普通 OAuth 仍按 ID token、access token 的顺序投影，不调用 whoami。
+                // 普通 OAuth 仍按 ID token、access token 的顺序投影，不调用 whoami
                 let id_metadata = secret
                     .id_token
                     .as_ref()
@@ -1254,6 +1265,14 @@ impl CodexCredentialAdminService {
         let id_token = id_token.map(SecretString::from);
         if let Some(access_token) = access_token {
             let access_token_expires_at = parse_access_token_expiration(&access_token);
+            // 已知过期且无法刷新的 AT 不能产生可用账号
+            if refresh_token.is_none()
+                && access_token_expires_at
+                    .as_ref()
+                    .is_some_and(|expires_at| expires_at <= &Utc::now())
+            {
+                return Err(CodexCredentialAdminError::InvalidCredential);
+            }
             let secret = CodexOAuthSecret {
                 access_token: SecretString::from(access_token),
                 refresh_token: refresh_token.map(SecretString::from),
@@ -1278,7 +1297,7 @@ impl CodexCredentialAdminService {
         let access_token_expires_at = parse_access_token_expiration(&access_token);
         let secret = CodexOAuthSecret {
             access_token: SecretString::from(access_token),
-            // RT 未轮换时仍保留导入提供的 RT，保证本次补全不会丢失后续刷新能力。
+            // RT 未轮换时仍保留导入提供的 RT，保证本次补全不会丢失后续刷新能力
             refresh_token: tokens
                 .refresh_token
                 .map(SecretString::from)
@@ -1328,12 +1347,6 @@ fn cpr_status(account: &ProviderAccount) -> &'static str {
     }
 }
 
-fn china_rfc3339(value: DateTime<Utc>) -> String {
-    value
-        .with_timezone(&FixedOffset::east_opt(8 * 60 * 60).expect("valid China offset"))
-        .to_rfc3339()
-}
-
 fn map_refresh_failure(error: RefreshFailure) -> CodexCredentialAdminError {
     match error {
         RefreshFailure::InvalidGrant { message, upstream } => {
@@ -1350,8 +1363,10 @@ fn map_refresh_failure(error: RefreshFailure) -> CodexCredentialAdminError {
         }
         RefreshFailure::RetryableTransport { .. } => CodexCredentialAdminError::RefreshUnavailable,
         // Worker 的 Transport 分类还承担 401 退避；管理提示只按已收到的响应事实细分，
-        // 不改变后台刷新策略，也不把明确失败响应误报为租约冲突或执行结果未知。
-        RefreshFailure::Transport { message, upstream } => match upstream {
+        // 不改变后台刷新策略，也不把明确失败响应误报为租约冲突或执行结果未知
+        RefreshFailure::Transport {
+            message, upstream, ..
+        } => match upstream {
             Some(upstream) => CodexCredentialAdminError::RefreshUpstream {
                 status: upstream.status(),
                 code: upstream.code().map(str::to_owned),
@@ -1360,20 +1375,6 @@ fn map_refresh_failure(error: RefreshFailure) -> CodexCredentialAdminError {
             None => CodexCredentialAdminError::RefreshAmbiguous { message },
         },
     }
-}
-
-fn log_manual_refresh_failure(account_id: &ProviderAccountId, error: &RefreshFailure) {
-    let upstream = error.upstream();
-    tracing::warn!(
-        account_id = %account_id,
-        failure_class = error.classification(),
-        upstream_message = ?error.message(),
-        upstream_status = ?upstream.map(super::token_client::RefreshUpstreamFailure::status),
-        upstream_code = ?upstream.and_then(super::token_client::RefreshUpstreamFailure::code),
-        upstream_type = ?upstream.and_then(super::token_client::RefreshUpstreamFailure::error_type),
-        upstream_body = ?upstream.map(super::token_client::RefreshUpstreamFailure::body),
-        "OpenAI OAuth manual refresh failed"
-    );
 }
 
 fn parse_import_document(
@@ -1474,7 +1475,7 @@ fn import_proxy(
     }
     let text = |field| proxy.get(field).and_then(Value::as_str).ok_or_else(invalid);
     let scheme = text("protocol")?;
-    // sub2api resolves SOCKS targets at the proxy.
+    // 导入的 SOCKS 代理使用远端 DNS，避免改为本地解析目标地址
     let scheme = if scheme == "socks5" {
         "socks5h"
     } else {
@@ -1604,17 +1605,17 @@ fn parse_api_key_import(value: &Value) -> Result<ApiKeyCredentialData, CodexCred
         .or_else(|| external.then(|| "https://api.openai.com/v1".to_owned()))
         .ok_or(CodexCredentialAdminError::InvalidInput)?;
     if external {
-        if !crate::transport::valid_upstream_base_url(&base_url) {
+        if crate::transport::parse_upstream_base_url(&base_url).is_none() {
             return Err(CodexCredentialAdminError::InvalidInput);
         }
-        // sub2api 接受服务根、版本前缀或完整 Responses 端点；仅在导入边界归一化。
+        // 外部账号的 base_url 可含服务根、版本前缀或完整 Responses 端点，仅在导入边界归一化
         base_url = base_url.trim_end_matches('/').to_owned();
         if let Some(prefix) = base_url.strip_suffix("/responses") {
             base_url = prefix.to_owned();
         } else if !sub2api_version_suffix(&base_url) {
             base_url.push_str("/v1");
         }
-        // 不静默丢失会改变协议、身份请求头或模型映射的外部设置。
+        // 不静默丢失会改变协议、身份请求头或模型映射的外部设置
         for field in [
             "model_mapping",
             "compact_model_mapping",

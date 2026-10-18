@@ -1,3 +1,5 @@
+//! 将宿主允许的恢复路径交给插件重试策略裁决，并处理调用失败
+
 use std::{sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
@@ -28,7 +30,7 @@ pub(super) fn decide(
                     input.facts.model.as_deref(),
                 )
         }) {
-            // 整条委托链共享预算，不能每个插件重新取得完整等待时间。
+            // 整条委托链共享预算，不能每个插件重新取得完整等待时间
             let remaining = timeout
                 .min(input.facts.remaining_deadline)
                 .saturating_sub(started.elapsed());
@@ -78,8 +80,19 @@ async fn call(
         allowed_actions,
     };
     let mut context = invocation.session.context(Stage::Retry, timeout);
+    context.request = crate::adapter::request_context(input.extension_scope.request());
     context.request_id = Some(request.request_id.clone());
     context.attempt_id = Some(format!("{}:{}", request.request_id, request.attempt_index));
+    let _scope = invocation
+        .callbacks
+        .prepare_data_plane(
+            &context,
+            Some(input.execution_effects()),
+            input.extension_scope.clone(),
+            None,
+            gateway_core::lifecycle::CancellationToken::new(),
+        )
+        .map_err(|_| ())?;
     let reply = invocation
         .session
         .call(
@@ -90,18 +103,14 @@ async fn call(
         )
         .await
         .map_err(|_| ())?;
-    if !reply.payload.is_empty()
-        || reply
-            .result
-            .as_object()
-            .is_none_or(|fields| fields.len() != 1)
+    // 重试资格由 Core 在策略返回后裁决，适配器只搬运插件决定
+    match invocation
+        .session
+        .decode_response::<WireDecision>(Stage::Retry, reply.result)
+        .map_err(|_| ())?
     {
-        return Err(());
-    }
-    match serde_json::from_value::<WireDecision>(reply.result).map_err(|_| ())? {
         WireDecision::Delegate => Ok(RetryDecision::Delegate),
         WireDecision::Stop => Ok(RetryDecision::Stop),
-        WireDecision::Retry if input.facts.retry_allowed => Ok(RetryDecision::Retry),
-        WireDecision::Retry => Err(()),
+        WireDecision::Retry => Ok(RetryDecision::Retry),
     }
 }

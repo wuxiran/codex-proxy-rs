@@ -1,4 +1,4 @@
-//! 可丢失、可从 PostgreSQL 或 Provider 重建的 Redis 协调状态。
+//! 可丢失、可从 PostgreSQL 或 Provider 重建的 Redis 协调状态
 
 use sha2::{Digest, Sha256};
 
@@ -6,6 +6,7 @@ mod admin_account_runtime;
 mod artifact_profile;
 mod auth;
 mod client_admission;
+mod client_retry;
 mod coordination_buffer;
 mod credential_cooldown;
 mod credential_leases;
@@ -21,6 +22,7 @@ pub use admin_account_runtime::*;
 pub use artifact_profile::*;
 pub use auth::*;
 pub use client_admission::*;
+pub use client_retry::*;
 pub use coordination_buffer::*;
 pub use credential_cooldown::*;
 pub use credential_leases::*;
@@ -48,9 +50,13 @@ pub(crate) fn namespace(value: &str) -> StoreResult<String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(StoreError::InvalidData {
+            source: None,
             entity: "Redis namespace",
             message: "namespace contains unsupported characters".to_owned(),
         });
     }
     Ok(value.to_owned())
 }
+
+/// 限制单批账号状态读取占用的 Redis 请求数，避免账号池规模直接变成并发峰值
+pub(crate) const ACCOUNT_STATE_READ_CONCURRENCY: usize = 128;

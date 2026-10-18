@@ -3,8 +3,8 @@
 // turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——全部只作中性诊断事实。
 // 数据源 /api/admin/logs/recent 为最近 300 条内存记录，筛选与翻页均在客户端进行。
 // 满血/降智不由本页任何被动信号判定（TTL 判降智已被实测否定）；只如实铺数据。
-import type { BaseTableColumn, BaseTablePaginationState as Pagination } from '@codex-proxy/ui'
-import { BaseCard, BaseCheckbox, BaseInput, BasePageHeader, BaseSegmented, BaseSelect, BaseTable, BaseTablePagination } from '@codex-proxy/ui'
+import type { PaginationState as Pagination, TableColumn } from '@codex-proxy/ui'
+import { ZCard, ZCheckbox, ZInput, ZPageHeader, ZPagination, ZSegmented, ZSelect, ZTable } from '@codex-proxy/ui'
 import { computed, onMounted, ref, watch } from 'vue'
 import request from '@/api/request'
 
@@ -47,7 +47,7 @@ interface LogRow {
   respCookies?: string[]
 }
 
-const columns: BaseTableColumn<LogRow>[] = [
+const columns: TableColumn<LogRow>[] = [
   { key: 'time', label: '时间', size: 'sm' },
   { key: 'action', label: '决策', kind: 'custom', size: 'sm' },
   { key: 'unified', label: 'cf 指纹', kind: 'custom', size: 'sm' },
@@ -263,7 +263,7 @@ const stats = computed(() => {
 
 <template>
   <div class="mx-auto flex max-w-[1600px] flex-col gap-5 px-4 py-6">
-    <BasePageHeader
+    <ZPageHeader
       title="请求日志台"
       description="逐请求观测统一 cookie 库（注入/沿用 __cf_bm）、turn-state 票、上游实际模型、service_tier、__cf_bm 签发 TTL——均为中性诊断事实，不作满血/降智判定。"
     >
@@ -281,52 +281,52 @@ const stats = computed(() => {
           {{ loading ? '刷新中…' : '↻ 刷新' }}
         </button>
       </template>
-    </BasePageHeader>
+    </ZPageHeader>
 
     <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-      <BaseCard>
+      <ZCard>
         <div class="text-xs text-neutral-500">
           筛选后请求
         </div>
         <div class="mt-2 text-2xl font-semibold tabular-nums">
           {{ stats.total }}
         </div>
-      </BaseCard>
-      <BaseCard>
+      </ZCard>
+      <ZCard>
         <div class="text-xs text-neutral-500">
           统一库沿用
         </div>
         <div class="mt-2 text-2xl font-semibold tabular-nums text-emerald-500">
           {{ stats.reuse }}
         </div>
-      </BaseCard>
-      <BaseCard>
+      </ZCard>
+      <ZCard>
         <div class="text-xs text-neutral-500">
           统一库注入
         </div>
         <div class="mt-2 text-2xl font-semibold tabular-nums text-amber-500">
           {{ stats.inject }}
         </div>
-      </BaseCard>
-      <BaseCard>
+      </ZCard>
+      <ZCard>
         <div class="text-xs text-neutral-500">
           短 TTL(&lt;300s) 计数
         </div>
         <div class="mt-2 text-2xl font-semibold tabular-nums text-neutral-600 dark:text-neutral-300">
           {{ stats.shortTtl }}<span class="ml-1 text-sm font-normal text-neutral-400">/ {{ stats.ttlSamples }} 有 TTL</span>
         </div>
-      </BaseCard>
+      </ZCard>
     </div>
 
-    <BaseCard padding="none">
+    <ZCard padding="none">
       <div class="flex flex-wrap items-center gap-2 border-b border-neutral-200 px-4 py-3 dark:border-neutral-800">
-        <BaseInput v-model="q" placeholder="搜索 cf指纹 / 出口 / 票 / 实际模型…" class="w-60" />
-        <BaseSelect v-model="modelFilter" :options="modelOptions" class="w-40" />
-        <BaseSelect v-model="actionFilter" :options="actionOptions" class="w-32" />
-        <BaseSegmented v-model="ttlFilter" label="TTL 档" :options="ttlOptions" />
-        <BaseCheckbox v-model="moleOnly" label="只看实际模型≠请求" class="ml-1 text-xs" />
+        <ZInput v-model="q" placeholder="搜索 cf指纹 / 出口 / 票 / 实际模型…" class="w-60" />
+        <ZSelect v-model="modelFilter" :options="modelOptions" class="w-40" />
+        <ZSelect v-model="actionFilter" :options="actionOptions" class="w-32" />
+        <ZSegmented v-model="ttlFilter" aria-label="TTL 档" :options="ttlOptions" />
+        <ZCheckbox v-model="moleOnly" aria-label="只看实际模型≠请求" class="ml-1 text-xs" />
       </div>
-      <BaseTable :columns="columns" :rows="pagedRows" row-key="id" :loading="loading" density="compact" :empty-text="allRows.length ? '无匹配请求（可调整筛选）' : emptyText">
+      <ZTable :columns="columns" :data="pagedRows" row-key="id" :loading="loading" size="small" :empty-text="allRows.length ? '无匹配请求（可调整筛选）' : emptyText">
         <template #action="{ row }">
           <span class="font-semibold" :class="actionClass((row as LogRow).action)">{{ actionLabel((row as LogRow).action) }}</span>
         </template>
@@ -394,13 +394,13 @@ const stats = computed(() => {
             </span>
           </template>
         </template>
-      </BaseTable>
-      <BaseTablePagination
-        :pagination="pagination"
-        :loading="loading"
-        @page-change="handlePageChange"
-        @page-size-change="handlePageSizeChange"
+      </ZTable>
+      <ZPagination
+        v-bind="pagination"
+        :disabled="loading"
+        @current-change="handlePageChange"
+        @size-change="handlePageSizeChange"
       />
-    </BaseCard>
+    </ZCard>
   </div>
 </template>

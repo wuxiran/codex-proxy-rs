@@ -1,4 +1,4 @@
-//! 管理账号目录的数据库分页 read model。
+//! 管理账号目录的数据库分页 read model
 
 use super::*;
 
@@ -12,6 +12,7 @@ pub(crate) struct AdminAccountPageRows {
 
 pub(crate) async fn load_admin_account_page(
     pool: &PgPool,
+    budget: &crate::postgres::ObservabilityQueryBudget,
     query: &AdminAccountListQuery,
     now: DateTime<Utc>,
     active_rate_limited_ids: Vec<String>,
@@ -22,7 +23,10 @@ pub(crate) async fn load_admin_account_page(
         .provider_kind
         .as_ref()
         .map(|provider| provider.as_str().to_owned());
-    let search_prefix = query.search.as_deref().map(literal_prefix_pattern);
+    let search_prefix = query
+        .search
+        .as_deref()
+        .map(crate::postgres::literal_prefix_pattern);
     let status = query.status.map(|status| status.as_str().to_owned());
     let (group_mode, group_id) = match query.group_filter.as_ref() {
         None => (0_i16, None),
@@ -32,37 +36,22 @@ pub(crate) async fn load_admin_account_page(
     let page_size = i64::from(query.page_size.get());
     let offset = i64::from(query.page - 1).saturating_mul(page_size);
     let order_by = admin_account_order(query.sort);
-    let usage_join = query.sort.is_some_and(|sort| {
+    let needs_usage = query.sort.is_some_and(|sort| {
         matches!(
             sort.field,
             AdminAccountSortField::Usage | AdminAccountSortField::LastUsedAt
         )
     });
-    let completed_usage = completed_usage_fact_predicate("mr");
-    let usage_join = if usage_join {
-        format!(
-            "left join (
-               select mr.provider_account_ref,
-                      coalesce(sum(coalesce(
-                        mr.total_tokens,
-                        coalesce(mr.input_tokens, 0) + coalesce(mr.output_tokens, 0)
-                      )), 0)::bigint as total_tokens,
-                      max(mr.started_at) as last_used_at
-                 from model_requests mr
-                where mr.started_at >= $2 - make_interval(days => settings.usage_retention_days::int)
-                  and mr.started_at < $2
-                  and {completed_usage}
-                group by mr.provider_account_ref
-             ) usage on usage.provider_account_ref = a.id"
-        )
+    let usage_join = if needs_usage {
+        "left join usage_values usage on usage.provider_account_ref = a.id"
     } else {
-        String::new()
+        ""
     };
 
     // fork：票据（account_tickets.expires_at）到点、且已不能调度（五态不是正常/限流）的账号
     // 归入 'expired'；默认目录与 summary_total 不含它们，只有显式筛 'expired' 才列出。
     let statement = format!(
-        "with base_statuses as (
+        "with usage_values as (select * from unnest($10::text[],$11::bigint[],$12::timestamptz[]) as usage(provider_account_ref,total_tokens,last_used_at)), base_statuses as (
            select a.id, a.provider_kind,
                   ticket.expires_at <= $2 as ticket_expired,
                   case
@@ -132,7 +121,7 @@ pub(crate) async fn load_admin_account_page(
              from runtime_settings
             where id = 1
          )
-         select p.auto_location, p.detected_location_json, p.location_country, p.location_region, p.location_city, p.location_timezone, a.outbound_proxy_url, a.id, a.provider_kind, a.name, a.notes, a.email, a.upstream_user_id,
+         select coalesce(p.enabled, true) as outbound_proxy_enabled, coalesce(p.max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, p.auto_location, p.detected_location_json, p.location_country, p.location_region, p.location_city, p.location_timezone, a.outbound_proxy_url, a.id, a.provider_kind, a.name, a.notes, a.email, a.upstream_user_id,
                 a.upstream_account_id, a.plan_type, a.authentication_kind,
                 a.credential_revision, a.has_refresh_token, a.access_token_expires_at,
                 a.next_refresh_at, a.enabled, a.concurrency_limit, a.weight, a.model_access_json,
@@ -163,20 +152,45 @@ pub(crate) async fn load_admin_account_page(
            left join outbound_proxies p on p.id = a.outbound_proxy_id
           order by page.page_position"
     );
-    // 动态片段只来自上面的封闭排序枚举与固定 usage predicate；所有请求值仍使用 bind。
-    let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
-        .bind(active_rate_limited_ids)
-        .bind(now)
-        .bind(provider_kind)
-        .bind(search_prefix)
-        .bind(status)
-        .bind(group_mode)
-        .bind(group_id)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(pool)
+    // 排序事实与本页总数共享同一快照，避免一次查询混入不同源版本
+    let rows = budget
+        .run(
+            pool,
+            "load admin account page",
+            |mut connection| async move {
+                let mut snapshot =
+                    crate::postgres::observability::AnalyticsSnapshot::new_for_accounts(
+                        &mut connection,
+                    )
+                    .await?;
+                let (usage_ids, usage_tokens, usage_latest) = if needs_usage {
+                    crate::postgres::observability::account_usage_sort_values(&mut snapshot, now)
+                        .await?
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
+                let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(active_rate_limited_ids)
+                    .bind(now)
+                    .bind(provider_kind)
+                    .bind(search_prefix)
+                    .bind(status)
+                    .bind(group_mode)
+                    .bind(group_id)
+                    .bind(page_size)
+                    .bind(offset)
+                    .bind(usage_ids)
+                    .bind(usage_tokens)
+                    .bind(usage_latest)
+                    .fetch_all(&mut *snapshot.tx)
+                    .await
+                    .map_err(|source| postgres_unavailable("load admin account page", source))?;
+                snapshot.finish().await?;
+                Ok(rows)
+            },
+        )
         .await
-        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load admin account page")))?;
+        .map_err(|error| admin_store_error(ENTITY, error))?;
     let metadata = rows.first().ok_or_else(|| {
         AdminStoreError::new(
             AdminStoreErrorKind::Unavailable,
@@ -228,10 +242,10 @@ async fn validate_group_filter(
             .bind(group_id.as_str())
             .fetch_one(pool)
             .await
-            .map_err(|_| {
+            .map_err(|source| {
                 admin_store_error(
                     ENTITY,
-                    postgres_unavailable("validate admin account group filter"),
+                    postgres_unavailable("validate admin account group filter", source),
                 )
             })?;
     if exists {
@@ -240,6 +254,7 @@ async fn validate_group_filter(
         Err(admin_store_error(
             ENTITY,
             StoreError::NotFound {
+                source: None,
                 entity: "account group",
                 id: group_id.as_str().to_owned(),
             },
@@ -265,18 +280,6 @@ fn admin_account_order(sort: Option<AdminAccountSort>) -> String {
         AdminSortDirection::Asc => format!("{expression} asc nulls first, a.id asc"),
         AdminSortDirection::Desc => format!("{expression} desc nulls last, a.id desc"),
     }
-}
-
-fn literal_prefix_pattern(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len().saturating_add(1));
-    for character in value.to_lowercase().chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped.push('%');
-    escaped
 }
 
 fn revision_from_row(row: &sqlx::postgres::PgRow) -> AdminStoreResult<AdminRevision> {

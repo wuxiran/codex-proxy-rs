@@ -1,13 +1,14 @@
-//! OpenAI 上游失败分类、恢复决策与稳定错误投影。
+//! OpenAI 上游失败分类、恢复决策与稳定错误投影
 
 use super::*;
-use gateway_core::diagnostics::TraceContext;
+use crate::transport::protocol::responses::is_replaceable_response_prelude;
+use gateway_core::error::TransientRetryPolicy;
 
-/// OpenAI 失败对 Smart 账号分数的结构化 reason 闭集。
+/// OpenAI 失败对 Smart 账号分数的结构化 reason 闭集
 ///
-/// 已归一的上游 code 优先；code 缺失时才读取结构化客户端错误的 code/type。
-/// 新增错误、裸 HTTP 状态和内部错误 kind 默认都不会进入该闭集。
-/// 容量拒绝影响短期调度健康度，但不证明账号凭据或额度失效。
+/// 原始上游 code 优先；code 缺失时才读取结构化客户端错误的 code/type
+/// 新增错误、裸 HTTP 状态和内部错误 kind 默认都不会进入该闭集
+/// 容量拒绝影响短期调度健康度，但不证明账号凭据或额度失效
 const OPENAI_ACCOUNT_SCORE_FAILURE_REASONS: &[&str] = &[
     "server_is_overloaded",
     "slow_down",
@@ -32,7 +33,7 @@ fn openai_account_score_failure_reason(error: &ProviderError) -> Option<&str> {
     upstream.code().or_else(|| upstream.error_type())
 }
 
-/// 返回该 OpenAI 失败是否属于 Smart 账号计分闭集。
+/// 返回该 OpenAI 失败是否属于 Smart 账号计分闭集
 #[doc(hidden)]
 pub fn openai_failure_affects_account_score(error: &ProviderError) -> bool {
     openai_account_score_failure_reason(error).is_some_and(is_openai_account_score_failure_reason)
@@ -42,7 +43,7 @@ pub(super) struct MappedProviderFailure {
     pub(super) error: ProviderError,
     pub(super) websocket_transport_retryable: bool,
     pub(super) account_failure: Option<CodexAccountFailure>,
-    /// 原始上游错误描述，仅在凭据错误状态下持久化。
+    /// 原始上游错误描述，仅在凭据错误状态下持久化
     pub(super) error_message: Option<String>,
     pub(super) cyber_policy_failure: bool,
     pub(super) upstream_capacity_failure: bool,
@@ -69,138 +70,66 @@ impl MappedProviderFailure {
     }
 }
 
-pub(super) enum PreCommitPoll<T> {
-    Upstream(T),
-    GraceElapsed,
+/// 正常事件立即交付，只记录后续失败能否请求重放
+/// 可替换前导不关闭窗口；实际输出、终态和未知事件使边界单向推进
+pub(super) struct ClientEventDelivery {
+    replay_closed: bool,
+    replayable_prelude: bool,
 }
 
-pub(super) async fn wait_for_replay_grace(deadline: Option<Instant>) {
-    if let Some(deadline) = deadline {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-    } else {
-        std::future::pending::<()>().await;
-    }
-}
-
-/// 提交边界前的上游事件预取。
-///
-/// 原始 chunk 计数而不是重编码后的 event 大小。时间与字节阈值共同限定无感换号
-/// 窗口；任一边界到达都会提交已缓存 wire，不能因网关私有资源规则伪造上游协议
-/// 失败。一旦提交，后续事件不再具备无痕重放资格。
-pub(super) struct PreCommitClientEvents {
-    pending: Vec<ProviderEvent>,
-    prefetched_bytes: usize,
-    replay_grace_started_at: Option<Instant>,
-    committed: bool,
-    trace: TraceContext,
-}
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum PreCommitReleaseReason {
-    SemanticOutput,
-    Terminal,
-    ByteLimit,
-    GraceTimeout,
-    Eof,
-}
-
-impl PreCommitClientEvents {
-    pub(super) const fn new(trace: TraceContext) -> Self {
+impl ClientEventDelivery {
+    pub(super) fn new(replayable_prelude: bool) -> Self {
         Self {
-            pending: Vec::new(),
-            prefetched_bytes: 0,
-            replay_grace_started_at: None,
-            committed: false,
-            trace,
+            replay_closed: false,
+            replayable_prelude,
         }
     }
 
-    pub(super) fn observe_chunk(&mut self, bytes: usize) {
-        if !self.committed {
-            self.prefetched_bytes = self.prefetched_bytes.saturating_add(bytes);
-        }
-    }
-
-    pub(super) fn stage(
+    pub(super) fn forward(
         &mut self,
         incoming: Vec<ProviderEvent>,
         timing_signals: ResponseEventSignals,
         completed: bool,
     ) -> Vec<ProviderEvent> {
-        if self.committed {
+        if self.replay_closed || incoming.is_empty() {
             return incoming;
         }
-        let starts_replay_grace = incoming.iter().any(ProviderEvent::has_client_event);
-        self.pending.extend(incoming);
-        if timing_signals.semantic_output {
-            return self.commit_pending(PreCommitReleaseReason::SemanticOutput);
+        if timing_signals.semantic_output
+            || completed
+            || !self.replayable_prelude
+            || !incoming.iter().all(is_replaceable_prelude)
+        {
+            return self.commit(incoming);
         }
-        if completed {
-            return self.commit_pending(PreCommitReleaseReason::Terminal);
-        }
-        if self.prefetched_bytes > MAX_STREAM_PREFETCH_BYTES {
-            return self.commit_pending(PreCommitReleaseReason::ByteLimit);
-        }
-        if starts_replay_grace && self.replay_grace_started_at.is_none() {
-            self.replay_grace_started_at = Some(Instant::now());
-        }
-        Vec::new()
-    }
-
-    pub(super) fn finish(
-        &mut self,
-        incoming: Vec<ProviderEvent>,
-        timing_signals: ResponseEventSignals,
-        completed: bool,
-    ) -> Vec<ProviderEvent> {
-        let events = self.stage(incoming, timing_signals, completed);
-        if self.committed {
-            events
-        } else {
-            self.commit_pending(PreCommitReleaseReason::Eof)
-        }
+        incoming
+            .into_iter()
+            .map(ProviderEvent::with_replayable_prelude)
+            .collect()
     }
 
     pub(super) fn commit(&mut self, incoming: Vec<ProviderEvent>) -> Vec<ProviderEvent> {
-        if self.committed {
-            return incoming;
-        }
-        self.pending.extend(incoming);
-        // 此入口只在同批次已出现语义输出、随后失败时释放原始事件。
-        self.commit_pending(PreCommitReleaseReason::SemanticOutput)
+        self.replay_closed = true;
+        incoming
     }
 
-    pub(super) fn take_for_failure(&mut self, incoming: Vec<ProviderEvent>) -> Vec<ProviderEvent> {
-        self.pending.extend(incoming);
-        self.prefetched_bytes = 0;
-        self.replay_grace_started_at = None;
-        std::mem::take(&mut self.pending)
+    pub(super) const fn replay_closed(&self) -> bool {
+        self.replay_closed
     }
+}
 
-    pub(super) fn replay_grace_deadline(&self) -> Option<Instant> {
-        self.replay_grace_started_at
-            .and_then(|started| started.checked_add(STREAM_REPLAY_GRACE))
-    }
-
-    pub(super) const fn is_committed(&self) -> bool {
-        self.committed
-    }
-
-    pub(super) fn commit_pending(&mut self, reason: PreCommitReleaseReason) -> Vec<ProviderEvent> {
-        // Provider 只记录释放缓存的原因；实际下游提交仍由 Core 记录和裁决。
-        if self.trace.is_enabled() {
-            self.trace.record("provider.precommit.released", json!({
-                "reason": reason,
-                "prefetchedBytes": self.prefetched_bytes,
-                "waitMs": self.replay_grace_started_at.map_or(0, |started| started.elapsed().as_millis()),
-            }));
-        }
-        self.committed = true;
-        self.prefetched_bytes = 0;
-        self.replay_grace_started_at = None;
-        std::mem::take(&mut self.pending)
-    }
+fn is_replaceable_prelude(event: &ProviderEvent) -> bool {
+    event
+        .wire_event()
+        .is_some_and(|wire| match wire.event_type() {
+            Some(event_type) => is_replaceable_response_prelude(event_type, wire.data()),
+            // 上游 SSE 注释也即时透传，但不能把传输心跳当作业务交付
+            None => wire.raw_sse_frame().is_some_and(|frame| {
+                std::str::from_utf8(frame).is_ok_and(|text| {
+                    text.lines()
+                        .all(|line| line.is_empty() || line.starts_with(':'))
+                })
+            }),
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -271,7 +200,7 @@ pub(super) fn log_client_upstream_error(
             body,
             transport,
             ..
-        } => log_raw_upstream_body(
+        } => log_upstream_error_summary(
             context,
             *transport,
             "http_error_response",
@@ -281,7 +210,7 @@ pub(super) fn log_client_upstream_error(
             body,
         ),
         CodexClientError::WebSocket(CodexWebSocketExchangeError::Upstream(upstream)) => {
-            log_raw_upstream_body(
+            log_upstream_error_summary(
                 context,
                 CodexBackendTransport::WebSocket,
                 "websocket_opening_response",
@@ -301,7 +230,7 @@ pub(super) fn log_client_upstream_error(
                 .map(|connection_id| connection_id.to_string())
                 .unwrap_or_default();
             let close_reason_bytes = close.reason().map_or(0, str::len);
-            tracing::warn!(
+            tracing::debug!(
                 request_id = %context.request_id,
                 account_id = %context.account_id,
                 attempt_index = context.attempt_index,
@@ -331,7 +260,7 @@ pub(super) fn log_canonical_upstream_error(
     let CodexCanonicalError::Upstream(failure) = error else {
         return;
     };
-    log_raw_upstream_body(
+    log_upstream_error_summary(
         context,
         transport,
         "responses_error_event",
@@ -342,7 +271,7 @@ pub(super) fn log_canonical_upstream_error(
     );
 }
 
-pub(super) fn log_raw_upstream_body(
+pub(super) fn log_upstream_error_summary(
     context: UpstreamErrorLogContext<'_>,
     transport: CodexBackendTransport,
     error_kind: &'static str,
@@ -355,7 +284,7 @@ pub(super) fn log_raw_upstream_body(
         .websocket_connection_id
         .map(|connection_id| connection_id.to_string())
         .unwrap_or_default();
-    tracing::warn!(
+    tracing::debug!(
         request_id = %context.request_id,
         account_id = %context.account_id,
         attempt_index = context.attempt_index,
@@ -364,11 +293,8 @@ pub(super) fn log_raw_upstream_body(
         upstream_error_kind = error_kind,
         upstream_status_code = status_code.unwrap_or_default(),
         upstream_status_code_present = status_code.is_some(),
-        upstream_error_code = upstream_code.unwrap_or_default(),
         upstream_error_code_present = upstream_code.is_some(),
-        upstream_error_type = upstream_type.unwrap_or_default(),
         upstream_error_type_present = upstream_type.is_some(),
-        upstream_error_raw,
         upstream_error_raw_bytes = upstream_error_raw.len(),
         "OpenAI upstream returned an error payload"
     );
@@ -426,11 +352,12 @@ pub(super) async fn apply_failure(
     {
         tracing::warn!(
             account_id = %account.id(),
+            credential_revision = account.revision().get(),
             error = %error,
             "Failed to persist OpenAI response cookies"
         );
     }
-    // 探测只验证恢复，不能把探测自身的单请求并发当作业务负载证据。
+    // 探测只验证恢复，不能把探测自身的单请求并发当作业务负载证据
     if context.allows_capacity_feedback && failure.upstream_capacity_failure {
         context
             .quota
@@ -443,13 +370,17 @@ pub(super) fn schedule_authoritative_quota_refresh_after_failure(
     quota: &Arc<CodexCredentialQuotaService>,
     account: &ProviderAccount,
 ) {
-    // 限额错误可以确认账号状态，但 Responses 事件中的 used_percent 可能仍停在上一结算点。
-    // usage 快照在后台补齐展示基线，不得撤销同一轮真实失败，也不能阻塞原始响应。
-    // 先等待 2 秒让上游结算，再查询；5 秒仅限制实际查询自身。
+    // 限额错误可以确认账号状态，但 Responses 事件中的 used_percent 可能仍停在上一结算点
+    // usage 快照在后台补齐展示基线，不得撤销同一轮真实失败，也不能阻塞原始响应
+    // 随机等待 1–3 秒让上游结算再查询，避免多账号同时受限时补查完全同步；
+    // 仍保持单次语义（一次 sleep + 一次查询），5 秒仅限制实际查询自身
     let quota = Arc::clone(quota);
     let account_id = account.id().clone();
     drop(tokio::spawn(async move {
-        tokio::time::sleep(QUOTA_FAILURE_REFRESH_DELAY).await;
+        tokio::time::sleep(crate::jitter::quota_failure_refresh_delay(
+            crate::jitter::random_u64(),
+        ))
+        .await;
         match tokio::time::timeout(
             QUOTA_FAILURE_REFRESH_TIMEOUT,
             quota.refresh_account_after_failure(&account_id),
@@ -475,11 +406,8 @@ pub(super) fn schedule_authoritative_quota_refresh_after_failure(
     }));
 }
 
-pub(super) fn map_handshake_error(
-    error: CodexClientError,
-    responses: bool,
-) -> MappedProviderFailure {
-    map_client_error(error, UpstreamSendState::Ambiguous, true, responses)
+pub(super) fn map_handshake_error(error: CodexClientError) -> MappedProviderFailure {
+    map_client_error(error, UpstreamSendState::Ambiguous, true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,14 +418,15 @@ pub(super) enum WebSocketFailurePolicy {
 
 pub(super) struct WebSocketRecoveryContext<'a> {
     pub(super) policy: WebSocketFailurePolicy,
+    pub(super) replay_boundary: ReplayBoundary,
     pub(super) requirement: TransportRequirement,
     pub(super) retry_count: u32,
     pub(super) max_retries: u32,
     pub(super) request_id: &'a str,
     pub(super) attempt_index: u32,
     pub(super) account_id: &'a str,
-    pub(super) session_affinity_key: Option<&'a ProviderSessionAffinityKey>,
-    pub(super) session_affinity_key_hash: Option<&'a str>,
+    pub(super) session_transport_key: Option<&'a ProviderSessionAffinityKey>,
+    pub(super) session_transport_key_hash: Option<&'a str>,
     pub(super) session_transport_recovery: &'a CodexSessionTransportRecovery,
 }
 
@@ -511,21 +440,6 @@ pub(super) fn websocket_client_failure_policy(
             ..
         } if *status == reqwest::StatusCode::UPGRADE_REQUIRED => {
             Some(WebSocketFailurePolicy::ImmediateFallback)
-        }
-        CodexClientError::Upstream {
-            status,
-            transport: CodexBackendTransport::WebSocket,
-            ..
-        } if status.is_server_error()
-            || matches!(
-                *status,
-                reqwest::StatusCode::REQUEST_TIMEOUT
-                    | reqwest::StatusCode::CONFLICT
-                    | reqwest::StatusCode::TOO_EARLY
-                    | reqwest::StatusCode::TOO_MANY_REQUESTS
-            ) =>
-        {
-            Some(WebSocketFailurePolicy::Budgeted)
         }
         CodexClientError::WebSocket(error)
             if !matches!(
@@ -547,7 +461,11 @@ pub(super) fn apply_websocket_recovery_policy(
     failure: &mut MappedProviderFailure,
     context: WebSocketRecoveryContext<'_>,
 ) {
-    // 明确账号拒绝走已有换号路径，容量拒绝走请求内退避；两者都不消耗 WS 传输预算。
+    // 未匹配网关恢复规则的上游拒绝直达客户端，不能转换成传输重试或污染会话回退状态
+    if failure.error.retry_is_prohibited() {
+        return;
+    }
+    // 明确账号拒绝走已有换号路径，业务瞬态失败走请求内退避，不消耗 WS 传输预算
     if failure.error.replay_is_safe()
         && (failure.account_failure.is_some()
             || matches!(
@@ -562,8 +480,9 @@ pub(super) fn apply_websocket_recovery_policy(
             websocket_failure_kind = failure.error.kind().as_str(),
             websocket_failure_code = failure
                 .error
-                .upstream_code()
-                .map_or("", OpaqueUpstreamValue::as_str),
+                .diagnostic()
+                .and_then(ProviderDiagnostic::code)
+                .unwrap_or(""),
             upstream_status_code = failure.error.upstream_status().unwrap_or_default(),
             upstream_status_code_present = failure.error.upstream_status().is_some(),
             transport_requirement = context.requirement.as_str(),
@@ -571,40 +490,17 @@ pub(super) fn apply_websocket_recovery_policy(
         );
         return;
     }
-    // close 1009 只拒绝当前请求，不代表会话的 WS 传输不可用。
+    // close 1009 只拒绝当前请求，不代表会话的 WS 传输不可用
     let session_budget_exhausted = failure.error.kind() != ProviderErrorKind::MessageTooBig
-        && context.session_affinity_key.is_some_and(|key| {
+        && context.session_transport_key.is_some_and(|key| {
             context
                 .session_transport_recovery
                 .record_websocket_failure(key, context.max_retries)
         });
-    let send_state = failure.error.send_state();
-    let post_send = matches!(
-        send_state,
-        UpstreamSendState::Sent | UpstreamSendState::Ambiguous
-    );
-    if send_state == UpstreamSendState::Ambiguous || (post_send && !failure.error.replay_is_safe())
-    {
-        tracing::warn!(
-            request_id = context.request_id,
-            attempt_index = context.attempt_index,
-            account_id = context.account_id,
-            websocket_failure_kind = failure.error.kind().as_str(),
-            websocket_failure_code = failure
-                .error
-                .upstream_code()
-                .map_or("", OpaqueUpstreamValue::as_str),
-            upstream_send_state = ?send_state,
-            transport_requirement = context.requirement.as_str(),
-            continuation_recovery_action = "client_replay_required",
-            session_http_fallback = session_budget_exhausted,
-            session_affinity_present = context.session_affinity_key.is_some(),
-            session_affinity_key_hash = context.session_affinity_key_hash.unwrap_or(""),
-            "OpenAI upstream WebSocket failed after payload send; proxy replay was suppressed"
-        );
+    // 已交付响应只影响后续请求的会话传输选择，不能重放当前请求
+    if matches!(context.replay_boundary, ReplayBoundary::AfterSemanticOutput) {
         return;
     }
-
     if matches!(
         context.requirement,
         TransportRequirement::ExactWebSocketContinuation | TransportRequirement::HttpRequired
@@ -612,8 +508,10 @@ pub(super) fn apply_websocket_recovery_policy(
         return;
     }
 
+    // 有效输出前，已发送或结果不明也允许按预算尽力恢复
+    // 保留发送事实和 replay_is_safe 原值，重试意图不能伪装成上游未执行的证明
     // 传输恢复必须保持原账号可调度；最终 HTTP attempt 若仍失败，再按真实 HTTP
-    // 结果更新账号健康度，避免中间 WS 错误把同账号钉选提前冷却掉。
+    // 结果更新账号健康度，避免中间 WS 错误把同账号钉选提前冷却掉
     failure.account_failure = None;
     let fallback_now = context.policy == WebSocketFailurePolicy::ImmediateFallback
         || context.retry_count >= context.max_retries
@@ -636,13 +534,16 @@ pub(super) fn apply_websocket_recovery_policy(
             websocket_failure_kind = failure.error.kind().as_str(),
             websocket_failure_code = failure
                 .error
-                .upstream_code()
-                .map_or("", OpaqueUpstreamValue::as_str),
+                .diagnostic()
+                .and_then(ProviderDiagnostic::code)
+                .unwrap_or(""),
             upstream_status_code = failure.error.upstream_status().unwrap_or_default(),
             upstream_status_code_present = failure.error.upstream_status().is_some(),
             websocket_retry_count = retry_index.get(),
             websocket_max_retries = context.max_retries,
             websocket_retry_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            upstream_send_state = ?failure.error.send_state(),
+            replay_proved_safe = failure.error.replay_is_safe(),
             transport_requirement = context.requirement.as_str(),
             "OpenAI upstream WebSocket failed; retrying the same account"
         );
@@ -653,7 +554,7 @@ pub(super) fn apply_websocket_recovery_policy(
         return;
     }
     failure.error.set_pre_delivery_transport_fallback();
-    if let Some(key) = context.session_affinity_key {
+    if let Some(key) = context.session_transport_key {
         context.session_transport_recovery.disable_websocket(key);
     }
     tracing::warn!(
@@ -663,8 +564,9 @@ pub(super) fn apply_websocket_recovery_policy(
         websocket_failure_kind = failure.error.kind().as_str(),
         websocket_failure_code = failure
             .error
-            .upstream_code()
-            .map_or("", OpaqueUpstreamValue::as_str),
+            .diagnostic()
+            .and_then(ProviderDiagnostic::code)
+            .unwrap_or(""),
         upstream_status_code = failure.error.upstream_status().unwrap_or_default(),
         upstream_status_code_present = failure.error.upstream_status().is_some(),
         websocket_retry_count = context.retry_count,
@@ -673,8 +575,8 @@ pub(super) fn apply_websocket_recovery_policy(
             WebSocketFailurePolicy::Budgeted => "retry_budget_exhausted",
             WebSocketFailurePolicy::ImmediateFallback => "upgrade_required",
         },
-        session_affinity_present = context.session_affinity_key.is_some(),
-        session_affinity_key_hash = context.session_affinity_key_hash.unwrap_or(""),
+        session_affinity_present = context.session_transport_key.is_some(),
+        session_transport_key_hash = context.session_transport_key_hash.unwrap_or(""),
         "OpenAI upstream WebSocket disabled for this session"
     );
 }
@@ -703,17 +605,14 @@ pub(super) fn continuation_replay_required_error(reason: &'static str) -> Provid
         ContinuationRecoveryDisposition::ClientReplayRequired,
     )
     .with_continuation_unavailable_reason(reason)
-    .with_upstream_code(OpaqueUpstreamValue::new(
-        PREVIOUS_RESPONSE_NOT_FOUND_CODE.to_owned(),
-    ))
     .with_diagnostic(ProviderDiagnostic::new(
         "previous response is unavailable in the selected upstream scope; client replay is required",
     ))
     .with_client_visible_upstream_error(continuation_replay_error_detail())
 }
 
-/// 额度拒绝使当前账号无法继续原生历史，由客户端携带完整输入创建新链。
-/// 只投影客户端响应；真实上游分类、发送状态和错误正文继续用于隔离与记账。
+/// 额度拒绝使当前账号无法继续原生历史，由客户端携带完整输入创建新链
+/// 只投影客户端响应；真实上游分类、发送状态和错误正文继续用于隔离与记账
 pub(super) fn quota_continuation_replay_error(
     mut error: ProviderError,
     request: &CodexResponsesRequest,
@@ -734,13 +633,13 @@ pub(super) fn quota_continuation_replay_error(
             response
                 .headers()
                 .iter()
-                // 额度窗口的等待时间不适用于客户端重建历史。
+                // 额度窗口的等待时间不适用于客户端重建历史
                 .filter(|header| !header.name().eq_ignore_ascii_case("retry-after"))
                 .cloned()
                 .collect()
         })
         .unwrap_or_default();
-    // 流内拒绝没有原始 HTTP 失败响应，仍需把该次失败的关联 ID 交给 HTTP 客户端。
+    // 流内拒绝没有原始 HTTP 失败响应，仍需把该次失败的关联 ID 交给 HTTP 客户端
     if !headers.iter().any(|header| {
         header.name().eq_ignore_ascii_case("x-request-id")
             || header.name().eq_ignore_ascii_case("x-oai-request-id")
@@ -757,8 +656,8 @@ pub(super) fn quota_continuation_replay_error(
         "code": detail.code(),
         "type": detail.error_type(),
     }});
-    // 未交付的 response.created 与额度错误帧必须一起丢弃，否则原错误帧会
-    // 覆盖恢复投影。该拒绝发生在语义输出和 commit 之前，不能带走已交付事件。
+    // 丢弃仍未交付的前导与额度错误帧，避免原错误覆盖客户端恢复投影
+    // 已交付的 Lite 前导不在此批次内，语义输出后的失败不进入此分支
     drop(error.take_atomic_client_events());
     error
         .with_continuation_failure(ContinuationFailure::HistoryUnavailable)
@@ -788,7 +687,7 @@ fn continuation_replay_error_detail() -> ClientVisibleUpstreamError {
 pub(super) fn map_stream_error(error: CodexClientError) -> MappedProviderFailure {
     let allows_pre_delivery_retry = stream_transport_allows_pre_delivery_retry(&error);
     let websocket_failure = error.transport() == Some(CodexBackendTransport::WebSocket);
-    let mut failure = map_client_error(error, UpstreamSendState::Sent, false, false);
+    let mut failure = map_client_error(error, UpstreamSendState::Sent, false);
     failure.websocket_transport_retryable = allows_pre_delivery_retry && websocket_failure;
     if allows_pre_delivery_retry && !websocket_failure {
         failure.error = failure.error.with_pre_delivery_retry();
@@ -816,7 +715,6 @@ pub(super) fn stream_transport_allows_pre_delivery_retry(error: &CodexClientErro
 pub(super) fn map_canonical_error(
     error: CodexCanonicalError,
     diagnostics: &CodexUpstreamDiagnostics,
-    set_cookie_headers: &[String],
     rate_limit_headers: &[(String, String)],
     replay_boundary: ReplayBoundary,
 ) -> MappedProviderFailure {
@@ -826,37 +724,14 @@ pub(super) fn map_canonical_error(
             CodexUpstreamFailure::from_sse_failure(
                 &failure,
                 diagnostics,
-                set_cookie_headers,
+                // 响应头在开始消费流时已写回，流内失败不重放同一批 Cookie
+                &[],
                 rate_limit_headers,
                 CodexUpstreamSendPhase::AfterPayload,
             ),
             None,
             replay_boundary,
-            true,
         ),
-    }
-}
-
-/// 临时服务故障只申请交付前换号，不把已发送请求伪装成已证明未执行。
-/// 在错误被投影为客户端消息前使用完整结构化字段，避免缺少 message 时误判未知错误。
-fn response_service_rotation(failure: &CodexUpstreamFailure) -> bool {
-    if !matches!(failure.send_phase, CodexUpstreamSendPhase::AfterPayload)
-        || !matches!(failure.category(), CodexFailureCategory::Unavailable | CodexFailureCategory::Timeout)
-        // 换号路径没有等待阶段，不能用它绕过上游明确要求的等待时间。
-        || failure.retry_after_seconds.is_some_and(|delay| delay > 0)
-        || failure.status.is_some_and(|status| !matches!(status.as_u16(), 500 | 502 | 503 | 504))
-    {
-        return false;
-    }
-    match failure
-        .code
-        .as_deref()
-        .or(failure.client_error_type.as_deref())
-    {
-        Some(reason) => ["server_error", "service_unavailable_error"]
-            .iter()
-            .any(|known| reason.trim().eq_ignore_ascii_case(known)),
-        None => failure.status.is_some(),
     }
 }
 
@@ -864,7 +739,6 @@ pub(super) fn map_client_error(
     error: CodexClientError,
     uncertain_state: UpstreamSendState,
     observe_transport: bool,
-    responses: bool,
 ) -> MappedProviderFailure {
     let local_connection_capacity = crate::transport::connection::is_admission_failure(&error);
     let diagnostic = if local_connection_capacity {
@@ -912,16 +786,18 @@ pub(super) fn map_client_error(
         .then(|| codex_error_observation(&error))
         .flatten();
     if let Some(failure) = error.upstream_failure() {
-        return map_upstream_failure(
-            failure,
-            observation,
-            ReplayBoundary::BeforeSemanticOutput,
-            responses,
-        );
+        return map_upstream_failure(failure, observation, ReplayBoundary::BeforeSemanticOutput);
     }
     let connect_retry = !local_connection_capacity
         && matches!(&error, CodexClientError::Http(error) if transient_http_connect(error));
-    let mut failure = match error {
+    let mut failure = match &error {
+        CodexClientError::Privacy(_) => MappedProviderFailure::plain(
+            provider_error(
+                ProviderErrorKind::InvalidRequest,
+                UpstreamSendState::NotSent,
+            )
+            .with_retry_prohibited(),
+        ),
         CodexClientError::ConnectionBudgetExhausted => MappedProviderFailure::plain(
             provider_error(ProviderErrorKind::Timeout, UpstreamSendState::NotSent)
                 .with_connection_retry(gateway_core::engine::AttemptTransport::Fallback),
@@ -954,7 +830,7 @@ pub(super) fn map_client_error(
             diagnostics,
             ..
         } => {
-            // 已知响应头只补充观测事实；不将残缺响应重新分类成可换号重放的上游拒绝。
+            // 已知响应头只补充观测事实；不将残缺响应重新分类成可换号重放的上游拒绝
             let mut error = provider_error(
                 if source.is_timeout() {
                     ProviderErrorKind::Timeout
@@ -964,8 +840,9 @@ pub(super) fn map_client_error(
                 uncertain_state,
             )
             .with_status(status.as_u16());
-            if let Some(request_id) = diagnostics.request_id {
-                error = error.with_upstream_request_id(OpaqueUpstreamValue::new(request_id));
+            if let Some(request_id) = &diagnostics.request_id {
+                error =
+                    error.with_upstream_request_id(OpaqueUpstreamValue::new(request_id.clone()));
             }
             MappedProviderFailure::plain(error)
         }
@@ -988,7 +865,7 @@ pub(super) fn map_client_error(
             let mut failure = MappedProviderFailure::plain(continuation_replay_required_error(
                 continuation_unavailable_reason.unwrap_or("scope_unavailable"),
             ));
-            if let Some(client_visible_error) = websocket_client_visible_error(&error) {
+            if let Some(client_visible_error) = websocket_client_visible_error(error) {
                 failure.error = failure
                     .error
                     .with_client_visible_upstream_error(client_visible_error);
@@ -996,12 +873,12 @@ pub(super) fn map_client_error(
             failure
         }
         CodexClientError::WebSocket(error) => {
-            let close_code = error.close_before_terminal().and_then(|close| close.code());
-            let client_visible_error = websocket_client_visible_error(&error);
+            let client_visible_error = websocket_client_visible_error(error);
             let mut failure = MappedProviderFailure::plain(provider_error(
-                websocket_error_kind(&error),
-                websocket_send_state(&error),
+                websocket_error_kind(error),
+                websocket_send_state(error),
             ));
+            // fork: ws-warm-pool —— 严格模式下没有已验证候选，短暂退避后重试
             if matches!(
                 error.classified(),
                 CodexWebSocketExchangeError::WarmUnavailable
@@ -1013,24 +890,15 @@ pub(super) fn map_client_error(
                         "warm_connection_unavailable".to_owned(),
                     ));
             }
-            if let Some(close_code) = close_code {
-                failure.error =
-                    failure
-                        .error
-                        .with_upstream_code(OpaqueUpstreamValue::new(format!(
-                            "websocket_close_{close_code}"
-                        )));
-            }
             if let CodexWebSocketExchangeError::ConnectionLimitReached(upstream) =
                 error.classified()
             {
-                failure.error =
-                    failure
+                failure.error = failure.error.with_replay_safe();
+                if let Some(code) = upstream.upstream_code.as_ref() {
+                    failure.error = failure
                         .error
-                        .with_replay_safe()
-                        .with_upstream_code(OpaqueUpstreamValue::new(
-                            WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.to_owned(),
-                        ));
+                        .with_upstream_code(OpaqueUpstreamValue::new(code.clone()));
+                }
                 if let Some(status) = upstream.explicit_status_code {
                     failure.error = failure.error.with_status(status);
                 }
@@ -1078,11 +946,44 @@ pub(super) fn map_client_error(
             .error
             .with_connection_observation(connection_observation);
     }
+    // Reqwest 的请求 URL 可能携带认证参数；原因链保留，请求方向的 URL 不进入运维详情
+    let mut request_url_redacted = false;
+    let error = match error {
+        CodexClientError::Http(source) => {
+            request_url_redacted = source.url().is_some();
+            CodexClientError::Http(source.without_url())
+        }
+        CodexClientError::HttpJson(source) => {
+            request_url_redacted = source.url().is_some();
+            CodexClientError::HttpJson(source.without_url())
+        }
+        CodexClientError::ErrorBodyRead {
+            source,
+            status,
+            diagnostics,
+            transport,
+            transport_metrics,
+        } => {
+            request_url_redacted = source.url().is_some();
+            CodexClientError::ErrorBodyRead {
+                source: source.without_url(),
+                status,
+                diagnostics,
+                transport,
+                transport_metrics,
+            }
+        }
+        error => error,
+    };
+    failure.error = failure.error.with_source(error);
+    if request_url_redacted {
+        failure.error = failure.error.redact_sensitive_context("request URL");
+    }
     failure.observation = observation;
     failure
 }
 
-/// 在消费 transport 错误前提取可持久化事实，不能使用可能携带 URL/凭据的 Display。
+/// 在消费 transport 错误前提取可持久化事实，不能使用可能携带 URL/凭据的 Display
 fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
     let (stage, code, message) = match error {
         CodexClientError::ConnectionBudgetExhausted => (
@@ -1134,6 +1035,11 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "invalid_sse",
             "OpenAI HTTP returned an invalid Responses event stream".to_owned(),
         ),
+        CodexClientError::Privacy(error) => (
+            "prepare",
+            "privacy_policy_rejected",
+            format!("Privacy rule {}: {}", error.rule_index + 1, error.reason),
+        ),
         CodexClientError::InvalidHeaderName(_) => (
             "prepare",
             "invalid_header_name",
@@ -1154,11 +1060,7 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "request_compression_failed",
             "OpenAI request compression failed".to_owned(),
         ),
-        CodexClientError::CustomCa(_) => (
-            "prepare",
-            "custom_ca_invalid",
-            "OpenAI custom CA configuration is invalid".to_owned(),
-        ),
+        CodexClientError::CustomCa(error) => return Some(custom_ca_diagnostic(error)),
         CodexClientError::ModelCatalog(_) => (
             "prepare",
             "model_catalog_invalid",
@@ -1167,6 +1069,63 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
         CodexClientError::Upstream { .. } => return None,
     };
     Some(ProviderDiagnostic::new(message).with_classification(stage, code))
+}
+
+pub(super) fn profile_diagnostic(
+    error: &crate::transport::profile::selection::ClientProfileError,
+) -> ProviderDiagnostic {
+    use crate::transport::profile::selection::ClientProfileError;
+    let code = match error {
+        ClientProfileError::Invalid => "request_profile_invalid",
+        ClientProfileError::InvalidUserAgent => "request_profile_user_agent_invalid",
+        ClientProfileError::CompanionHeadersRequired => "request_profile_headers_required",
+        ClientProfileError::CompanionHeadersConflict => "request_profile_headers_conflict",
+        ClientProfileError::ReleaseUnavailable => "request_profile_release_unavailable",
+    };
+    // 此类型的 Display 全部由本地固定文案组成，不包含配置字段
+    ProviderDiagnostic::new(error.to_string()).with_classification("prepare", code)
+}
+
+fn custom_ca_diagnostic(error: &crate::transport::tls::CustomCaError) -> ProviderDiagnostic {
+    use crate::transport::tls::CustomCaError;
+    let (code, message) = match error {
+        CustomCaError::ProxyConfiguration => (
+            "account_proxy_invalid",
+            "OpenAI account proxy configuration is invalid".to_owned(),
+        ),
+        CustomCaError::ReadCaFile { source_env, .. } => (
+            "custom_ca_read_failed",
+            format!("OpenAI CA certificate file selected by {source_env} could not be read"),
+        ),
+        CustomCaError::InvalidCaFile { source_env, .. } => (
+            "custom_ca_invalid",
+            format!("OpenAI CA certificate file selected by {source_env} is not valid PEM"),
+        ),
+        CustomCaError::RegisterCertificate {
+            certificate_index, ..
+        }
+        | CustomCaError::RegisterRustlsCertificate {
+            certificate_index, ..
+        } => (
+            "custom_ca_registration_failed",
+            format!("OpenAI CA certificate #{certificate_index} could not be registered"),
+        ),
+        CustomCaError::BuildClientWithCustomCa { .. } => (
+            "custom_ca_client_build_failed",
+            "OpenAI HTTP client with custom CA certificates could not be built".to_owned(),
+        ),
+        CustomCaError::BuildClientWithSystemRoots(_) => (
+            "system_tls_client_build_failed",
+            "OpenAI HTTP client with system root certificates could not be built".to_owned(),
+        ),
+        CustomCaError::LoadNativeRoots(_) => (
+            "system_tls_roots_unavailable",
+            "OpenAI system root certificates could not be loaded".to_owned(),
+        ),
+    };
+    ProviderDiagnostic::new(message)
+        .with_classification("prepare", code)
+        .with_io_cause(error)
 }
 
 fn websocket_diagnostic(error: &CodexWebSocketExchangeError) -> ProviderDiagnostic {
@@ -1184,6 +1143,7 @@ fn websocket_diagnostic(error: &CodexWebSocketExchangeError) -> ProviderDiagnost
         CodexWebSocketExchangeError::OriginHalfOpenBusy => ("connect", "origin_half_open_busy"),
         CodexWebSocketExchangeError::InvalidRequest(_) => ("prepare", "invalid_request"),
         CodexWebSocketExchangeError::SendTimeout { .. } => ("send", "send_timeout"),
+        CodexWebSocketExchangeError::SendNotStarted => ("send", "send_not_started"),
         CodexWebSocketExchangeError::ReceiveIdleTimeout { .. } => {
             ("receive", "receive_idle_timeout")
         }
@@ -1268,6 +1228,9 @@ fn websocket_diagnostic_message(error: &CodexWebSocketExchangeError) -> Provider
         }
         CodexWebSocketExchangeError::SharedConnectFailed => {
             "OpenAI shared WebSocket connection failed before payload send".to_owned()
+        }
+        CodexWebSocketExchangeError::SendNotStarted => {
+            "OpenAI WebSocket connection closed before payload send started".to_owned()
         }
         CodexWebSocketExchangeError::SendTimeout { timeout } => {
             format!("OpenAI WebSocket payload send timed out after {timeout:?}")
@@ -1360,7 +1323,7 @@ pub(super) fn websocket_client_visible_error(
             },
             str::to_owned,
         );
-    // RFC 6455 close 1009 是请求过大，客户端需收到可行动的错误码。
+    // RFC 6455 close 1009 是请求过大，客户端需收到可行动的错误码
     let (code, error_type) = if message_too_big {
         (Some("message_too_big".to_owned()), "invalid_request_error")
     } else {
@@ -1376,23 +1339,41 @@ pub(super) fn websocket_client_visible_error(
     ))
 }
 
+/// OpenAI 瞬态重试场景的策略归类入口
+///
+/// 新增场景在此选择重试后换号或返回错误，不在 Core 重新识别上游错误码
+/// 此处只选择策略，重放资格、次数与等待仍由现有 Provider 证明和 Core 门禁约束
+fn transient_retry_policy(
+    category: CodexFailureCategory,
+    failure: &CodexUpstreamFailure,
+) -> Option<TransientRetryPolicy> {
+    match category {
+        // 明确容量拒绝沿用既有恢复范围，同账号重试耗尽后仍可尝试其他账号
+        CodexFailureCategory::CapacityUnavailable => {
+            Some(TransientRetryPolicy::RetryThenRotateAccount)
+        }
+        // 通用服务故障不足以证明账号异常，503/server_error 仅在原账号内恢复
+        _ if failure.is_retryable_server_error() => {
+            Some(TransientRetryPolicy::RetryThenReturnError)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn map_upstream_failure(
     mut failure: CodexUpstreamFailure,
     observation: Option<ProviderResponseObservation>,
     replay_boundary: ReplayBoundary,
-    responses: bool,
 ) -> MappedProviderFailure {
-    let service_rotation = responses
-        && replay_boundary.permits_provider_proof()
-        && response_service_rotation(&failure);
     let category = failure.category();
     let capacity_unavailable = category == CodexFailureCategory::CapacityUnavailable;
+    let retry_policy = transient_retry_policy(category, &failure);
     let cyber_policy_failure = failure
         .status
         .is_some_and(|status| status.is_client_error())
         && is_cyber_policy_code(failure.code.as_deref());
     let continuation_failure = failure
-        .persistable_code()
+        .upstream_code()
         .filter(|code| is_history_failure_code(code))
         .map(|_| ContinuationFailure::HistoryUnavailable);
     let send_state = upstream_send_state(failure.send_phase);
@@ -1402,6 +1383,15 @@ pub(super) fn map_upstream_failure(
         provider_error_kind(category)
     };
     let mut error = provider_error(error_kind, send_state);
+    let replay_safe = failure.replay_is_safe() || cyber_policy_failure;
+    // WS opening 的 426 是明确的传输切换信号；普通拒绝不能仅凭 NotSent 触发换号
+    let upgrade_required = failure.send_phase == CodexUpstreamSendPhase::BeforePayload
+        && failure.status == Some(reqwest::StatusCode::UPGRADE_REQUIRED);
+    if category == CodexFailureCategory::FlexUnavailable
+        || (!replay_safe && continuation_failure.is_none() && !upgrade_required)
+    {
+        error = error.with_retry_prohibited();
+    }
     error = error.with_raw_upstream_error(RawUpstreamError::new(failure.raw_body.clone()));
     if let Some(message) = failure.client_message.as_ref() {
         error = error.with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
@@ -1430,13 +1420,8 @@ pub(super) fn map_upstream_failure(
     if let Some(status) = failure.status {
         error = error.with_status(status.as_u16());
     }
-    if replay_boundary.permits_provider_proof()
-        && (failure.replay_is_safe() || cyber_policy_failure)
-    {
+    if replay_boundary.permits_provider_proof() && replay_safe {
         error = error.with_replay_safe();
-    }
-    if service_rotation {
-        error = error.with_pre_delivery_retry();
     }
     if let Some(continuation_failure) = continuation_failure {
         error = error
@@ -1449,18 +1434,29 @@ pub(super) fn map_upstream_failure(
     if let Some(retry_after) = failure.retry_after_seconds.map(Duration::from_secs) {
         error = error.with_retry_after(retry_after);
     }
-    if capacity_unavailable && error.replay_is_safe() {
-        let max_delay = Duration::from_secs(8);
+    if let Some(policy) = retry_policy
+        && error.replay_is_safe()
+    {
+        let (max_retries, max_delay, jitter) = match policy {
+            TransientRetryPolicy::RetryThenRotateAccount => {
+                (3, Duration::from_secs(8), Duration::ZERO)
+            }
+            // 服务故障只在原账号恢复，以较短的等待上限控制总延迟，并逐次采样分散重试
+            TransientRetryPolicy::RetryThenReturnError => (
+                5,
+                Duration::from_secs(2),
+                crate::jitter::server_error_retry_jitter(crate::jitter::random_u64()),
+            ),
+        };
         error = error.with_transient_retry(
-            NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN),
-            failure
-                .retry_after_seconds
-                .map_or(Duration::from_millis(500), Duration::from_secs)
-                .min(max_delay),
+            NonZeroU32::new(max_retries).unwrap_or(NonZeroU32::MIN),
+            Duration::from_millis(500),
             max_delay,
+            jitter,
+            policy,
         );
     }
-    if let Some(code) = failure.persistable_code() {
+    if let Some(code) = failure.upstream_code() {
         error = error.with_upstream_code(OpaqueUpstreamValue::new(code.to_owned()));
     }
     if let Some(request_id) = failure.request_id.as_deref() {
@@ -1469,13 +1465,10 @@ pub(super) fn map_upstream_failure(
     let status = error
         .upstream_status()
         .map_or_else(|| "none".to_owned(), |status| status.to_string());
-    let code = error
-        .upstream_code()
-        .map_or_else(|| "none".to_owned(), |code| code.as_str().to_owned());
     let kind = error.kind().as_str();
     error = error.with_diagnostic(
         ProviderDiagnostic::new(format!(
-            "OpenAI upstream failure: kind={}, status={status}, code={code}",
+            "OpenAI upstream failure: kind={}, status={status}",
             kind
         ))
         .with_classification("upstream", "upstream_rejected"),
@@ -1490,7 +1483,7 @@ pub(super) fn map_upstream_failure(
         ),
         error_message: failure.client_message,
         cyber_policy_failure,
-        // 普通 5xx 与未知流内错误不足以证明容量拒绝，不能用于冻结账号。
+        // 普通 5xx 与未知流内错误不足以证明容量拒绝，不能用于冻结账号
         upstream_capacity_failure: capacity_unavailable,
         set_cookie_headers: failure.set_cookie_headers,
         rate_limit_headers: failure.rate_limit_headers,
@@ -1507,13 +1500,14 @@ pub(super) fn is_cyber_policy_code(code: Option<&str>) -> bool {
 }
 
 pub(super) fn is_history_failure_code(code: &str) -> bool {
-    matches!(
-        code,
-        "previous_response_not_found"
-            | "invalid_encrypted_content"
-            | "missing_tool_output"
-            | "no_tool_output"
-    )
+    [
+        "previous_response_not_found",
+        "invalid_encrypted_content",
+        "missing_tool_output",
+        "no_tool_output",
+    ]
+    .iter()
+    .any(|known| code.trim().eq_ignore_ascii_case(known))
 }
 
 pub(super) const fn provider_error_kind(category: CodexFailureCategory) -> ProviderErrorKind {
@@ -1524,10 +1518,13 @@ pub(super) const fn provider_error_kind(category: CodexFailureCategory) -> Provi
             ProviderErrorKind::PermissionDenied
         }
         CodexFailureCategory::UsageLimitExhausted => ProviderErrorKind::QuotaExhausted,
-        CodexFailureCategory::RateLimited => ProviderErrorKind::RateLimited,
+        CodexFailureCategory::RateLimited | CodexFailureCategory::TurnRateLimited => {
+            ProviderErrorKind::RateLimited
+        }
         CodexFailureCategory::QuotaExhausted => ProviderErrorKind::QuotaExhausted,
         CodexFailureCategory::CloudflareChallenge
         | CodexFailureCategory::CloudflarePathBlocked
+        | CodexFailureCategory::FlexUnavailable
         | CodexFailureCategory::Unavailable => ProviderErrorKind::Unavailable,
         CodexFailureCategory::CapacityUnavailable => ProviderErrorKind::UpstreamCapacityUnavailable,
         CodexFailureCategory::InvalidRequest => ProviderErrorKind::InvalidRequest,
@@ -1578,10 +1575,12 @@ pub(super) fn account_failure(
             Some(CodexAccountFailure::CloudflarePathBlocked)
         }
         CodexFailureCategory::ModelUnsupported
+        | CodexFailureCategory::TurnRateLimited
         | CodexFailureCategory::InvalidRequest
         | CodexFailureCategory::PermissionDenied
         | CodexFailureCategory::Timeout
         | CodexFailureCategory::CapacityUnavailable
+        | CodexFailureCategory::FlexUnavailable
         | CodexFailureCategory::Unavailable
         | CodexFailureCategory::Transport => None,
     }
@@ -1596,6 +1595,7 @@ pub(super) fn websocket_send_state(error: &CodexWebSocketExchangeError) -> Upstr
         | CodexWebSocketExchangeError::OriginHalfOpenBusy
         | CodexWebSocketExchangeError::WarmUnavailable
         | CodexWebSocketExchangeError::SharedConnectFailed
+        | CodexWebSocketExchangeError::SendNotStarted
         | CodexWebSocketExchangeError::ContinuationUnavailable { .. } => UpstreamSendState::NotSent,
         CodexWebSocketExchangeError::Upstream(_)
         | CodexWebSocketExchangeError::ConnectionLimitReached(_)
@@ -1636,12 +1636,13 @@ pub(super) fn websocket_error_kind(error: &CodexWebSocketExchangeError) -> Provi
         CodexWebSocketExchangeError::Upstream(_) => ProviderErrorKind::Unavailable,
         CodexWebSocketExchangeError::ConnectionLimitReached(_) => ProviderErrorKind::RateLimited,
         CodexWebSocketExchangeError::Transport(_)
+        | CodexWebSocketExchangeError::SendNotStarted
         | CodexWebSocketExchangeError::Connect(_)
         | CodexWebSocketExchangeError::StreamEndedBeforeTerminal { .. }
         | CodexWebSocketExchangeError::ReusedConnectionDiedBeforeFirstEvent { .. } => {
             ProviderErrorKind::Transport
         }
-        // live 流可能包在 PostSendAmbiguous 中；RFC 6455 close 1009 是请求过大。
+        // live 流可能包在 PostSendAmbiguous 中；RFC 6455 close 1009 是请求过大
         CodexWebSocketExchangeError::ClosedBeforeTerminal(_)
         | CodexWebSocketExchangeError::PostSendAmbiguous { .. } => {
             if error
@@ -1666,21 +1667,20 @@ pub(super) fn provider_error(
     ProviderError::new(kind, send_state)
 }
 
-pub(super) fn remaining(deadline: SystemTime) -> Option<Duration> {
-    deadline
-        .duration_since(SystemTime::now())
-        .ok()
-        .filter(|remaining| !remaining.is_zero())
-}
-
-/// 只恢复明确未发送的 HTTP 建连失败；已知 TLS/配置错误不反复尝试同一路径。
+/// 只恢复明确未发送的 HTTP 建连失败；TLS 协议、证书及配置错误不反复尝试同一路径
 fn transient_http_connect(error: &reqwest::Error) -> bool {
     if !error.is_connect() || error.is_builder() {
         return false;
     }
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
-        if cause.is::<native_tls::Error>() || cause.is::<rustls::Error>() {
+        // native-tls 的 source() 不暴露 OpenSSL 错误本体，无底层 cause 的握手 EOF 需精确匹配文本
+        // 仅在类型化 native TLS 错误且 HTTP 尚未发送时放行，其他 TLS 错误仍不重试
+        if cause
+            .downcast_ref::<native_tls::Error>()
+            .is_some_and(|error| error.to_string() != "unexpected EOF")
+            || cause.is::<rustls::Error>()
+        {
             return false;
         }
         if let Some(io) = cause.downcast_ref::<std::io::Error>()

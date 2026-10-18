@@ -1,3 +1,5 @@
+//! 验证 Provider 额度窗口投影与待提交凭据变更的数据合同
+
 use gateway_admin::model::provider_credentials::{
     AccountUsagePeriod, AuthorizationMutationTarget, AuthorizationOwnerBinding,
     PendingAuthorizationMutation, ProviderQuota, ProviderQuotaWindow, ProviderQuotaWindowRole,
@@ -84,6 +86,7 @@ fn selected_usage_window(quota: &ProviderQuota) -> Option<(&str, AccountUsagePer
 
 fn usage_quota(windows: Vec<ProviderQuotaWindow>) -> ProviderQuota {
     ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -113,9 +116,9 @@ fn usage_window(key: &str, group: &str, seconds: u64) -> ProviderQuotaWindow {
             success_count: 0,
             input_tokens: None,
             output_tokens: None,
-            cached_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: None,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
             image_input_tokens: None,
             image_output_tokens: None,
             image_request_count: 0,
@@ -134,6 +137,7 @@ fn usage_window(key: &str, group: &str, seconds: u64) -> ProviderQuotaWindow {
 #[test]
 fn dashboard_quota_should_preserve_unknown_and_actual_window_facts() {
     let mut quota = ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -220,8 +224,9 @@ fn pending_mutation_v1_should_round_trip_all_targets_and_owners() {
                 assert_eq!(
                     PendingAuthorizationMutation::from_storage_v1(Value::Object(
                         expected.to_storage_v1()
-                    )),
-                    Ok(expected.clone()),
+                    ))
+                    .unwrap(),
+                    expected.clone(),
                 );
                 let with_proxy = expected
                     .with_outbound_proxy(Some(
@@ -234,8 +239,9 @@ fn pending_mutation_v1_should_round_trip_all_targets_and_owners() {
                 assert_eq!(
                     PendingAuthorizationMutation::from_storage_v1(Value::Object(
                         with_proxy.to_storage_v1()
-                    )),
-                    Ok(with_proxy)
+                    ))
+                    .unwrap(),
+                    with_proxy
                 );
             }
         }

@@ -1,4 +1,4 @@
-//! 插件资源写入在同一事务中验证当前实例、访问域与资源归属。
+//! 插件资源写入在同一事务中验证当前实例、访问域与资源归属
 
 use super::super::{
     account_groups::insert_account_group_in_transaction,
@@ -108,7 +108,7 @@ impl PluginResourceStore for PgPluginStore {
         let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         if let Some(row) = sqlx::query(
-            "select g.id,g.name,g.enabled from plugin_group_resources r
+            "select g.id,g.name,g.enabled from plugin_account_group_resources r
              join account_groups g on g.id=r.group_id
              where r.instance_id=$1 and r.resource_key=$2",
         )
@@ -131,7 +131,7 @@ impl PluginResourceStore for PgPluginStore {
         insert_account_group_in_transaction(&mut tx, &command)
             .await
             .map_err(|e| admin_store_error("account group", e))?;
-        sqlx::query("insert into plugin_group_resources(instance_id,resource_key,group_id) values($1,$2,$3)")
+        sqlx::query("insert into plugin_account_group_resources(instance_id,resource_key,group_id) values($1,$2,$3)")
             .bind(instance)
             .bind(resource_key)
             .bind(command.id.as_str())
@@ -174,7 +174,7 @@ impl PluginResourceStore for PgPluginStore {
         let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         if let Some(row) = sqlx::query(
-            "select k.id,k.name,k.enabled from plugin_key_resources r
+            "select k.id,k.name,k.enabled from plugin_client_api_key_resources r
              join client_api_keys k on k.id=r.key_id
              where r.instance_id=$1 and r.resource_key=$2",
         )
@@ -194,7 +194,7 @@ impl PluginResourceStore for PgPluginStore {
             )
             .await;
         }
-        let group_ids: Vec<String> = sqlx::query_scalar("select group_id from plugin_group_resources where instance_id=$1 and resource_key=any($2::text[])")
+        let group_ids: Vec<String> = sqlx::query_scalar("select group_id from plugin_account_group_resources where instance_id=$1 and resource_key=any($2::text[])")
             .bind(instance)
             .bind(&groups)
             .fetch_all(&mut *tx)
@@ -217,7 +217,7 @@ impl PluginResourceStore for PgPluginStore {
             .await
             .map_err(|e| admin_store_error("client API key", e))?;
         sqlx::query(
-            "insert into plugin_key_resources(instance_id,resource_key,key_id) values($1,$2,$3)",
+            "insert into plugin_client_api_key_resources(instance_id,resource_key,key_id) values($1,$2,$3)",
         )
         .bind(instance)
         .bind(resource_key)
@@ -260,7 +260,7 @@ impl PluginResourceStore for PgPluginStore {
         let mut tx = super::begin_plugin_mutation(&self.pool, owner).await?;
         let instance = uuid::Uuid::parse_str(&owner.instance_id).map_err(|_| denied())?;
         let group: String = sqlx::query_scalar(
-            "select group_id from plugin_group_resources where instance_id=$1 and resource_key=$2",
+            "select group_id from plugin_account_group_resources where instance_id=$1 and resource_key=$2",
         )
         .bind(instance)
         .bind(command.resource_key)
@@ -268,7 +268,7 @@ impl PluginResourceStore for PgPluginStore {
         .await
         .map_err(|_| unavailable())?
         .ok_or_else(denied)?;
-        // 已删除账号自然不再需要加入；外键负责与并发账号删除保持一致。
+        // 已删除账号自然不再需要加入；外键负责与并发账号删除保持一致
         let added = sqlx::query(
             "insert into account_group_accounts(account_group_id,provider_account_id,created_at)
              select $1,id,now() from provider_accounts where id=any($2::text[])

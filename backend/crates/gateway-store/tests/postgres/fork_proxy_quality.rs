@@ -19,6 +19,14 @@ fn geo() -> ProxyExitGeo {
     }
 }
 
+/// 时区只在检测当次用于回填位置，DB 子表不持久化（见 `ProxyExitGeo::timezone`），读回为 None。
+fn stored_geo() -> ProxyExitGeo {
+    ProxyExitGeo {
+        timezone: None,
+        ..geo()
+    }
+}
+
 #[tokio::test]
 async fn quality_reports_round_trip_refresh_connectivity_and_reset_with_the_address() {
     let Some(database) = TestDatabase::create("proxy_quality").await else {
@@ -58,7 +66,7 @@ async fn quality_reports_round_trip_refresh_connectivity_and_reset_with_the_addr
         .await
         .unwrap()
         .record;
-    assert_eq!(located.last_test.unwrap().exit_geo, Some(geo()));
+    assert_eq!(located.last_test.unwrap().exit_geo, Some(stored_geo()));
     let failed = store
         .record_test(
             &created.id,
@@ -124,7 +132,7 @@ async fn quality_reports_round_trip_refresh_connectivity_and_reset_with_the_addr
     let last_test = checked.last_test.unwrap();
     assert!(last_test.success);
     assert_eq!(last_test.latency_ms, 321);
-    assert_eq!(last_test.exit_geo, Some(geo()));
+    assert_eq!(last_test.exit_geo, Some(stored_geo()));
     assert_eq!(
         store.quality_report(&created.id).await.unwrap(),
         Some(report)
@@ -151,6 +159,8 @@ async fn quality_reports_round_trip_refresh_connectivity_and_reset_with_the_addr
                 auto_location: None,
                 test: None,
                 location: None,
+                max_websocket_connections: None,
+                enabled: None,
                 id: created.id.clone(),
                 revision: created.revision,
                 name: "Renamed".to_owned(),
@@ -168,6 +178,8 @@ async fn quality_reports_round_trip_refresh_connectivity_and_reset_with_the_addr
                 auto_location: None,
                 test: None,
                 location: None,
+                max_websocket_connections: None,
+                enabled: None,
                 id: created.id.clone(),
                 revision: renamed.revision,
                 name: "Renamed".to_owned(),

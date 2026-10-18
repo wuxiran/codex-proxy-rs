@@ -1,5 +1,5 @@
-//! fork：代理替身的 fork 状态（代理池、导入预留记录），以及代理质量检测、批量增删、
-//! 测试槽位排队的用例（内存代理目录 `MemoryProxies`）。
+//! fork：代理替身的 fork 状态（代理池、导入预留记录），以及代理质量检测、批量删除、
+//! 测试槽位排队的用例（内存代理目录 `MemoryProxies`）。批量创建已由上游 `/proxies/create` 数组请求覆盖。
 
 use async_trait::async_trait;
 use gateway_admin::{
@@ -60,6 +60,7 @@ struct MemoryProxies {
 
 fn memory_record(id: &str, url: &str) -> ProxyRecord {
     ProxyRecord {
+        enabled: true,
         auto_location: false,
         detected_location: None,
         location: None,
@@ -192,7 +193,7 @@ impl ProxyStore for MemoryProxies {
 
 #[async_trait]
 impl ProxyProbe for MemoryProxies {
-    async fn test(&self, _: &OutboundProxy, _: bool) -> ProxyTestResult {
+    async fn test(&self, _: Option<&OutboundProxy>, _: bool) -> ProxyTestResult {
         self.probes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.block_probe {
@@ -212,7 +213,7 @@ impl ProxyProbe for MemoryProxies {
 
     async fn quality(&self, proxy: &OutboundProxy) -> ProxyQualityProbe {
         ProxyQualityProbe {
-            base: self.test(proxy, false).await,
+            base: self.test(Some(proxy), false).await,
             items: vec![ProxyQualityItem {
                 target: "chatgpt".to_owned(),
                 status: ProxyQualityItemStatus::Challenge,
@@ -271,7 +272,7 @@ async fn quality_check_scores_the_probe_and_rejects_stale_revisions_before_probi
 }
 
 #[tokio::test]
-async fn batch_create_and_delete_skip_individual_conflicts_without_failing_the_batch() {
+async fn batch_delete_skips_individual_conflicts_without_failing_the_batch() {
     use super::accounts::context;
     use std::sync::Arc;
 
@@ -279,38 +280,11 @@ async fn batch_create_and_delete_skip_individual_conflicts_without_failing_the_b
         in_use: vec!["proxy_1".to_owned()],
         ..Default::default()
     });
+    proxies.records.lock().unwrap().extend([
+        memory_record("proxy_1", "http://user:secret@10.0.0.1:8080"),
+        memory_record("proxy_2", "socks5h://10.0.0.3:1080"),
+    ]);
     let services = memory_services(proxies.clone()).await;
-    let new_proxy = |name: &str, url: &str| NewProxy {
-        auto_location: false,
-        test: None,
-        location: None,
-        name: name.to_owned(),
-        proxy: OutboundProxy::parse(url).unwrap(),
-    };
-    let created = services
-        .proxies()
-        .create_batch(
-            vec![
-                new_proxy("a", "http://user:secret@10.0.0.1:8080"),
-                new_proxy("dup", "http://user:secret@10.0.0.1:8080"),
-                new_proxy(" ", "socks5://10.0.0.2:1080"),
-                new_proxy("b", "socks5h://10.0.0.3:1080"),
-            ],
-            &context("batch-create"),
-        )
-        .await
-        .unwrap();
-    assert_eq!(created.created.len(), 2);
-    assert_eq!(created.config_revision, Some(Revision::new(12).unwrap()));
-    assert_eq!(created.skipped.len(), 2);
-    assert_eq!(created.skipped[0].reason, "代理地址已存在");
-    // 跳过项只回显脱敏端点，凭据不随结果返回。
-    assert!(
-        created
-            .skipped
-            .iter()
-            .all(|skip| !skip.reference.contains("secret"))
-    );
 
     let item = |id: &str, revision| ProxyBatchDeleteItem {
         id: id.to_owned(),
@@ -330,12 +304,14 @@ async fn batch_create_and_delete_skip_individual_conflicts_without_failing_the_b
         .unwrap();
     assert_eq!(deleted.deleted_ids, ["proxy_2"]);
     assert_eq!(deleted.skipped.len(), 2);
+    assert_eq!(deleted.skipped[0].reason, "代理仍有账号使用，或已被修改");
+    assert_eq!(deleted.skipped[1].reason, "代理不存在或已被删除");
     assert!(deleted.config_revision.is_some());
 
     assert!(
         services
             .proxies()
-            .create_batch(vec![], &context("empty"))
+            .delete_batch(vec![], &context("empty"))
             .await
             .is_err()
     );
@@ -357,7 +333,7 @@ async fn busy_test_slots_queue_briefly_then_report_rate_limited() {
         let services = services.clone();
         let proxy = proxy.clone();
         running.push(tokio::spawn(async move {
-            services.proxies().probe(&proxy, false).await
+            services.proxies().probe(Some(&proxy), false).await
         }));
     }
     while proxies.probes.load(Ordering::SeqCst) < 4 {
@@ -365,7 +341,11 @@ async fn busy_test_slots_queue_briefly_then_report_rate_limited() {
     }
     // 四个槽位都被占用：第五个请求排队到超时才被拒绝，而不是立刻 429。
     let started = tokio::time::Instant::now();
-    let error = services.proxies().probe(&proxy, false).await.unwrap_err();
+    let error = services
+        .proxies()
+        .probe(Some(&proxy), false)
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), AdminErrorKind::RateLimited);
     assert!(started.elapsed() >= std::time::Duration::from_secs(20));
     assert_eq!(proxies.probes.load(Ordering::SeqCst), 4);

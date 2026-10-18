@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import type { ClientProfilePreset, ClientProfilePreview, ClientProfileSelection, CustomClientProfileSelection, PresetClientProfileSelection } from '@/api/modules/client-profiles'
-import { BaseFormItem, BaseSelect, BaseTextarea } from '@codex-proxy/ui'
+import type { ClientProfilePreset, ClientProfilePreview, ClientProfileSelection, CustomClientProfileSelection, PresetClientProfileSelection } from '@/api/modules/settings/profiles'
+import { ZFormItem, ZInput, ZSelect, ZTextarea } from '@codex-proxy/ui'
 import { computed, shallowRef } from 'vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   presets: ClientProfilePreset[]
   preview?: ClientProfilePreview
   previewing: boolean
   error: string
   disabled: boolean
-}>()
+  maxVersionLag?: number
+}>(), {
+  maxVersionLag: 10,
+})
 const model = defineModel<ClientProfileSelection | null>({ required: true })
 const presetDraft = shallowRef<PresetClientProfileSelection>()
 const customDraft = shallowRef<CustomClientProfileSelection>()
@@ -65,6 +68,33 @@ const versionMode = computed({
     }
   },
 })
+const versionLag = computed({
+  get: () => preset.value?.versionLag == null ? '' : String(preset.value.versionLag),
+  set: (value: string) => {
+    if (preset.value)
+      model.value = { ...preset.value, versionLag: value === '' ? null : Number(value) }
+  },
+})
+const versionLagError = computed(() => {
+  const value = preset.value?.versionLag
+  return value != null && (!Number.isInteger(value) || value < 1 || value > props.maxVersionLag)
+    ? `请输入 1～${props.maxVersionLag} 的正整数`
+    : ''
+})
+const terminal = computed({
+  get: () => preset.value?.terminal ?? '',
+  set: (value: string) => {
+    if (preset.value)
+      model.value = { ...preset.value, terminal: value === '' ? null : value }
+  },
+})
+const osVersion = computed({
+  get: () => preset.value?.osVersion ?? '',
+  set: (value: string) => {
+    if (preset.value)
+      model.value = { ...preset.value, osVersion: value === '' ? null : value }
+  },
+})
 const userAgent = computed({
   get: () => model.value?.mode === 'custom' ? model.value.userAgent : props.preview?.userAgent ?? '',
   set: (value: string) => {
@@ -85,11 +115,11 @@ const userAgent = computed({
 <template>
   <div class="grid gap-4">
     <div class="grid gap-4" :class="preset?.client === 'cli' && !custom ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
-      <BaseFormItem label="客户端预设">
-        <BaseSelect v-model="selectedPreset" class="w-full" :options="presetOptions" :placeholder="custom ? '使用自定义用户代理' : undefined" :disabled="disabled || custom || !presets.length" />
-      </BaseFormItem>
-      <BaseFormItem v-if="preset?.client === 'cli' && !custom" label="CLI 入口">
-        <BaseSelect
+      <ZFormItem label="客户端预设">
+        <ZSelect v-model="selectedPreset" class="w-full" :options="presetOptions" :placeholder="custom ? '使用自定义用户代理' : undefined" :disabled="disabled || custom || !presets.length" />
+      </ZFormItem>
+      <ZFormItem v-if="preset?.client === 'cli' && !custom" label="CLI 入口">
+        <ZSelect
           v-model="cliEntry"
           class="w-full"
           :options="[
@@ -99,9 +129,9 @@ const userAgent = computed({
           ]"
           :disabled="disabled"
         />
-      </BaseFormItem>
-      <BaseFormItem label="版本策略">
-        <BaseSelect
+      </ZFormItem>
+      <ZFormItem label="版本策略">
+        <ZSelect
           v-model="versionMode"
           class="w-full"
           :options="[
@@ -110,13 +140,54 @@ const userAgent = computed({
           ]"
           :disabled="disabled"
         />
-      </BaseFormItem>
+      </ZFormItem>
     </div>
     <p v-if="!custom && currentPreset?.reason" class="m-0 text-cp-sm text-cp-text-secondary">
       {{ currentPreset.reason }}
     </p>
+    <div v-if="!custom" class="grid gap-4 sm:grid-cols-2">
+      <ZFormItem label="版本滞后" :error="versionLagError">
+        <ZInput
+          v-model="versionLag"
+          aria-label="版本滞后"
+          type="number"
+          inputmode="numeric"
+          min="1"
+          :max="maxVersionLag"
+          step="1"
+          :placeholder="`滞后 1～${maxVersionLag} 个版本，留空不滞后`"
+          :disabled="disabled"
+        />
+      </ZFormItem>
+      <div class="grid gap-4" :class="{ 'sm:grid-cols-2': preset?.client === 'desktop' }">
+        <ZFormItem label="终端标识">
+          <ZInput
+            v-model="terminal"
+            :disabled="disabled"
+            aria-label="终端标识"
+            placeholder="留空使用 unknown"
+            maxlength="128"
+            spellcheck="false"
+            autocomplete="off"
+            class="font-mono"
+          />
+        </ZFormItem>
+        <ZFormItem v-if="preset?.client === 'desktop'" label="系统版本">
+          <ZInput
+            v-model="osVersion"
+            :disabled="disabled"
+            aria-label="系统版本"
+            :placeholder="currentPreset?.defaults.osVersion ?? undefined"
+            maxlength="128"
+            spellcheck="false"
+            autocomplete="off"
+            class="font-mono"
+          />
+        </ZFormItem>
+      </div>
+    </div>
     <template v-if="custom">
-      <BaseTextarea
+      <ZTextarea
         v-model="userAgent"
         :rows="3"
         :disabled="disabled || (!model?.mode && previewing)"

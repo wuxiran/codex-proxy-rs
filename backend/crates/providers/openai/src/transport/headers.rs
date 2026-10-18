@@ -1,4 +1,4 @@
-//! 各官方调用链的请求头契约；版本与平台信息统一来自运行时画像快照。
+//! 各官方调用链的请求头契约；版本与平台信息统一来自运行时画像快照
 
 use gateway_protocol::openai::{
     X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER, X_OPENAI_MEMGEN_REQUEST_HEADER,
@@ -16,8 +16,8 @@ use super::protocol::responses::CodexResponsesRequest;
 
 const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 
-/// 不透传下游携带的认证、账号及相关身份字段，避免影响网关选定的上游身份。
-/// 上游需要的官方身份头由网关构造；这里也包含通用认证和 Cookie 字段。
+/// 不透传下游携带的认证、账号及相关身份字段，避免影响网关选定的上游身份
+/// 上游需要的官方身份头由网关构造；这里也包含通用认证和 Cookie 字段
 pub(super) fn is_managed_identity_header(name: &str) -> bool {
     matches!(
         name,
@@ -30,15 +30,23 @@ pub(super) fn is_managed_identity_header(name: &str) -> bool {
             | "chatgpt-project-id"
             | "openai-organization"
             | "openai-project"
-            // 工作区路由和合规属性属于认证账号，不能继承下游账号的值。
+            // 工作区路由和合规属性属于认证账号，不能继承下游账号的值
             | "x-openai-account-routing-override"
             | "x-openai-fedramp"
-            // 安装身份由当前账号写入 client_metadata，不继承下游安装头。
+            // 安装身份由当前账号写入 client_metadata，不继承下游安装头
             | "x-codex-installation-id"
+            // 画像和设备证明须属于选定账号，不能由下游覆盖
+            | "originator"
+            | "user-agent"
+            | "version"
+            | "x-openai-internal-codex-residency"
+            | "x-oai-attestation"
+            | "x-oai-is"
+            | "x-oai-is-update"
     )
 }
 
-/// 构造 Codex Core 为模型请求设置的稳定身份请求头。
+/// 构造 Codex Core 为模型请求设置的稳定身份请求头
 pub fn build_codex_model_headers(
     profile: &CodexWireProfile,
     authorization: &str,
@@ -54,7 +62,7 @@ pub fn build_codex_model_headers(
     Ok(headers)
 }
 
-/// Core 默认客户端身份，用于模型接口及 OAuth refresh；raw token exchange 不使用。
+/// Core 默认客户端身份，用于模型接口及 OAuth refresh；raw token exchange 不使用
 pub fn build_codex_profile_headers(profile: &CodexWireProfile) -> CodexClientResult<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -71,7 +79,7 @@ pub fn build_codex_profile_headers(profile: &CodexWireProfile) -> CodexClientRes
     Ok(headers)
 }
 
-/// Core backend-client 的账号请求：不携带模型版本或 originator。
+/// Core backend-client 的账号请求：不携带模型版本或 originator
 pub fn build_codex_account_headers(
     profile: &CodexWireProfile,
     authorization: &str,
@@ -84,7 +92,7 @@ pub fn build_codex_account_headers(
     Ok(headers)
 }
 
-/// 桌面下载的账号身份；完整性凭据须由认证主体持有，不能借用下游客户端的值。
+/// 桌面下载的账号身份；完整性凭据须由认证主体持有，不能借用下游客户端的值
 pub fn build_codex_download_headers(
     profile: &CodexWireProfile,
     authorization: &str,
@@ -110,7 +118,7 @@ impl CodexBackendClient {
         profile: &CodexWireProfile,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        // 客户端画像与认证方式无关；API Key 不携带 OAuth 账号身份和 Cookie。
+        // 客户端画像与认证方式无关；API Key 不携带 OAuth 账号身份和 Cookie
         let (account_id, cookie_header) = match self.protocol {
             OpenAiUpstreamProtocol::Codex => (context.account_id, context.cookie_header),
             OpenAiUpstreamProtocol::ResponsesApi => (None, None),
@@ -135,10 +143,11 @@ impl CodexBackendClient {
 
     pub(super) fn request_headers_for_http_response(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
+        let mut headers = self.response_headers(profile, request, context)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insert_optional_protocol_header(
@@ -151,10 +160,17 @@ impl CodexBackendClient {
 
     pub(super) fn request_headers_for_websocket_response(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
+        let mut headers = self.response_headers(profile, request, context)?;
+        if !headers.contains_key("x-responsesapi-include-timing-metrics") {
+            headers.insert(
+                HeaderName::from_static("x-responsesapi-include-timing-metrics"),
+                HeaderValue::from_static("true"),
+            );
+        }
         headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses_websockets=2026-02-06"),
@@ -162,13 +178,14 @@ impl CodexBackendClient {
         Ok(headers)
     }
 
-    /// HTTP 和 WS 共用的 Core 会话字段；传输专属字段由各自入口生成。
+    /// HTTP 和 WS 共用的 Core 会话字段；传输专属字段由各自入口生成
     fn response_headers(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.model_request_headers(&self.profile.snapshot(), context)?;
+        let mut headers = self.model_request_headers(profile, context)?;
         headers.insert(
             HeaderName::from_static("x-client-request-id"),
             HeaderValue::from_str(context.request_id)?,
@@ -208,7 +225,7 @@ impl CodexBackendClient {
             None => format!("model={}", request.model()),
         };
         insert_optional_protocol_header(&mut headers, "x-codex-routing-hint", Some(&routing_hint));
-        append_passthrough_headers(&mut headers, request);
+        append_passthrough_headers(&mut headers, &request.passthrough_headers);
         self.append_middleware_headers(&mut headers)?;
         Ok(headers)
     }
@@ -220,7 +237,7 @@ impl CodexBackendClient {
         let mut replaced = std::collections::HashSet::new();
         for header in &self.middleware_headers {
             let name = HeaderName::from_bytes(header.name().as_bytes())?;
-            // 宿主画像和账号鉴权先形成基线；插件首次写入同名头时替换，随后保留多值。
+            // 宿主画像和账号鉴权先形成基线；插件首次写入同名头时替换，随后保留多值
             if replaced.insert(name.clone()) {
                 headers.remove(&name);
             }
@@ -230,33 +247,25 @@ impl CodexBackendClient {
     }
 }
 
-fn append_passthrough_headers(headers: &mut HeaderMap, request: &CodexResponsesRequest) {
-    for name in request.passthrough_headers.keys() {
-        // 身份与传输字段只由画像/正文生成；其余协议头保留原始多值字节。
-        if matches!(
-            name.as_str(),
-            "originator"
-                | "user-agent"
-                | "version"
-                | "authorization"
-                | "chatgpt-account-id"
-                | "cookie"
-                | "x-openai-internal-codex-residency"
-                | "openai-beta"
-                | "accept"
-                | "content-type"
-                | "content-encoding"
-                | "x-codex-routing-hint"
-                | "x-codex-turn-id"
-                | "x-oai-attestation"
-                | "x-oai-is"
-                | "x-oai-is-update"
-                | X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER
-        ) {
+pub(super) fn append_passthrough_headers(headers: &mut HeaderMap, passthrough: &HeaderMap) {
+    for name in passthrough.keys() {
+        // 身份与传输字段只由画像/正文生成；其余协议头保留原始多值字节
+        if is_managed_identity_header(name.as_str())
+            || matches!(
+                name.as_str(),
+                "openai-beta"
+                    | "accept"
+                    | "content-type"
+                    | "content-encoding"
+                    | "x-codex-routing-hint"
+                    | "x-codex-turn-id"
+                    | X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER
+            )
+        {
             continue;
         }
         headers.remove(name);
-        for value in request.passthrough_headers.get_all(name) {
+        for value in passthrough.get_all(name) {
             headers.append(name.clone(), value.clone());
         }
     }
@@ -274,7 +283,7 @@ pub(super) fn insert_optional_header(
     Ok(())
 }
 
-/// 尽力投影客户端协议值；无法表示为 HTTP header 时保留正文并跳过投影。
+/// 尽力投影客户端协议值；无法表示为 HTTP header 时保留正文并跳过投影
 pub(super) fn insert_optional_protocol_header(
     headers: &mut HeaderMap,
     name: &'static str,
@@ -290,7 +299,7 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         // tungstenite 的 opening serializer 只接受可 `to_str()` 的值；逐条跳过
-        // 无法构造的头，不能让一个扩展头中断业务 payload。
+        // 无法构造的头，不能让一个扩展头中断业务 payload
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -300,11 +309,12 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-pub(super) fn websocket_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+pub(crate) fn websocket_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     let mut pairs = header_pairs(headers);
     // WebSocket opening 的 HeaderMap 先由业务头构造，再被 tungstenite 插入协议头；
     // 这里复现官方 HeaderMap 交给 tungstenite 时的迭代顺序，最终序列化后的
-    // 线级顺序由 fingerprint 测试锁定。未知扩展头仍保持相对顺序。
+    // 线级顺序由 fingerprint 测试锁定
+    // 未知扩展头仍保持相对顺序
     pairs.sort_by_key(|(name, _)| websocket_header_order(name));
     pairs
 }
@@ -320,6 +330,7 @@ fn websocket_header_order(name: &str) -> usize {
         "x-codex-turn-metadata",
         "x-codex-routing-hint",
         "openai-beta",
+        "x-responsesapi-include-timing-metrics",
         "originator",
         "user-agent",
         "authorization",

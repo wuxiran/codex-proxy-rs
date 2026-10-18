@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
-      # Rust 1.97 编译 AWS SDK 调试信息需要更大的 codegen 线程栈。
+      # 编译 AWS SDK 调试信息需要更大的 codegen 线程栈
       RUST_MIN_STACK: 16777216
       CPR_TEST_DATABASE_URL: postgres://codex_proxy:codex_proxy@127.0.0.1:5432/codex_proxy
       CPR_TEST_REDIS_URL: redis://127.0.0.1:6379
@@ -97,9 +97,14 @@ jobs:
             fi
           fi
 
+      - name: Read build toolchains
+        id: toolchains
+        run: ruby .github/scripts/toolchains.rb >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ steps.toolchains.outputs.rust }}
           components: rustfmt,clippy
 
       - name: Cache Rust
@@ -202,6 +207,8 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # GitHub 已支持 queue: max，actionlint 尚未支持该字段
+      # https://github.com/rhysd/actionlint/issues/657
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm
@@ -209,6 +216,7 @@ jobs:
           --workdir /repo
           rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
           -color
+          -ignore '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
           .github/workflows/*.yml
 
       - name: Check workflow script syntax
@@ -216,3 +224,6 @@ jobs:
           bash -n release/publish
           shopt -s globstar nullglob
           for script in .github/**/*.sh; do bash -n "$script"; done
+          for script in .github/scripts/*.rb; do ruby -c "$script"; done
+          ruby .github/scripts/toolchains.rb
+          ruby -c backend/crates/gateway-plugin/runtime/plugin-api-lifecycle.rb

@@ -294,7 +294,7 @@ impl CodexReviveService {
             .await
         {
             Ok(_) => Ok(true),
-            Err(CredentialRepositoryError::RevisionConflict) => {
+            Err(CredentialRepositoryError::RevisionConflict(_)) => {
                 tracing::info!(
                     account_id = account.id().as_str(),
                     "credential changed during revive; discarding the stale revive result"

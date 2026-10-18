@@ -1,4 +1,4 @@
-//! Responses WebSocket pre-send/post-send 与 pool/breaker 编排。
+//! Responses WebSocket pre-send/post-send 与 pool/breaker 编排
 
 use std::{
     future::Future,
@@ -35,15 +35,16 @@ use super::{
 
 pub(crate) const WEBSOCKET_FAST_PATH_BUDGET: Duration = Duration::from_millis(800);
 
-/// WebSocket 快路径的控制流结果；预算未命中不代表连接失败。
+/// WebSocket 快路径的控制流结果；预算未命中不代表连接失败
 pub(crate) enum WebSocketFastPath<T> {
-    /// 在前台预算内获得结果。
+    /// 在前台预算内获得结果
     Ready(T),
-    /// 前台停止等待；池化 opening 可以继续在后台完成。
+    /// 前台停止等待；池化 opening 可以继续在后台完成
     Missed,
 }
 
-/// 尚未发送 `response.create` 的 WebSocket。只有该类型可以安全切换到 HTTP。
+/// 尚未发送 `response.create` 的 WebSocket
+/// 只有该类型可以安全切换到 HTTP
 pub(crate) struct PreparedWebSocket {
     connection: PooledWebSocketConnection,
     binding: PoolBinding,
@@ -109,10 +110,10 @@ impl PreparedWebSocket {
     }
 }
 
-/// 只建立或租用 WebSocket，不发送 payload。
+/// 只建立或租用 WebSocket，不发送 payload
 pub(crate) async fn prepare_response_create_request_with_pool(
     request: &CodexWebSocketRequest,
-    pool: Option<(&CodexWebSocketPool, CodexWebSocketPoolKey)>,
+    pool: Option<(&CodexWebSocketPool, Option<CodexWebSocketPoolKey>)>,
     breaker: &WebSocketOriginBreaker,
     origin_key: &str,
     fast_path_budget: Option<Duration>,
@@ -120,7 +121,8 @@ pub(crate) async fn prepare_response_create_request_with_pool(
     fallback_stream_idle_timeout: Option<Duration>,
 ) -> Result<WebSocketFastPath<PreparedWebSocket>, CodexWebSocketExchangeError> {
     let decision_started_at = Instant::now();
-    let Some((pool, key)) = pool else {
+    let Some((pool, Some(key))) = pool else {
+        // fork: ws-warm-pool —— 严格模式只能走已验证的池化候选，不池化就直接报不可用
         if request.require_verified_warm {
             return Err(CodexWebSocketExchangeError::WarmUnavailable);
         }
@@ -136,6 +138,7 @@ pub(crate) async fn prepare_response_create_request_with_pool(
             fast_path_budget,
             fallback_stream_idle_timeout,
             decision_started_at,
+            pool.map(|(pool, _)| pool),
         )
         .await;
     };
@@ -148,12 +151,14 @@ pub(crate) async fn prepare_response_create_request_with_pool(
         | WebSocketContinuationRequirement::Persisted { .. }
         | WebSocketContinuationRequirement::ExternalUnknown { .. } => None,
     };
+    // fork: ws-warm-pool —— 严格模式下在有限时间内等待 warmer 发布已验证候选，不新拨、不重放正文
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let acquired = loop {
         let acquired = pool
             .acquire(
                 &key,
                 required_response_id,
+                request.connection().outbound_proxy.as_ref(),
                 request.requested_model(),
                 request.require_verified_warm,
                 request.allow_warm_reuse,
@@ -167,7 +172,7 @@ pub(crate) async fn prepare_response_create_request_with_pool(
         if tokio::time::Instant::now() >= ready_deadline {
             return Err(CodexWebSocketExchangeError::WarmUnavailable);
         }
-        // 不新拨、不重放正文；等待后台发布候选，取消时 Future 释放即可。
+        // 取消时 Future 释放即可
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     match acquired {
@@ -242,7 +247,14 @@ async fn prepare_unpooled_websocket(
     fast_path_budget: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
     decision_started_at: Instant,
+    capacity_pool: Option<&CodexWebSocketPool>,
 ) -> Result<WebSocketFastPath<PreparedWebSocket>, CodexWebSocketExchangeError> {
+    let proxy_permit = if let Some(pool) = capacity_pool {
+        pool.acquire_proxy_capacity(request.connection().outbound_proxy.as_ref(), None)
+            .await?
+    } else {
+        None
+    };
     let permit = acquire_breaker_permit(breaker, origin_key, fast_path_budget.is_some())?;
     let context = pump_log_context_from_connection(request.connection());
     let connected = connect_with_budget(
@@ -250,6 +262,7 @@ async fn prepare_unpooled_websocket(
         PumpKeepalive::disabled(),
         fast_path_budget,
         context,
+        proxy_permit,
     )
     .await;
     let connected = match connected {
@@ -347,10 +360,11 @@ impl PooledWebSocketConnectWaiter {
 fn start_pooled_websocket_connect(
     connection: CodexWebSocketConnection,
     pool: CodexWebSocketPool,
-    connect_lease: WebSocketPoolConnectLease,
+    mut connect_lease: WebSocketPoolConnectLease,
     permit: Option<WebSocketOriginBreakerPermit>,
     fast_path: bool,
 ) -> PooledWebSocketConnectWaiter {
+    let proxy_permit = connect_lease.take_proxy_permit();
     let task_key = connect_lease.key().clone();
     let started_at = connect_lease.started_at();
     let cancellation = connect_lease.cancellation_token();
@@ -379,7 +393,7 @@ fn start_pooled_websocket_connect(
                 );
                 return;
             }
-            result = connect_websocket_connection(&connection, keepalive, context, fast_path) => result,
+            result = connect_websocket_connection(&connection, keepalive, context, fast_path, proxy_permit) => result,
         };
         match finish_breaker_attempt(permit, connected) {
             Ok((connection, connect_elapsed)) => {
@@ -425,7 +439,7 @@ fn start_pooled_websocket_connect(
             Err(error) => {
                 let connection_exit_reason = opening_failure_reason(&error);
                 let error_message = error.to_string();
-                // 先交付 opening 原始错误，避免连接池清理侵占前台 fast-path 预算。
+                // 先交付 opening 原始错误，避免连接池清理侵占前台 fast-path 预算
                 let foreground_waiting = sender.send(Err(error)).is_ok();
                 connect_lease.failed().await;
                 tracing::warn!(
@@ -468,7 +482,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
         .max(1)
 }
 
-/// 非池化建连的 pump 日志上下文：从业务头提取账号归属（会话 hash 只有池 key 才有）。
+/// 非池化建连的 pump 日志上下文：从业务头提取账号归属（会话 hash 只有池 key 才有）
 fn pump_log_context_from_connection(connection: &CodexWebSocketConnection) -> PumpLogContext {
     let account_id = connection
         .headers()
@@ -483,11 +497,18 @@ async fn connect_with_budget(
     keepalive: PumpKeepalive,
     fast_path_budget: Option<Duration>,
     context: PumpLogContext,
+    proxy_permit: Option<pool::ProxyConnectionPermit>,
 ) -> Result<WebSocketFastPath<(PooledWebSocketConnection, Duration)>, CodexWebSocketExchangeError> {
     match wait_for_fast_path(
         TokioInstant::now(),
         fast_path_budget,
-        connect_websocket_connection(connection, keepalive, context, fast_path_budget.is_some()),
+        connect_websocket_connection(
+            connection,
+            keepalive,
+            context,
+            fast_path_budget.is_some(),
+            proxy_permit,
+        ),
     )
     .await
     {
@@ -501,10 +522,11 @@ async fn connect_websocket_connection(
     keepalive: PumpKeepalive,
     context: PumpLogContext,
     fast_path: bool,
+    proxy_permit: Option<pool::ProxyConnectionPermit>,
 ) -> Result<(PooledWebSocketConnection, Duration), CodexWebSocketExchangeError> {
     let started_at = Instant::now();
     let (websocket, response) =
-        connect_pumped_websocket(connection, keepalive, context, fast_path).await?;
+        connect_pumped_websocket(connection, keepalive, context, fast_path, proxy_permit).await?;
     let mut metadata = websocket_connection_metadata(&response);
     // fork: served-mismatch
     metadata.route_pair = crate::route_pair::RoutePairRef::handshake(
@@ -557,7 +579,7 @@ fn finish_breaker_attempt(
             Err(error)
         }
         Err(CodexWebSocketExchangeError::Upstream(upstream)) if upstream.status_code < 500 => {
-            // 账号或请求级 opening 响应证明 origin 可达，不得污染 transport 熔断器。
+            // 账号或请求级 opening 响应证明 origin 可达，不得污染 transport 熔断器
             permit.succeed();
             Err(CodexWebSocketExchangeError::Upstream(upstream))
         }
@@ -575,7 +597,7 @@ async fn wait_for_shared_connect(
     wait_for_fast_path(waiter.started_at(), fast_path_budget, waiter.wait()).await
 }
 
-// 同一次 opening 的所有等待者共享截止时间；后来的请求不会重置 800ms 预算。
+// 同一次 opening 的所有等待者共享截止时间；后来的请求不会重置 800ms 预算
 async fn wait_for_fast_path<F: Future>(
     started_at: TokioInstant,
     budget: Option<Duration>,
@@ -644,7 +666,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         let observation = websocket
             .observation()
             .with_exit_reason("mint_route_mismatch");
-        discard_connection(websocket, lease, observation.clone()).await;
+        discard_after_send(websocket, lease, observation.clone()).await;
         return Err(CodexWebSocketExchangeError::Connect(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -677,7 +699,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         let observation = websocket
             .observation()
             .with_exit_reason("warm_verification_unavailable");
-        discard_connection(websocket, lease, observation).await;
+        discard_after_send(websocket, lease, observation).await;
         return Err(CodexWebSocketExchangeError::WarmUnavailable);
     }
     trace.record("upstream.connection", serde_json::json!({
@@ -693,13 +715,17 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
     }));
     trace.capture("upstream.request.body", request.payload_text().as_bytes());
     if let Err(error) = send_websocket_request(&websocket, request.payload_text()).await {
-        let observation = websocket
-            .observation()
-            .with_exit_reason("outbound_transport_error");
+        let not_started = matches!(error, CodexWebSocketExchangeError::SendNotStarted);
+        let observation = websocket.observation();
+        let observation = if observation.exit_reason() == "running" {
+            observation.with_exit_reason("outbound_transport_error")
+        } else {
+            observation
+        };
         trace.record(
             "upstream.send.failed",
             serde_json::json!({
-                "phase": "websocket_payload", "sendState": "ambiguous",
+                "phase": "websocket_payload", "sendState": if not_started { "not_sent" } else { "ambiguous" },
                 "failureReason": error.transport_failure_reason().unwrap_or(observation.exit_reason()),
                 "connectionId": observation.connection_id().to_string(),
                 "connectionAgeMs": observation.age_ms(),
@@ -707,10 +733,17 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
                 "reused": reused,
             }),
         );
-        discard_connection(websocket, lease, observation.clone()).await;
-        return Err(post_send_ambiguous(
-            error.with_connection_observation(observation),
-        ));
+        discard_after_send(websocket, lease, observation.clone()).await;
+        let error = if not_started {
+            if request.continuation().permits_fresh_connection() {
+                error
+            } else {
+                continuation_unavailable(PreviousResponseUnavailableReason::ReusedConnectionLost)
+            }
+        } else {
+            post_send_ambiguous(error)
+        };
+        return Err(error.with_connection_observation(observation));
     }
     trace.record("upstream.payload.sent", serde_json::json!({}));
     let connection_local_available = lease.is_some();
@@ -736,7 +769,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
     Ok(exchange)
 }
 
-async fn discard_connection(
+async fn discard_after_send(
     websocket: PumpedWebSocket,
     lease: Option<WebSocketPoolLease>,
     observation: super::pump::WebSocketConnectionObservation,

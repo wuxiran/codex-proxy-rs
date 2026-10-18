@@ -1,3 +1,5 @@
+//! 验证 HTTP 登录身份、会话轮换与管理员和 Key 会话的权限隔离
+
 use std::sync::atomic::Ordering;
 
 use axum::{
@@ -19,6 +21,27 @@ fn session_cookie(response: &axum::response::Response) -> String {
         .next()
         .expect("cookie pair")
         .to_owned()
+}
+
+fn refresh_cookie(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("cpr_refresh="))
+        .expect("refresh cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+async fn refresh(app: &axum::Router, cookie: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(cookie_request(Method::POST, "/api/auth/refresh", cookie))
+        .await
+        .unwrap()
 }
 
 async fn login(
@@ -532,4 +555,182 @@ async fn key_auth_should_issue_restore_and_clear_a_unified_cookie() {
         .await
         .expect("logged out");
     assert_eq!(response_json(status).await["data"]["authenticated"], false);
+}
+
+#[tokio::test]
+async fn refresh_restores_expired_access_with_only_the_refresh_cookie() {
+    let (app, fixture) = auth_app().await;
+    let response = login(
+        &app,
+        json!({"mode": "admin", "password": "strong-admin-password"}),
+        None,
+    )
+    .await;
+    let access = session_cookie(&response);
+    let renewal = refresh_cookie(&response);
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].contains("Path=/;"));
+    assert!(cookies[1].contains("Path=/api/auth;"));
+    assert!(
+        cookies
+            .iter()
+            .all(|value| value.contains("HttpOnly") && value.contains("SameSite=Lax"))
+    );
+    assert_eq!(
+        response_json(refresh(&app, &access).await).await["data"]["authenticated"],
+        false
+    );
+    fixture.set_session_expiry(
+        access.split_once('=').unwrap().1,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    );
+    assert_eq!(
+        get(&app, "/api/admin/system/version", &access)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response_json(get(&app, "/api/auth/status", &renewal).await).await["data"]["authenticated"],
+        false
+    );
+
+    let response = refresh(&app, &renewal).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let next_access = session_cookie(&response);
+    let next_renewal = refresh_cookie(&response);
+    assert_ne!(next_access, access);
+    assert_ne!(next_renewal, renewal);
+    assert_eq!(response_json(response).await["data"]["authenticated"], true);
+    assert_eq!(
+        get(&app, "/api/admin/system/version", &next_access)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&app, "/api/admin/system/version", &access)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 模拟响应丢失后的重试，返回同一代 Cookie
+    let retry = refresh(&app, &renewal).await;
+    assert_eq!(session_cookie(&retry), next_access);
+    assert_eq!(refresh_cookie(&retry), next_renewal);
+}
+
+#[tokio::test]
+async fn key_refresh_preserves_fixed_expiry_and_clears_admin_refresh_cookie() {
+    let (app, _) = auth_app().await;
+    let admin = login(
+        &app,
+        json!({"mode": "admin", "password": "strong-admin-password"}),
+        None,
+    )
+    .await;
+    let renewal = refresh_cookie(&admin);
+    let response = login(
+        &app,
+        json!({"mode": "key", "apiKey": RAW_KEY}),
+        Some(&renewal),
+    )
+    .await;
+    assert_eq!(refresh_cookie(&response), "cpr_refresh=");
+    assert!(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| {
+                let value = value.to_str().unwrap();
+                value.starts_with("cpr_refresh=")
+                    && value.contains("Max-Age=0")
+                    && value.contains("Path=/api/auth;")
+            })
+    );
+    let cookie = session_cookie(&response);
+    let original = response_json(response).await["data"]["expiresAt"].clone();
+    let response = refresh(&app, &cookie).await;
+    assert_eq!(session_cookie(&response), cookie);
+    let data = response_json(response).await;
+    assert_eq!(data["data"]["authenticated"], true);
+    assert_eq!(data["data"]["session"]["expiresAt"], original);
+    assert_eq!(
+        response_json(refresh(&app, &renewal).await).await["data"]["authenticated"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn refresh_after_logout_or_password_change_cannot_recreate_a_session() {
+    let (app, fixture) = auth_app().await;
+    for password_change in [false, true] {
+        let login_response = login(
+            &app,
+            json!({"mode": "admin", "password": "strong-admin-password"}),
+            None,
+        )
+        .await;
+        let cookie = session_cookie(&login_response);
+        let renewal = refresh_cookie(&login_response);
+        let response = if password_change {
+            change_password(
+                &app,
+                Some(&cookie),
+                "strong-admin-password",
+                "new-strong-admin-password",
+            )
+            .await
+        } else {
+            fixture.set_session_expiry(
+                cookie.split_once('=').unwrap().1,
+                chrono::Utc::now() - chrono::Duration::seconds(1),
+            );
+            app.clone()
+                .oneshot(cookie_request(Method::POST, "/api/auth/logout", &renewal))
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .all(|value| value.to_str().unwrap().contains("Max-Age=0"))
+        );
+        let response = app
+            .clone()
+            .oneshot(cookie_request(Method::POST, "/api/auth/refresh", &renewal))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            response_json(response).await["data"]["authenticated"],
+            false
+        );
+        assert_eq!(
+            get(&app, "/api/admin/system/version", &cookie)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

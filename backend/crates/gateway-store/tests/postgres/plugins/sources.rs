@@ -1,3 +1,5 @@
+//! 验证插件更新来源、制品引用、并发安装与代理版本约束
+
 use gateway_admin::{
     model::{
         plugins::{
@@ -9,7 +11,9 @@ use gateway_admin::{
     ports::{plugins::PluginStore, proxy::ProxyStore, store::AdminStoreErrorKind},
 };
 use gateway_core::account::OutboundProxy;
-use gateway_store::postgres::{PgPluginStore, PgProxyRepository};
+use gateway_store::postgres::{
+    PgPluginStore, PgProviderAccountRepository, PgProxyRepository, ProviderAccountRepository,
+};
 
 use super::{
     super::TestDatabase,
@@ -287,6 +291,8 @@ async fn source_proxy_is_revision_fenced_and_referenced_until_the_artifact_is_de
     let updated = proxies
         .update(
             UpdateProxy {
+                max_websocket_connections: None,
+                enabled: None,
                 auto_location: None,
                 test: None,
                 location: None,
@@ -300,6 +306,25 @@ async fn source_proxy_is_revision_fenced_and_referenced_until_the_artifact_is_de
         .await
         .unwrap()
         .record;
+    let accounts = PgProviderAccountRepository::new(database.pool.clone());
+    let mut account = super::super::provider_accounts::account("acct_plugin_proxy", "Plugin proxy");
+    account.outbound_proxy = Some(updated.proxy.clone());
+    accounts.insert_provider_account(account).await.unwrap();
+    let before: serde_json::Value = sqlx::query_scalar(
+        "select to_jsonb(a) from provider_accounts a where id = 'acct_plugin_proxy'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let revision: i64 =
+        sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let audit_count: i64 = sqlx::query_scalar("select count(*) from admin_audit_events")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
     let mut candidate = artifact('f', &["linux-x86_64"]);
     candidate.metadata.version = "2.0.0".into();
     let Err(error) = plugins
@@ -316,6 +341,27 @@ async fn source_proxy_is_revision_fenced_and_referenced_until_the_artifact_is_de
             .unwrap_err()
             .kind(),
         AdminStoreErrorKind::Conflict
+    );
+    let after: serde_json::Value = sqlx::query_scalar(
+        "select to_jsonb(a) from provider_accounts a where id = 'acct_plugin_proxy'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select config_revision from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap(),
+        revision
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from admin_audit_events")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap(),
+        audit_count
     );
     plugins
         .change_update_source(

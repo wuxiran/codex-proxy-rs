@@ -20,6 +20,8 @@ impl TokenRefresher for UnusedRefresher {
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenPair, RefreshFailure> {
         Err(RefreshFailure::RetryableTransport {
             message: "unused".to_owned(),
+            source: None,
+            redacted: false,
         })
     }
 }
@@ -99,6 +101,7 @@ fn cdk_service(base_url: String) -> CodexCredentialAdminService {
         Arc::new(UnusedRefresher),
         Arc::new(TestLeaseCoordinator::default()),
         runtime_policy(),
+        Arc::new(crate::RecordingDiagnostics::default()),
     )
     .with_cdk_client(cdk)
 }
@@ -159,9 +162,12 @@ async fn cdk_document_redeems_and_imports_signed_export() {
     mount_receipt(&server, redemption_id).await;
 
     let prepared = cdk_service(server.uri())
-        .prepare_import_document(json!({
-            "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
-        }))
+        .prepare_import_document_with_proxy(
+            json!({
+                "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
+            }),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(prepared.accounts().len(), 1);
@@ -198,12 +204,15 @@ async fn cdk_redeem_across_workspaces_imports_every_signed_file_and_acknowledges
     mount_receipt(&server, "red-b").await;
 
     let prepared = cdk_service(server.uri())
-        .prepare_import_document(json!({
-            "cdks": [
-                "CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH",
-                "CDK-IIII-JJJJ-KKKK-LLLL-MMMM-NNNN-OOOO-PPPP"
-            ]
-        }))
+        .prepare_import_document_with_proxy(
+            json!({
+                "cdks": [
+                    "CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH",
+                    "CDK-IIII-JJJJ-KKKK-LLLL-MMMM-NNNN-OOOO-PPPP"
+                ]
+            }),
+            None,
+        )
         .await
         .unwrap();
     // 修复前只下载第一个空间，第二个空间已消耗的 CDK 会被静默丢掉。
@@ -251,9 +260,12 @@ async fn cdk_receipt_failure_does_not_block_import() {
         .await;
 
     let prepared = cdk_service(server.uri())
-        .prepare_import_document(json!({
-            "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
-        }))
+        .prepare_import_document_with_proxy(
+            json!({
+                "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
+            }),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(prepared.accounts().len(), 1);
@@ -275,9 +287,12 @@ async fn cdk_client_update_required_names_the_version_guanlan_expects() {
         .await;
 
     let error = cdk_service(server.uri())
-        .prepare_import_document(json!({
-            "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
-        }))
+        .prepare_import_document_with_proxy(
+            json!({
+                "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
+            }),
+            None,
+        )
         .await
         .unwrap_err();
     let message = format!("{error:?}");
@@ -303,9 +318,12 @@ async fn cdk_response_without_complete_download_is_rejected() {
         .await;
 
     let error = cdk_service(server.uri())
-        .prepare_import_document(json!({
-            "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
-        }))
+        .prepare_import_document_with_proxy(
+            json!({
+                "cdks": ["CDK-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH"]
+            }),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(format!("{error:?}").contains("无法识别"), "{error:?}");
@@ -321,10 +339,11 @@ async fn invalid_cdk_format_is_rejected_before_import() {
         Arc::new(UnusedRefresher),
         Arc::new(TestLeaseCoordinator::default()),
         runtime_policy(),
+        Arc::new(crate::RecordingDiagnostics::default()),
     )
     .with_cdk_client(cdk);
     let error = service
-        .prepare_import_document(json!({ "cdks": ["NOT-A-CDK"] }))
+        .prepare_import_document_with_proxy(json!({ "cdks": ["NOT-A-CDK"] }), None)
         .await
         .unwrap_err();
     assert!(format!("{error}").contains("CDK redeem failed"));
@@ -337,29 +356,33 @@ async fn sub2api_top_level_export_with_revive_manifest_imports() {
         Arc::new(UnusedRefresher),
         Arc::new(TestLeaseCoordinator::default()),
         runtime_policy(),
+        Arc::new(crate::RecordingDiagnostics::default()),
     );
     let prepared = service
-        .prepare_import_document(serde_json::json!({
-            "exported_at": "2026-09-17T09:23:33.325693Z",
-            "proxies": [],
-            "x_revive_manifest": {
-                "signature": "test-signature",
-                "source": "cdk_redeem"
-            },
-            "accounts": [{
-                "name": "paezoastridj77+mj5@gmail.com",
-                "platform": "openai",
-                "type": "oauth",
-                "group_ids": [4],
-                "extra": {"source": "sub2api"},
-                "credentials": {
-                    "access_token": test_jwt("user-sub2api"),
-                    "refresh_token": "rt-sub2api",
-                    "email": "paezoastridj77+mj5@gmail.com",
-                    "plan_type": "self_serve_business_prolite"
-                }
-            }]
-        }))
+        .prepare_import_document_with_proxy(
+            serde_json::json!({
+                "exported_at": "2026-09-17T09:23:33.325693Z",
+                "proxies": [],
+                "x_revive_manifest": {
+                    "signature": "test-signature",
+                    "source": "cdk_redeem"
+                },
+                "accounts": [{
+                    "name": "paezoastridj77+mj5@gmail.com",
+                    "platform": "openai",
+                    "type": "oauth",
+                    "group_ids": [4],
+                    "extra": {"source": "sub2api"},
+                    "credentials": {
+                        "access_token": test_jwt("user-sub2api"),
+                        "refresh_token": "rt-sub2api",
+                        "email": "paezoastridj77+mj5@gmail.com",
+                        "plan_type": "self_serve_business_prolite"
+                    }
+                }]
+            }),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(prepared.accounts().len(), 1);

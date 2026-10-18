@@ -1,8 +1,10 @@
-//! OpenAI 额度事实边界与展示快照回归。
+//! OpenAI 额度事实边界与展示快照回归
 
 mod capacity_freeze;
+mod initial_sync;
 mod recovery;
 mod refresh_timing;
+mod reset_credits;
 mod scheduling;
 mod slots;
 mod snapshot;
@@ -10,7 +12,7 @@ mod subscription;
 mod warmup;
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use chrono::{TimeZone as _, Utc};
 use gateway_core::account::{
@@ -65,6 +67,17 @@ pub(super) fn quota_service_with_base_url(
     http: reqwest::Client,
     base_url: String,
 ) -> CodexCredentialQuotaService {
+    // 首查随机启动延迟只在 initial_sync 专项测试中注入非零值；
+    // 其余测试固定为零，保持「首轮即查」的确定性旧行为。
+    quota_service_with_initial_delays(store, http, base_url, Arc::new(|| Duration::ZERO))
+}
+
+pub(super) fn quota_service_with_initial_delays(
+    store: &Arc<MemoryAccountStore>,
+    http: reqwest::Client,
+    base_url: String,
+    delays: provider_openai::credential::CodexInitialSyncDelays,
+) -> CodexCredentialQuotaService {
     CodexCredentialQuotaService::new(
         store.repository(),
         wire_profile(),
@@ -74,6 +87,7 @@ pub(super) fn quota_service_with_base_url(
         Arc::new(crate::support::TestLeaseCoordinator::default()),
         crate::support::runtime_policy(),
     )
+    .with_initial_sync_delays(delays)
 }
 
 async fn create_account(store: &Arc<MemoryAccountStore>, account_id: &str) {
@@ -208,7 +222,7 @@ async fn passive_quota_updates_keep_core_and_model_specific_buckets_independent(
 
     let spark_headers = vec![
         // 生产响应会把当前具名桶同时复制到旧版 `x-codex-*` 默认头；这个
-        // 兼容别名不能覆盖已有的账号 core 桶。
+        // 兼容别名不能覆盖已有的账号 core 桶
         ("x-codex-active-limit".to_owned(), "codex".to_owned()),
         ("x-codex-primary-used-percent".to_owned(), "1".to_owned()),
         (
@@ -475,6 +489,37 @@ async fn quota_refresh_synchronizes_plan_changes_without_losing_subtypes() {
 }
 
 #[tokio::test]
+async fn passive_quota_observation_preserves_account_egress() {
+    let store = Arc::new(MemoryAccountStore::default());
+    let account_id = "acct_passive_quota_egress";
+    create_account(&store, account_id).await;
+    let proxy = gateway_core::account::OutboundProxy::parse("http://127.0.0.1:8080").unwrap();
+    let location = serde_json::from_value::<gateway_core::account::RequestLocation>(json!({
+        "country": "US", "region": "New York", "city": "New York",
+        "timezone": "America/New_York"
+    }))
+    .unwrap();
+    store.set_egress(account_id, Some(proxy.clone()), Some(location.clone()));
+    let account = store.account(account_id).unwrap();
+    let observation = parse_rate_limits_event(&json!({
+        "type": "codex.rate_limits",
+        "plan_type": "pro",
+        "rate_limits": {"primary": {"used_percent": 5, "window_minutes": 300, "reset_at": 1900000000}}
+    }))
+    .unwrap();
+
+    quota_service(&store)
+        .synchronize_passive_rate_limits(&account, &[observation])
+        .await
+        .unwrap();
+
+    let updated = store.account(account_id).unwrap();
+    assert!(store.quota_json(account_id).is_some());
+    assert_eq!(updated.outbound_proxy(), Some(&proxy));
+    assert_eq!(updated.request_location(), Some(&location));
+}
+
+#[tokio::test]
 async fn passive_plan_observations_update_account_without_replaying_stale_plan() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_passive_plan").await;
@@ -524,7 +569,7 @@ async fn passive_plan_observations_update_account_without_replaying_stale_plan()
     );
     let state = exhausted_quota(None);
     persist_quota_state(&store, &original, state).await;
-    // 仅有套餐的新观察不能清除既有额度耗尽结论。
+    // 仅有套餐的新观察不能清除既有额度耗尽结论
     service
         .synchronize_passive_headers(
             &original,
@@ -535,7 +580,7 @@ async fn passive_plan_observations_update_account_without_replaying_stale_plan()
     let changed = store.account("acct_passive_plan").unwrap();
     assert_eq!(changed.plan_type(), Some("plus"));
     assert_eq!(changed.quota(), state);
-    // 后台 RT 刷新拿着旧账号快照返回时，仍要提交新 token 并保留刚观测的套餐。
+    // 后台 RT 刷新拿着旧账号快照返回时，仍要提交新 token 并保留刚观测的套餐
     store
         .repository()
         .rotate_refreshed_oauth_secret(
@@ -710,7 +755,7 @@ async fn quota_endpoint_rejection_preserves_details_without_changing_account_fac
         }
         other => panic!("expected upstream rejection, got {other:?}"),
     }
-    // 额度查询诊断不能进入凭据快照，否则会干扰在途 OAuth 刷新的终态提交。
+    // 额度查询诊断不能进入凭据快照，否则会干扰在途 OAuth 刷新的终态提交
     let current = store.account(account_id).expect("account after refresh");
     assert_eq!(current, before);
     store
@@ -790,4 +835,41 @@ async fn quota_refresh_preserves_disabled_and_credential_error_facts() {
         current.status_projection(SystemTime::now(), None).status,
         AccountStatus::Disabled
     );
+}
+
+#[tokio::test]
+async fn passive_credit_updates_replace_balance_without_changing_quota_access() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_passive_credits").await;
+    let account = store.account("acct_passive_credits").unwrap();
+    let service = quota_service(&store);
+    let initial = parse_rate_limits_event(&json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {"primary": {"used_percent": 28, "window_minutes": 300}},
+        "credits": {"has_credits": true, "unlimited": false, "balance": "62500"}
+    }))
+    .unwrap();
+    service
+        .synchronize_passive_rate_limits(&account, &[initial])
+        .await
+        .unwrap();
+    for (wire, expected) in [
+        (
+            json!({"has_credits": false, "unlimited": false, "balance": "0"}),
+            Some("0"),
+        ),
+        (json!({"has_credits": true, "unlimited": false}), None),
+    ] {
+        let update =
+            parse_rate_limits_event(&json!({"type": "codex.rate_limits", "credits": wire}))
+                .unwrap();
+        service
+            .synchronize_passive_rate_limits(&account, &[update])
+            .await
+            .unwrap();
+        let snapshot = service.read_account(account.id()).await.unwrap().unwrap();
+        assert_eq!(snapshot.credits().unwrap().balance.as_deref(), expected);
+        assert_eq!(snapshot.windows()[0].used_percent(), Some(28.0));
+        assert_eq!(snapshot.quota().access(), QuotaAccessState::Allowed);
+    }
 }

@@ -1,3 +1,5 @@
+//! 上游适配请求与事件的元数据、正文及续接信息编解码
+
 use serde::{Deserialize, Serialize};
 
 use super::{UpstreamAdapterEvent, UpstreamAdapterRequest, UpstreamContinuation, UpstreamFailure};
@@ -7,7 +9,6 @@ use crate::call::model::{
 };
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Metadata {
     service_tier: Option<String>,
     continuation: Option<UpstreamContinuation>,

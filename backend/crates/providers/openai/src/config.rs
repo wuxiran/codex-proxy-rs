@@ -1,4 +1,4 @@
-//! OpenAI Provider 启动配置；客户端身份由管理端设置持久化。
+//! OpenAI Provider 启动配置；客户端身份由管理端设置持久化
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,18 +17,20 @@ use crate::{
     },
 };
 
-/// 本服务的流式请求默认重试次数。
+/// 本服务的流式请求默认重试次数
 pub const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
-/// 防止错误配置产生无界隐藏重放；与官方 Codex 的硬上限一致。
+/// 防止错误配置产生无界隐藏重放；与官方 Codex 的硬上限一致
 pub const MAX_STREAM_MAX_RETRIES: u64 = 100;
 
 const fn default_stream_max_retries() -> u64 {
     DEFAULT_STREAM_MAX_RETRIES
 }
 
-/// OpenAI Provider 唯一启动配置。
+/// OpenAI Provider 唯一启动配置
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct OpenAiConfig {
+    #[serde(skip)]
+    pub(crate) timezone: gateway_core::time::DeploymentTimeZone,
     #[serde(default)]
     pub api: CodexApiConfig,
     #[serde(default)]
@@ -52,7 +54,13 @@ pub struct OpenAiConfig {
 }
 
 impl OpenAiConfig {
-    /// 校验 Provider-owned 字段，并从统一运行数据目录定位会话身份密钥。
+    #[must_use]
+    pub fn with_timezone(mut self, timezone: gateway_core::time::DeploymentTimeZone) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
+    /// 校验 Provider-owned 字段，并从统一运行数据目录定位会话身份密钥
     pub fn resolve_and_validate(
         &mut self,
         runtime_data_dir: &Path,
@@ -130,7 +138,7 @@ impl OpenAiConfig {
         &self.auth.cdk
     }
 
-    /// 返回经官方同款硬上限约束后的上游流重试预算。
+    /// 返回经官方同款硬上限约束后的上游流重试预算
     #[must_use]
     pub fn stream_max_retries(&self) -> u32 {
         u32::try_from(self.stream_max_retries.min(MAX_STREAM_MAX_RETRIES))
@@ -147,6 +155,7 @@ impl OpenAiConfig {
 impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
+            timezone: Default::default(),
             api: CodexApiConfig::default(),
             ws_pool: CodexWebSocketPoolSettings::default(),
             quota: CodexQuotaSettings::default(),
@@ -161,7 +170,7 @@ impl Default for OpenAiConfig {
     }
 }
 
-/// Codex 上游 API 的 Provider-owned 地址配置。
+/// Codex 上游 API 的 Provider-owned 地址配置
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CodexApiConfig {
     pub base_url: String,
@@ -177,14 +186,23 @@ impl Default for CodexApiConfig {
 
 impl CodexApiConfig {
     fn validate(&self) -> Result<(), OpenAiConfigError> {
-        if !crate::transport::valid_upstream_base_url(&self.base_url) {
+        let url = crate::transport::parse_upstream_base_url(&self.base_url)
+            .ok_or(OpenAiConfigError::InvalidField("openai.api.base_url"))?;
+        // OAuth 启动地址的 HTTP 例外仅用于本机联调，不沿用 API Key 中转账号的传输选择
+        let loopback = match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
+        if url.scheme() == "http" && !loopback {
             return Err(OpenAiConfigError::InvalidField("openai.api.base_url"));
         }
         Ok(())
     }
 }
 
-/// Codex Responses WebSocket pool 的 Provider-owned 启动设置。
+/// Codex Responses WebSocket pool 的 Provider-owned 启动设置
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CodexWebSocketPoolSettings {
     pub enabled: bool,
@@ -224,10 +242,10 @@ impl CodexWebSocketPoolSettings {
     }
 }
 
-/// OpenAI Provider 的额度刷新策略。
+/// OpenAI Provider 的额度刷新策略
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CodexQuotaSettings {
-    /// 保留模型目录的刷新周期；额度独立每 30 秒检查周期复核和 reset 到期条件。
+    /// 保留模型目录的刷新周期；额度独立每 30 秒检查周期复核和 reset 到期条件
     pub refresh_interval_minutes: u64,
 }
 
@@ -256,7 +274,7 @@ impl CodexQuotaSettings {
     }
 }
 
-/// OpenAI OAuth 的 Provider-owned 运行开关和端点。
+/// OpenAI OAuth 的 Provider-owned 运行开关和端点
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CodexAuthSettings {

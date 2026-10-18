@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { PoolAccount } from '@/api'
 import { computed } from 'vue'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
 import { latestAttempt, poolPhaseText, remaining } from '../utils/poolOverview'
 
 const props = defineProps<{ account?: PoolAccount, stale: boolean, paused: boolean, now: number, expanded?: boolean }>()

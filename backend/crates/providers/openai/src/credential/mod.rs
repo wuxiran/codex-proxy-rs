@@ -1,4 +1,4 @@
-//! Codex credential 领域导出。
+//! Codex credential 领域导出
 
 mod admin;
 mod affinity;
@@ -22,15 +22,15 @@ mod types;
 pub(crate) use affinity::{
     CodexSessionAffinity, derive_codex_cyber_policy_session_key,
     derive_codex_endpoint_session_affinity, derive_codex_session_affinity,
-    derive_previous_response_id_hash,
+    derive_codex_transport_key, derive_endpoint_affinity_with_headers,
+    derive_live_session_affinity, derive_previous_response_id_hash, derive_turn_alias,
 };
 pub(crate) use oauth::oauth_owner_ref;
 pub(crate) use types::{parse_access_token_expiration, parse_chatgpt_jwt_claims};
 
-pub use api_key::{
-    ApiKeyAuthentication, ApiKeyConfiguration, ApiKeyCredentialData,
-    CODEX_AUTHENTICATION_KIND_API_KEY,
-};
+pub(crate) use crate::CODEX_AUTHENTICATION_KIND_API_KEY;
+
+pub use api_key::{ApiKeyAuthentication, ApiKeyConfiguration, ApiKeyCredentialData};
 
 pub use admin::{
     CodexCprExportDocument, CodexCredentialAdmin, CodexCredentialAdminError,
@@ -55,8 +55,9 @@ pub use profile_statistics::{
 };
 pub use quota::{
     CodexAccountQuotaSnapshot, CodexCredentialQuotaError, CodexCredentialQuotaService,
-    CodexQuotaFact, CodexQuotaRefreshPolicy, CodexQuotaSyncSummary, CodexQuotaWindow,
-    CodexQuotaWindowKind, CodexQuotaWindowRole, CodexResetCreditsError, parse_codex_quota_usage,
+    CodexInitialSyncDelays, CodexQuotaFact, CodexQuotaRefreshPolicy, CodexQuotaSyncSummary,
+    CodexQuotaWindow, CodexQuotaWindowKind, CodexQuotaWindowRole, CodexResetCreditsError,
+    parse_codex_quota_usage,
 };
 pub use refresh::{
     CodexCredentialRefreshError, CodexCredentialRefreshOutcome, CodexCredentialRefreshService,
@@ -72,9 +73,13 @@ pub use selector::{
     CodexAccountFailure, CodexCredentialLease, CodexCredentialSelector, CredentialSelectionError,
     SelectCodexCredential,
 };
-pub(crate) use selector::{CodexCyberPolicyScope, SelectCodexProviderEndpointCredential};
+pub(crate) use selector::{
+    CodexCyberPolicyScope, CodexSelectionModel, SelectCodexProviderEndpointCredential,
+};
 pub use types::{
     CODEX_AUTHENTICATION_KIND_OAUTH, CodexAccountProfile, CodexCookie, CodexCookieCaptureOutcome,
     CodexCredentialData, CodexCredentialPrincipal, CodexOAuthCredentialData, CodexOAuthSecret,
     ResponsesTransport, RuntimeCodexCookie, UpsertCodexCookie,
 };
+
+mod diagnostics;

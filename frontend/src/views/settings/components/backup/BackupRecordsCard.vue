@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import type { BackupRecord } from '@/api'
 
-import { BaseButton, BaseCard, BaseConfirmModal, BaseIconButton, BaseTable, BaseTablePagination, defineTableColumns } from '@codex-proxy/ui'
+import { defineTableColumns, ZButton, ZCard, ZConfirmDialog, ZIconButton, ZPagination, ZTable } from '@codex-proxy/ui'
 import { Download, Play, RefreshCw, Trash2 } from '@lucide/vue'
-import { formatDateTime } from '@/utils/format'
 
 import BackupStatusBadge from './BackupStatusBadge.vue'
 
@@ -30,8 +29,8 @@ const emit = defineEmits<{
   download: [record: BackupRecord]
   requestDelete: [record: BackupRecord]
   confirmDelete: []
-  cancelDelete: []
 }>()
+const deleteOpen = defineModel<boolean>('deleteOpen', { required: true })
 
 const columns = defineTableColumns<BackupRecord>([
   { key: 'id', label: 'ID', kind: 'mono', size: 'lg' },
@@ -85,14 +84,14 @@ function canDelete(record: BackupRecord): boolean {
 </script>
 
 <template>
-  <BaseCard
+  <ZCard
     title="备份记录"
     description="创建手动备份和管理已有备份记录"
   >
     <template #actions>
       <div class="flex flex-wrap items-center gap-2">
-        <BaseButton
-          variant="primary"
+        <ZButton
+          type="primary"
           :loading="creating"
           :disabled="loading || activeBackup"
           @click="emit('create')"
@@ -101,9 +100,8 @@ function canDelete(record: BackupRecord): boolean {
             <Play class="size-4" />
           </template>
           {{ creating ? '创建中...' : '创建备份' }}
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
+        </ZButton>
+        <ZButton
           :loading="refreshing"
           :disabled="loading"
           @click="emit('refresh')"
@@ -115,15 +113,15 @@ function canDelete(record: BackupRecord): boolean {
             <RefreshCw class="size-4" />
           </template>
           刷新
-        </BaseButton>
+        </ZButton>
       </div>
     </template>
 
     <div class="flex min-h-0 flex-1 flex-col">
-      <BaseTable
+      <ZTable
         class="min-h-0 flex-1"
         :columns="columns"
-        :rows="records"
+        :data="records"
         row-key="id"
         :loading="loading"
         empty-text="暂无备份记录"
@@ -146,11 +144,11 @@ function canDelete(record: BackupRecord): boolean {
 
         <template #expiresAt="{ row }">
           <span class="text-cp-text-secondary">
-            {{ row.expiresAt ? formatDateTime(row.expiresAt) : '—' }}
+            {{ row.expiresAtDisplay ?? '—' }}
           </span>
         </template>
 
-        <template #trigger="{ row }">
+        <template #reference="{ row }">
           <span class="text-cp-text-secondary">
             {{ triggerLabel(row.triggerKind) }}
           </span>
@@ -158,53 +156,50 @@ function canDelete(record: BackupRecord): boolean {
 
         <template #startedAt="{ row }">
           <span class="text-cp-text-secondary">
-            {{ row.startedAt ? formatDateTime(row.startedAt) : '—' }}
+            {{ row.startedAtDisplay ?? '—' }}
           </span>
         </template>
 
         <template #actions="{ row }">
           <div class="flex items-center justify-start gap-1">
-            <BaseIconButton
-              variant="ghost"
+            <ZIconButton
               :disabled="!canDownload(row)"
               :loading="Boolean(downloadStates[row.id])"
-              label="下载备份"
+              aria-label="下载备份"
               @click="emit('download', row)"
             >
               <Download class="size-4" />
-            </BaseIconButton>
-            <BaseIconButton
-              variant="ghost"
+            </ZIconButton>
+            <ZIconButton
               :disabled="!canDelete(row)"
-              label="删除备份"
+              aria-label="删除备份"
               @click="emit('requestDelete', row)"
             >
               <Trash2 class="size-4" />
-            </BaseIconButton>
+            </ZIconButton>
           </div>
         </template>
-      </BaseTable>
-      <BaseTablePagination
-        :pagination="{ currentPage: page, pageSize, total }"
-        :loading="loading"
-        @page-change="emit('pageChange', $event)"
-        @page-size-change="emit('pageSizeChange', $event)"
+      </ZTable>
+      <ZPagination
+        v-bind="{ currentPage: page, pageSize, total }"
+        :disabled="loading"
+        @current-change="emit('pageChange', $event)"
+        @size-change="emit('pageSizeChange', $event)"
       />
     </div>
 
-    <BaseConfirmModal
-      :model-value="deleteTarget !== null"
+    <ZConfirmDialog
+      v-model="deleteOpen"
       title="删除备份"
       description="将删除远端对象并移除记录，此操作不可撤销"
       destructive
       confirm-text="确认删除"
       :loading="deleting"
-      @update:model-value="emit('cancelDelete')"
       @confirm="emit('confirmDelete')"
     >
       <p class="m-0">
         确定要删除备份 <span class="font-emphasis">{{ deleteTarget?.id }}</span> 吗？
       </p>
-    </BaseConfirmModal>
-  </BaseCard>
+    </ZConfirmDialog>
+  </ZCard>
 </template>

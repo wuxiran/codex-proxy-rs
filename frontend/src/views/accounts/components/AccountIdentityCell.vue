@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import type { getAccounts } from '@/api'
+import type { Account } from '@/api'
+
 import { computed } from 'vue'
 
-import { stablePresetVisualToneClass } from '../utils/visualTone'
+import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
+import { stablePresetVisualToneClass } from '@/utils/color'
+import { accountIdentityLabel } from '../utils/accountIdentity'
 import AccountNotesPopover from './AccountNotesPopover.vue'
-import AccountPlanBadge from './AccountPlanBadge.vue'
 
-type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-type AccountIdentity = Pick<AccountRow, 'id' | 'email' | 'planType' | 'planTypeDisplay'>
-  & Partial<Pick<AccountRow, 'accountId' | 'notes' | 'name' | 'authenticationKind'>>
+type AccountIdentity = Pick<Account, 'id' | 'email' | 'planType' | 'planTypeDisplay'>
+  & Partial<Pick<Account, 'accountId' | 'notes' | 'name' | 'authenticationKind'>>
 
 const props = withDefaults(
   defineProps<{
@@ -30,16 +31,7 @@ const props = withDefaults(
   },
 )
 
-const emailText = computed(() => {
-  if (props.account.authenticationKind === 'api_key' && props.account.name)
-    return props.account.name
-  const email = props.account.email?.trim()
-  if (email)
-    return email
-  if ('accountId' in props.account && typeof props.account.accountId === 'string')
-    return props.account.accountId
-  return String(props.account.id)
-})
+const emailText = computed(() => accountIdentityLabel(props.account))
 
 const visibleNotes = computed(() => props.showNotes ? props.account.notes : undefined)
 

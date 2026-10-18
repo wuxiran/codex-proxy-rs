@@ -1,3 +1,5 @@
+//! Provider 账号存储测试入口，以及凭据与额度端口测试
+
 use std::{
     collections::BTreeMap,
     num::NonZeroU32,
@@ -6,11 +8,13 @@ use std::{
 
 mod admin_adapter;
 mod authorization;
+mod deletion;
 mod fork_billing; // fork: billing
 mod fork_expired_status; // fork: expired-status
 mod fork_turn_state; // fork: turn-state
 mod quota_forecast;
 mod timestamps;
+mod usage_projection;
 
 use chrono::{TimeDelta, Utc};
 use gateway_admin::{
@@ -42,7 +46,7 @@ use gateway_store::{
     ConflictKind, JsonObject, Revision, StoreError,
     postgres::{
         AdminAuditActorKind, AdminAuditEvent, BatchUpdateProviderAccountsAdmin,
-        DeleteProviderAccounts, ImportProviderAccounts, NewProviderAccount, PgAdminAccountStore,
+        DeleteProviderAccounts, ImportProviderAccounts, NewProviderAccount,
         PgProviderAccountRepository, ProviderAccountAdminRepository, ProviderAccountAdminScope,
         ProviderAccountRepository, ProviderCredentialUpdate, RotateProviderAccount,
         UpdateProviderAccount,
@@ -81,18 +85,6 @@ struct CoreRefreshRow {
     quota_evidence: Option<String>,
     quota_access_observed_at: Option<chrono::DateTime<Utc>>,
     quota_reset_at: Option<chrono::DateTime<Utc>>,
-}
-
-#[test]
-fn postgres_provider_account_adapter_implements_core_port() {
-    fn assert_port<T: ProviderAccountStore>() {}
-    assert_port::<PgProviderAccountRepository>();
-
-    fn assert_admin_port<T: ProviderAccountAdminRepository>() {}
-    assert_admin_port::<PgProviderAccountRepository>();
-
-    fn assert_terminal_admin_port<T: AccountStore>() {}
-    assert_terminal_admin_port::<PgAdminAccountStore>();
 }
 
 #[tokio::test]
@@ -494,7 +486,7 @@ async fn quota_plan_changes_survive_inflight_background_and_manual_token_refresh
     assert_eq!(upgraded.revision(), original.revision());
     assert_eq!(current_revision(&database.pool).await, config_revision);
 
-    // 刷新在额度更新前已准备好旧资料，CAS 提交仍须保留数据库中的新套餐。
+    // 刷新在额度更新前已准备好旧资料，CAS 提交仍须保留数据库中的新套餐
     let refresh = CredentialCasUpdate::new(
         id.clone(),
         original.revision(),
@@ -943,6 +935,7 @@ async fn terminal_admin_usage_chunks_large_selections_and_preserves_exact_costs(
     let mut account_ids = vec!["acct_usage_exact".to_owned()];
     account_ids.extend((0..200).map(|index| format!("missing_account_{index}")));
 
+    super::drain_analytics(&database.pool).await;
     let usage = admin_account_store(&database.pool)
         .load_account_usage(
             TimeRange {
@@ -960,7 +953,7 @@ async fn terminal_admin_usage_chunks_large_selections_and_preserves_exact_costs(
     assert_eq!(usage[0].total_tokens, Some(18));
     assert_eq!(usage[0].costs[0].currency, "USD");
     assert_eq!(usage[0].costs[0].amount.as_str(), "1.2345678901");
-    assert_eq!(usage[0].request_buckets.len(), 2);
+    assert_eq!(usage[0].request_buckets.len(), 24);
     assert_eq!(
         usage[0]
             .request_buckets
@@ -2094,6 +2087,8 @@ async fn authorization_import_rejects_a_saved_proxy_changed_during_oauth() {
     let edited = proxies
         .update(
             UpdateProxy {
+                max_websocket_connections: None,
+                enabled: None,
                 auto_location: None,
                 test: None,
                 location: None,
@@ -2825,7 +2820,7 @@ async fn verified_credential_rotation_preserves_quota_exhaustion() {
         })
         .await
         .expect("import exhausted account");
-    // 模拟应用与数据库的微小时钟偏差，轮换不能把更新时间倒退到已有额度观测之前。
+    // 模拟应用与数据库的微小时钟偏差，轮换不能把更新时间倒退到已有额度观测之前
     let observed_at = SystemTime::now() + Duration::from_secs(3);
     repository
         .apply_quota_access(QuotaAccessChange {
@@ -2992,7 +2987,7 @@ async fn core_refresh_cas_updates_credentials_after_scheduling_is_disabled() {
     .unwrap()
     .preserving_profile()
     .with_account_state(CredentialState::Ready, SystemTime::now(), None, None);
-    // 模拟刷新在途时停用调度；提交新凭据不能重新启用账号，也不能丢弃刷新结果。
+    // 模拟刷新在途时停用调度；提交新凭据不能重新启用账号，也不能丢弃刷新结果
     repository.set_enabled(&account_id, false).await.unwrap();
     assert!(matches!(
         repository
@@ -3198,23 +3193,19 @@ async fn seed_model_request(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id,
-           provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           upstream_send_state, downstream_committed_at, outcome, client_status_code,
-           upstream_status_code,
-           input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens,
-           total_tokens, cost_source, cost_amount, cost_currency,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, downstream_committed_at, outcome, client_status_code, upstream_status_code, input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, reasoning_output_tokens, total_tokens, cost_source, cost_amount, cost_currency, started_at, recovery_lease_expires_at, completed_at, request_observation_json
          ) values (
-           $1, 'key-provider-account-test', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', $4, $3, $2, $2, $4, 'http_sse', 1,
-           'sent', $7 + interval '1 second', 'succeeded', 200, 200, $5, 0, 0, 0, 0,
-           $5, 'provider_reported', $6::numeric, 'USD', $7,
-           $7 + interval '5 minutes', $7 + interval '1 second',
-           'all', '{}'::text[], '[]'::jsonb
+           $1, 'key-provider-account-test', 'responses', 'http_sse', $4, $3, $2, $4, 'http_sse', 1, 'sent', $7 + interval '1 second', 'succeeded', 200, 200, $5, 0, 0, 0, 0, $5, 'provider_reported', $6::numeric, 'USD', $7, $7 + interval '5 minutes', $7 + interval '1 second',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(seed.request_id)
@@ -3608,7 +3599,7 @@ async fn adaptive_concurrency_handles_unlimited_and_latest_locked_settings_witho
                 .await
                 .expect("atomic adaptation")
         });
-        // 管理员持有设置锁时提交新的账号事实，worker 必须依据提交后的值判断。
+        // 管理员持有设置锁时提交新的账号事实，worker 必须依据提交后的值判断
         sqlx::query("update provider_accounts set enabled = $2, concurrency_limit = $3, weight = 7, notes = 'administrator edit' where id = $1")
             .bind(id.as_str()).bind(enabled).bind(account_limit).execute(&mut *admin).await.expect("concurrent admin edit");
         admin.commit().await.expect("commit admin edit");

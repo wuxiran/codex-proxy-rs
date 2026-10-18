@@ -17,19 +17,37 @@ flowchart TB
 | `turn-state` | Codex `X-Codex-Turn-State` 模板的桶存储（账号 × 模型，落运行数据目录）、Fernet 到期、注入决策、观测统计；纯逻辑 + 文件，不依赖其它 workspace crate，由 `providers/openai` 在请求前/响应后两处钩子调用，管理接口由 `gateway-api` 直接持有服务句柄 |
 | `gateway-admin::ops_report` + `gateway-store::postgres::ops_report` | 经营日报：定时按北京时间自然日汇总 CPR 号池投入与只读 sub2api 库的消费、收款，快照落 `runtime_data_dir/ops_report/daily.json`；买入成本每轮按票据现状校正全部日期 |
 | `gateway-admin::use_case::public_import` | 免登录导入入口（按号商多配置），配置落 `runtime_data_dir/public_import/` |
+| `gateway-admin::use_case::openai::OpenAiService` | fork 保留的窄 trait：票据复活、免登录导入与票据恢复用的 OpenAI 固定凭据入口，由上游通用 `CredentialsService` 冻结 openai 实现后委托 |
+| `gateway-admin::use_case::usage_projection_cache` | 账号列表用量投影的 20 秒进程内 SWR 缓存；只缓存由请求历史推导的聚合。分组成本用上游 analytics 投影，不另缓存 |
+| `gateway-core::request_log` | 进程内 300 条请求观测环形缓冲（cookie 库 / 票 / 实际模型 / `service_tier` 的短标识），`/api/admin/logs/recent` 的数据源，不存票或 cookie 原文 |
+| `gateway-core::engine::DiagnosticEgress`、`AccountProbeMode` | 管理端探测的临时出口（只作用于本次请求，地域随出口走）与测智台的 `business` / `diagnostic` 模式；带临时出口的探测不计熔断、不写账号探测失败事实 |
 | 账号票据（fork 迁移 9003/9004） | 账号成本、到期、AES-256-GCM 加密登录票据与自动复活计数；「已过期」目录状态只存在于管理目录，不进入调度五态 |
+| 代理质量（fork 迁移 9002） | `gateway-host::proxy_probe` 在上游出口检测之上叠加出口地理（5 秒、尽力而为）与固定上游目标的质量检测；子表 `outbound_proxy_quality` 读侧 LEFT JOIN |
+
+fork 对组合根的扩展集中在 `gateway-admin/src/fork.rs`（服务、运行目录、3 个 worker 注册）；
+`apps/gateway/src/bootstrap/{startup,server,command}.rs` 只留运行目录计算、字段透传与 `turn_state` 实参三处接线。
+账号的 fork `concurrency`（实时占用 / 上限）与上游 `capacity` 并存：前者只在管理目录下发，调度仍以上游容量为准。
 
 ## 计量
 
 Provider 上报费用优先于本地估算作为既有结算金额；模型计算费用同时独立保留，不能冒充真实上游费用。
 父表 `model_requests` 持久化入口请求模型、路由模型与上游实际响应模型（`upstream_response_model`）；
 实际计价模型与本地计算费用存入子表 `model_request_billing`（fork 迁移 9001，避免 ALTER 巨表）。
+Core 侧的观测类型是 `gateway_core::metering::ModelBillingObservation`，随 `ResponseMeta.observed_model` /
+`billing_model` 累积；管理端的 `AccountModelUsage`（`gateway-admin::model::observability`）多出 `identity` 与
+`billing`，由 `gateway-store/.../observability/queries/fork_billing.rs` 从子表补算，只在管理端账号面板触发。
 最终响应与计价观测在重试前一并清空，丢弃的 attempt 不得污染最终计量。
+Coordinator 每次尝试记录 `request.attempt_attribution`（路由模型、账号、脱敏出口），归因以通过冻结校验的最后一次真实尝试为准。
 
 ## Provider 执行不变量补充
 
-- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、通用重试和 fallback 由 Core 决定。
+- Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、通用重试和 fallback 由 Core 按上游
+  `transient_retry_policy` 决定（500 / 502 / 504 没有 `server_error` 正文时不重试）。Provider 不在预输出阶段自行换号重试。
   OpenAI 密文恢复仅在该次执行内处理明确拒绝，受下述 Provider 恢复边界约束。
+- 上游 WS 交换按原始 JSON 逐帧即时转发，`created` / `in_progress` 这类空前导帧不再随错误一起挂起。密文恢复因此先攒住
+  前导帧，等到首个非前导帧或终态再放行；被拒绝那次的前导帧作废，恢复流重新给出自己的前导帧。工具结构帧已交付、
+  或有未知服务端副作用时不重试。
+- 会话亲和的续期用上游 `admit_session`；fork 不另做选择器续期。
 - OpenAI Provider 对明确的 `invalid_encrypted_content` 拒绝提供一次同账号、同凭据、同模型恢复，
   仅在尚未交付客户端事件、未观察到输出或工具活动，且输入可自含重放时移除加密 reasoning 项。
   普通消息和配对工具历史保持原样；引用、compaction、孤儿工具结果及未知历史项继续要求客户端重放。
@@ -51,10 +69,13 @@ Provider 上报费用优先于本地估算作为既有结算金额；模型计�
 
 ## Worker 补充
 
-- Provider：OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`）复用 `OAuthRefresh` 类别，默认关闭；
-  cloud mint 续票、WS 暖池 warmer 与上游的定时账号预热（默认关闭）并存。
+- Provider：OpenAI 可选的签名号池 401 复活（`openai-oauth-revive`，60 秒一轮）复用 `OAuthRefresh` 类别，默认关闭；
+  云端打票 `openai-cloud-mint`（20 秒）、WS 暖池 `openai-ws-warm-pool`（20 秒，可被账号导入事件唤醒）与上游的
+  定时账号预热（默认关闭）并存。OpenAI Provider 登记的 worker 数 = 上游数 + 3。
 - Admin：经营日报 `ops-daily-report`（10 分钟一轮，跨实例租约）、票据自动复活。
 
+暖池探针同时对照 metadata 帧里的模型头与正文 `response.model`，声明了别的模型或没读到终态的连接不算满血；
+判决流必须读到自然结束，上游连接才会回池供业务领养
 WS 预热的候选审批由 Provider 持有，发布凭证由请求构造、转发任务和连接池共享
 连接回池时仍不可被业务领养，完整验证及路由条件发布完成后才开放复用
 匹配保留账号、握手画像、模型和实际路由约束，专用代理候选另外绑定创建时的账号业务出口身份

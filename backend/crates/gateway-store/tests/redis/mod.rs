@@ -1,6 +1,9 @@
+//! Redis 协调、缓存、会话与租约适配器的测试入口
+
 mod artifact_profile;
 mod auth;
 mod client_admission;
+mod client_retry;
 mod coordination_buffer;
 mod credential_cooldown;
 mod credential_leases;

@@ -1,5 +1,4 @@
-import { toast } from '@codex-proxy/ui'
-import { watchDebounced } from '@vueuse/core'
+import { ZNotification } from '@codex-proxy/ui'
 import { computed, shallowRef, watch } from 'vue'
 import { getProxyAccounts, removeProxyAccount } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
@@ -32,6 +31,8 @@ export function useProxyAccounts(options: {
   }
 
   function setPage(page: number) {
+    if (!options.isOpen())
+      return
     query.page.value = page
     query.items.value = []
     load()
@@ -49,7 +50,7 @@ export function useProxyAccounts(options: {
     return await removeAction.run(async () => {
       await removeProxyAccount({ proxyId, accountId })
       options.onRemoved()
-      toast.success('账号已移出当前代理，改为直连')
+      ZNotification.success({ message: '账号已移出当前代理，改为直连' })
       if (options.isOpen() && options.proxyId() === proxyId) {
         query.invalidate()
         query.items.value = query.items.value.filter(account => account.id !== accountId)
@@ -63,15 +64,22 @@ export function useProxyAccounts(options: {
 
   watch([options.isOpen, options.proxyId], () => {
     // 关闭或切换代理后丢弃旧请求，避免上一条代理的账号覆盖新列表。
-    query.invalidate()
+    query.invalidate({ resetLoading: options.isOpen() })
+    if (!options.isOpen())
+      return
     query.items.value = []
     query.total.value = 0
     query.error.value = ''
     query.page.value = 1
     search.value = ''
     load()
-  }, { immediate: true })
-  watchDebounced(search, () => setPage(1), { debounce: 300 })
+  }, { immediate: true, flush: 'sync' })
+  watch(search, (_value, _previous, onCleanup) => {
+    const timer = setTimeout(() => {
+      void setPage(1)
+    }, 300)
+    onCleanup(() => clearTimeout(timer))
+  })
 
   return {
     accounts: query.items,

@@ -1,3 +1,5 @@
+//! 将宿主执行、会话、费用与观测事实投影为插件线协议值
+
 use gateway_core::{
     engine::provider::ProviderCallMetadata,
     event::{
@@ -84,7 +86,7 @@ fn breakdown(value: &CalculatedCostBreakdown) -> facts::CostBreakdown {
         long_context_billing_applied: value.long_context_billing_applied(),
         image: value.image().map(|value| facts::ImageCostBreakdown {
             input_tokens: value.input_tokens,
-            cached_tokens: value.cached_tokens,
+            cached_tokens: value.cached_input_tokens,
             input_amount: money(value.input_amount),
             cache_read_amount: money(value.cache_read_amount),
             input_price_per_million: money(value.input_price_per_million),
@@ -127,6 +129,13 @@ fn observation(value: &ProviderResponseObservation) -> facts::ResponseObservatio
             first_text_ms: timings.first_text_ms,
             first_token_ms: timings.first_token_ms,
             provider_processing_ms: timings.provider_processing_ms,
+            upstream_response_ms: timings.upstream_response_ms,
+            upstream_api_overhead_ms: timings.upstream_api_overhead_ms,
+            upstream_engine_ms: timings.upstream_engine_ms,
+            upstream_engine_iapi_ttft_ms: timings.upstream_engine_iapi_ttft_ms,
+            upstream_engine_service_ttft_ms: timings.upstream_engine_service_ttft_ms,
+            upstream_engine_iapi_tbt_ms: timings.upstream_engine_iapi_tbt_ms,
+            upstream_engine_service_tbt_ms: timings.upstream_engine_service_tbt_ms,
             latency_ms: None,
         },
         client_headers: value
@@ -225,15 +234,15 @@ fn project_fact(event: GatewayEvent) -> Option<Result<CanonicalEvent, PluginFaul
             usage: WireUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                cached_tokens: usage.cached_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
+                cached_tokens: usage.cached_input_tokens,
+                cache_write_tokens: usage.cache_write_input_tokens,
+                reasoning_tokens: usage.reasoning_output_tokens,
                 image_input_tokens: usage.image_input_tokens,
                 image_output_tokens: usage.image_output_tokens,
                 total_tokens: usage.total_tokens,
             },
         },
-        // 费用随 host 快照完整开放，结算仍由原执行完成。
+        // 费用随 host 快照完整开放，结算仍由原执行完成
         GatewayEvent::CalculatedCost(_) | GatewayEvent::ProviderCost(_) => return None,
         GatewayEvent::Completed(meta) => CanonicalEvent::Completed {
             id: meta.response_id().to_owned(),
@@ -277,6 +286,15 @@ fn project_wire(wire: &ProtocolWireEvent) -> Result<WireEvent, PluginFault> {
     } else if let Some(frame) = wire.raw_sse_frame() {
         WirePayload::RawSse {
             frame: frame.to_vec(),
+        }
+    } else if let Some(message) = wire.raw_websocket_message() {
+        // 子模型回调采用 SDK 的事件流表达，不把 WebSocket 文本冒充 HTTP body
+        WirePayload::RawSse {
+            frame: gateway_protocol::openai::sse::encode_sse_event(
+                wire.event_type().unwrap_or_default(),
+                message,
+            )
+            .into_bytes(),
         }
     } else {
         return Err(PluginFault::new(

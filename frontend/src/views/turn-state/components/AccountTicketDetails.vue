@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { Account, OAuthStateConfiguration, PoolAccount, TurnStateAutoHunt } from '@/api'
-import { BaseButton, BaseModal } from '@codex-proxy/ui'
+import { ZButton, ZDialog } from '@codex-proxy/ui'
 import { ref } from 'vue'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
 import AccountPoolSummary from './AccountPoolSummary.vue'
 import AccountTurnStateHistory from './AccountTurnStateHistory.vue'
 import AccountTurnStateHunt from './AccountTurnStateHunt.vue'
@@ -27,7 +27,7 @@ function onHuntBusy(value: boolean) {
 </script>
 
 <template>
-  <BaseModal v-model="open" title="账号票据详情" size="md-wide" :dismissible="!busy && !hunting">
+  <ZDialog v-model="open" title="账号票据详情" width="42rem" :show-close="!busy && !hunting" :close-on-click-modal="!busy && !hunting" :close-on-press-escape="!busy && !hunting">
     <div class="grid min-w-0 gap-4">
       <div class="truncate font-emphasis" :title="account.name">
         {{ account.name }}
@@ -58,21 +58,21 @@ function onHuntBusy(value: boolean) {
           </summary>
           <div class="mt-3 grid min-w-0 gap-3">
             <div class="flex flex-wrap gap-2">
-              <BaseButton size="sm" variant="soft" :disabled="busy || hunting || !configuration.pinTurnState" @click="showHunt = !showHunt">
+              <ZButton size="small" type="primary" variant="plain" :disabled="busy || hunting || !configuration.pinTurnState" @click="showHunt = !showHunt">
                 遍历代理
-              </BaseButton>
-              <BaseButton size="sm" variant="soft" :disabled="busy" @click="showHistory = !showHistory">
+              </ZButton>
+              <ZButton size="small" type="primary" variant="plain" :disabled="busy" @click="showHistory = !showHistory">
                 最近记录
-              </BaseButton>
-              <BaseButton size="sm" variant="secondary" :disabled="busy || hunting || !configuration.pinTurnState" @click="emit('recapture')">
+              </ZButton>
+              <ZButton size="small" :disabled="busy || hunting || !configuration.pinTurnState" @click="emit('recapture')">
                 重新捕获
-              </BaseButton>
+              </ZButton>
             </div>
             <div v-if="configuration.turnStateAutoHunt" class="flex flex-wrap items-center gap-2 text-cp-sm">
               自动遍历续期：{{ configuration.turnStateAutoHunt.modelId }}
-              <BaseButton size="sm" variant="soft" :disabled="busy || hunting" @click="emit('stopAutoHunt')">
+              <ZButton size="small" type="primary" variant="plain" :disabled="busy || hunting" @click="emit('stopAutoHunt')">
                 停止续期
-              </BaseButton>
+              </ZButton>
             </div>
             <AccountTurnStateHunt
               v-if="showHunt" :account-id="account.id" :capture-rule="configuration.turnStateCaptureRule ?? null"
@@ -84,5 +84,5 @@ function onHuntBusy(value: boolean) {
         </details>
       </template>
     </div>
-  </BaseModal>
+  </ZDialog>
 </template>

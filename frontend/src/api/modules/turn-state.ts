@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
 import request from '../request'
+import { downloadDiagnostics } from './usage'
 
 export type TurnStateInjectMode = 'fill-missing' | 'always' | 'replace-only'
 export type TurnStateServedMismatchAction = 'observe' | 'block'
@@ -281,4 +282,57 @@ export function getTurnStatePool(options: RequestOptions = {}) {
     method: 'GET',
     ...options,
   })
+}
+
+/** 请求轨迹事件（上游 #447 起只在诊断导出包里提供；fork 票据记录页仍需读取头部长度摘要）。 */
+export interface RequestTraceEvent {
+  sequence: number
+  lastSequence: number
+  elapsedMs: number
+  lastElapsedMs: number
+  attemptIndex: number
+  exchangeId: number | null
+  stage: string
+  count: number
+  data: Record<string, unknown>
+}
+
+export interface RequestTrace {
+  schemaVersion: number
+  requestId: string
+  startedAtUnixMs: number
+  totalEvents: number
+  droppedEvents: number
+  maxEvents: number
+  captureMode: string
+  events: RequestTraceEvent[]
+}
+
+function isRecordLike(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * 从 `/api/admin/diagnostics/export?requestId=` 的导出包里取出该请求的 trace。
+ * 导出包按 `requests[].evidence.trace` 组织；没有证据或被截断时返回 null，由调用方标记「诊断不完整」。
+ */
+export async function getRequestTrace(requestId: string, options: RequestOptions = {}): Promise<RequestTrace | null> {
+  const file = await downloadDiagnostics({ requestId }, options)
+  let document: unknown
+  try {
+    document = JSON.parse(new TextDecoder().decode(file.body))
+  }
+  catch {
+    return null
+  }
+  if (!isRecordLike(document) || !Array.isArray(document.requests))
+    return null
+  for (const entry of document.requests) {
+    if (!isRecordLike(entry) || entry.requestId !== requestId || !isRecordLike(entry.evidence))
+      continue
+    const trace = entry.evidence.trace
+    if (isRecordLike(trace) && Array.isArray(trace.events))
+      return trace as unknown as RequestTrace
+  }
+  return null
 }

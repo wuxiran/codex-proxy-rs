@@ -1,3 +1,5 @@
+//! 验证账号分组分页查询的运行态补充与可用容量聚合
+
 use std::{
     collections::BTreeMap,
     str::FromStr as _,
@@ -8,12 +10,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use gateway_admin::{
     model::{
-        MutationContext, PageSize, Revision,
+        AdminErrorKind, MutationContext, PageSize, Revision,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         accounts::AccountRuntimeSnapshot,
         observability::DecimalAmount,
@@ -24,6 +27,7 @@ use gateway_admin::{
     },
 };
 use gateway_core::{
+    account::FastMode,
     account::{AccountStatusFacts, CredentialState, QuotaState},
     routing::AccountGroupId,
 };
@@ -87,6 +91,62 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
     );
 }
 
+#[tokio::test]
+async fn group_options_query_should_skip_member_and_runtime_enrichment() {
+    let groups = Arc::new(FakeGroupStore::default());
+    let runtime = Arc::new(FakeRuntimeStore::default());
+    let service = AdminHarness::new()
+        .account_groups(groups.clone())
+        .account_runtime(runtime.clone())
+        .build()
+        .await;
+
+    let page = service
+        .account_groups()
+        .list_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect("list account group options");
+
+    assert_eq!(page.items[0].id.as_str(), GROUP_ID);
+    assert!(
+        groups
+            .requested_groups
+            .lock()
+            .expect("requested groups")
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .requested_accounts
+            .lock()
+            .expect("requested accounts")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn group_options_query_should_preserve_store_failures() {
+    let service = AdminHarness::new().build().await;
+
+    let error = service
+        .account_groups()
+        .list_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect_err("unavailable options store must fail");
+
+    assert_eq!(error.kind(), AdminErrorKind::Unavailable);
+}
+
 #[derive(Default)]
 pub(super) struct FakeGroupStore {
     requested_groups: Mutex<Vec<String>>,
@@ -135,6 +195,24 @@ impl AccountGroupStore for FakeGroupStore {
         Ok(AccountGroupPage {
             config_revision: Revision::new(1).expect("revision"),
             items: vec![group_record()],
+            total: 1,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        Ok(AccountGroupOptionsPage {
+            config_revision: Revision::new(1).expect("revision"),
+            items: vec![AccountGroupRef {
+                id: group_id(),
+                name: "Primary".to_owned(),
+                color: AccountGroupColor::parse("#2563EBFF").expect("color"),
+                enabled: true,
+            }],
             total: 1,
             page: query.page,
             page_size: query.page_size.get(),
@@ -195,6 +273,19 @@ struct FakeRuntimeStore {
 
 #[async_trait]
 impl AccountRuntimeStore for FakeRuntimeStore {
+    async fn account_concurrency(
+        &self,
+        _: &str,
+        _: u64,
+        _: u32,
+    ) -> AdminStoreResult<gateway_admin::model::accounts::AccountConcurrencyPage> {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "account concurrency",
+            "not configured in this fixture",
+        ))
+    }
+
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
         Ok(AccountRuntimeSnapshot::default())
     }
@@ -239,7 +330,8 @@ impl AccountRuntimeStore for FakeRuntimeStore {
 fn group_record() -> AccountGroupRecord {
     let now = Utc::now();
     AccountGroupRecord {
-        disable_fast: false,
+        allow_image_generation: true,
+        fast_mode: FastMode::Default,
         id: group_id(),
         name: "Primary".to_owned(),
         description: None,
@@ -293,4 +385,49 @@ fn unused() -> AdminStoreError {
         "account group",
         "unused test operation",
     )
+}
+
+#[tokio::test]
+async fn invalid_group_fields_are_rejected_before_store_mutations() {
+    use gateway_admin::model::{MutationActor, account_groups::CreateAccountGroup};
+    let service = AdminHarness::new()
+        .account_groups(Arc::new(FakeGroupStore::default()))
+        .build()
+        .await;
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "invalid-group".to_owned(),
+    };
+    let record = group_record();
+    let created = service
+        .account_groups()
+        .create(
+            &context,
+            CreateAccountGroup {
+                allow_image_generation: true,
+                fast_mode: FastMode::Default,
+                name: " invalid".to_owned(),
+                description: None,
+                color: record.color.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let updated = service
+        .account_groups()
+        .update(
+            &context,
+            UpdateAccountGroup {
+                allow_image_generation: None,
+                fast_mode: None,
+                id: record.id,
+                name: "valid".to_owned(),
+                description: Some("invalid\n".to_owned()),
+                color: record.color,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(created.kind(), AdminErrorKind::Invalid);
+    assert_eq!(updated.kind(), AdminErrorKind::Invalid);
 }

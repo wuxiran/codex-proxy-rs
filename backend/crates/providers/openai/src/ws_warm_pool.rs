@@ -80,7 +80,8 @@ struct State {
 }
 
 /// 探针判决。
-enum Verdict {
+#[doc(hidden)]
+pub enum Verdict {
     /// 本次启用的检查通过，是否检查答案由报告单独标记。
     Verified(Option<String>),
     /// 声明或答案未通过检查。
@@ -103,11 +104,19 @@ impl ProbeCapture {
         &self,
         previous: Option<&'a (uuid::Uuid, WarmConnectionApproval)>,
     ) -> Option<&'a WarmConnectionApproval> {
-        // 同一槽位也可能已重连，旧票的证明只能由原连接继承。
-        previous
-            .filter(|(id, _)| self.connection_id == Some(*id))
-            .map(|(_, approval)| approval)
+        inherited_approval(self.connection_id, previous)
     }
+}
+
+/// 同一槽位也可能已重连，旧票的证明只能由原连接继承。
+#[doc(hidden)]
+pub fn inherited_approval(
+    connection_id: Option<uuid::Uuid>,
+    previous: Option<&(uuid::Uuid, WarmConnectionApproval)>,
+) -> Option<&WarmConnectionApproval> {
+    previous
+        .filter(|(id, _)| connection_id == Some(*id))
+        .map(|(_, approval)| approval)
 }
 
 /// 取消或提前返回也撤销候选，后台维护随后回收连接，不会遗留可被领养的半成品。
@@ -122,7 +131,8 @@ impl Drop for PendingApproval {
 }
 
 /// 不实现 Debug：持有仓库句柄与账号上下文。
-pub(crate) struct WarmPoolService {
+#[doc(hidden)]
+pub struct WarmPoolService {
     repository: CodexCredentialRepository,
     pins: crate::turn_state_pin::TurnStatePins,
     mint: Arc<crate::turn_state_mint::CloudMintService>,
@@ -826,7 +836,7 @@ impl WarmPoolService {
             .residency_free_client()
             .for_account(&probe_account)
             .map_err(|_| "client".to_owned())?
-            .with_authentication(&credential.authentication);
+            .with_responses_api_base_url(credential.authentication.responses_api_base_url());
 
         let prompt = if settings.probe_prompt.trim().is_empty() {
             DEFAULT_PROBE_PROMPT
@@ -953,16 +963,26 @@ impl WarmPoolService {
             if verdict.is_some() {
                 continue;
             }
-            buf.extend_from_slice(&next);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line);
-                let Some(data) = line.trim().strip_prefix("data:") else {
-                    continue;
-                };
-                let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
-                    continue;
-                };
+            // 上游 WS 交换按原始消息文本逐条转发（不再包成 SSE 帧）；HTTP SSE 仍是 data: 行。
+            // 两种帧都收：整块是一个 JSON 事件就直接用，否则按行找 data: 前缀。
+            let mut events = Vec::new();
+            match serde_json::from_slice::<Value>(&next) {
+                Ok(event) if event.is_object() => events.push(event),
+                _ => {
+                    buf.extend_from_slice(&next);
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line);
+                        let Some(data) = line.trim().strip_prefix("data:") else {
+                            continue;
+                        };
+                        if let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+            for event in events {
                 let event_type = event.get("type").and_then(Value::as_str);
                 let (header_model, body_model) = event_declared_models(&event);
                 if header_model.is_some() {
@@ -1024,7 +1044,8 @@ impl WarmPoolService {
         }))
     }
 
-    fn judge(
+    #[doc(hidden)]
+    pub fn judge(
         answer: &str,
         expect: Option<&str>,
         probe_model: &str,
@@ -1081,7 +1102,8 @@ impl turn_state::pool::PoolRuntime for WarmPoolService {
 }
 
 /// 响应头 `openai-model` / `x-openai-model` 与正文 `response.model` 分开取。
-fn event_declared_models(event: &Value) -> (Option<String>, Option<String>) {
+#[doc(hidden)]
+pub fn event_declared_models(event: &Value) -> (Option<String>, Option<String>) {
     let header = [event.pointer("/response/headers"), event.get("headers")]
         .into_iter()
         .flatten()
@@ -1107,7 +1129,8 @@ fn event_declared_models(event: &Value) -> (Option<String>, Option<String>) {
 }
 
 /// 两处声明有一处和探针模型不一致就返回那一处。都没声明时返回 None，交给 judge 拒绝满血。
-fn disagreeing_model(
+#[doc(hidden)]
+pub fn disagreeing_model(
     header: Option<&str>,
     body: Option<&str>,
     probe_model: &str,
@@ -1120,7 +1143,8 @@ fn disagreeing_model(
 }
 
 /// 只接受完整期望值；允许单层强调或行内代码，不把带解释或矛盾结论的前缀判为通过。
-fn answer_matches(answer: &str, expect: &str) -> bool {
+#[doc(hidden)]
+pub fn answer_matches(answer: &str, expect: &str) -> bool {
     let answer = answer.trim();
     let normalized = ["**", "__", "`", "*", "_"]
         .into_iter()
@@ -1134,7 +1158,8 @@ fn answer_matches(answer: &str, expect: &str) -> bool {
     normalized == expect.trim()
 }
 
-fn verification_valid_for(
+#[doc(hidden)]
+pub fn verification_valid_for(
     reprobe: Duration,
     ticket_ttl: Duration,
     ticket: Option<&str>,
@@ -1170,178 +1195,4 @@ fn probe_transport_error(error: crate::transport::CodexClientError) -> String {
         || "upstream_transport".to_owned(),
         |status| format!("upstream_http_{status}"),
     )
-}
-
-#[cfg(test)]
-mod judge_tests {
-    use super::{Verdict, WarmPoolService};
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnecting_a_slot_cannot_transfer_the_previous_connections_ticket_proof() {
-        use super::{ProbeCapture, WarmConnectionApproval};
-        use std::time::Duration;
-
-        let lifetime = Duration::from_secs(240);
-        let previous = WarmConnectionApproval::new("model".into(), lifetime);
-        previous.publish_scoped(
-            true,
-            Duration::from_secs(30),
-            Some("synthetic-old-ticket"),
-            None,
-        );
-        let old_id = uuid::Uuid::new_v4();
-        let previous = (old_id, previous);
-        for id in [Some(old_id), Some(uuid::Uuid::new_v4()), None] {
-            let capture = ProbeCapture {
-                ticket: None,
-                headers: Vec::new(),
-                route: None,
-                connection_id: id,
-                pin_generation: None,
-            };
-            let next = WarmConnectionApproval::new("model".into(), lifetime);
-            next.publish_rechecked(
-                true,
-                lifetime,
-                None,
-                None,
-                None,
-                capture.previous_approval(Some(&previous)),
-            );
-            tokio::time::advance(Duration::from_secs(31)).await;
-            assert_eq!(next.checked(), id != Some(old_id));
-        }
-    }
-
-    #[test]
-    fn answer_must_not_contain_a_second_or_contradicting_conclusion() {
-        for answer in [
-            "21，但最终答案是29",
-            "21 or 29",
-            "21.0",
-            "21\n29",
-            "21 apples",
-            "210",
-        ] {
-            assert!(!super::answer_matches(answer, "21"), "accepted {answer:?}");
-        }
-        for answer in ["21", " **21** ", "`21`", "_21_", "\n21\n"] {
-            assert!(super::answer_matches(answer, "21"), "rejected {answer:?}");
-        }
-    }
-
-    #[test]
-    fn probe_proof_cannot_outlive_the_ticket_that_was_issued_before_the_probe_completed() {
-        use base64::Engine as _;
-        use std::time::{Duration, UNIX_EPOCH};
-        let issued = 1_700_000_000u64;
-        let mut bytes = vec![0x80];
-        bytes.extend_from_slice(&issued.to_be_bytes());
-        let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let at = UNIX_EPOCH + Duration::from_secs(issued);
-        let ttl = Duration::from_secs(240);
-        assert_eq!(
-            super::verification_valid_for(
-                Duration::from_secs(300),
-                ttl,
-                Some(&ticket),
-                at,
-                at + Duration::from_secs(80)
-            ),
-            Duration::from_secs(160)
-        );
-        assert_eq!(
-            super::verification_valid_for(
-                Duration::from_secs(300),
-                ttl,
-                Some(&ticket),
-                at,
-                at + ttl
-            ),
-            Duration::ZERO
-        );
-        assert_eq!(
-            super::verification_valid_for(
-                Duration::from_secs(300),
-                ttl,
-                Some(&ticket),
-                at,
-                at - Duration::from_secs(60)
-            ),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn a_right_answer_from_a_swapped_model_is_not_verified() {
-        let swapped = Some("gpt-5.6-luna".to_owned());
-        assert!(matches!(
-            WarmPoolService::judge("21", Some("21"), "gpt-6-astra", swapped.clone(), swapped),
-            Verdict::Degraded(Some(model)) if model == "gpt-5.6-luna"
-        ));
-        assert!(matches!(
-            WarmPoolService::judge(
-                "**21**",
-                Some("21"),
-                "gpt-6-astra",
-                Some("gpt-6-astra".to_owned()),
-                None
-            ),
-            Verdict::Verified(_)
-        ));
-        assert!(matches!(
-            WarmPoolService::judge(
-                "21",
-                Some("21"),
-                "gpt-6-astra",
-                Some("GPT-6-ASTRA".to_owned()),
-                None
-            ),
-            Verdict::Verified(_)
-        ));
-        assert!(matches!(
-            WarmPoolService::judge(
-                "20",
-                Some("21"),
-                "gpt-6-astra",
-                Some("gpt-6-astra".to_owned()),
-                None
-            ),
-            Verdict::Degraded(_)
-        ));
-        assert!(matches!(
-            WarmPoolService::judge(
-                "210",
-                Some("21"),
-                "gpt-6-astra",
-                Some("gpt-6-astra".to_owned()),
-                None
-            ),
-            Verdict::Degraded(_)
-        ));
-        assert!(matches!(
-            WarmPoolService::judge("21", Some("21"), "gpt-6-astra", None, None),
-            Verdict::Degraded(None)
-        ));
-    }
-
-    #[test]
-    fn a_header_model_disagrees_even_when_the_body_matches() {
-        let event = serde_json::json!({
-            "type": "response.created",
-            "response": {
-                "model": "gpt-6-astra",
-                "headers": {"openai-model": "gpt-5.6-luna"}
-            }
-        });
-        let (header, body) = super::event_declared_models(&event);
-        assert_eq!(
-            super::disagreeing_model(header.as_deref(), body.as_deref(), "gpt-6-astra").as_deref(),
-            Some("gpt-5.6-luna")
-        );
-        let header_only = serde_json::json!({"headers": {"x-openai-model": ["gpt-6-astra"]}});
-        let (header, body) = super::event_declared_models(&header_only);
-        assert_eq!(header.as_deref(), Some("gpt-6-astra"));
-        assert!(body.is_none());
-    }
 }

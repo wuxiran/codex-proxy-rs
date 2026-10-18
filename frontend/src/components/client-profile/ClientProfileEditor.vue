@@ -3,10 +3,10 @@ import type {
   ClientProfileOptions,
   ClientProfilePreview,
   ClientProfileSelection,
-} from '@/api/modules/client-profiles'
-import { BaseButton, BaseSegmented } from '@codex-proxy/ui'
+} from '@/api/modules/settings/profiles'
+import { ZButton, ZSegmented } from '@codex-proxy/ui'
 import { computed, onMounted, shallowRef, watch } from 'vue'
-import { getClientProfileOptions, previewClientProfile } from '@/api/modules/client-profiles'
+import { getClientProfileOptions, previewClientProfile } from '@/api/modules/settings/profiles'
 import { errorMessage } from '@/utils/operation'
 import ClientProfilePresetFields from './ClientProfilePresetFields.vue'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
@@ -60,11 +60,13 @@ async function load() {
 }
 
 watch([model, () => props.active], ([configuration, active], _, onCleanup) => {
+  if (!active)
+    return
   let cancelled = false
   preview.value = undefined
   previewError.value = ''
-  previewing.value = active && !needsInput.value
-  if (!active || needsInput.value)
+  previewing.value = !needsInput.value
+  if (needsInput.value)
     return
   const timer = setTimeout(async () => {
     try {
@@ -93,9 +95,9 @@ onMounted(() => load())
 <template>
   <div class="grid min-w-0 gap-4">
     <div v-if="allowInherit" class="flex flex-wrap items-center justify-between gap-3">
-      <BaseSegmented
+      <ZSegmented
         v-model="profileSource"
-        label="客户端身份来源"
+        aria-label="客户端身份来源"
         class="shrink-0"
         :options="[
           { label: '全局配置', value: 'global' },
@@ -107,9 +109,9 @@ onMounted(() => load())
     </div>
     <div v-if="loadError" role="alert" class="flex flex-wrap items-center justify-between gap-3 text-cp text-cp-error">
       <span>预设加载失败：{{ loadError }}</span>
-      <BaseButton size="sm" :disabled="disabled || loading" @click="load()">
+      <ZButton size="small" :disabled="disabled || loading" @click="load()">
         重试
-      </BaseButton>
+      </ZButton>
     </div>
     <ClientProfilePresetFields
       v-if="!inherited"
@@ -119,6 +121,7 @@ onMounted(() => load())
       :previewing="previewing"
       :error="previewError"
       :disabled="disabled || loading"
+      :max-version-lag="options?.maxVersionLag"
       :aria-busy="loading || undefined"
       @update:model-value="model = $event"
     />

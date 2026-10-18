@@ -1,17 +1,22 @@
-//! OpenAI Provider 专属能力。
+//! OpenAI Provider 专属能力
 
 mod admin;
 mod cf_cookie_pool;
 pub mod config;
 mod fork_account_ticket;
+mod jitter;
 mod pool_overview;
 mod provider;
+mod request_identity;
 mod route_pair;
 mod session_transport;
 mod turn_state_auto_hunt;
 mod turn_state_mint;
 mod turn_state_pin;
 mod ws_warm_pool;
+
+/// 持久账号使用的 API Key 认证种类，凭据与账号传输隔离共用
+pub(crate) const CODEX_AUTHENTICATION_KIND_API_KEY: &str = "api_key";
 
 use std::sync::Arc;
 
@@ -36,9 +41,28 @@ use crate::transport::profile::{
 use crate::transport::{CodexWebSocketPool, build_reqwest_client};
 
 pub use config::{OpenAiConfig, OpenAiConfigError};
+#[doc(hidden)]
+pub use jitter::{
+    catalog_refresh_jitter, quota_failure_refresh_delay, server_error_retry_jitter, uniform_delay,
+};
 pub use provider::{
     CodexProvider, CodexProviderConfigError, CodexProviderTransport, OFFICIAL_CODEX_BASE_PATH,
     OFFICIAL_CODEX_BASE_URL, openai_failure_affects_account_score,
+};
+
+// fork: 测试缝。生产源文件不再内联测试模块，纯函数按上游 jitter 的做法以 doc(hidden) 再导出给 tests/ 用
+#[doc(hidden)]
+pub use cf_cookie_pool::{BorrowedCf, CfCookiePool};
+#[doc(hidden)]
+pub use provider::{
+    MismatchDisposition, cfbm_issued_ttl_seconds, mismatch_disposition, served_mismatch_error,
+};
+#[doc(hidden)]
+pub use turn_state_mint::{MintError, mint_http_client, mint_proxy};
+#[doc(hidden)]
+pub use ws_warm_pool::{
+    Verdict as WarmPoolVerdict, WarmPoolService, answer_matches, disagreeing_model,
+    event_declared_models, inherited_approval, verification_valid_for,
 };
 
 pub mod credential;
@@ -50,7 +74,7 @@ pub use transport::{
     encode_generate_request, openai_billing_breakdown,
 };
 
-/// OpenAI 初始化后交给组装根的最小能力集。
+/// OpenAI 初始化后交给组装根的最小能力集
 pub struct ProviderBundle {
     core_provider: Arc<dyn Provider>,
     admin_provider: Arc<dyn ProviderAdmin>,
@@ -58,7 +82,7 @@ pub struct ProviderBundle {
     turn_state_service: turn_state::TurnStateService,
 }
 
-/// 构造 OpenAI 数据面、Provider-owned 后台任务与 Redis OAuth pending owner。
+/// 构造 OpenAI 数据面、Provider-owned 后台任务与 Redis OAuth pending owner
 pub async fn initialize(
     config: OpenAiConfig,
     ports: ProviderStorePorts,
@@ -213,6 +237,8 @@ pub async fn initialize(
         )
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
+        .with_timezone(config.timezone)
+        .with_live_support(repository.clone())
         .with_turn_state_pins(turn_state_pins.clone())
         .with_cloud_mint(Arc::clone(&cloud_mint))
         .with_ws_warm_pool(Arc::clone(&ws_warm_pool)),
@@ -244,6 +270,7 @@ pub async fn initialize(
             Arc::clone(&refresher),
             Arc::clone(&leases),
             Arc::clone(&runtime_policy),
+            ports.diagnostics(),
         )
         .with_personal_access_token_client(token_client)
         .with_revive_exports(Arc::clone(&revive))
@@ -255,6 +282,7 @@ pub async fn initialize(
         Arc::clone(&leases),
         credential_state,
         Arc::clone(&runtime_policy),
+        ports.diagnostics(),
     ));
     let pending = Arc::new(OpenAiOAuthPendingStore::new(
         ports.oauth_pending(),
@@ -307,6 +335,7 @@ pub async fn initialize(
         ),
     );
     let worker_contributions = provider::worker_contributions(
+        config.timezone,
         refresh,
         quota,
         catalog,
@@ -342,19 +371,19 @@ impl ProviderBundle {
         Arc::clone(&self.admin_provider)
     }
 
-    /// turn-state 模板/设置/观测服务；组装根把它交给管理端 HTTP adapter，不经过 ProviderAdmin。
+    /// turn-state 模板/设置/观测服务；组装根把它交给管理端 HTTP adapter，不经过 ProviderAdmin
     #[must_use]
     pub fn turn_state_service(&self) -> turn_state::TurnStateService {
         self.turn_state_service.clone()
     }
 
-    /// 一次性移交 Host 任务计划，防止同一 owner 被重复注册。
+    /// 一次性移交 Host 任务计划，防止同一 owner 被重复注册
     pub fn take_worker_contributions(&mut self) -> Vec<WorkerContribution> {
         std::mem::take(&mut self.worker_contributions)
     }
 }
 
-/// OpenAI 初始化失败的脱敏分类。
+/// OpenAI 初始化失败的脱敏分类
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiInitializeError {
     #[error("OpenAI runtime policy is unavailable")]

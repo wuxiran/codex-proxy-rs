@@ -1,4 +1,6 @@
-use std::{sync::Arc, time::SystemTime};
+//! 执行插件上游适配调用，管理事件流、续接状态与调用生命周期
+
+use std::sync::Arc;
 
 use futures::stream;
 use gateway_core::{
@@ -8,7 +10,7 @@ use gateway_core::{
     upstream::UpstreamSendState,
 };
 use gateway_plugin_sdk::{
-    CallContext, ErrorCode, PluginFault, Stage,
+    CallContext, Stage,
     call::upstream_adapter::{
         ContinuationScope, EXECUTE_METHOD, UpstreamAdapterRequest, UpstreamContinuation,
         UpstreamTransport,
@@ -18,10 +20,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     PluginUpstreamAdapter,
-    event::{DecodedEvent, EventDecoder, invalid},
+    event::{DecodedEvent, EventDecodeError, EventDecoder},
+    failure::{fault_error, invalid, rpc_error},
 };
 use crate::{
-    RpcError, RpcStream,
+    RpcStream,
     callback::{
         CallbackScope,
         upstream::{ConnectionOwner, ManagedUpstream},
@@ -64,7 +67,7 @@ pub(super) fn execute(
         decoder: EventDecoder::default(),
         ended: false,
     };
-    // try_unfold 首次 poll 才运行闭包；Core 在此前登记 attempt 并持有账号租约。
+    // try_unfold 首次 poll 才运行闭包；Core 在此前登记 attempt 并持有账号租约
     Box::pin(stream::try_unfold(state, |mut state| async move {
         if state.ended {
             return Ok(None);
@@ -91,16 +94,28 @@ impl Execution {
             biased;
             () = cancellation.cancelled() => return Err(ProviderError::new(ProviderErrorKind::Cancelled, active.managed.send_state.get())),
             result = active.stream.next() => result.map_err(|error| rpc_error(error, active.managed.send_state.get()))?,
-        }.ok_or_else(|| invalid(active.managed.send_state.get()))?;
-        let mut decoded = self.decoder.decode(
-            &chunk,
-            &self.adapter.declaration.protocol,
-            self.adapter.declaration.transport.as_str(),
-            self.invocation.account.as_ref(),
-            active.managed.send_state.get(),
-        )?;
+        }.ok_or_else(|| {
+            self.adapter.session.invalid_response(Stage::Upstream);
+            invalid(active.managed.send_state.get())
+        })?;
+        let mut decoded = self
+            .decoder
+            .decode(
+                &chunk,
+                &self.adapter.declaration.protocol,
+                self.adapter.declaration.transport.as_str(),
+                self.invocation.account.as_ref(),
+                active.managed.send_state.get(),
+            )
+            .map_err(|error| match error {
+                EventDecodeError::Invalid(error) => {
+                    self.adapter.session.invalid_response(Stage::Upstream);
+                    error
+                }
+                EventDecodeError::Upstream(error) => error,
+            })?;
         if self.decoder.completed {
-            // 先确认 RPC 正常终结，再发布唯一 Completed；否则 Core 不会继续 poll 尾部错误。
+            // 先确认 RPC 正常终结，再发布唯一 Completed；否则 Core 不会继续 poll 尾部错误
             let terminal = async {
                 let tail = tokio::select! {
                     biased;
@@ -108,13 +123,14 @@ impl Execution {
                     result = active.stream.next() => result.map_err(|error| rpc_error(error, active.managed.send_state.get()))?,
                 };
                 if tail.is_some() {
+                    self.adapter.session.invalid_response(Stage::Upstream);
                     return Err(invalid(active.managed.send_state.get()));
                 }
                 self.decoder.finish(active.managed.send_state.get())?;
                 attach_continuation(&self.adapter, &self.invocation, active, &mut decoded).await
             }.await;
             if let Err(error) = terminal {
-                // 尾部故障不得交付成功 wire，但已经解析的计量事实仍归 Core 结算。
+                // 尾部故障不得交付成功 wire，但已经解析的计量事实仍归 Core 结算
                 let metering = decoded
                     .event
                     .canonical_facts()
@@ -153,11 +169,7 @@ impl Execution {
         let timeout = invocation
             .context
             .deadline()
-            .duration_since(SystemTime::now())
-            .map_err(|_| {
-                ProviderError::new(ProviderErrorKind::Timeout, UpstreamSendState::NotSent)
-            })?
-            .min(self.adapter.session.maximum_call_timeout());
+            .bounded(self.adapter.session.maximum_call_timeout());
         if timeout.is_zero() || invocation.context.cancellation().is_cancelled() {
             return Err(ProviderError::new(
                 ProviderErrorKind::Cancelled,
@@ -165,6 +177,8 @@ impl Execution {
             ));
         }
         let mut context = self.adapter.session.context(Stage::Upstream, timeout);
+        context.request =
+            crate::adapter::request_context(invocation.context.extension_scope().request());
         context.request_id = Some(invocation.context.request_id().as_str().to_owned());
         context.attempt_id = Some(format!(
             "{}:{}",
@@ -215,7 +229,7 @@ impl Execution {
             credential_revision: invocation.account.credential_revision().get(),
             protocol: invocation.operation.protocol().to_owned(),
             client_transport: invocation.context.client_transport().as_str().to_owned(),
-            disable_fast: invocation.context.disable_fast(),
+            fast_mode: invocation.context.fast_mode().as_str().to_owned(),
             headers: invocation
                 .headers
                 .iter()
@@ -228,19 +242,19 @@ impl Execution {
                 invocation
                     .operation
                     .middleware_body()
-                    .map_err(|_| invalid())?
+                    .map_err(|source| invalid().with_source(source))?
                     .to_vec(),
             )
-            .map_err(|_| invalid())?;
+            .map_err(|source| invalid().with_source(source))?;
         invocation.context.trace().record("plugin.upstream", serde_json::json!({ "instanceId": self.adapter.instance_id, "adapterId": declaration.id, "generation": context.generation, "transport": declaration.transport.as_str() }));
-        let stream = tokio::select! {
+        let mut stream = tokio::select! {
             biased;
             () = invocation.context.cancellation().cancelled() => return Err(ProviderError::new(ProviderErrorKind::Cancelled, managed.send_state.get())),
             result = self.adapter.session.call_stream(EXECUTE_METHOD, context.clone(), serde_json::json!({}), payload) => result.map_err(|error| rpc_error(error, managed.send_state.get()))?,
         };
-        if stream.initial.result != serde_json::json!({}) || !stream.initial.payload.is_empty() {
-            return Err(super::event::invalid(managed.send_state.get()));
-        }
+        // 后续只消费事件流，初始附带数据不应随长连接保留
+        stream.initial.result = serde_json::Value::Null;
+        stream.initial.payload = Vec::new();
         Ok(ActiveCall {
             context,
             stream,
@@ -279,7 +293,7 @@ fn previous_continuation(
     }
     let stored: StoredContinuation =
         serde_json::from_value(serde_json::Value::Object(state.payload().clone()))
-            .map_err(|_| invalid())?;
+            .map_err(|source| invalid().with_source(source))?;
     if stored.client_key_id != owner.client_key_id
         || stored.account_id != owner.account_id
         || stored.credential_revision != owner.credential_revision
@@ -312,7 +326,7 @@ async fn attach_continuation(
     if continuation.upstream_response_id.is_empty()
         || continuation.upstream_response_id.len() > 512
         || serde_json::to_vec(&continuation)
-            .map_err(|_| invalid())?
+            .map_err(|source| invalid().with_source(source))?
             .len()
             > 32 * 1024
     {
@@ -337,12 +351,13 @@ async fn attach_continuation(
         account_id: invocation.account.account_id().as_str().to_owned(),
         credential_revision: invocation.account.credential_revision().get(),
     };
-    let serde_json::Value::Object(payload) = serde_json::to_value(state).map_err(|_| invalid())?
+    let serde_json::Value::Object(payload) =
+        serde_json::to_value(state).map_err(|source| invalid().with_source(source))?
     else {
         return Err(invalid());
     };
     let state = ProviderSessionState::new(adapter.declaration.provider.as_str(), payload)
-        .map_err(|_| invalid())?
+        .map_err(|source| invalid().with_source(source))?
         .with_extension_owner(extension_owner(adapter, &active.context, local));
     decoded.event.attach_session_update(state);
     Ok(())
@@ -361,26 +376,4 @@ fn extension_owner(
         incarnation: context.incarnation.clone(),
         connection_local,
     }
-}
-
-fn rpc_error(error: RpcError, sent: UpstreamSendState) -> ProviderError {
-    match error {
-        RpcError::Remote(fault) => fault_error(fault, sent),
-        RpcError::Timeout => ProviderError::new(ProviderErrorKind::Timeout, sent),
-        RpcError::Cancelled => ProviderError::new(ProviderErrorKind::Cancelled, sent),
-        _ => ProviderError::new(ProviderErrorKind::Unavailable, sent),
-    }
-}
-
-fn fault_error(fault: PluginFault, sent: UpstreamSendState) -> ProviderError {
-    let kind = match fault.code {
-        ErrorCode::Timeout => ProviderErrorKind::Timeout,
-        ErrorCode::Cancelled => ProviderErrorKind::Cancelled,
-        ErrorCode::Unsupported => ProviderErrorKind::Unsupported,
-        ErrorCode::InvalidInput | ErrorCode::Rejected | ErrorCode::PermissionDenied => {
-            ProviderErrorKind::InvalidRequest
-        }
-        _ => ProviderErrorKind::Unavailable,
-    };
-    ProviderError::new(kind, sent)
 }

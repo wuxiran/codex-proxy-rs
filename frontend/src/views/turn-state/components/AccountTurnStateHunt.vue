@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { TurnStateHuntRow } from '../composables/useAccountTurnStateHunt'
 import type { TurnStateAutoHunt, TurnStateCaptureRule } from '@/api'
-import { BaseButton, BaseCheckbox, BaseInput, BaseNumberInput, BaseSelect } from '@codex-proxy/ui'
+import { ZButton, ZCheckbox, ZInput, ZInputNumber, ZSelect } from '@codex-proxy/ui'
 import { computed, onMounted, ref, watch } from 'vue'
 import { getAccountModels } from '@/api'
 import { useProxyCatalog } from '@/composables/useProxyCatalog'
@@ -220,9 +220,9 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       <h4 class="m-0 text-cp-sm font-heavy text-cp-text">
         遍历代理找 state
       </h4>
-      <BaseButton variant="soft" size="sm" :disabled="busy" @click="emit('close')">
+      <ZButton type="primary" variant="plain" size="small" :disabled="busy" @click="emit('close')">
         收起
-      </BaseButton>
+      </ZButton>
     </div>
     <p class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
       经已测试通过的代理请求票据，成功后更换账号出口并更新账号共享票
@@ -231,11 +231,11 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
     <div class="mt-3 flex flex-wrap items-end gap-3">
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>方式</span>
-        <BaseSelect v-model="mode" class="min-w-56" size="sm" aria-label="方式" :options="modeOptions" :disabled="busy" />
+        <ZSelect v-model="mode" class="min-w-56" size="small" aria-label="方式" :options="modeOptions" :disabled="busy" />
       </div>
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>模型 id（可手填）{{ modelsLoading ? '，目录加载中…' : '' }}</span>
-        <BaseInput v-model="customModel" class="min-w-56" size="sm" aria-label="模型 id" placeholder="gpt-6-astra" :disabled="busy" />
+        <ZInput v-model="customModel" class="min-w-56" size="small" aria-label="模型 id" placeholder="gpt-6-astra" :disabled="busy" />
       </div>
     </div>
     <p v-if="models.length && mode === 'auto'" class="mb-0 mt-2 text-cp-xs text-cp-text-secondary">
@@ -244,55 +244,54 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
     <div v-if="models.length && mode === 'sweep'" class="mt-3 flex flex-wrap items-end gap-3">
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>模型</span>
-        <BaseSelect v-model="modelId" class="min-w-56" size="sm" aria-label="模型" :options="modelOptions" :disabled="busy" />
+        <ZSelect v-model="modelId" class="min-w-56" size="small" aria-label="模型" :options="modelOptions" :disabled="busy" />
       </div>
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>范围</span>
-        <BaseSelect v-model="onlyProxyId" class="min-w-56" size="sm" aria-label="遍历范围" :options="proxyOptions" :disabled="busy" />
+        <ZSelect v-model="onlyProxyId" class="min-w-56" size="small" aria-label="遍历范围" :options="proxyOptions" :disabled="busy" />
       </div>
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>{{ single ? '最多尝试（轮换出口可到 200）' : '每个代理最多尝试' }}</span>
-        <BaseNumberInput v-model="attempts" label="每个代理最多尝试次数" :min="1" :max="maxAttempts" unit="次" :disabled="busy" />
+        <ZInputNumber v-model="attempts" aria-label="每个代理最多尝试次数" :min="1" :max="maxAttempts" unit="次" :disabled="busy" />
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
-        <BaseCheckbox v-model="includeDirect" label="同时尝试直连" show-label :disabled="busy || single" />
+        <ZCheckbox v-model="includeDirect" label="同时尝试直连" :disabled="busy || single" />
       </div>
       <div class="pb-2 text-cp-sm text-cp-text">
-        <BaseCheckbox v-model="autoRenew" label="过期后按需补票" show-label :disabled="busy" />
+        <ZCheckbox v-model="autoRenew" label="过期后按需补票" :disabled="busy" />
       </div>
       <div class="flex gap-2 pb-1">
-        <BaseButton variant="primary" size="sm" :disabled="!canStart" @click="start">
+        <ZButton type="primary" size="small" :disabled="!canStart" @click="start">
           {{ status === 'idle' ? '开始遍历' : '重新遍历' }}
-        </BaseButton>
-        <BaseButton v-if="busy" variant="secondary" size="sm" :disabled="status === 'finalizing'" @click="hunt.cancel">
+        </ZButton>
+        <ZButton v-if="busy" size="small" :disabled="status === 'finalizing'" @click="hunt.cancel">
           取消
-        </BaseButton>
+        </ZButton>
       </div>
     </div>
     <div v-if="models.length && mode === 'auto'" class="mt-3 grid gap-3">
       <div class="flex flex-wrap items-end gap-3">
         <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
           <span>模型</span>
-          <BaseSelect v-model="modelId" class="min-w-56" size="sm" aria-label="模型" :options="modelOptions" :disabled="busy" />
+          <ZSelect v-model="modelId" class="min-w-56" size="small" aria-label="模型" :options="modelOptions" :disabled="busy" />
         </div>
         <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
           <span>轮换代理模板</span>
-          <BaseSelect v-model="templateProxyId" class="min-w-64" size="sm" aria-label="轮换代理模板" :options="templateOptions" :disabled="busy" />
+          <ZSelect v-model="templateProxyId" class="min-w-64" size="small" aria-label="轮换代理模板" :options="templateOptions" :disabled="busy" />
         </div>
         <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
           <span>最多 IP 数（额度闸）</span>
-          <BaseNumberInput v-model="maxIps" label="最多生成多少个临时 IP" :min="1" :max="2000" unit="个" :disabled="busy" />
+          <ZInputNumber v-model="maxIps" aria-label="最多生成多少个临时 IP" :min="1" :max="2000" unit="个" :disabled="busy" />
         </div>
       </div>
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>出口国家（随机轮换）</span>
         <div class="flex flex-wrap gap-3">
-          <BaseCheckbox
+          <ZCheckbox
             v-for="code in HUNT_COUNTRIES"
             :key="code"
             :model-value="selectedCountries.includes(code)"
             :label="code"
-            show-label
             :disabled="busy"
             @update:model-value="toggleCountry(code)"
           />
@@ -301,24 +300,23 @@ function attemptText(attempt: TurnStateHuntRow['attempts'][number]) {
       <div class="grid gap-1 text-cp-xs text-cp-text-secondary">
         <span>命中后切到的静态出口（选账号数最少的一个）</span>
         <div class="flex flex-wrap gap-x-3 gap-y-1.5">
-          <BaseCheckbox
+          <ZCheckbox
             v-for="proxy in usable"
             :key="proxy.id"
             :model-value="staticIds.includes(proxy.id)"
             :label="proxy.name"
-            show-label
             :disabled="busy"
             @update:model-value="toggleStatic(proxy.id)"
           />
         </div>
       </div>
       <div class="flex gap-2">
-        <BaseButton variant="primary" size="sm" :disabled="!canStartAuto" @click="startAuto">
+        <ZButton type="primary" size="small" :disabled="!canStartAuto" @click="startAuto">
           {{ auto.status.value === 'idle' ? '开始自动撞' : '重新自动撞' }}
-        </BaseButton>
-        <BaseButton v-if="autoBusy" variant="secondary" size="sm" :disabled="auto.status.value === 'finalizing'" @click="auto.cancel">
+        </ZButton>
+        <ZButton v-if="autoBusy" size="small" :disabled="auto.status.value === 'finalizing'" @click="auto.cancel">
           停止
-        </BaseButton>
+        </ZButton>
       </div>
       <p v-if="!usable.length" class="mb-0 text-cp-xs text-cp-error">
         没有测试通过的代理：请先到代理页添加轮换代理模板与静态出口并测试通过。

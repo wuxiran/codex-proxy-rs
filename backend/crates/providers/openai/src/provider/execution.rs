@@ -1,8 +1,10 @@
-//! OpenAI attempt 的选择、发送与响应流执行。
+//! OpenAI attempt 的选择、发送与响应流执行
 
 use gateway_core::metering::{CalculatedCost, Usage};
 
 use super::*;
+use crate::credential::CodexSelectionModel;
+use gateway_core::operation::RawJsonPayload;
 
 impl CodexProvider {
     pub(super) async fn execute_image(
@@ -30,11 +32,9 @@ impl CodexProvider {
             .get("image_turn_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let session_affinity = derive_codex_endpoint_session_affinity(
-            image.payload(),
-            context.client_api_key_ref(),
-            "session_id",
-        );
+        let session_affinity = self
+            .image_session_affinity(image.payload(), &[], &context)
+            .await?;
         self.execute_raw_json_endpoint(
             context,
             RawJsonEndpointRequest {
@@ -48,6 +48,63 @@ impl CodexProvider {
             },
         )
         .await
+    }
+
+    async fn image_session_affinity(
+        &self,
+        payload: &RawJsonPayload,
+        headers: &[MiddlewareHeader],
+        context: &AttemptContext,
+    ) -> Result<Option<CodexSessionAffinity>, ProviderError> {
+        if context.is_diagnostic_required_account() {
+            return Ok(None);
+        }
+        let explicit = derive_endpoint_affinity_with_headers(
+            payload,
+            context.client_api_key_ref(),
+            "session_id",
+            headers,
+        );
+        let turn = headers
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case("x-codex-image-turn-id"))
+            .and_then(|header| std::str::from_utf8(header.value()).ok())
+            .or_else(|| {
+                payload
+                    .context()
+                    .get("image_turn_id")
+                    .and_then(Value::as_str)
+            });
+        let inferred = if let Some(alias) =
+            turn.and_then(|turn| derive_turn_alias(turn, context.client_api_key_ref()))
+        {
+            self.selector
+                .session_for_turn(&alias)
+                .await
+                .map_err(map_selection_error)?
+        } else {
+            None
+        };
+        if explicit
+            .as_ref()
+            .zip(inferred.as_ref())
+            .is_some_and(|(explicit, inferred)| explicit.key() != inferred.key())
+        {
+            return Err(provider_error(
+                ProviderErrorKind::InvalidRequest,
+                UpstreamSendState::NotSent,
+            )
+            .with_retry_prohibited());
+        }
+        let follow_only = inferred
+            .as_ref()
+            .is_some_and(CodexSessionAffinity::follow_only)
+            || explicit
+                .as_ref()
+                .is_some_and(CodexSessionAffinity::follow_only);
+        Ok(inferred
+            .or(explicit)
+            .map(|affinity| affinity.with_follow_only(follow_only)))
     }
 
     pub(super) async fn execute_search(
@@ -94,6 +151,16 @@ impl CodexProvider {
         context: AttemptContext,
         request: RawJsonEndpointRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        let requested_model = match &request.operation {
+            Operation::GenerateImage(image) => endpoint_requested_model(image.payload()),
+            Operation::Search(search) => endpoint_requested_model(search.payload()),
+            _ => None,
+        };
+        let model = if matches!(&request.operation, Operation::GenerateImage(_)) {
+            CodexSelectionModel::Image(requested_model.as_ref().map(|model| model.as_str()))
+        } else {
+            CodexSelectionModel::Search(requested_model.as_ref().map(|model| model.as_str()))
+        };
         let selection_started_at = Instant::now();
         let lease = self
             .selector
@@ -101,12 +168,13 @@ impl CodexProvider {
                 request_url: &request.response_origin,
                 attempt: &context,
                 session_affinity: request.session_affinity.as_ref(),
+                model,
+                requires_oauth: false,
             })
             .await
             .map_err(map_selection_error)?;
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let lease = Arc::new(lease);
         let operation = request.operation.clone();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
@@ -117,7 +185,7 @@ impl CodexProvider {
             .execute_middleware(
                 operation,
                 provider_kind,
-                None,
+                requested_model.map(|model| model.as_str().to_owned()),
                 account_id,
                 Box::new(move |operation, middleware_headers| {
                     Box::pin(async move {
@@ -143,10 +211,52 @@ impl CodexProvider {
         operation: Operation,
         middleware_headers: Vec<MiddlewareHeader>,
         mut request: RawJsonEndpointRequest,
-        lease: Arc<CodexCredentialLease>,
+        mut lease: CodexCredentialLease,
         account_selection_wait_ms: u64,
     ) -> Result<ProviderStream, ProviderError> {
-        match operation {
+        let affinity = match &operation {
+            Operation::GenerateImage(image) => {
+                let model = endpoint_requested_model(image.payload());
+                let selection =
+                    CodexSelectionModel::Image(model.as_ref().map(|model| model.as_str()));
+                // 中间件可改写正文，最终图片模型必须仍被当前租约账号允许
+                // 校验先于亲和变更和发送，不能在持有租约时重新选号
+                if !selection.allows_account(lease.account())
+                    || (!context.is_diagnostic_required_account()
+                        && !context
+                            .account_scope()
+                            .is_some_and(|scope| selection.allows(scope, lease.account_id())))
+                {
+                    return Err(provider_error(
+                        ProviderErrorKind::NoEligibleAccount,
+                        UpstreamSendState::NotSent,
+                    )
+                    .with_retry_prohibited());
+                }
+                self.image_session_affinity(image.payload(), &middleware_headers, &context)
+                    .await?
+            }
+            Operation::Search(search) => derive_endpoint_affinity_with_headers(
+                search.payload(),
+                context.client_api_key_ref(),
+                "id",
+                &middleware_headers,
+            ),
+            _ => None,
+        };
+        if !context.is_diagnostic_required_account() {
+            self.selector
+                .validate_translated_selection(
+                    &mut lease,
+                    affinity.as_ref(),
+                    None,
+                    context.account_selection_policy(),
+                )
+                .await
+                .map_err(map_selection_error)?;
+        }
+        let lease = Arc::new(lease);
+        let passthrough_headers = match operation {
             Operation::GenerateImage(image) => {
                 let Operation::GenerateImage(original) = &request.operation else {
                     return Err(provider_error(
@@ -167,6 +277,7 @@ impl CodexProvider {
                     .get("image_turn_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                crate::transport::request::decode_passthrough_headers(image.payload().context())
             }
             Operation::Search(search) => {
                 if !matches!(&request.operation, Operation::Search(_))
@@ -184,6 +295,7 @@ impl CodexProvider {
                     .get("turn_metadata")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                crate::transport::request::decode_passthrough_headers(search.payload().context())
             }
             _ => {
                 return Err(provider_error(
@@ -191,6 +303,21 @@ impl CodexProvider {
                     UpstreamSendState::NotSent,
                 ));
             }
+        };
+        if !context.is_diagnostic_required_account()
+            && let Some(affinity) = affinity.as_ref()
+            && let Some(turn) = affinity.turn_alias()
+        {
+            self.selector
+                .remember_turn(
+                    turn,
+                    affinity,
+                    context
+                        .account_selection_policy()
+                        .openai_session_affinity_ttl(),
+                )
+                .await
+                .map_err(map_selection_error)?;
         }
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
@@ -202,13 +329,16 @@ impl CodexProvider {
                 provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
             })?,
         )
-        .with_outbound_proxy(lease.account().outbound_proxy())
+        .with_account_snapshot(Some(
+            gateway_core::account::AccountHistorySnapshot::from_account(lease.account()),
+        ))
+        .with_outbound_proxy(lease.account().outbound_proxy()) // fork: diagnostic-egress 归因实际出口
         .with_selection_observation(ProviderSelectionObservation::new(
             account_selection_wait_ms,
             lease.capacity_snapshot(),
         ));
         // Standalone Provider 端点没有可证明的账号 owner；Search metadata 必须按
-        // 跨账号输入收敛到当前 lease，不能沿用下游声明的账号或 installation identity。
+        // 跨账号输入收敛到当前 lease，不能沿用下游声明的账号或 installation identity
         let turn_metadata = request.turn_metadata.as_deref().and_then(|metadata| {
             crate::transport::request::scope_turn_metadata(metadata, lease.installation_id(), true)
         });
@@ -216,22 +346,20 @@ impl CodexProvider {
             client: self
                 .client_for_request(&context)?
                 .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication())
-                .with_middleware_headers(middleware_headers),
+                .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+                .with_responses_api_base_url(lease.authentication().responses_api_base_url())
+                .with_middleware_headers(middleware_headers)
+                .with_privacy(context.privacy(), context.cancellation().clone()),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
             body: request.body,
+            passthrough_headers,
             image_turn_id: request.image_turn_id,
             turn_metadata,
             context,
             selector: Arc::clone(&self.selector),
             quota: Arc::clone(&self.quota),
             lease: Arc::clone(&lease),
-            output_started_at: Instant::now(),
-            session_affinity_key: request.session_affinity.map(CodexSessionAffinity::into_key),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {
@@ -270,9 +398,8 @@ pub(super) struct ColdResponse {
     pub(super) quota: Arc<CodexCredentialQuotaService>,
     pub(super) catalog: Arc<CodexCredentialCatalogService>,
     pub(super) lease: Arc<CodexCredentialLease>,
-    pub(super) output_started_at: Instant,
-    pub(super) session_affinity_key: Option<ProviderSessionAffinityKey>,
-    pub(super) session_affinity_key_hash: Option<String>,
+    pub(super) session_transport_key: Option<ProviderSessionAffinityKey>,
+    pub(super) session_transport_key_hash: Option<String>,
     pub(super) session_transport_recovery: CodexSessionTransportRecovery,
     pub(super) invalid_encrypted_content: InvalidEncryptedContentCache,
     pub(super) websocket_retry_count: u32,
@@ -285,14 +412,13 @@ pub(super) struct ColdJsonResponse {
     pub(super) response_origin: Url,
     pub(super) endpoint_path: &'static str,
     pub(super) body: Bytes,
+    pub(super) passthrough_headers: reqwest::header::HeaderMap,
     pub(super) image_turn_id: Option<String>,
     pub(super) turn_metadata: Option<String>,
     pub(super) context: AttemptContext,
     pub(super) selector: Arc<CodexCredentialSelector>,
     pub(super) quota: Arc<CodexCredentialQuotaService>,
     pub(super) lease: Arc<CodexCredentialLease>,
-    pub(super) output_started_at: Instant,
-    pub(super) session_affinity_key: Option<ProviderSessionAffinityKey>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -334,7 +460,8 @@ pub(super) fn same_client_turn(previous: Option<&str>, current: Option<&str>) ->
 }
 
 /// 阻断只结束当前响应，不授予 Core 重放业务请求的许可。
-pub(super) fn served_mismatch_error() -> ProviderError {
+#[doc(hidden)]
+pub fn served_mismatch_error() -> ProviderError {
     provider_error(ProviderErrorKind::Protocol, UpstreamSendState::Sent)
         .with_client_visible_upstream_error(gateway_core::error::ClientVisibleUpstreamError::new(
             "Upstream served a different model than requested",
@@ -372,7 +499,8 @@ fn codex_response_log_patch(
 
 /// 从未过滤的 Set-Cookie 头里取本次 `__cf_bm` 的**签发 TTL**（秒）：优先 Max-Age，
 /// 否则用 Expires - now。短（~120s）= 降智节点特征，长（~1800s）= 好。只读结构，不留原文。
-fn cfbm_issued_ttl_seconds(headers: &[String]) -> Option<u32> {
+#[doc(hidden)]
+pub fn cfbm_issued_ttl_seconds(headers: &[String]) -> Option<u32> {
     let raw = headers
         .iter()
         .map(|h| h.trim())
@@ -529,16 +657,16 @@ pub(super) async fn create_response_attempt(
     request: &CodexResponsesRequest,
     request_context: CodexRequestContext<'_>,
     account_id: &str,
-    deadline: SystemTime,
+    deadline: gateway_core::lifecycle::Deadline,
     cancellation: &CancellationToken,
 ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
-    let Some(handshake_deadline) = remaining(deadline) else {
+    if deadline.is_elapsed() {
         return Err(CodexHandshakeAttemptError::Timeout);
     };
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(CodexHandshakeAttemptError::Cancelled),
-        _ = tokio::time::sleep(handshake_deadline) => Err(CodexHandshakeAttemptError::Timeout),
+        _ = deadline.wait() => Err(CodexHandshakeAttemptError::Timeout),
         response = client.create_response_stream_with_pool_account(
             request,
             request_context,
@@ -549,10 +677,9 @@ pub(super) async fn create_response_attempt(
 
 pub(super) fn map_handshake_attempt_error(
     error: CodexHandshakeAttemptError,
-    responses: bool,
 ) -> MappedProviderFailure {
     match error {
-        CodexHandshakeAttemptError::Client(error) => map_handshake_error(error, responses),
+        CodexHandshakeAttemptError::Client(error) => map_handshake_error(error),
         CodexHandshakeAttemptError::Cancelled => MappedProviderFailure::plain(provider_error(
             ProviderErrorKind::Cancelled,
             UpstreamSendState::Ambiguous,
@@ -572,7 +699,7 @@ pub(super) async fn create_json_attempt(
     cookie_header: Option<&SecretString>,
     account_selection: CodexAccountSelectionTelemetry<'_>,
 ) -> Result<CodexBackendJsonResponse, CodexHandshakeAttemptError> {
-    let Some(handshake_deadline) = remaining(request.context.deadline()) else {
+    if request.context.deadline().is_elapsed() {
         return Err(CodexHandshakeAttemptError::Timeout);
     };
     let request_id = request.context.request_id().as_str();
@@ -590,10 +717,11 @@ pub(super) async fn create_json_attempt(
     tokio::select! {
         biased;
         _ = request.context.cancellation().cancelled() => Err(CodexHandshakeAttemptError::Cancelled),
-        _ = tokio::time::sleep(handshake_deadline) => Err(CodexHandshakeAttemptError::Timeout),
+        _ = request.context.deadline().wait() => Err(CodexHandshakeAttemptError::Timeout),
         response = request.client.post_raw_json(
             request.endpoint_path,
             request.body.clone(),
+            &request.passthrough_headers,
             request.image_turn_id.as_deref(),
             request_context,
         ) => response.map_err(CodexHandshakeAttemptError::Client),
@@ -644,7 +772,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
                 error,
             );
         }
-        let response = match response.map_err(|error| map_handshake_attempt_error(error, false)) {
+        let response = match response.map_err(map_handshake_attempt_error) {
             Ok(response) => response,
             Err(mut failure) => {
                 if let Some(observation) = failure.observation.take() {
@@ -656,17 +784,10 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             }
         };
 
-        if allows_account_state_mutation && let Some(key) = request.session_affinity_key.as_ref() {
-            // JSON 已完整接收；在首个 yield 前提交亲和迁移，避免下游取消漏掉更新。
-            request.selector.update_session_affinity(
-                key,
-                request.lease.affinity_expected_account_id(),
-                active_account.id(),
-            ).await;
-        }
         let mut metrics = response.transport_metrics.clone();
         metrics.first_event_ms = Some(
-            i64::try_from(request.output_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+            i64::try_from(request.context.timing_started_at().elapsed().as_millis())
+                .unwrap_or(i64::MAX),
         );
         if let Some(observation) = codex_response_observation(
             CodexBackendTransport::HttpJson,
@@ -732,7 +853,7 @@ fn image_response_metering(
     body: &[u8],
     prices: &gateway_core::metering::PricingOverrides,
 ) -> Option<(Usage, Option<CalculatedCost>)> {
-    // 只保留 usage，跳过通常很大的 base64 图片；原始响应仍按字节透传。
+    // 只保留 usage，跳过通常很大的 base64 图片；原始响应仍按字节透传
     #[derive(Deserialize)]
     struct ImageUsageEnvelope {
         usage: Option<Value>,
@@ -744,7 +865,7 @@ fn image_response_metering(
     let mut usage = Usage::new();
     usage.input_tokens = raw.get("input_tokens").and_then(Value::as_u64);
     usage.output_tokens = raw.get("output_tokens").and_then(Value::as_u64);
-    usage.cached_tokens = raw
+    usage.cached_input_tokens = raw
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64);
     usage.image_input_tokens = raw
@@ -753,7 +874,7 @@ fn image_response_metering(
     usage.image_output_tokens = raw
         .pointer("/output_tokens_details/image_tokens")
         .and_then(Value::as_u64);
-    // 总量是上游独立报告的事实；图片明细是总输入/输出的子集，不能再次相加。
+    // 总量是上游独立报告的事实；图片明细是总输入/输出的子集，不能再次相加
     usage.total_tokens = raw.get("total_tokens").and_then(Value::as_u64);
     let cost = crate::transport::usage::image_calculated_cost(request_body, &raw, prices);
     (usage != Usage::default()).then_some((usage, cost))
@@ -777,15 +898,32 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             // 仅候选恢复请求保留一份快照；重试沿用同一个 lease/client，不刷新或换号。
             let mut events = cold_response_stream_once(response.clone());
             let mut delivered = false;
+            // 上游 WS 交换改为逐条即时转发原始事件，created/in_progress 这类空前导帧不再随错误
+            // 作为原子事件挂起。这里先攒住前导帧，等到首个非前导帧或终态再放行，使「前导帧之后
+            // 才收到 invalid_encrypted_content」仍能在同凭据上静默恢复（HTTP 路径行为不变）。
+            let mut prelude: Vec<ProviderEvent> = Vec::new();
             while let Some(event) = events.next().await {
                 match event {
                     Ok(event) => {
-                        delivered |= event.has_client_event() || !event.canonical_facts().is_empty();
+                        if !event.has_client_event() && event.canonical_facts().is_empty() {
+                            yield event;
+                            continue;
+                        }
+                        if !delivered && encrypted_recovery_prelude(&event) {
+                            prelude.push(event);
+                            continue;
+                        }
+                        delivered = true;
+                        for held in prelude.drain(..) {
+                            yield held;
+                        }
                         yield event;
                     }
                     Err(mut error) => {
                         if !delivered && !retried && is_encrypted_content_rejection(&error)
-                            && (error.client_visible_upstream_response().is_some() || error.has_atomic_client_events())
+                            && (error.client_visible_upstream_response().is_some()
+                                || error.has_atomic_client_events()
+                                || !prelude.is_empty())
                             && can_recover(&response.request) {
                             let pending = error.take_atomic_client_events();
                             if pending.iter().all(encrypted_recovery_prelude) {
@@ -796,14 +934,21 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                                     tracing::info!(request_id = response.context.request_id().as_str(), removed_items = removed,
                                         recovery = "invalid_encrypted_content", recovery_attempt = 1,
                                         "OpenAI rejected reasoning history recovered on the same credential");
+                                    // 被拒绝那次的前导帧随之作废，恢复流会重新给出自己的前导帧。
                                     continue 'recovery;
                                 }
                             }
                             error = error.with_atomic_client_events(pending);
                         }
+                        for held in prelude.drain(..) {
+                            yield held;
+                        }
                         Err(error)?;
                     }
                 }
+            }
+            for held in prelude.drain(..) {
+                yield held;
             }
             break;
         }
@@ -844,9 +989,8 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         quota,
         catalog,
         lease,
-        output_started_at,
-        session_affinity_key,
-        session_affinity_key_hash,
+        session_transport_key,
+        session_transport_key_hash,
         session_transport_recovery,
         invalid_encrypted_content: _,
         websocket_retry_count,
@@ -997,7 +1141,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 error,
             );
         }
-        let response = response.map_err(|error| map_handshake_attempt_error(error, true));
+        let response = response.map_err(map_handshake_attempt_error);
         let response = match response {
             Ok(response) => response,
             Err(mut failure) => {
@@ -1006,14 +1150,15 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         &mut failure,
                         WebSocketRecoveryContext {
                             policy,
+                            replay_boundary: ReplayBoundary::BeforeSemanticOutput,
                             requirement: request_transport_requirement,
                             retry_count: websocket_retry_count,
                             max_retries: stream_max_retries,
                             request_id: context.request_id().as_str(),
                             attempt_index: context.attempt_index().get(),
                             account_id: active_account.id().as_str(),
-                            session_affinity_key: session_affinity_key.as_ref(),
-                            session_affinity_key_hash: session_affinity_key_hash.as_deref(),
+                            session_transport_key: session_transport_key.as_ref(),
+                            session_transport_key_hash: session_transport_key_hash.as_deref(),
                             session_transport_recovery: &session_transport_recovery,
                         },
                     );
@@ -1088,49 +1233,62 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         }
         if allows_account_state_mutation
             && !response.set_cookie_headers.is_empty()
-            && let Ok(outcome) = selector
+        {
+            match selector
                 .capture_response_cookies(
                     &active_account,
                     &response_origin,
                     &response.set_cookie_headers,
                 )
                 .await
-                && let Some(revision) = outcome.credential_revision
-                && let Ok(current) = selector.current_account(active_account.id()).await
-                && current.revision().get() == revision
-        {
-            active_account = current;
+            {
+                Ok(outcome) => {
+                    if let Some(revision) = outcome.credential_revision
+                        && let Ok(current) = selector.current_account(active_account.id()).await
+                        && current.revision().get() == revision
+                    {
+                        active_account = current;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        account_id = %active_account.id(),
+                        credential_revision = active_account.revision().get(),
+                        error = %error,
+                        "Failed to persist OpenAI response cookies"
+                    );
+                }
+            }
         }
         let response_transport = response.transport;
         let websocket_connection_id = response.websocket_connection_id;
         let mut body = response.body;
         let mut failure_diagnostics = response.diagnostics.clone();
         if response_transport == CodexBackendTransport::WebSocket {
-            // opening ID 标识连接，不可作为缺失请求级错误头时的当前请求 ID。
+            // opening ID 标识连接，不可作为缺失请求级错误头时的当前请求 ID
             failure_diagnostics.request_id = None;
         }
-        let failure_set_cookie_headers = response.set_cookie_headers.clone();
         let failure_rate_limit_headers = response.rate_limit_headers.clone();
         let mut passive_quota_observation =
             OpenAiPassiveQuotaObservation::new(response.rate_limit_headers);
         let rate_limit_updates = response.rate_limit_updates;
         let response_metadata_updates = response.response_metadata_updates;
-        // OpenAI 线路为透明代理：HTTP SSE 与 WebSocket 两条上游均启用 raw 透传，
-        // 下游按字节转发上游原文，避免 serde 往返改写数值/精度（大整数→f64、logprobs 等）。
-        // WS 帧由 reducer 以 encode_sse_event(&event, raw) 逐字节内嵌上游原始 JSON
-        // （transport/protocol/websocket.rs），push_frames 抽出的 data 即上游原文。
+        // 同协议保留原始帧；canonical 解析只提取计费、续接和状态事实
+        let websocket_transport = response.transport == CodexBackendTransport::WebSocket;
         let mut decoder = CodexCanonicalDecoder::new(upstream_model.as_str())
             .with_pricing(context.pricing().get("openai").and_then(|models| models.get(upstream_model.as_str())).cloned())
             .with_reported_model(response.response_metadata.effective_model.as_deref())
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
+        // fork: served-mismatch —— HTTP 响应头里的全部模型头先行判定
         if response.response_metadata.has_model_mismatch(upstream_model.as_str()) {
             decoder.note_served_mismatch();
         }
-        let mut pre_commit_events = PreCommitClientEvents::new(trace);
+        let mut client_events = ClientEventDelivery::new(context.allows_replayable_prelude());
         loop {
-            let Some(stream_deadline) = remaining(context.deadline()) else {
+            if context.deadline().is_elapsed() {
                 if allows_account_state_mutation {
                     synchronize_passive_quota(
                         &quota,
@@ -1142,20 +1300,18 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 Err(provider_error(ProviderErrorKind::Timeout, UpstreamSendState::Sent))?;
                 return;
             };
-            let replay_grace_deadline = pre_commit_events.replay_grace_deadline();
             let next = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Err(MappedProviderFailure::plain(provider_error(
                     ProviderErrorKind::Cancelled,
                     UpstreamSendState::Sent,
                 ))),
-                _ = tokio::time::sleep(stream_deadline) => Err(MappedProviderFailure::plain(provider_error(
+                _ = context.deadline().wait() => Err(MappedProviderFailure::plain(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::Sent,
                 ))),
-                _ = wait_for_replay_grace(replay_grace_deadline) => Ok(PreCommitPoll::GraceElapsed),
                 chunk = body.next() => match chunk {
-                    Some(Ok(chunk)) => Ok(PreCommitPoll::Upstream(Some(chunk))),
+                    Some(Ok(chunk)) => Ok(Some(chunk)),
                     Some(Err(error)) => {
                         log_client_upstream_error(
                             UpstreamErrorLogContext::new(
@@ -1167,17 +1323,11 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         );
                         Err(map_stream_error(error))
                     }
-                    None => Ok(PreCommitPoll::Upstream(None)),
+                    None => Ok(None),
                 },
             };
             let next = match next {
-                Ok(PreCommitPoll::Upstream(next)) => next,
-                Ok(PreCommitPoll::GraceElapsed) => {
-                    for event in pre_commit_events.commit_pending(PreCommitReleaseReason::GraceTimeout) {
-                        yield event;
-                    }
-                    continue;
-                }
+                Ok(next) => next,
                 Err(mut failure) => {
                     let updates = take_rate_limit_updates(rate_limit_updates.as_ref()).await;
                     let rate_limits_changed = if updates.is_empty() {
@@ -1195,30 +1345,29 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                         &mut decoder,
                     )
                     .await;
-                    let observation_event = if rate_limits_changed || metadata_merge.is_some() {
-                        observation_state.observation(None).map(ProviderEvent::observation)
+                    let observation_event = if rate_limits_changed || metadata_merge.is_some()
+                        || response_transport == CodexBackendTransport::WebSocket
+                    {
+                        observation_state.observation(Some(&failure.error)).map(ProviderEvent::observation)
                     } else {
                         None
                     };
                     if failure.websocket_transport_retryable
                         && response_transport == CodexBackendTransport::WebSocket
-                        && (matches!(
-                            failure.error.send_state(),
-                            UpstreamSendState::Sent | UpstreamSendState::Ambiguous
-                        ) || !pre_commit_events.is_committed())
                     {
                         apply_websocket_recovery_policy(
                             &mut failure,
                             WebSocketRecoveryContext {
                                 policy: WebSocketFailurePolicy::Budgeted,
+                                replay_boundary: ReplayBoundary::from_semantic_output(client_events.replay_closed()),
                                 requirement: request_transport_requirement,
                                 retry_count: websocket_retry_count,
                                 max_retries: stream_max_retries,
                                 request_id: context.request_id().as_str(),
                                 attempt_index: context.attempt_index().get(),
                                 account_id: active_account.id().as_str(),
-                                session_affinity_key: session_affinity_key.as_ref(),
-                                session_affinity_key_hash: session_affinity_key_hash.as_deref(),
+                                session_transport_key: session_transport_key.as_ref(),
+                                session_transport_key_hash: session_transport_key_hash.as_deref(),
                                 session_transport_recovery: &session_transport_recovery,
                             },
                         );
@@ -1239,7 +1388,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                     Err(quota_continuation_replay_error(
                         failure.error,
                         &request,
-                        ReplayBoundary::from_semantic_output(pre_commit_events.is_committed()),
+                        ReplayBoundary::from_semantic_output(client_events.replay_closed()),
                     ))?;
                     return;
                 }
@@ -1253,9 +1402,14 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 observation_state.merge_rate_limit_headers(&rate_limit_update_headers(&updates))
             };
             let first_event_changed =
-                observation_state.observe_stream_chunk(&chunk, output_started_at);
-            let chunk_len = chunk.len();
-            let (mut events, canonical_failure) = match decoder.push(&chunk) {
+                observation_state.observe_stream_chunk(&chunk, context.timing_started_at());
+            let decoded = if websocket_transport {
+                let text = std::str::from_utf8(&chunk).map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::Sent))?;
+                decoder.push_websocket(text)
+            } else {
+                decoder.push(&chunk)
+            };
+            let (mut events, canonical_failure) = match decoded {
                 CodexCanonicalOutcome::Events(events) => (events, None),
                 CodexCanonicalOutcome::Failed(failure) => {
                     let (events, error, semantic_output_seen) = failure.into_parts();
@@ -1271,7 +1425,6 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             )
             .await;
             let metadata_changed = metadata_merge.unwrap_or(false);
-            pre_commit_events.observe_chunk(chunk_len);
             let response_model_changed = observation_state
                 .observe_upstream_response_model(decoder.response_model());
             let service_tier_changed = observation_state
@@ -1315,19 +1468,25 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                     map_canonical_error(
                         error,
                         &failure_diagnostics,
-                        &failure_set_cookie_headers,
                         &failure_rate_limit_headers,
                         ReplayBoundary::from_semantic_output(
-                            semantic_output_seen || pre_commit_events.is_committed(),
+                            semantic_output_seen || client_events.replay_closed(),
                         ),
                     ),
                     atomic_upstream_failure,
                 )
             });
             let timing_signals = decoder.take_timing_signals();
+            let output_timing_changed = observation_state
+                .observe_timing_signals(timing_signals, context.timing_started_at());
+            let upstream_timing_changed = observation_state
+                .observe_upstream_response_ms(decoder.upstream_response_ms());
+            let upstream_metrics_changed = observation_state
+                .observe_upstream_timing_metrics(decoder.upstream_timing_metrics());
             let timing_changed = first_event_changed
-                || observation_state
-                    .observe_timing_signals(timing_signals, output_started_at);
+                || output_timing_changed
+                || upstream_timing_changed
+                || upstream_metrics_changed;
             let completed = events
                 .iter()
                 .flat_map(ProviderEvent::canonical_facts)
@@ -1336,7 +1495,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 && observation_state.mark_completed(terminal_response_is_incomplete(&events));
             if response_transport == CodexBackendTransport::WebSocket
                 && completed && terminal_failure.is_none()
-                && let Some(key) = session_affinity_key.as_ref()
+                && let Some(key) = session_transport_key.as_ref()
             {
                 session_transport_recovery.websocket_succeeded(key);
             }
@@ -1358,14 +1517,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             if completed && terminal_failure.is_none() { served_watch.completed(); } // fork: served-mismatch
             attach_openai_session_update(&mut events, &mut session_capture);
             if allows_account_state_mutation && completed && terminal_failure.is_none() {
-                // 完成事件一旦交给下游，Core 可以立刻停止轮询 Provider stream；
-                // 在此之前持久化亲和关系，保证成功请求不会因流被提前 drop 而丢失绑定。
+                // 完成事实交给下游前更新账号健康，绑定已经在发送前完成
                 selector
-                    .record_success(
-                        &active_account,
-                        session_affinity_key.as_ref(),
-                        lease.affinity_expected_account_id(),
-                    )
+                    .record_success(&active_account)
                     .await;
                 selector
                     .observe_cyber_policy_success(cyber_policy_scope.as_ref())
@@ -1386,15 +1540,15 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             }
             if let Some((mut failure, atomic_upstream_failure)) = terminal_failure {
                 let failure_after_commit =
-                    timing_signals.semantic_output || pre_commit_events.is_committed();
+                    timing_signals.semantic_output || client_events.replay_closed();
                 if failure_after_commit {
-                    for event in pre_commit_events.commit(events) {
+                    for event in client_events.commit(events) {
                         yield event;
                     }
                 } else if atomic_upstream_failure {
                     failure.error = failure
                         .error
-                        .with_atomic_client_events(pre_commit_events.take_for_failure(events));
+                        .with_atomic_client_events(events);
                 }
                 Err(quota_continuation_replay_error(
                     failure.error,
@@ -1403,7 +1557,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 ))?;
                 return;
             }
-            let events = pre_commit_events.stage(events, timing_signals, completed);
+            let events = client_events.forward(events, timing_signals, completed);
             for event in events {
                 yield event;
             }
@@ -1448,10 +1602,9 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 map_canonical_error(
                     error,
                     &failure_diagnostics,
-                    &failure_set_cookie_headers,
                     &failure_rate_limit_headers,
                     ReplayBoundary::from_semantic_output(
-                        semantic_output_seen || pre_commit_events.is_committed(),
+                        semantic_output_seen || client_events.replay_closed(),
                     ),
                 ),
                 atomic_upstream_failure,
@@ -1462,8 +1615,15 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             .observe_upstream_response_model(decoder.response_model());
         let service_tier_changed = observation_state
             .observe_upstream_service_tier(decoder.response_service_tier());
-        let timing_changed = observation_state
-            .observe_timing_signals(timing_signals, output_started_at);
+        let output_timing_changed = observation_state
+            .observe_timing_signals(timing_signals, context.timing_started_at());
+        let upstream_timing_changed = observation_state
+            .observe_upstream_response_ms(decoder.upstream_response_ms());
+        let upstream_metrics_changed = observation_state
+            .observe_upstream_timing_metrics(decoder.upstream_timing_metrics());
+        let timing_changed = output_timing_changed
+            || upstream_timing_changed
+            || upstream_metrics_changed;
         let updates = take_rate_limit_updates(rate_limit_updates.as_ref()).await;
         let rate_limits_changed = if updates.is_empty() {
             false
@@ -1528,18 +1688,14 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
             && observation_state.mark_completed(terminal_response_is_incomplete(&events));
         if response_transport == CodexBackendTransport::WebSocket
             && completed && terminal_failure.is_none()
-            && let Some(key) = session_affinity_key.as_ref()
+            && let Some(key) = session_transport_key.as_ref()
         {
             session_transport_recovery.websocket_succeeded(key);
         }
         if allows_account_state_mutation && completed && terminal_failure.is_none() {
-            // 同上：尾部 finish() 也可能产出 completed，亲和记录必须先于任何下游 yield。
+            // 尾部 finish() 也可能产出 completed，账号健康更新先于下游 yield
             selector
-                .record_success(
-                    &active_account,
-                    session_affinity_key.as_ref(),
-                    lease.affinity_expected_account_id(),
-                )
+                .record_success(&active_account)
                 .await;
             selector
                 .observe_cyber_policy_success(cyber_policy_scope.as_ref())
@@ -1560,15 +1716,15 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
         }
         if let Some((mut failure, atomic_upstream_failure)) = terminal_failure {
             let failure_after_commit =
-                timing_signals.semantic_output || pre_commit_events.is_committed();
+                timing_signals.semantic_output || client_events.replay_closed();
             if failure_after_commit {
-                for event in pre_commit_events.commit(events) {
+                for event in client_events.commit(events) {
                     yield event;
                 }
             } else if atomic_upstream_failure {
                 failure.error = failure
                     .error
-                    .with_atomic_client_events(pre_commit_events.take_for_failure(events));
+                    .with_atomic_client_events(events);
             }
             Err(quota_continuation_replay_error(
                 failure.error,
@@ -1592,7 +1748,7 @@ fn cold_response_stream_once(response: ColdResponse) -> EventStream {
                 )),
             );
         }
-        let events = pre_commit_events.finish(events, timing_signals, completed);
+        let events = client_events.forward(events, timing_signals, completed);
         for event in events {
             yield event;
         }
@@ -1633,31 +1789,4 @@ async fn merge_response_metadata_updates(
         changed |= observation_state.observe_upstream_response_model(decoder.response_model());
     }
     Some(changed)
-}
-
-#[cfg(test)]
-mod cfbm_ttl_tests {
-    use super::cfbm_issued_ttl_seconds;
-
-    #[test]
-    fn parses_max_age_short_and_long() {
-        let short =
-            vec!["__cf_bm=abc.def; Path=/; Max-Age=120; Domain=.chatgpt.com; HttpOnly".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&short), Some(120));
-        let long = vec!["__cf_bm=xyz; Max-Age=1800; Path=/".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&long), Some(1800));
-    }
-
-    #[test]
-    fn ignores_non_cfbm_and_missing() {
-        let other = vec![
-            "_cfuvid=zzz; Max-Age=600".to_owned(),
-            "cf_clearance=q; Max-Age=999".to_owned(),
-        ];
-        assert_eq!(cfbm_issued_ttl_seconds(&other), None);
-        assert_eq!(cfbm_issued_ttl_seconds(&[]), None);
-        // 有 __cf_bm 但既无 Max-Age 也无 Expires → None（不瞎猜）。
-        let no_ttl = vec!["__cf_bm=abc; Path=/; HttpOnly".to_owned()];
-        assert_eq!(cfbm_issued_ttl_seconds(&no_ttl), None);
-    }
 }

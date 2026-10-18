@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { BaseButton, BaseEmpty, BaseSelect, toast } from '@codex-proxy/ui'
+import { ZButton, ZEmpty, ZNotification, ZSelect } from '@codex-proxy/ui'
 import { CircleAlert, LoaderCircle } from '@lucide/vue'
 import { computed, onScopeDispose, shallowRef, watch } from 'vue'
 import { getAccountGroups, getApiKeys } from '@/api'
 import { errorMessage } from '@/utils/operation'
 
-const props = withDefaults(defineProps<{ kind: 'keys' | 'groups', disabled?: boolean, maxCollapseTags?: number }>(), { maxCollapseTags: 1 })
+const props = withDefaults(defineProps<{ kind: 'keys' | 'groups', disabled?: boolean, active?: boolean, maxCollapseTags?: number }>(), { active: true, maxCollapseTags: 1 })
 const selected = defineModel<string[]>({ required: true })
 const options = shallowRef<{ id: string, label: string, disabled: boolean }[]>([])
 const loading = shallowRef(false)
@@ -57,8 +57,7 @@ async function load() {
     if (!current.signal.aborted) {
       error.value = errorMessage(cause)
       // 同一弹窗可能挂载多个范围选择器，只显示一份相同错误。
-      if (!toast.messages.some(message => message.type === 'error' && message.message === error.value))
-        toast.error(error.value)
+      ZNotification.error({ message: error.value, deduplicate: true })
     }
   }
   finally {
@@ -66,12 +65,17 @@ async function load() {
       loading.value = false
   }
 }
-watch(() => props.kind, load, { immediate: true })
+watch([() => props.kind, () => props.active], ([, active]) => {
+  controller?.abort()
+  controller = undefined
+  if (active)
+    void load()
+}, { immediate: true, flush: 'sync' })
 onScopeDispose(() => controller?.abort())
 </script>
 
 <template>
-  <BaseSelect
+  <ZSelect
     v-model="selected"
     :options="choices"
     multiple
@@ -86,26 +90,26 @@ onScopeDispose(() => controller?.abort())
     class="w-full min-w-0"
   >
     <template #empty="{ search }">
-      <BaseEmpty v-if="loading" title="正在加载…" size="sm" surface="none" role="status">
+      <ZEmpty v-if="loading" title="正在加载…" size="small" surface="none" role="status">
         <template #icon>
           <LoaderCircle :size="18" class="animate-spin text-cp-text-quaternary motion-reduce:animate-none" />
         </template>
-      </BaseEmpty>
-      <BaseEmpty v-else-if="error" title="加载失败" :description="`暂时无法获取${label}`" :icon="CircleAlert" size="sm" surface="none" role="alert">
+      </ZEmpty>
+      <ZEmpty v-else-if="error" title="加载失败" :description="`暂时无法获取${label}`" :icon="CircleAlert" size="small" surface="none" role="alert">
         <template #action>
-          <BaseButton size="sm" variant="secondary" :disabled="disabled" @click="load">
+          <ZButton size="small" :disabled="disabled" @click="load">
             重试
-          </BaseButton>
+          </ZButton>
         </template>
-      </BaseEmpty>
-      <BaseEmpty
+      </ZEmpty>
+      <ZEmpty
         v-else
         :title="search ? '没有匹配项' : `暂无${label}`"
         :description="search ? undefined : `请先在${kind === 'keys' ? 'API 密钥' : '分组管理'}中创建`"
-        size="sm"
+        size="small"
         surface="none"
         role="status"
       />
     </template>
-  </BaseSelect>
+  </ZSelect>
 </template>

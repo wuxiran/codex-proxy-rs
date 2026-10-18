@@ -1,4 +1,4 @@
-//! Codex Provider 测试用内存 ports；不依赖 SQL、Redis 或 secret 加密。
+//! Codex Provider 测试用内存 ports；不依赖 SQL、Redis 或 secret 加密
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -54,6 +54,8 @@ pub(crate) struct MemoryAccountStore {
     accounts: Mutex<BTreeMap<ProviderAccountId, StoredAccount>>,
     quota_reads: AtomicUsize,
     fail_provider_listing: AtomicBool,
+    pending_account_reads: bool,
+    // fork: revive 测试需要让凭据写入失败
     fail_credential_writes: AtomicBool,
     credential_load_hook: Mutex<Option<Arc<CredentialLoadHook>>>,
     credential_loads: AtomicUsize,
@@ -62,9 +64,18 @@ pub(crate) struct MemoryAccountStore {
 }
 
 impl MemoryAccountStore {
+    pub(crate) fn with_pending_account_reads() -> Self {
+        Self {
+            pending_account_reads: true,
+            ..Self::default()
+        }
+    }
+
+    // fork: revive
     pub(crate) fn fail_credential_writes(&self) {
         self.fail_credential_writes.store(true, Ordering::SeqCst);
     }
+
     pub(crate) fn repository(self: &Arc<Self>) -> CodexCredentialRepository {
         CodexCredentialRepository::new(self.clone())
     }
@@ -292,6 +303,9 @@ impl ProviderAccountStore for MemoryAccountStore {
         &self,
         account: &ProviderAccountId,
     ) -> Result<Option<ProviderAccount>, StoreError> {
+        if self.pending_account_reads {
+            futures::future::pending::<()>().await;
+        }
         Ok(self
             .accounts
             .lock()
@@ -315,9 +329,15 @@ impl ProviderAccountStore for MemoryAccountStore {
         provider: &ProviderKind,
     ) -> Result<Vec<ProviderAccount>, StoreError> {
         if self.fail_provider_listing.load(Ordering::SeqCst) {
-            return Err(store_error(StoreErrorKind::Unavailable));
+            return Err(StoreError::caused_by(
+                StoreErrorKind::Unavailable,
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "PRIVATE_DATABASE_CAUSE",
+                ),
+            ));
         }
-        // 与 Postgres 实现的调度列表语义一致：停用账号不进入常规候选。
+        // 与 Postgres 实现的调度列表语义一致：停用账号不进入常规候选
         Ok(self
             .accounts
             .lock()
@@ -364,7 +384,7 @@ impl ProviderAccountStore for MemoryAccountStore {
             .lock()
             .expect("credential hook lock")
             .clone();
-        // 在列表快照与凭据读取之间确定性提交并发变更，不依赖线程调度或延时。
+        // 在列表快照与凭据读取之间确定性提交并发变更，不依赖线程调度或延时
         if let Some(hook) = hook {
             hook(self, account, count).await?;
         }
@@ -707,6 +727,8 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
     )
     .with_scheduling(current.concurrency_limit(), current.weight())
     .with_refresh_schedule(rebuild.has_refresh_token, rebuild.next_refresh_at)
+    .with_outbound_proxy(current.outbound_proxy().cloned())
+    .with_request_location(current.request_location().cloned())
 }
 
 #[derive(Default)]
@@ -715,6 +737,7 @@ pub(crate) struct TestLeaseCoordinator {
     pub(crate) busy: Mutex<bool>,
     pub(crate) busy_accounts: Mutex<BTreeSet<ProviderAccountId>>,
     pub(crate) signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
+    pub(crate) reserved_signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
     round_robin_cursor: Mutex<u64>,
 }
 
@@ -724,9 +747,17 @@ impl ProviderLeasePort for TestLeaseCoordinator {
         _client_api_key_id: &'a ClientApiKeyId,
         _provider_kind: &'a ProviderKind,
         accounts: &'a [ProviderAccountId],
+        pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
-            let overrides = self.signals.lock().expect("scheduling signals lock");
+            let overrides = match pool {
+                gateway_core::provider_ports::ProviderConcurrencyPool::Shared => &self.signals,
+                gateway_core::provider_ports::ProviderConcurrencyPool::Reserved => {
+                    &self.reserved_signals
+                }
+            }
+            .lock()
+            .expect("scheduling signals lock");
             let signals = accounts
                 .iter()
                 .map(|account| {
@@ -787,12 +818,27 @@ impl ProviderLeasePort for TestLeaseCoordinator {
 
 #[derive(Default)]
 pub(crate) struct MemorySessionAffinity {
-    bindings: Mutex<BTreeMap<(String, String), ProviderAccountId>>,
+    initial_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+    aliases: Mutex<BTreeMap<(String, String), gateway_core::provider_ports::ProviderSessionAlias>>,
+    bindings:
+        Mutex<BTreeMap<(String, String), gateway_core::provider_ports::ProviderSessionBinding>>,
     lookups: Mutex<Vec<String>>,
     renewal_ttls: Mutex<Vec<Duration>>,
+    alias_ttls: Mutex<Vec<Duration>>,
 }
 
 impl MemorySessionAffinity {
+    pub(crate) fn with_initial_claim_barrier(participants: usize) -> Self {
+        Self {
+            initial_claim_barrier: Some(Arc::new(tokio::sync::Barrier::new(participants))),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn alias_ttls(&self) -> Vec<Duration> {
+        self.alias_ttls.lock().unwrap().clone()
+    }
+
     pub(crate) fn renewal_ttls(&self) -> Vec<Duration> {
         self.renewal_ttls.lock().expect("affinity TTL lock").clone()
     }
@@ -813,121 +859,142 @@ impl MemorySessionAffinity {
     ) {
         self.bindings.lock().expect("session affinity lock").insert(
             (provider_kind.as_str().to_owned(), key.to_owned()),
-            account_id,
+            gateway_core::provider_ports::ProviderSessionBinding::new(
+                account_id,
+                uuid::Uuid::new_v4().simple().to_string(),
+            )
+            .expect("binding"),
         );
+    }
+    pub(crate) async fn bind(
+        &self,
+        provider: &ProviderKind,
+        key: &ProviderSessionAffinityKey,
+        account: &ProviderAccountId,
+        _ttl: Duration,
+    ) -> Result<(), ProviderStoreError> {
+        self.seed_binding(provider, key.expose_to_store(), account.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn load(
+        &self,
+        provider: &ProviderKind,
+        key: &ProviderSessionAffinityKey,
+    ) -> Result<Option<ProviderAccountId>, ProviderStoreError> {
+        ProviderSessionAffinityPort::load(self, provider, key)
+            .await
+            .map(|binding| binding.map(|binding| binding.account_id().clone()))
     }
 }
 
 impl ProviderSessionAffinityPort for MemorySessionAffinity {
     fn load<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
+        provider: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-    ) -> BoxFuture<'a, Result<Option<ProviderAccountId>, ProviderStoreError>> {
+    ) -> BoxFuture<
+        'a,
+        Result<Option<gateway_core::provider_ports::ProviderSessionBinding>, ProviderStoreError>,
+    > {
         Box::pin(async move {
             self.lookups
                 .lock()
-                .expect("session affinity lookup lock")
+                .expect("lookups")
                 .push(key.expose_to_store().to_owned());
             Ok(self
                 .bindings
                 .lock()
-                .expect("session affinity lock")
+                .expect("bindings")
                 .get(&(
-                    provider_kind.as_str().to_owned(),
+                    provider.as_str().to_owned(),
                     key.expose_to_store().to_owned(),
                 ))
                 .cloned())
         })
     }
 
-    fn bind<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        account_id: &'a ProviderAccountId,
-        _ttl: Duration,
-    ) -> BoxFuture<'a, Result<(), ProviderStoreError>> {
-        Box::pin(async move {
-            self.bindings.lock().expect("session affinity lock").insert(
-                (
-                    provider_kind.as_str().to_owned(),
-                    key.expose_to_store().to_owned(),
-                ),
-                account_id.clone(),
-            );
-            Ok(())
-        })
-    }
-
-    fn claim_or_load<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        candidate_account_id: &'a ProviderAccountId,
-        _ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
-        Box::pin(async move {
-            let mut bindings = self.bindings.lock().expect("session affinity lock");
-            Ok(bindings
-                .entry((
-                    provider_kind.as_str().to_owned(),
-                    key.expose_to_store().to_owned(),
-                ))
-                .or_insert_with(|| candidate_account_id.clone())
-                .clone())
-        })
-    }
-
     fn compare_and_bind<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
+        provider: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-        expected_account_id: &'a ProviderAccountId,
-        replacement_account_id: &'a ProviderAccountId,
+        expected: Option<&'a gateway_core::provider_ports::ProviderSessionBinding>,
+        account: &'a ProviderAccountId,
         ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
+    ) -> BoxFuture<
+        'a,
+        Result<Option<gateway_core::provider_ports::ProviderSessionBinding>, ProviderStoreError>,
+    > {
         Box::pin(async move {
-            let binding_key = (
-                provider_kind.as_str().to_owned(),
+            // 让并发首请求都读到空绑定，再验证发送前的原子认领冲突
+            if expected.is_none()
+                && let Some(barrier) = &self.initial_claim_barrier
+            {
+                barrier.wait().await;
+            }
+            let key = (
+                provider.as_str().to_owned(),
                 key.expose_to_store().to_owned(),
             );
-            let mut bindings = self.bindings.lock().expect("session affinity lock");
-            if bindings
-                .get(&binding_key)
-                .is_none_or(|current| current == expected_account_id)
-            {
-                bindings.insert(binding_key, replacement_account_id.clone());
-                self.renewal_ttls
-                    .lock()
-                    .expect("affinity TTL lock")
-                    .push(ttl);
-                return Ok(replacement_account_id.clone());
+            let mut bindings = self.bindings.lock().expect("bindings");
+            if bindings.get(&key) != expected {
+                return Ok(None);
             }
-            bindings.get(&binding_key).cloned().ok_or_else(|| {
-                ProviderStoreError::new(
-                    gateway_core::provider_ports::ProviderStoreErrorKind::Unavailable,
-                    "resolve in-memory provider session affinity",
-                )
-            })
+            let binding = expected
+                .filter(|binding| binding.account_id() == account)
+                .cloned()
+                .unwrap_or_else(|| {
+                    gateway_core::provider_ports::ProviderSessionBinding::new(
+                        account.clone(),
+                        uuid::Uuid::new_v4().simple().to_string(),
+                    )
+                    .expect("binding")
+                });
+            bindings.insert(key, binding.clone());
+            self.renewal_ttls.lock().expect("TTLs").push(ttl);
+            Ok(Some(binding))
         })
     }
-
-    fn clear<'a>(
+    fn load_alias<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-    ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+    ) -> BoxFuture<
+        'a,
+        Result<Option<gateway_core::provider_ports::ProviderSessionAlias>, ProviderStoreError>,
+    > {
         Box::pin(async move {
             Ok(self
-                .bindings
+                .aliases
                 .lock()
-                .expect("session affinity lock")
-                .remove(&(
-                    provider_kind.as_str().to_owned(),
-                    key.expose_to_store().to_owned(),
+                .unwrap()
+                .get(&(
+                    provider.as_str().to_owned(),
+                    alias.expose_to_store().to_owned(),
                 ))
-                .is_some())
+                .cloned())
+        })
+    }
+    fn bind_alias<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+        session: &'a gateway_core::provider_ports::ProviderSessionAlias,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
+        Box::pin(async move {
+            let mut aliases = self.aliases.lock().unwrap();
+            let current = aliases
+                .entry((
+                    provider.as_str().to_owned(),
+                    alias.expose_to_store().to_owned(),
+                ))
+                .or_insert_with(|| session.clone());
+            let applied = current == session;
+            if applied {
+                self.alias_ttls.lock().unwrap().push(ttl);
+            }
+            Ok(applied)
         })
     }
 }
@@ -1081,11 +1148,11 @@ pub(crate) fn runtime_policy() -> Arc<dyn ProviderRuntimePolicyPort> {
     Arc::new(StaticRuntimePolicy)
 }
 
-/// 冻结策略可配置的运行时策略 fake；容量熔断触发测试用。
+/// 冻结策略可配置的运行时策略 fake；容量熔断触发测试用
 pub(crate) struct StaticFreezePolicy(ProviderFreezePolicy);
 
 impl StaticFreezePolicy {
-    /// 构造带固定冻结策略的端口句柄；命名沿用测试构造器语义。
+    /// 构造带固定冻结策略的端口句柄；命名沿用测试构造器语义
     #[must_use]
     pub(crate) fn policy_port(policy: ProviderFreezePolicy) -> Arc<dyn ProviderRuntimePolicyPort> {
         Arc::new(Self(policy))
@@ -1123,13 +1190,13 @@ pub(crate) fn account_policy() -> gateway_core::account::AccountSelectionPolicy 
     gateway_core::account::AccountSelectionPolicy::new(
         gateway_core::account::RotationStrategy::Smart,
         NonZeroU32::new(2).expect("nonzero concurrency"),
-        Duration::from_millis(10),
     )
+    .with_openai_account_affinity(gateway_core::account::AccountAffinity::Strict)
 }
 
 /// 内存 `ProviderCooldownPort`：实现 `read`/`put_if_later` 与容量失败计数
 /// 证据（openai selector 429 冷却与容量熔断路径用），scope 变体测试不涉及，
-/// 返回占位。
+/// 返回占位
 #[derive(Clone, Default)]
 pub(crate) struct MemoryCooldownPort {
     pub(crate) cooldowns: Arc<Mutex<BTreeMap<ProviderAccountId, ProviderCooldown>>>,
@@ -1142,7 +1209,7 @@ impl MemoryCooldownPort {
         Self::default()
     }
 
-    /// 测试断言用：窗口内累计失败次数与在途峰值。
+    /// 测试断言用：窗口内累计失败次数与在途峰值
     #[must_use]
     pub(crate) fn capacity_evidence(&self, account_id: &ProviderAccountId) -> Option<(u32, u32)> {
         self.capacity_failures
