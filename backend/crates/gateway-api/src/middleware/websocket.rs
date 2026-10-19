@@ -1,4 +1,4 @@
-//! 服务器握手与双工传输；自定义协议及多轮执行由接管会话的插件编排。
+//! 服务器握手与双工传输；自定义协议及多轮执行由接管会话的插件编排
 
 use std::sync::Arc;
 
@@ -14,15 +14,14 @@ use futures::{
     future::BoxFuture,
     stream::{SplitSink, SplitStream},
 };
-use gateway_core::{
-    engine::middleware::{FrozenMiddlewarePlan, MiddlewareError, MiddlewareHeader},
-    lifecycle::CancellationToken,
-    middleware::{
-        compose,
-        http::{self as http, upgrade},
-        websocket as core,
-    },
-};
+use gateway_core::engine::middleware::FrozenMiddlewarePlan;
+use gateway_core::engine::middleware::MiddlewareError;
+use gateway_core::engine::middleware::MiddlewareHeader;
+use gateway_core::engine::middleware::http;
+use gateway_core::engine::middleware::http::upgrade;
+use gateway_core::engine::middleware::websocket as core;
+use gateway_core::lifecycle::CancellationToken;
+use gateway_core::middleware::compose;
 use http_body_util::BodyExt as _;
 
 pub(super) struct Upgrade {
@@ -73,6 +72,7 @@ impl upgrade::WebSocketUpgrade for Upgrade {
                 let reader_task = tokio::spawn(read_messages(reader, incoming, cancellation));
                 Ok(Arc::new(Session {
                     reader: tokio::sync::Mutex::new(received), reader_task: reader_task.abort_handle(), writer,
+                    extensions: context.extensions,
                     plan: context.plan, connection_id: context.request_id, headers,
                     cancellation: context.cancellation,
                 }) as Arc<dyn core::Session>)
@@ -86,7 +86,7 @@ impl upgrade::WebSocketUpgrade for Upgrade {
     }
 }
 
-/// 原生协议与插件接管会话共用消息链；调用取消不等待插件释放 transport 锁。
+/// 原生协议与插件接管会话共用消息链；调用取消不等待插件释放 transport 锁
 pub(crate) async fn transform(
     context: core::Context,
     message: core::Message,
@@ -109,6 +109,7 @@ pub(crate) async fn transform(
 }
 
 struct Session {
+    extensions: gateway_core::engine::extensions::ExtensionCallScope,
     reader: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message>>,
     reader_task: tokio::task::AbortHandle,
     writer: Arc<Writer>,
@@ -126,6 +127,7 @@ impl Session {
     ) -> Result<Option<core::Message>, MiddlewareError> {
         transform(
             core::Context {
+                extensions: self.extensions.clone(),
                 plan: self.plan.clone(),
                 connection_id: self.connection_id.clone(),
                 direction,
@@ -152,7 +154,7 @@ impl core::Session for Session {
                     return Ok(None);
                 };
                 let message = into_core(message);
-                // transport 锁只保护一次读取；插件可以在收包处理中主动发送。
+                // transport 锁只保护一次读取；插件可以在收包处理中主动发送
                 if let Some(message) = self.transform(message, core::Direction::Incoming).await? {
                     return Ok(Some(message));
                 }

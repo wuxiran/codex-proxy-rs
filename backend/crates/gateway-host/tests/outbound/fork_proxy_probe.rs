@@ -35,7 +35,7 @@ async fn exit_geo_is_best_effort_and_never_changes_the_connectivity_result() {
     let probe = HttpProxyProbe::new("http://unresolvable.invalid/ip");
     let located = probe
         .with_geo_endpoint("http://unresolvable.invalid/geo")
-        .test(&proxy, false)
+        .test(Some(&proxy), false)
         .await;
     assert!(located.success);
     let geo = located.exit_geo.unwrap();
@@ -48,7 +48,7 @@ async fn exit_geo_is_best_effort_and_never_changes_the_connectivity_result() {
     // 地区服务出错、被限流或返回垃圾时，测试仍然成功，只是没有地区。
     let broken = HttpProxyProbe::new("http://unresolvable.invalid/ip")
         .with_geo_endpoint("http://unresolvable.invalid/missing")
-        .test(&proxy, false)
+        .test(Some(&proxy), false)
         .await;
     assert!(broken.success);
     assert!(broken.exit_geo.is_none());

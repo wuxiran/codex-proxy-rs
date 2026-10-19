@@ -1,3 +1,5 @@
+//! 将插件管理声明编译为页面、路由与资源入口
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use gateway_admin::model::{
@@ -38,7 +40,7 @@ pub(crate) async fn prepare(
         )
         .await
         .map_err(|_| AdminError::invalid("插件管理扩展注册失败"))?;
-    if reply.result != serde_json::json!({}) || reply.payload.len() > 64 * 1024 {
+    if reply.payload.len() > 64 * 1024 {
         return Err(AdminError::invalid("插件管理注册信封无效或过大"));
     }
     let registration: ManagementRegistration = serde_json::from_slice(&reply.payload)

@@ -1,6 +1,12 @@
+//! 验证插件重试、模型路由与账号调度策略的顺序及宿主约束
+
+mod compatibility;
 mod facts;
 mod http;
+mod lifecycle;
 mod mounts;
+mod retry;
+mod scheduling;
 mod service;
 mod websocket;
 
@@ -26,6 +32,7 @@ use gateway_admin::{
     ports::plugins::PluginPackageInspector,
 };
 use gateway_core::{
+    account::FastMode,
     account::{
         AccountCandidate, AccountEligibilityPolicy, AccountRuntimeSignals, AccountSelectionContext,
         AccountSelectionPolicy, AccountWeight, CredentialRevision, CredentialState,
@@ -47,8 +54,8 @@ use gateway_core::{
     lifecycle::CancellationToken,
     operation::{GenerateRequest, Operation, OperationKind, ProtocolPayload},
     policy::ClientApiKeyId,
+    routing::extensions::{ExtensionPreparationPort, ExtensionSetReference},
     routing::{AccountGroupId, ConfigRevision, PublicModelId},
-    runtime::extensions::{ExtensionPreparationPort, ExtensionSetReference},
 };
 use gateway_plugin_runtime::{
     PackageInspector, PackageLimits, PluginRuntime, PluginRuntimeConfig, RpcLimits,
@@ -204,6 +211,7 @@ fn operation() -> Operation {
             ["session_id", "c2VjcmV0"],
             ["thread_id", "c2VjcmV0"],
             ["X_Extension!#$%&'*+-.^_`|~", "b24="],
+            ["x-plugin opaque", "not-base64?"],
         ]
     })
     .as_object()
@@ -223,7 +231,60 @@ fn operation() -> Operation {
 }
 
 #[tokio::test]
-async fn retry_policy_uses_ordered_delegation_and_rejects_disallowed_actions() {
+async fn retry_callback_preserves_entry_snapshot_and_ancestor_scope() {
+    use crate::support::request_context::{Dispatcher, request};
+    use gateway_core::{
+        engine::policy::{RetryDecision, RetryFacts},
+        error::ProviderErrorKind,
+        upstream::UpstreamSendState,
+    };
+    let (_cache, runtime) = setup(vec![InstanceFixture {
+        id: "retry-source",
+        configuration: serde_json::json!({"dispatch_on_method":"policy.retry_decision", "retry_decision":{"decision":"stop"}}),
+        bindings: vec![binding("test.example.retryPolicy", "retry", 0, PluginFailurePolicy::Delegate)],
+    }]).await;
+    let dispatcher = Arc::new(Dispatcher::default());
+    let port: Arc<dyn gateway_core::engine::middleware::http::Dispatcher> = dispatcher.clone();
+    runtime.bind_http(&port).unwrap();
+    let request = request();
+    let extensions = ExtensionCallScope::default()
+        .with_request(request.clone())
+        .extending("ancestor".into())
+        .unwrap();
+    let context = policy_context(&runtime, prepare(&runtime).await, "req_retry_child")
+        .with_extension_scope(extensions);
+    assert_eq!(
+        context
+            .retry_decision(RetryFacts {
+                attempt_index: NonZeroU32::MIN,
+                provider: ProviderKind::new("openai").unwrap(),
+                model: Some("gpt-test".into()),
+                error_kind: ProviderErrorKind::RateLimited,
+                upstream_status: Some(429),
+                send_state: UpstreamSendState::NotSent,
+                remaining_routing_attempts: 1,
+                remaining_deadline: Duration::from_secs(3),
+                retry_allowed: true,
+            })
+            .await,
+        RetryDecision::Stop
+    );
+    {
+        let calls = dispatcher.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(Arc::ptr_eq(
+            &calls[0].extensions.shared_request().unwrap(),
+            &request
+        ));
+        assert!(calls[0].extensions.contains("ancestor"));
+        assert!(calls[0].extensions.contains("retry-source"));
+        assert_eq!(calls[0].request_id, "req_retry_child");
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_policy_preserves_decisions_and_leaves_replay_safety_to_core() {
     use gateway_core::{
         engine::policy::{RetryDecision, RetryFacts},
         error::ProviderErrorKind,
@@ -243,12 +304,12 @@ async fn retry_policy_uses_ordered_delegation_and_rejects_disallowed_actions() {
         (
             serde_json::json!({"decision":"retry"}),
             false,
-            RetryDecision::Stop,
+            RetryDecision::Retry,
         ),
         (
             serde_json::json!({"decision":"retry","account_id":"acct_forbidden"}),
             true,
-            RetryDecision::Stop,
+            RetryDecision::Retry,
         ),
     ] {
         let records = tempfile::tempdir().unwrap();
@@ -447,7 +508,8 @@ async fn model_router_preserves_order_and_exposes_complete_request_data() {
             {"name":"authorization","value_base64":"c2VjcmV0"},
             {"name":"session_id","value_base64":"c2VjcmV0"},
             {"name":"thread_id","value_base64":"c2VjcmV0"},
-            {"name":"x_extension!#$%&'*+-.^_`|~","value_base64":"b24="}
+            {"name":"x_extension!#$%&'*+-.^_`|~","value_base64":"b24="},
+            {"name":"x-plugin opaque","value_base64":"not-base64?"}
         ])
     );
     assert!(!lines[1].to_string().contains("secret"));
@@ -548,15 +610,16 @@ fn selection_context() -> AccountSelectionContext {
         policy: AccountSelectionPolicy::new(
             RotationStrategy::RoundRobin,
             NonZeroU32::new(4).unwrap(),
-            Duration::ZERO,
         ),
         now: SystemTime::now(),
         excluded_accounts: BTreeSet::new(),
+        busy_accounts: Default::default(),
         preferred_account: None,
         preferred_account_overrides_weight: true,
         round_robin_cursor: 0,
         eligibility: AccountEligibilityPolicy::Enforce,
         account_scope: None,
+        reserved_concurrency: 0,
     }
 }
 
@@ -577,14 +640,14 @@ async fn scheduler_cannot_pick_outside_the_host_projected_priority_tier() {
     let generation = prepare(&runtime).await;
     let context = policy_context(&runtime, generation.clone(), "req_schedule");
     let candidates = [candidate("acct_high", 100), candidate("acct_low", 10)];
-    let selection = selection_context();
+    let mut selection = selection_context();
     let selected = context
         .select_account(
             NonZeroU32::MIN,
             &ProviderKind::new("example").unwrap(),
             Some("upstream-a"),
             &candidates,
-            &selection,
+            &mut selection,
         )
         .await
         .unwrap()
@@ -675,6 +738,16 @@ impl Downstream {
 }
 
 fn middleware_context(transport: ClientTransport) -> MiddlewareContext {
+    middleware_context_with_deadline(
+        transport,
+        (SystemTime::now() + Duration::from_secs(5)).into(),
+    )
+}
+
+fn middleware_context_with_deadline(
+    transport: ClientTransport,
+    deadline: gateway_core::lifecycle::Deadline,
+) -> MiddlewareContext {
     MiddlewareContext::new(
         MiddlewareTarget {
             request_id: ModelRequestId::new("req_middleware").unwrap(),
@@ -691,7 +764,7 @@ fn middleware_context(transport: ClientTransport) -> MiddlewareContext {
             client_key_id: ClientApiKeyId::new("key-middleware").unwrap(),
             account_group_ids: Arc::<[AccountGroupId]>::from([]),
             cancellation: CancellationToken::new(),
-            deadline: SystemTime::now() + Duration::from_secs(5),
+            deadline,
             extension_scope: ExtensionCallScope::default(),
             execution_effects: None,
         },
@@ -699,6 +772,13 @@ fn middleware_context(transport: ClientTransport) -> MiddlewareContext {
 }
 
 fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareContext {
+    attempt_middleware_context_for_transport(effects, ClientTransport::HttpJson)
+}
+
+fn attempt_middleware_context_for_transport(
+    effects: Arc<ExecutionEffects>,
+    transport: ClientTransport,
+) -> MiddlewareContext {
     MiddlewareContext::new(
         MiddlewareTarget {
             request_id: ModelRequestId::new("req_attempt_http").unwrap(),
@@ -706,7 +786,7 @@ fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareConte
             attempt_index: Some(NonZeroU32::MIN),
             operation: Some(OperationKind::Generate),
             endpoint: "/v1/responses".into(),
-            transport: ClientTransport::HttpJson,
+            transport,
             provider: Some(ProviderKind::new("openai").unwrap()),
             model: Some("public-a".into()),
             account_id: Some(ProviderAccountId::new("acct_openai").unwrap()),
@@ -715,7 +795,7 @@ fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareConte
             client_key_id: ClientApiKeyId::new("key-middleware").unwrap(),
             account_group_ids: Arc::<[AccountGroupId]>::from([]),
             cancellation: CancellationToken::new(),
-            deadline: SystemTime::now() + Duration::from_secs(5),
+            deadline: (SystemTime::now() + Duration::from_secs(5)).into(),
             extension_scope: ExtensionCallScope::default(),
             execution_effects: Some(effects),
         },
@@ -761,8 +841,8 @@ async fn attempt_middleware_can_delegate_after_a_managed_http_side_effect() {
     .await;
     let generation = prepare(&runtime).await;
     let plan = runtime
-        .middleware_registry()
-        .resolve(&generation)
+        .execution_registry()
+        .middleware(&generation)
         .expect("middleware plan");
     let calls = Arc::new(AtomicUsize::new(0));
     let closes = Arc::new(AtomicUsize::new(0));
@@ -816,8 +896,8 @@ async fn middleware_next_and_lazy_body_mapping_use_one_real_rpc_call() {
     .await;
     let generation = prepare(&runtime).await;
     let plan = runtime
-        .middleware_registry()
-        .resolve(&generation)
+        .execution_registry()
+        .middleware(&generation)
         .expect("middleware plan");
     let calls = Arc::new(AtomicUsize::new(0));
     let closes = Arc::new(AtomicUsize::new(0));
@@ -969,7 +1049,10 @@ async fn middleware_classifies_real_rpc_output_after_a_terminal_frame() {
         }])
         .await;
         let generation = prepare(&runtime).await;
-        let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+        let plan = runtime
+            .execution_registry()
+            .middleware(&generation)
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let response = plan
@@ -1030,7 +1113,10 @@ async fn outer_plugin_receives_inner_rejection_details_and_preserves_rejection_s
         InstanceFixture {id:"inner-error", configuration:serde_json::json!({"mode":"rejected"}), bindings:vec![binding(MIDDLEWARE_CONTRIBUTION,"request",1,PluginFailurePolicy::Reject)]},
     ],package).await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     let result = plan
         .handle(
             middleware_context(ClientTransport::HttpJson),
@@ -1044,6 +1130,7 @@ async fn outer_plugin_receives_inner_rejection_details_and_preserves_rejection_s
         panic!("expected rejection")
     };
     assert!(error.is_rejected());
+    assert!(generation.is_ready(), "主动拒绝请求不应停止插件");
     let MiddlewareError::Remote { source, .. } = error else {
         panic!("expected remote details")
     };
@@ -1084,7 +1171,10 @@ async fn real_request_plugin_receives_downstream_error_details_without_consuming
         bindings:vec![binding(MIDDLEWARE_CONTRIBUTION,"request",0,PluginFailurePolicy::Reject)],
     }],package).await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     let result = plan
         .handle(
             middleware_context(ClientTransport::HttpJson),
@@ -1134,7 +1224,9 @@ async fn real_request_plugin_receives_downstream_error_details_without_consuming
 
 #[tokio::test]
 async fn real_request_plugins_rewrite_settings_in_onion_order() {
-    use gateway_core::{policy::RateLimits, settings::ExecutionSettings, settings::SettingsValues};
+    use gateway_core::{
+        policy::RateLimits, routing::request_settings::ExecutionSettings, settings::SettingsValues,
+    };
     let profiles = |identity| {
         BTreeMap::from([(
             gateway_core::identity::ProviderKind::new("openai").unwrap(),
@@ -1147,19 +1239,19 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
         )])
     };
     let baseline = ExecutionSettings {
-        runtime: SettingsValues::new(3, 50, "smart", BTreeMap::new(), None, None)
+        runtime: SettingsValues::new(3, "smart", BTreeMap::new(), None, None)
             .with_request_profiles(profiles("key-default")),
-        disable_fast: true,
+        fast_mode: FastMode::Disabled,
         client_limits: RateLimits {
             max_concurrency: 2,
             requests_per_minute: 10,
         },
-        timeout_ms: 60_000,
+        timeout_ms: Some(60_000),
     };
     let baseline_json = serde_json::to_value(&baseline).unwrap();
     let host_snapshot = gateway_core::routing::RuntimeSnapshot::new(
         ConfigRevision::new(1).unwrap(),
-        gateway_core::settings::SettingsValues::new(1, 0, "smart", Default::default(), None, None),
+        gateway_core::settings::SettingsValues::new(1, "smart", Default::default(), None, None),
         vec![],
         vec![],
         vec![],
@@ -1172,34 +1264,35 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
             .with_request_profiles(profiles("host")),
     )
     .unwrap();
-    let configuration = gateway_core::settings::RequestSettings::new(Arc::new(host_snapshot))
-        .with_execution(
-            &gateway_core::policy::ClientPolicy::new(
-                middleware_context(ClientTransport::HttpJson)
-                    .client_key_id()
-                    .clone(),
-                gateway_core::policy::PlaintextClientApiKey::new("fixture-key").unwrap(),
-                Arc::new(
-                    gateway_core::routing::FrozenAccountScope::new(
-                        Arc::default(),
-                        gateway_core::routing::ClientRoutingScope::all_accounts(),
-                    )
-                    .with_request_profiles(profiles("key-default"))
-                    .with_disable_fast(baseline.disable_fast),
+    let configuration =
+        gateway_core::routing::request_settings::RequestSettings::new(Arc::new(host_snapshot))
+            .with_execution(
+                &gateway_core::policy::ClientPolicy::new(
+                    middleware_context(ClientTransport::HttpJson)
+                        .client_key_id()
+                        .clone(),
+                    gateway_core::policy::PlaintextClientApiKey::new("fixture-key").unwrap(),
+                    Arc::new(
+                        gateway_core::routing::FrozenAccountScope::new(
+                            Arc::default(),
+                            gateway_core::routing::ClientRoutingScope::all_accounts(),
+                        )
+                        .with_request_profiles(profiles("key-default"))
+                        .with_fast_mode(baseline.fast_mode),
+                    ),
+                    true,
+                    baseline.client_limits,
                 ),
-                true,
-                baseline.client_limits,
-            ),
-            baseline.timeout_ms,
-        );
+                baseline.timeout_ms,
+            );
     let mut first = baseline_json.clone();
-    first["disable_fast"] = serde_json::json!(false);
-    first["runtime"]["request_interval_ms"] = serde_json::json!(0);
+    first["fast_mode"] = serde_json::json!("default");
+    first["runtime"]["max_account_rotations"] = serde_json::json!(0);
     first["runtime"]["model_mappings"] = serde_json::json!({"alias":"model-one"});
     let mut last = first.clone();
     last["runtime"]["model_mappings"] = serde_json::json!({"alias":"model-two"});
     last["timeout_ms"] = serde_json::json!(90_000);
-    // 显式写回宿主值也要记录覆盖，否则 Key 默认值会再次生效。
+    // 显式写回宿主值也要记录覆盖，否则 Key 默认值会再次生效
     last["runtime"]["request_profiles"] = serde_json::json!({"openai":{"identity":"host"}});
     let worker = std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap();
     let package = crate::support::package_with_contributions(
@@ -1217,8 +1310,11 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
         InstanceFixture { id: "settings-pass", configuration: serde_json::json!({"mode":"settings","expected_settings":last}), bindings: vec![binding(MIDDLEWARE_CONTRIBUTION,"request",2,PluginFailurePolicy::Reject)] },
     ], package).await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
-    // 连续调用使用同一宿主基线，前一次插件改写不能泄漏到后一次。
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
+    // 连续调用使用同一宿主基线，前一次插件改写不能泄漏到后一次
     for _ in 0..2 {
         let expected: ExecutionSettings = serde_json::from_value(last.clone()).unwrap();
         let next = (Downstream {
@@ -1251,10 +1347,10 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
                             "settings-second"
                         );
                         assert_eq!(
-                            sources["execution"]["disable_fast"]["instance_id"],
+                            sources["execution"]["fast_mode"]["instance_id"],
                             "settings-first"
                         );
-                        assert_eq!(sources["execution"]["disable_fast"]["value"], false);
+                        assert_eq!(sources["execution"]["fast_mode"]["value"], "default");
                         assert_eq!(
                             sources["execution"]["timeout_ms"]["instance_id"],
                             "settings-second"
@@ -1304,7 +1400,10 @@ async fn sdk_middleware_entry_registers_and_maps_a_real_process_response() {
     )
     .await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let closes = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -1340,7 +1439,7 @@ async fn sdk_middleware_entry_registers_and_maps_a_real_process_response() {
     })
     .await
     .unwrap();
-    // 模拟慢消费者：SDK 可以继续发起读回调，但宿主不得预读第二个源。
+    // 模拟慢消费者：SDK 可以继续发起读回调，但宿主不得预读第二个源
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(reads.load(Ordering::Relaxed), 1);
     let frame = body.next_frame().await.unwrap().unwrap();
@@ -1361,7 +1460,7 @@ async fn sdk_middleware_entry_registers_and_maps_a_real_process_response() {
     })
     .await
     .unwrap();
-    // 尚未消费源帧就关闭，等待源归还的回调必须一起取消并释放下游正文。
+    // 尚未消费源帧就关闭，等待源归还的回调必须一起取消并释放下游正文
     reads.store(0, Ordering::Relaxed);
     let response = plan
         .handle(
@@ -1442,7 +1541,12 @@ async fn instances_without_data_plane_bindings_publish_neither_plan() {
     .await;
     let generation = prepare(&runtime).await;
     assert!(runtime.policy_registry().resolve(&generation).is_none());
-    assert!(runtime.middleware_registry().resolve(&generation).is_none());
+    assert!(
+        runtime
+            .execution_registry()
+            .middleware(&generation)
+            .is_none()
+    );
     drop(generation);
     super::wait_until_empty(cache.path()).await;
 }
@@ -1489,7 +1593,7 @@ impl CapabilitiesNext {
 
 #[tokio::test]
 async fn sdk_capability_declarations_require_request_stage() {
-    for (version, attempt) in [(3, false), (3, true)] {
+    for (version, attempt) in [(5, false), (5, true)] {
         let stage = if attempt {
             Stage::Attempt
         } else {
@@ -1516,7 +1620,10 @@ async fn sdk_capability_declarations_require_request_stage() {
             bindings: vec![binding(MIDDLEWARE_CONTRIBUTION, if attempt { "attempt" } else { "request" }, 0, PluginFailurePolicy::Reject)],
         }], package).await;
         let generation = prepare(&runtime).await;
-        let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+        let plan = runtime
+            .execution_registry()
+            .middleware(&generation)
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let context = if attempt {
             attempt_middleware_context(Arc::default())
@@ -1598,7 +1705,10 @@ async fn assert_sdk_transparency(mode: &'static str) {
     )
     .await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     let mut headers = middleware_headers();
     headers.extend([
         MiddlewareHeader::new("X-Repeated", Bytes::from_static(b"first")),
@@ -1771,7 +1881,10 @@ async fn a_failed_middleware_preserves_scope_and_the_configured_failure_policy()
         }])
         .await;
         let generation = prepare(&runtime).await;
-        let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+        let plan = runtime
+            .execution_registry()
+            .middleware(&generation)
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let response = plan
             .handle(
@@ -1847,7 +1960,10 @@ async fn middleware_preserves_large_body_and_following_requests() {
     }])
     .await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     for length in [4 * 1024 * 1024 + 17, 32] {
         let payload = Bytes::from(
             (0..length)

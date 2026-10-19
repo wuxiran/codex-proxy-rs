@@ -1,4 +1,4 @@
-//! 进程结构化日志与按日期/大小轮转的文件 writer。
+//! 进程结构化日志与按日期/大小轮转的文件 writer
 
 use std::env;
 use std::io;
@@ -15,20 +15,20 @@ mod sink;
 mod writer;
 
 use sink::{FileLogGuard, FileLogSink, LogHealth};
-use writer::RotatingLogWriter;
+use writer::{LogRetention, RotatingLogWriter};
 
-// 文件前缀统一为 codex-proxy-rs-<kebab-case 类别>；专用 tracing target 使用 snake_case。
+// 文件前缀统一为 codex-proxy-rs-<kebab-case 类别>；专用 tracing target 使用 snake_case
 const APPLICATION_LOG_FILE_PREFIX: &str = "codex-proxy-rs-application";
 
-/// 内部分类标识；由 host.logging.oauth_recovery 控制是否写入独立文件。
+/// 内部分类标识；由 host.logging.oauth_recovery 控制是否写入独立文件
 const OAUTH_RECOVERY_LOG_TARGET: &str = "oauth_recovery";
 const OAUTH_RECOVERY_LOG_FILE_PREFIX: &str = "codex-proxy-rs-oauth-recovery";
 
-/// 请求转储含完整凭据与正文，只允许在显式开启时写入独立文件。
+/// 请求转储含完整凭据与正文，只允许在显式开启时写入独立文件
 const REQUEST_DUMP_LOG_TARGET: &str = "request_dump";
 const REQUEST_DUMP_LOG_FILE_PREFIX: &str = "codex-proxy-rs-request-dump";
 
-/// 文件日志在正常退出时排空队列并等待落盘；控制台日志单独持有守卫。
+/// 文件日志在正常退出时排空队列并等待落盘；控制台日志单独持有守卫
 pub struct LogGuard {
     _stdout: Vec<WorkerGuard>,
     _files: Vec<FileLogGuard>,
@@ -45,10 +45,15 @@ pub enum LogError {
     AlreadyInitialized,
     #[error("logging size limit is too large")]
     SizeOverflow,
+    #[error(transparent)]
+    InvalidConfig(#[from] crate::config::ConfigError),
 }
 
-/// 初始化日志；文件按完整日期留存，不以分片数量淘汰窗口内记录。
-pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> {
+/// 初始化日志；按各通道的保留窗口清理，不以分片数量淘汰记录
+pub fn initialize_logging(
+    config: &LoggingConfig,
+    timezone: gateway_core::time::DeploymentTimeZone,
+) -> Result<LogGuard, LogError> {
     let directive = env::var("RUST_LOG").unwrap_or_else(|_| config.level.clone());
     let file_filter = application_file_filter(&directive)?;
     let recovery_file_filter = oauth_recovery_file_filter();
@@ -70,7 +75,8 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let file_writer = if config.file.enabled {
         let (writer, guard) = create_file_writer(
             config,
-            config.file.retention_days,
+            timezone,
+            LogRetention::CalendarDays(config.file.retention_days),
             APPLICATION_LOG_FILE_PREFIX,
             "gateway-log-application-file",
             Arc::clone(&health),
@@ -83,7 +89,8 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let recovery_file_writer = if config.oauth_recovery {
         let (writer, guard) = create_file_writer(
             config,
-            config.file.retention_days,
+            timezone,
+            LogRetention::CalendarDays(config.file.retention_days),
             OAUTH_RECOVERY_LOG_FILE_PREFIX,
             "gateway-log-oauth-recovery-file",
             Arc::clone(&health),
@@ -96,7 +103,8 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let request_dump_file_writer = if config.request_dump {
         let (writer, guard) = create_file_writer(
             config,
-            config.request_dump_retention_days,
+            timezone,
+            LogRetention::Elapsed(config.request_dump_retention()?),
             REQUEST_DUMP_LOG_FILE_PREFIX,
             "gateway-log-request-dump-file",
             Arc::clone(&health),
@@ -110,6 +118,7 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let stdout_layer = stdout_writer.map(|writer| {
         tracing_subscriber::fmt::layer()
             .compact()
+            .with_timer(DeploymentClock(timezone))
             .with_writer(writer)
             .with_target(false)
             .with_ansi(false)
@@ -118,6 +127,7 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let file_layer = file_writer.map(|writer| {
         tracing_subscriber::fmt::layer()
             .json()
+            .with_timer(DeploymentClock(timezone))
             .with_writer(writer)
             .with_target(true)
             .with_file(true)
@@ -131,6 +141,7 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let recovery_file_layer = recovery_file_writer.map(|writer| {
         tracing_subscriber::fmt::layer()
             .json()
+            .with_timer(DeploymentClock(timezone))
             .with_writer(writer)
             .with_target(true)
             .with_file(true)
@@ -144,6 +155,7 @@ pub fn initialize_logging(config: &LoggingConfig) -> Result<LogGuard, LogError> 
     let request_dump_file_layer = request_dump_file_writer.map(|writer| {
         tracing_subscriber::fmt::layer()
             .json()
+            .with_timer(DeploymentClock(timezone))
             .with_writer(writer)
             .with_target(true)
             .with_file(true)
@@ -209,7 +221,8 @@ impl LogGuard {
 
 fn create_file_writer(
     config: &LoggingConfig,
-    retention_days: usize,
+    timezone: gateway_core::time::DeploymentTimeZone,
+    retention: LogRetention,
     prefix: &'static str,
     thread_name: &'static str,
     health: Arc<LogHealth>,
@@ -223,8 +236,21 @@ fn create_file_writer(
         config.file.directory.clone(),
         prefix,
         maximum_bytes,
-        retention_days,
+        retention,
         Arc::clone(&health),
+        timezone,
     )?;
     Ok(FileLogSink::spawn(writer, thread_name, health)?)
+}
+
+#[derive(Clone, Copy)]
+struct DeploymentClock(gateway_core::time::DeploymentTimeZone);
+
+impl tracing_subscriber::fmt::time::FormatTime for DeploymentClock {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(writer, "{}", self.0.local(chrono::Utc::now()).to_rfc3339())
+    }
 }

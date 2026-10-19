@@ -1,33 +1,34 @@
 <script setup lang="ts">
-import type { AccountRow } from './constants'
-import { BaseCard, BaseCheckbox, BaseConfirmModal, BasePageHeader, BaseTable, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+import type { Account } from '@/api'
 
+import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
 import { ChevronDown } from '@lucide/vue'
-import { useMediaQuery } from '@vueuse/core'
+import { useMediaQuery } from '@vueuse/core' // fork: narrow-actions
 import { ref, shallowRef } from 'vue'
+import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
-import SyncedSwitch from '@/components/SyncedSwitch.vue'
-import { useAccountConfigurations } from '@/composables/useAccountConfigurations'
+import SyncedSwitch from '@/components/SyncedSwitch.vue' // fork: synced-switch
+import { useAccountConfigurations } from '@/composables/useAccountConfigurations' // fork: guanlan 复活
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
-import AccountAutoRefresh from './components/AccountAutoRefresh.vue'
+import AccountCreateModal from './components/account-create-modal/index.vue'
+import AccountImportTasks from './components/account-import-tasks/index.vue'
+import AccountQuotaPanel from './components/account-quota-panel/index.vue'
+import AccountQuotaSummaryCell from './components/account-quota-summary-cell/index.vue'
+import AccountStatusBadge from './components/account-status-badge/index.vue'
+import AccountAutoRefresh from './components/AccountAutoRefresh.vue' // fork: auto-refresh
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
+import AccountConcurrencyModal from './components/AccountConcurrencyModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
-import AccountCreateModal from './components/AccountCreateModal/index.vue'
 import AccountEditModal from './components/AccountEditModal.vue'
 import AccountFilters from './components/AccountFilters.vue'
 import AccountIdentityCell from './components/AccountIdentityCell.vue'
-import AccountImportTasks from './components/AccountImportTasks/index.vue'
 import AccountOverviewCards from './components/AccountOverviewCards.vue'
-import AccountPlanBadge from './components/AccountPlanBadge.vue'
-import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
-import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
-import AccountRecentErrors from './components/AccountRecentErrors.vue'
-import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
+import AccountRecentErrors from './components/AccountRecentErrors.vue' // fork: recent-errors
 import AccountTableActions from './components/AccountTableActions.vue'
-import AccountTicketCell from './components/AccountTicketCell.vue'
-import AccountTicketModal from './components/AccountTicketModal.vue'
+import AccountTicketCell from './components/AccountTicketCell.vue' // fork: ticket
+import AccountTicketModal from './components/AccountTicketModal.vue' // fork: ticket
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
@@ -36,15 +37,24 @@ import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
-import { accountColumns, derivedAccountStatus } from './constants'
+import { accountColumns } from './constants'
+
+const concurrencyAccount = shallowRef<Account | null>(null)
+const showConcurrency = shallowRef(false)
+function openConcurrency(account: Account) {
+  concurrencyAccount.value = account
+  showConcurrency.value = true
+}
 
 const selectedIds = ref<Set<string>>(new Set())
-const ticketAccount = shallowRef<AccountRow | null>(null)
+// fork: ticket — 成本与票据弹窗
+const ticketAccount = shallowRef<Account | null>(null)
 const showTicketModal = shallowRef(false)
-function openTicket(account: AccountRow) {
+function openTicket(account: Account) {
   ticketAccount.value = account
   showTicketModal.value = true
 }
+// fork: narrow-actions — 窄屏下操作列不固定，避免挤掉其他列
 const narrowTable = useMediaQuery('(max-width: 639px)')
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(
   () => accountColumns.map(column => narrowTable.value && column.key === 'actions'
@@ -99,6 +109,7 @@ const {
   showDeleteModal,
   showSingleDeleteModal,
   pendingDeleteAccount,
+  deleteCount,
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
@@ -118,6 +129,7 @@ const {
   handleCreate,
   handleAuthorizeOAuth,
   openCreateAccount,
+  clearCreate,
   openReauthorizeAccount,
   requestDeleteAccount,
   handleDelete,
@@ -176,8 +188,8 @@ const {
   concurrencyLimit: batchConcurrencyLimit,
   weight: batchWeight,
   modelAccess: batchModelAccess,
-  hasChanges: batchHasChanges,
   catalogAccountId: batchCatalogAccountId,
+  editingCount: batchEditingCount,
   proxyMode: batchProxyMode,
   proxyId: batchProxyId,
   selectedGroupIds: batchGroupIds,
@@ -209,8 +221,8 @@ const {
   saving: savingAccountEdit,
   open: openAccountEdit,
   save: saveAccountEdit,
+  clearCredentials,
 } = useAccountEditor({
-  accounts,
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
@@ -218,7 +230,7 @@ const {
 
 <template>
   <div class="flex min-h-0 w-full flex-col xl:h-full xl:overflow-hidden">
-    <BasePageHeader
+    <ZPageHeader
       class="h-17"
       title="账号管理"
       description="维护账号池，查看可用性、配额与使用状态"
@@ -226,7 +238,7 @@ const {
 
     <AccountOverviewCards :summary="accountSummary" />
 
-    <BaseCard
+    <ZCard
       class="mt-4 flex flex-col xl:h-[calc(100dvh-250px)] xl:min-h-125"
     >
       <template #header>
@@ -250,12 +262,13 @@ const {
           @edit-selected="openBatchEdit"
         >
           <template #actions>
+            <!-- fork: auto-refresh -->
             <AccountAutoRefresh
               v-model="autoRefreshSeconds"
               :refreshing="refreshingAccounts"
               @refresh="refreshAccountsNow"
             />
-            <BaseTableColumnSettings
+            <ZTableColumnSettings
               :options="columnOptions"
               @change="setColumnVisible"
               @reorder="setColumnOrder"
@@ -267,10 +280,10 @@ const {
 
       <template #body>
         <div class="flex min-h-0 flex-col xl:h-full">
-          <BaseTable
+          <ZTable
             class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
             :columns="visibleColumns"
-            :rows="accounts"
+            :data="accounts"
             :loading="loading"
             :selected-row-keys="selectedRowKeys"
             :expanded-row-keys="expandedRowKeys"
@@ -293,18 +306,18 @@ const {
             </template>
 
             <template #header-selection>
-              <BaseCheckbox
+              <ZCheckbox
                 :model-value="allSelected"
                 :indeterminate="indeterminate"
-                label="选择当前页账号"
+                aria-label="选择当前页账号"
                 @update:model-value="toggleAll"
               />
             </template>
 
             <template #selection="{ row }">
-              <BaseCheckbox
+              <ZCheckbox
                 :model-value="selectedIds.has(row.id)"
-                label="选择账号"
+                aria-label="选择账号"
                 @update:model-value="toggleSelection(row.id)"
               />
             </template>
@@ -320,6 +333,7 @@ const {
               />
             </template>
 
+            <!-- fork: ticket -->
             <template #ticket="{ row }">
               <AccountTicketCell :ticket="row.ticket" :added-at-display="row.addedAtDisplay" />
             </template>
@@ -327,20 +341,16 @@ const {
             <template #status="{ row }">
               <div class="grid justify-items-start gap-1">
                 <AccountStatusBadge
-                  :status="derivedAccountStatus(row)"
+                  :status="row.status"
                   :error-reason="row.errorReason"
                   :error-message="row.errorMessage"
-                  :rate-limited-until="row.quota.rateLimitedUntil"
+                  :rate-limit-recovery-display="row.quota.rateLimitRecoveryDisplay"
                   :rate-limit-reason="row.quota.rateLimitReason"
                   :recovery-probe-required="row.quota.recoveryProbeRequired"
                   :next-refresh-at="row.nextRefreshAt"
+                  :next-refresh-at-display="row.nextRefreshAtDisplay"
                 />
-                <span
-                  class="whitespace-nowrap text-cp-xs font-emphasis tabular-nums text-cp-text-tertiary"
-                  :title="row.concurrencyLimit === null ? '当前并发 / 并发上限（继承全局默认）' : '当前并发 / 并发上限'"
-                >
-                  并发 {{ row.concurrency.inFlight ?? '—' }}/{{ row.concurrency.limit ?? '不限' }}
-                </span>
+                <!-- fork: recent-errors — 并发占用改由上游用量列的容量标记 + 并发详情展示 -->
                 <AccountRecentErrors
                   :account-id="row.id"
                   :request-count="row.recentErrors.requestCount"
@@ -349,6 +359,7 @@ const {
               </div>
             </template>
 
+            <!-- fork: synced-switch — 行内调度开关 -->
             <template #enabled="{ row }">
               <SyncedSwitch
                 :model-value="row.enabled"
@@ -361,11 +372,13 @@ const {
             </template>
 
             <template #planType="{ row }">
-              <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              <div class="flex min-w-0 justify-center">
+                <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              </div>
             </template>
 
             <template #usage="{ row }">
-              <AccountQuotaSummaryCell :account="row" />
+              <AccountQuotaSummaryCell :account="row" @show-concurrency="openConcurrency(row)" />
             </template>
 
             <template #groups="{ row }">
@@ -375,7 +388,7 @@ const {
             </template>
 
             <template #lastUsedAt="{ row }">
-              <LastUsedAtCell :value="row.usage.lastUsedAt" />
+              <LastUsedAtCell :value="row.usage.lastUsedAt" :display="row.usage.lastUsedAtDisplay" :full-display="row.usage.lastUsedAtFullDisplay" />
             </template>
 
             <template #actions="{ row }">
@@ -414,16 +427,18 @@ const {
                 <AccountUsagePanel :account="row" />
               </div>
             </template>
-          </BaseTable>
-          <BaseTablePagination
-            :pagination="accountPagination"
-            :loading="loading"
-            @page-change="handlePageChange"
-            @page-size-change="handlePageSizeChange"
+          </ZTable>
+          <ZPagination
+            v-bind="accountPagination"
+            :disabled="loading"
+            @current-change="handlePageChange"
+            @size-change="handlePageSizeChange"
           />
         </div>
       </template>
-    </BaseCard>
+    </ZCard>
+
+    <AccountConcurrencyModal v-model="showConcurrency" :account="concurrencyAccount" />
 
     <AccountConnectionTestModal
       v-model="showConnectionTestModal"
@@ -455,6 +470,7 @@ const {
       @select="importTasks.select"
       @refresh="importTasks.refresh"
       @stop="importTasks.stop"
+      @after-leave="importTasks.refresh(true)"
       @view-accounts="showImportTasks = false; loadAccounts()"
     />
 
@@ -471,8 +487,10 @@ const {
       :saving="creatingAccount"
       @create="handleCreate"
       @generate-oauth="handleAuthorizeOAuth"
+      @after-leave="clearCreate"
     />
 
+    <!-- fork: ticket -->
     <AccountTicketModal
       v-model="showTicketModal"
       :account="ticketAccount"
@@ -498,6 +516,7 @@ const {
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
       @save="saveAccountEdit"
+      @after-leave="clearCredentials"
     />
 
     <AccountBatchEditModal
@@ -510,15 +529,14 @@ const {
       v-model:proxy-id="batchProxyId"
       v-model:selected-group-ids="batchGroupIds"
       :catalog-account-id="batchCatalogAccountId"
-      :selected-count="selectedIds.size"
+      :selected-count="batchEditingCount"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingBatchEdit"
-      :has-changes="batchHasChanges"
       @save="saveBatchEdit"
     />
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showDeleteModal"
       title="确认删除"
       description="删除后该账号将不再参与调度，此操作不可撤销"
@@ -528,11 +546,11 @@ const {
       @confirm="handleBatchDelete"
     >
       <p class="m-0">
-        确定要删除选中的 {{ selectedIds.size }} 个账号吗？此操作不可撤销
+        确定要删除选中的 {{ deleteCount }} 个账号吗？此操作不可撤销
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showSingleDeleteModal"
       title="删除账号"
       description="删除后该账号将不再参与调度，此操作不可撤销"
@@ -551,6 +569,6 @@ const {
         }}
         吗？
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
   </div>
 </template>

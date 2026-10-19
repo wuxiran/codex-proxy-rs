@@ -19,6 +19,14 @@
 账号列表额外支持 `status=expired`：票据 `expiresAt` 已到且账号已不能调度（五态不是正常 / 限流）的账号归入
 「已过期」，默认列表与 `summary.total` 不含它们，`summary.expired` 单独计数。
 
+账号列表每行另带三个 fork 字段：`ticket`（成本、到期、打码邮箱，见上表）、`concurrency { inFlight, limit }`
+（实时占用与生效上限，lease 存储不可用时 `inFlight` 为 `null`）、`recentErrors { requestCount, errorCount }`
+（近 24 小时已结束请求数与报错数，客户端取消不算报错）。并发详情与报错明细不另设接口：管理端用上游的
+并发详情面板和 `GET /api/admin/usage/records?status=error&accountId=` 展示。
+
+账号列表里由请求历史推导的用量投影（24h 滚动用量、额度窗口与本地累计）有 20 秒的进程内
+stale-while-revalidate 缓存；票据、并发、状态等管理动作会改的事实不进缓存。
+
 ### 账号用量与费用来源
 
 账号列表、详情的 `usage.billing` 和逐模型 `usage.models[].billing` 使用相同时间窗口，提供以下 USD 字段：
@@ -53,6 +61,7 @@
 - `windowStartAt` / `curve`：源窗口起点，以及窗口内当前连续段的已用比例观测
   `[{ observedAt, usedPercent }]`（按时间升序，末点为当前额度快照）。曲线与能否预测无关，
   样本不足时仍返回；额度回落（上游重置）之前的旧段不返回。窗口过期或边界无效时为 `null` / `[]`。
+  容量与速率的采样基线沿用上游口径（跨回落累计），回落只清空曲线。
 - `burnPercentPerHour` / `burnPercentPerHourDisplay`：与容量估算同一配对样本的消耗速率
   （`sampledPercent / 采样时长`，百分点每小时）；不满足 5 个百分点门槛时为 `null` / `—`。
 - `exhaustion`：源窗口的耗尽结论，不随目标周期折算。`kind: "reached"` 表示上游已报告用尽（事实，
@@ -65,8 +74,9 @@
 | --- | --- | --- | --- |
 | `POST` | `/api/admin/proxies/quality-check` | `{ id, revision }` | `{ record, report }` |
 | `GET` | `/api/admin/proxies/quality-report` | `id` | `{ report }`，从未检测时 `report` 为 `null` |
-| `POST` | `/api/admin/proxies/batch-create` | `{ items: [{ name?, proxyUrl }] }`（1-200 条） | `{ created, skipped, configRevision }` |
 | `POST` | `/api/admin/proxies/batch-delete` | `{ items: [{ id, revision }] }`（1-200 条） | `{ deletedIds, skipped, configRevision }` |
+
+批量添加与批量测试用上游 `POST /api/admin/proxies/create`、`/test` 的数组请求，fork 不另设接口。
 
 与上游的差异：
 
@@ -97,11 +107,9 @@ Responses 的 `location` 无关。地区查询是尽力而为：失败、被限�
 D（≥40）、F。`status` 按 `challenge` > `failed` > `warn` > `healthy` 取最严重的一项。
 评分通过不表示账号权限或额度可用。连接配置改变时，质量结论与测试结果一起清除；普通测试不清除质量结论。
 
-批量添加逐条处理，单条失败不影响其余条目：地址不合法（`reference` 为「第 N 条」）或与已有代理重复
-（`reference` 为脱敏端点）计入 `skipped: [{ reference, reason }]`，响应不回显任何凭据。`name` 省略时取
-脱敏端点的 `host:port`。批量删除同样逐条处理：仍被账号使用、版本过期或已不存在的代理计入 `skipped`
-（`reference` 为代理 ID）。没有任何条目成功时 `configRevision` 为 `null`。
-新建的代理尚未测试，绑定账号前仍需通过连接测试。
+批量删除逐条处理，单条失败不影响其余条目：仍被账号使用、版本过期或已不存在的代理计入
+`skipped: [{ reference, reason }]`（`reference` 为代理 ID），响应不回显任何凭据。没有任何条目成功时
+`configRevision` 为 `null`。
 
 ### 免登录账号导入
 
@@ -152,7 +160,9 @@ OpenAI OAuth 账号在「票据管理 → 账号票与预热」启停票据与�
 
 开启后，普通生成请求可从完整成功响应中捕获候选，按账号、模型及客户端密钥隔离，被动捕获不覆盖已有有效票。
 票据合法性检查使用 ASCII 与最小长度，不再按套餐或模型精确匹配长度。`turnStateCaptureRule` 是兼容字段，
-`defaultLength: 0` 表示无精确长度门，不能解释成要求零字节。上游票据记录只展示观测摘要，不推断是否入库。
+`defaultLength: 0` 表示无精确长度门，不能解释成要求零字节。上游票据记录只展示观测摘要，不推断是否入库；
+该记录由管理端从上游接口拼出（`GET /api/admin/usage/records?accountId=`、`/usage/records/detail`，trace 取自
+`GET /api/admin/diagnostics/export?requestId=` 的导出包），fork 不另设历史接口，票值不出现在任何一处。
 注入按运行设置决定，默认 `fill-missing` 保留客户端自带当轮票。失败、不完整响应及原始诊断不进入被动捕获，
 暖池验证后的发布遵循[连接预热](#连接预热)规则。被动票有效期默认 240 秒，不随命中续期，最终以票据到期时间为准。
 到期、凭据绑定变化或重新捕获后重新获取候选，持久化的有效账号票可在重启后重新读取，尚无票时保留普通请求路径。

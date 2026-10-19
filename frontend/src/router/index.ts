@@ -1,5 +1,5 @@
 import type { AuthSession } from '@/api'
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, START_LOCATION } from 'vue-router'
 
 import { useAuthStore } from '@/stores/modules/auth'
 import { routes } from './routes'
@@ -16,8 +16,8 @@ function resolveRoleEntry(role: AuthSession['role']) {
   return { path: entry.path }
 }
 
-router.beforeEach(async (to) => {
-  // 密链导入页不属于任何登录身份，既不恢复会话也不跳转登录。
+router.beforeEach(async (to, from) => {
+  // fork: public-import — 密链导入页不属于任何登录身份，既不恢复会话也不跳转登录。
   if (to.name === 'public-import')
     return
 
@@ -45,8 +45,8 @@ router.beforeEach(async (to) => {
       await authStore.checkAuth()
     }
     catch {
-      // 暂时无法确认会话时不进入受保护页面，也不缓存成“已退出”。
-      return login
+      // 首次进入时没有页面可保留，转到登录页；已有页面则保留，且不清除会话。
+      return from === START_LOCATION ? login : false
     }
   }
 

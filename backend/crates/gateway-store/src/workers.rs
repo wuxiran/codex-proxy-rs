@@ -1,4 +1,4 @@
-//! Worker 贡献、调度定义与健康探针。
+//! Worker 贡献、调度定义与健康探针
 
 use super::*;
 use gateway_core::task::DaemonTask;
@@ -11,7 +11,7 @@ pub(crate) struct CommandStoreWriters {
     pub(crate) admission_release: redis::ClientAdmissionReleaseWriter,
 }
 
-/// 短生命周期 CLI 只运行数据面必需的三个写泵，不注册恢复、保留或维护 Worker。
+/// 短生命周期 CLI 只运行数据面必需的三个写泵，不注册恢复、保留或维护 Worker
 pub struct CommandStoreDrain {
     cancellation: gateway_core::lifecycle::CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<Result<(), WorkerTaskError>>>,
@@ -58,7 +58,7 @@ impl CommandStoreDrain {
     pub(crate) async fn shutdown(mut self) -> Result<(), CommandStoreDrainError> {
         let deadline = std::time::Instant::now() + COMMAND_DRAIN_TIMEOUT;
         // CLI 调用方已结束数据面会话；先让已接收的 execution 写入在正常 writer
-        // 路径完成，避免立即取消后落入更短的常驻进程关闭丢弃窗口。
+        // 路径完成，避免立即取消后落入更短的常驻进程关闭丢弃窗口
         let mut failed = !self.execution_idle.wait_until(deadline).await;
         self.cancellation.cancel();
         for mut task in self.tasks.drain(..) {
@@ -181,6 +181,7 @@ pub(crate) fn worker_definition_error(
     error: gateway_core::task::WorkerDefinitionError,
 ) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "store worker plan",
         message: error.to_string(),
     }
@@ -202,7 +203,9 @@ impl ScheduledTask for StaleModelRequestRecoveryTask {
             )
             .await
             .map(|_| ())
-            .map_err(|_| WorkerTaskError::safe("stale request recovery failed"))
+            .map_err(|source| {
+                WorkerTaskError::safe("stale request recovery failed").with_source(source)
+            })
         })
     }
 }
@@ -310,5 +313,79 @@ impl HealthProbe for RedisHealthProbe {
                 Err(_) => HealthState::Unhealthy("Redis is unavailable".to_owned()),
             }
         })
+    }
+}
+
+/// 每轮有界推进队列和历史回填；取消时丢弃未提交事务，待下轮重新领取
+pub(crate) fn request_analytics_worker(
+    repository: postgres::PgRequestAnalyticsRepository,
+) -> StoreResult<WorkerContribution> {
+    let id = WorkerId::try_new(WorkerKind::RequestAnalytics, "postgres")
+        .map_err(worker_definition_error)?;
+    Ok(WorkerContribution::Registration(scheduled_worker(
+        id,
+        Duration::from_secs(5),
+        Box::new(RequestAnalyticsTask { repository }),
+    )?))
+}
+
+struct RequestAnalyticsTask {
+    repository: postgres::PgRequestAnalyticsRepository,
+}
+
+impl ScheduledTask for RequestAnalyticsTask {
+    fn run_cycle(
+        &self,
+        context: WorkerCycleContext,
+    ) -> futures::future::BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = context.cancellation().cancelled() => Ok(()),
+                result = run_request_analytics_cycle(&self.repository) => result.map(|_| ()).map_err(|source| {
+                    WorkerTaskError::safe("request analytics maintenance failed").with_source(source)
+                }),
+            }
+        })
+    }
+}
+
+/// 生产与隔离压测共用的单周期推进预算；各批独立提交并归还观测槽位
+pub async fn run_request_analytics_cycle(
+    repository: &postgres::PgRequestAnalyticsRepository,
+) -> StoreResult<postgres::AnalyticsMaintenance> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut total = postgres::AnalyticsMaintenance::default();
+    loop {
+        let result = match tokio::time::timeout_at(deadline, repository.maintain(1_000)).await {
+            Ok(result) => result?,
+            Err(source) => {
+                if total.projected_requests == 0
+                    && total.backfilled_requests == 0
+                    && total.rebuilt_buckets == 0
+                    && total.advanced_buckets == 0
+                    && !total.reset_progress
+                {
+                    return Err(StoreError::Unavailable {
+                        backend: StoreBackend::PostgreSql,
+                        message: "request analytics cycle timed out without progress".to_owned(),
+                        source: Some(gateway_core::error::ErrorSource::new(source)),
+                    });
+                }
+                return Ok(total);
+            }
+        };
+        let idle = result.projected_requests == 0
+            && result.backfilled_requests == 0
+            && result.rebuilt_buckets == 0
+            && result.advanced_buckets == 0
+            && !result.reset_progress;
+        total.projected_requests += result.projected_requests;
+        total.backfilled_requests += result.backfilled_requests;
+        total.rebuilt_buckets += result.rebuilt_buckets;
+        total.advanced_buckets += result.advanced_buckets;
+        total.reset_progress |= result.reset_progress;
+        if idle || tokio::time::Instant::now() >= deadline {
+            return Ok(total);
+        }
     }
 }

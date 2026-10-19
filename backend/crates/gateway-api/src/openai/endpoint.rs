@@ -1,6 +1,6 @@
-//! OpenAI Provider 原生非流式 JSON 端点的公共交付边界。
+//! OpenAI Provider 原生非流式 JSON 端点的公共交付边界
 
-use std::net::IpAddr;
+use std::{future::Future, net::IpAddr};
 
 use axum::{
     body::{Body, Bytes},
@@ -29,8 +29,8 @@ use super::{
     service::OpenAiService,
 };
 
-/// Provider 自有端点也先冻结身份，再通过统一请求链进入原有执行与结算路径。
-pub(super) async fn provider_endpoint_response<F>(
+/// Provider 自有端点也先冻结身份，再通过统一请求链进入原有执行与结算路径
+pub(super) async fn provider_endpoint_response<F, Fut>(
     service: OpenAiService,
     client: AuthenticatedClient,
     input: RequestInput,
@@ -39,7 +39,8 @@ pub(super) async fn provider_endpoint_response<F>(
     decode: F,
 ) -> Response
 where
-    F: FnOnce(Bytes, &HeaderMap) -> Result<Operation, GatewayError> + Send + 'static,
+    F: FnOnce(Bytes, HeaderMap) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Operation, GatewayError>> + Send,
 {
     let execution = service.execution();
     let prepared = match execution.prepare_execution(client).await {
@@ -58,10 +59,12 @@ where
                 if protocol != "openai" {
                     return Err(MiddlewareError::Rejected);
                 }
-                let operation = request.apply_capabilities(decode(body, &headers)?)?;
+                let operation = request.apply_capabilities(decode(body, headers).await?)?;
                 let started = match service
                     .start_prepared_provider_endpoint(
-                        prepared, operation, client_ip, user_agent, endpoint,
+                        prepared, operation,
+                        // 原生端点的模型语义由 Provider 从正文提取并检查账号政策
+                        None, client_ip, user_agent, endpoint,
                     )
                     .await
                 {
@@ -86,7 +89,7 @@ where
     }
 }
 
-/// 只收集正文，不提前 commit；外层完成响应变换与校验后才提交 Core。
+/// 只收集正文，不提前 commit；外层完成响应变换与校验后才提交 Core
 async fn collect_raw_json_response(
     started: StartedExecution,
 ) -> Result<MiddlewareResponse, MiddlewareError> {

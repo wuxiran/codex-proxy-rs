@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import type { ImportAccount } from './utils/document'
 import type { PublicImportEntry } from '@/api'
-import { BaseButton, BaseCard, BaseFormItem, BaseInput, BaseScrollbar, BaseSegmented, BaseTextarea } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZFormItem, ZInput, ZScrollbar, ZSegmented, ZTextarea } from '@codex-proxy/ui'
 import { CircleCheck, CircleX, LoaderCircle, Upload } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useRoute } from 'vue-router'
 import { getPublicImportEntry, submitPublicImport, submitPublicTickets } from '@/api'
 import { ApiError } from '@/api/request'
-import { formatDateTime } from '@/utils/format'
-import AccountImportFields from '@/views/accounts/components/AccountCreateModal/AccountImportFields.vue'
+import { formatDateTime } from '@/utils/format.fork'
+import AccountImportFields from '@/views/accounts/components/account-create-modal/AccountImportFields.vue'
 import { importAccountLabel, splitImportDocument } from './utils/document'
 
 interface ImportRow {
@@ -210,7 +210,7 @@ async function startImport() {
 
 <template>
   <main class="h-dvh overflow-hidden bg-cp-bg-layout text-cp-text">
-    <BaseScrollbar>
+    <ZScrollbar>
       <div class="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-5 p-4 min-[961px]:p-6">
         <header>
           <h1 class="m-0 text-cp-xl font-bold">
@@ -229,7 +229,7 @@ async function startImport() {
         </p>
 
         <template v-if="entry">
-          <BaseCard title="导入设置" description="以下设置由管理员固定，提交的文件无法更改">
+          <ZCard title="导入设置" description="以下设置由管理员固定，提交的文件无法更改">
             <dl class="m-0 grid gap-2 text-cp-sm">
               <div class="flex gap-3">
                 <dt class="w-20 shrink-0 text-cp-text-secondary">
@@ -264,14 +264,14 @@ async function startImport() {
                 </dd>
               </div>
             </dl>
-          </BaseCard>
+          </ZCard>
 
-          <BaseSegmented v-model="mode" label="导入方式" :options="modeOptions" :disabled="running" />
+          <ZSegmented v-model="mode" aria-label="导入方式" :options="modeOptions" :disabled="running" />
 
-          <BaseCard v-if="mode === 'ticket'" title="登录票据" description="服务端用票据逐个登录建号，并加密保存票据；账号令牌失效时自动用票据复活（最多 3 次）">
+          <ZCard v-if="mode === 'ticket'" title="登录票据" description="服务端用票据逐个登录建号，并加密保存票据；账号令牌失效时自动用票据复活（最多 3 次）">
             <div class="grid gap-4">
-              <BaseFormItem label="票据" :description="`一行一个：邮箱----密码----2FA密钥，单次最多 ${entry.maxAccounts} 个`" required>
-                <BaseTextarea
+              <ZFormItem label="票据" :description="`一行一个：邮箱----密码----2FA密钥，单次最多 ${entry.maxAccounts} 个`" required>
+                <ZTextarea
                   v-model="ticketText"
                   :rows="5"
                   autocomplete="off"
@@ -279,31 +279,31 @@ async function startImport() {
                   placeholder="name@example.com----password----BASE32SECRET"
                   :disabled="running"
                 />
-              </BaseFormItem>
-              <BaseFormItem label="买入价（每个账号）" required>
+              </ZFormItem>
+              <ZFormItem label="买入价（每个账号）" required>
                 <div class="flex flex-wrap items-center gap-2">
-                  <BaseInput v-model="purchaseAmount" class="max-w-40" inputmode="decimal" placeholder="例如 55" aria-label="买入价" :disabled="running" />
-                  <BaseSegmented v-model="purchaseCurrency" label="币种" :options="currencyOptions" :disabled="running" />
+                  <ZInput v-model="purchaseAmount" class="max-w-40" inputmode="decimal" placeholder="例如 55" aria-label="买入价" :disabled="running" />
+                  <ZSegmented v-model="purchaseCurrency" aria-label="币种" :options="currencyOptions" :disabled="running" />
                 </div>
-              </BaseFormItem>
-              <BaseFormItem label="预计到期时间" description="例如车主说 23:20 踢人" required>
-                <BaseInput v-model="expiresAtLocal" type="datetime-local" class="max-w-64" aria-label="预计到期时间" :disabled="running" />
-              </BaseFormItem>
+              </ZFormItem>
+              <ZFormItem label="预计到期时间" description="例如车主说 23:20 踢人" required>
+                <ZInput v-model="expiresAtLocal" type="datetime-local" class="max-w-64" aria-label="预计到期时间" :disabled="running" />
+              </ZFormItem>
               <p v-if="ticketError" role="alert" class="m-0 text-cp-sm text-cp-error">
                 {{ ticketError }}
               </p>
               <div class="flex items-center justify-end">
-                <BaseButton variant="primary" :loading="running" :disabled="!ticketLines.length || entryState !== 'ready'" @click="startTicketImport">
+                <ZButton type="primary" :loading="running" :disabled="!ticketLines.length || entryState !== 'ready'" @click="startTicketImport">
                   <template #icon>
                     <Upload class="size-4" />
                   </template>
                   {{ running ? `导入中 ${finished}/${rows.length}` : `导入 ${ticketLines.length} 个票据` }}
-                </BaseButton>
+                </ZButton>
               </div>
             </div>
-          </BaseCard>
+          </ZCard>
 
-          <BaseCard v-else title="账号文件">
+          <ZCard v-else title="账号文件">
             <div class="grid gap-4">
               <AccountImportFields
                 v-model="text"
@@ -316,17 +316,17 @@ async function startImport() {
                 {{ parseError }}
               </p>
               <div class="flex items-center justify-end">
-                <BaseButton variant="primary" :loading="running" :disabled="!text.trim() || entryState !== 'ready'" @click="startImport">
+                <ZButton type="primary" :loading="running" :disabled="!text.trim() || entryState !== 'ready'" @click="startImport">
                   <template #icon>
                     <Upload class="size-4" />
                   </template>
                   {{ running ? `导入中 ${finished}/${rows.length}` : '开始导入' }}
-                </BaseButton>
+                </ZButton>
               </div>
             </div>
-          </BaseCard>
+          </ZCard>
 
-          <BaseCard v-if="rows.length" title="导入结果" :description="`成功 ${imported} · 失败 ${failed} · 共 ${rows.length}`">
+          <ZCard v-if="rows.length" title="导入结果" :description="`成功 ${imported} · 失败 ${failed} · 共 ${rows.length}`">
             <ul class="m-0 grid list-none gap-1.5 p-0" aria-live="polite">
               <li
                 v-for="(row, index) in rows"
@@ -346,9 +346,9 @@ async function startImport() {
                 </div>
               </li>
             </ul>
-          </BaseCard>
+          </ZCard>
         </template>
       </div>
-    </BaseScrollbar>
+    </ZScrollbar>
   </main>
 </template>

@@ -2,15 +2,15 @@
 import type { AccountTicket } from '@/api/modules/accounts'
 import { computed } from 'vue'
 
-import { useUiClock } from '@/composables/useUiClock'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
+import { useStatusClock } from './account-status-badge/useStatusClock'
 
 const props = defineProps<{ ticket: AccountTicket, addedAtDisplay?: string | null }>()
 
 /** 剩余不足此时长时标红提醒。 */
 const WARN_MS = 2 * 3600 * 1000
 
-const now = useUiClock()
+const now = useStatusClock()
 
 /** 票据是否已过期：过期即视作「无票据」状态，不再展示到期行与「已存票据」提示。 */
 const isExpired = computed(() => {

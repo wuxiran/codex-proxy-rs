@@ -1,20 +1,21 @@
 import type { RequestOptions } from '../request'
-import request from '../request'
+import type { AnalyticsMetadata } from './analytics'
+import request, { requestRaw } from '../request'
 
 export interface UsageTokenDetails {
   inputTokens: number | null
   outputTokens: number | null
-  cachedTokens: number | null
-  cacheWriteTokens: number | null
-  reasoningTokens: number | null
+  cachedInputTokens: number | null
+  cacheWriteInputTokens: number | null
+  reasoningOutputTokens: number | null
   imageInputTokens: number | null
   imageOutputTokens: number | null
   totalTokens: number | null
   inputTokensDisplay: string
   outputTokensDisplay: string
-  cachedTokensDisplay: string
-  cacheWriteTokensDisplay: string
-  reasoningTokensDisplay: string
+  cachedInputTokensDisplay: string
+  cacheWriteInputTokensDisplay: string
+  reasoningOutputTokensDisplay: string
   imageInputTokensDisplay: string
   imageOutputTokensDisplay: string
   totalTokensDisplay: string
@@ -55,6 +56,13 @@ export interface UsageBilling {
 }
 
 export interface UsageLatencyDetails {
+  upstreamResponseMs?: number
+  upstreamApiOverheadMs?: number
+  upstreamEngineMs?: number
+  upstreamEngineIapiTtftMs?: number
+  upstreamEngineServiceTtftMs?: number
+  upstreamEngineIapiTbtMs?: number
+  upstreamEngineServiceTbtMs?: number
   admissionDecisionMs?: number
   accountSelectionWaitMs?: number
   capacityUsedSlots?: number
@@ -65,7 +73,6 @@ export interface UsageLatencyDetails {
   firstEventMs?: number
   firstReasoningMs?: number
   firstTextMs?: number
-  firstTokenMs?: number
   openaiProcessingMs?: number
 }
 
@@ -74,7 +81,12 @@ export interface UsageRecordMetadata {
   [key: string]: unknown
 }
 
+export type UsageRecordStatus = 'success' | 'error' | 'all'
+
 export interface UsageListRecord {
+  logicalOutcome: string
+  errorCode: string | null
+  errorMessage: string | null
   clientApiKeyName: string | null
   id: string
   provider: string | null
@@ -140,12 +152,11 @@ export interface UsageRecord {
   responseId: string | null
   upstreamRequestId: string | null
   latencyMs: number | null
-  firstTokenMs: number | null
   inputTokens: number | null
   outputTokens: number | null
-  cachedTokens: number | null
-  cacheWriteTokens: number | null
-  reasoningTokens: number | null
+  cachedInputTokens: number | null
+  cacheWriteInputTokens: number | null
+  reasoningOutputTokens: number | null
   imageInputTokens: number | null
   imageOutputTokens: number | null
   message: string
@@ -164,7 +175,6 @@ export interface UsageRecord {
   costs: UsageCost[]
   costCoverage: UsageCostCoverage
   firstTokenLatencyMs: number | null
-  firstTokenLatencyMsDisplay: string
   latencyMsDisplay: string
   logicalOutcome: string
 }
@@ -187,7 +197,7 @@ export interface UsageAttempt {
   estimatedCostCurrency: string | null
   inputTokens: number | null
   outputTokens: number | null
-  cachedTokens: number | null
+  cachedInputTokens: number | null
   totalTokens: number | null
   firstTokenMs: number | null
   latencyMs: number | null
@@ -200,39 +210,7 @@ export interface UsageAttempt {
   completedAt: string | null
 }
 
-export interface RequestTraceEvent {
-  sequence: number
-  lastSequence: number
-  elapsedMs: number
-  lastElapsedMs: number
-  attemptIndex: number
-  exchangeId: number | null
-  stage: string
-  count: number
-  data: Record<string, unknown>
-}
-
-export interface RequestTrace {
-  schemaVersion: number
-  requestId: string
-  startedAtUnixMs: number
-  totalEvents: number
-  droppedEvents: number
-  maxEvents: number
-  captureMode: string
-  events: RequestTraceEvent[]
-}
-
-export interface RelatedRequest {
-  requestId: string
-  relation: 'recovered_by' | 'recovers'
-  outcome: string
-  completedAt: string | null
-}
-
 export type UsageRecordDetail = UsageRecord & {
-  trace: RequestTrace | null
-  relatedRequests: RelatedRequest[]
   attempts: UsageAttempt[]
   /** 尝试列表是否完整；best-effort 下恒为 false。 */
   attemptsComplete: boolean
@@ -245,83 +223,13 @@ export interface UsageRecordsResponse {
   total: number
 }
 
-export interface OpsErrorMetadata {
-  source: string
-  component: string
-  attemptId: string | null
-  accountLabel: string | null
-  continuationAffinityHash: string | null
-  continuationPreviousResponseIdHash: string | null
-  continuationUnavailableReason: string | null
-  upstreamConnectionId: string | null
-  upstreamConnectionExitReason: string | null
-  upstreamConnectionAgeMs: number | null
-  upstreamConnectionIdleMs: number | null
-  recoveryRequestId: string | null
-  recoveredAt: string | null
-  recoveryAttemptCount: number
-  recoveryRetryDelayMs: number | null
-  recoveryTotalLatencyMs: number | null
-}
-
-export interface OpsError {
-  clientApiKeyName: string | null
-  id: string
-  requestId: string | null
-  clientApiKeyId: string | null
-  kind: string
-  operation: string
-  protocol: string | null
-  clientTransport: string | null
-  provider: string | null
-  authenticationKind: string | null
-  accountId: string | null
-  accountName: string | null
-  accountEmail: string | null
-  accountPlanType: string | null
-  accountPlanTypeDisplay: string | null
-  route: string
-  model: string | null
-  requestedModel: string | null
-  upstreamModel: string | null
-  serviceTier: string | null
-  clientStatusCode: number | null
-  upstreamStatusCode: number | null
-  transport: string | null
-  attemptIndex: number | null
-  failureClass: string
-  upstreamSendState: string | null
-  providerErrorCode: string | null
-  responseId: string | null
-  upstreamRequestId: string | null
-  latencyMs: number | null
-  clientIp: string | null
-  userAgent: string | null
-  reasoningEffort: string | null
-  reasoningPreset: string | null
-  requestKind: string | null
-  subagentKind: string | null
-  compact: boolean | null
-  message: string
-  rawUpstreamError: string | null
-  metadata: OpsErrorMetadata
-  createdAt: string
-  createdAtDisplay: string
-}
-
-export interface OpsErrorsResponse {
-  items: OpsError[]
-  currentPage: number
-  pageSize: number
-  total: number
-}
-
 export interface UsageSummaryResponse {
+  analytics: AnalyticsMetadata
   totalRequests: string
   inputTokens: string
   outputTokens: string
-  cachedTokens: string
-  cacheWriteTokens: string
+  cachedInputTokens: string
+  cacheWriteInputTokens: string
   totalTokens: string
   averageLatencyMs: string
 }
@@ -401,7 +309,7 @@ export interface UsageOverviewCostPoint {
   label: string
   inputTokens: number
   outputTokens: number
-  cachedTokens: number
+  cachedInputTokens: number
   totalTokens: number
   estimatedCost: string | null
   standardCost: string | null
@@ -424,13 +332,14 @@ export interface UsageOverviewCost {
   cacheHitRequestRate: number | null
   inputTokens: number
   outputTokens: number
-  cachedTokens: number
+  cachedInputTokens: number
   totalTokens: number
   points: UsageOverviewCostPoint[]
   coverage: UsageCostCoverage
 }
 
 export interface UsageInsightsOverviewResponse {
+  analytics: AnalyticsMetadata
   granularity: string
   health: UsageOverviewHealth
   performance: UsageOverviewPerformance
@@ -460,6 +369,7 @@ export interface UsageDiagnosticItem {
 }
 
 export interface UsageDiagnosticsResponse {
+  analytics: AnalyticsMetadata
   dimension: string
   items: UsageDiagnosticItem[]
 }
@@ -472,7 +382,6 @@ interface UsageRangeQuery {
   provider?: string
   model?: string
   statusCode?: number
-  search?: string
 }
 
 interface PageQuery {
@@ -480,9 +389,7 @@ interface PageQuery {
   pageSize: number
 }
 
-type UsagePageQuery = UsageRangeQuery & PageQuery
-
-type OpsErrorPageQuery = UsagePageQuery
+type UsagePageQuery = UsageRangeQuery & PageQuery & { search?: string, status?: UsageRecordStatus }
 
 interface UsageDetailQuery {
   id: string
@@ -493,15 +400,6 @@ type UsageDiagnosticsQuery = UsageRangeQuery & { dimension: string }
 export function getUsageRecords(data: UsagePageQuery, options: RequestOptions = {}) {
   return request<UsageRecordsResponse>({
     url: '/api/admin/usage/records',
-    method: 'GET',
-    params: data,
-    ...options,
-  })
-}
-
-export function getOpsErrors(data: OpsErrorPageQuery, options: RequestOptions = {}) {
-  return request<OpsErrorsResponse>({
-    url: '/api/admin/operations/errors',
     method: 'GET',
     params: data,
     ...options,
@@ -541,5 +439,18 @@ export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, o
     method: 'GET',
     params: data,
     ...options,
+  })
+}
+
+export function downloadDiagnostics(data: { requestId: string } | { errorId: string }, options: RequestOptions = {}) {
+  return requestRaw({
+    url: '/api/admin/diagnostics/export',
+    method: 'GET',
+    params: data,
+    timeout: 25_000,
+    ...options,
+  }, {
+    maximumBytes: 16 * 1024 * 1024,
+    accept: response => response.status === 200 && !!response.header('content-type')?.startsWith('application/json'),
   })
 }

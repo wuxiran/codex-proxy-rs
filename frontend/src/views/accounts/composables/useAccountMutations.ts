@@ -1,8 +1,7 @@
 import type { Ref } from 'vue'
-import type { AccountImportTask, getAccounts } from '@/api'
+import type { Account, AccountImportTask } from '@/api'
 import type { RequestOptions } from '@/api/request'
-import { toast } from '@codex-proxy/ui'
-import dayjs from 'dayjs'
+import { ZNotification } from '@codex-proxy/ui'
 import { computed, ref, shallowReactive, watch } from 'vue'
 import {
   batchUpdateAccounts,
@@ -23,14 +22,12 @@ import { isSupportedProvider } from '@/utils/providers'
 
 import { useAccountOnboarding } from './useAccountOnboarding'
 
-type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-
 export function useAccountMutations(options: {
-  accounts: Ref<AccountRow[]>
+  accounts: Ref<Account[]>
   selectedIds: Ref<Set<string>>
-  onImportTaskCreated: (task: AccountImportTask) => void
+  onImportTaskCreated: (task: AccountImportTask, reveal?: boolean) => void
   reload: () => Promise<unknown>
-  replaceAccount: (account: AccountRow) => Promise<boolean>
+  replaceAccount: (account: Account) => Promise<boolean>
 }) {
   const loadAccounts = options.reload
   const { downloadJson } = useDownload()
@@ -38,10 +35,11 @@ export function useAccountMutations(options: {
     reload: loadAccounts,
     onImportTaskCreated: options.onImportTaskCreated,
   })
-  const selectedAccountsById = shallowReactive(new Map<string, AccountRow>())
+  const selectedAccountsById = shallowReactive(new Map<string, Account>())
   const showDeleteModal = ref(false)
   const showSingleDeleteModal = ref(false)
-  const pendingDeleteAccount = ref<AccountRow | null>(null)
+  const pendingDeleteAccount = ref<Account | null>(null)
+  const deleteCount = ref(0)
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
@@ -60,6 +58,10 @@ export function useAccountMutations(options: {
   const deletingAccount = deletingAccountAction.loading
   const batchDeleting = batchDeletingAction.loading
   const exportingAccounts = exportingAccountsAction.loading
+  watch([showDeleteModal, batchDeleting], ([open, busy]) => {
+    if (open && !busy)
+      deleteCount.value = options.selectedIds.value.size
+  })
   const exportDisabledReason = computed(() => {
     if (options.selectedIds.value.size === 0)
       return ''
@@ -88,7 +90,7 @@ export function useAccountMutations(options: {
     { immediate: true, flush: 'sync' },
   )
 
-  function requestDeleteAccount(account: AccountRow) {
+  function requestDeleteAccount(account: Account) {
     pendingDeleteAccount.value = account
     showSingleDeleteModal.value = true
   }
@@ -105,9 +107,8 @@ export function useAccountMutations(options: {
         remaining.delete(account.id)
         options.selectedIds.value = remaining
         showSingleDeleteModal.value = false
-        pendingDeleteAccount.value = null
         await loadAccounts()
-        toast.success('账号已删除')
+        ZNotification.success({ message: '账号已删除' })
       },
     )
   }
@@ -131,17 +132,15 @@ export function useAccountMutations(options: {
         }
         showDeleteModal.value = false
         await loadAccounts()
-        toast.success(`已删除 ${deletedCount} 个账号`)
+        ZNotification.success({ message: `已删除 ${deletedCount} 个账号` })
       },
       {
         errorText: false,
         onError: (error) => {
           void loadAccounts().catch(() => undefined)
-          toast.error(
-            deletedCount > 0
-              ? `已删除 ${deletedCount} 个账号，其余未删除：${errorMessage(error, '操作失败')}`
-              : errorMessage(error, '批量删除失败'),
-          )
+          ZNotification.error({ message: deletedCount > 0
+            ? `已删除 ${deletedCount} 个账号，其余未删除：${errorMessage(error, '操作失败')}`
+            : errorMessage(error, '批量删除失败') })
         },
       },
     )
@@ -152,11 +151,11 @@ export function useAccountMutations(options: {
       return
     const selected = [...options.selectedIds.value]
     if (selected.length === 0) {
-      toast.warning('请选择要导出的账号')
+      ZNotification.warning({ message: '请选择要导出的账号' })
       return
     }
     if (exportDisabledReason.value) {
-      toast.warning(exportDisabledReason.value)
+      ZNotification.warning({ message: exportDisabledReason.value })
       return
     }
 
@@ -166,22 +165,22 @@ export function useAccountMutations(options: {
           accountIds: selected.join(','),
           confirm: 'export_sensitive_accounts',
         })
-        const fileName = `cpr-accounts-selected-${selected.length}-${dayjs().format('YYYY-MM-DD')}.json`
+        const fileName = payload.fileName
         await downloadJson(payload, fileName)
-        toast.success(`已导出 ${selected.length} 个账号`)
+        ZNotification.success({ message: `已导出 ${selected.length} 个账号` })
       },
       { errorText: '导出失败' },
     )
   }
 
-  async function handleDownloadModelCatalog(account: AccountRow) {
+  async function handleDownloadModelCatalog(account: Account) {
     await downloadingCatalogAccounts.run(account.id, async () => {
       try {
         const result = await getAccountModelCatalog({ accountId: account.id })
         const plan = account.planTypeDisplay.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'unknown-plan'
         const name = account.name.trim().replace(/[^\p{L}\p{N}_-]/gu, '_') || 'account'
         await downloadJson(result.catalog, `cpr-model-catalog-${plan}-${name}.json`)
-        toast.success(`已下载模型目录，共 ${result.modelCount} 个模型`)
+        ZNotification.success({ message: `已下载模型目录，共 ${result.modelCount} 个模型` })
       }
       catch {}
     })
@@ -197,14 +196,14 @@ export function useAccountMutations(options: {
         )
         await loadAccounts()
         if (result.result === 'skipped') {
-          toast.warning(result.error || 'Token 正在刷新中')
+          ZNotification.warning({ message: result.error || 'Token 正在刷新中' })
           return
         }
         if (result.result === 'failed') {
-          toast.error(result.error || '刷新失败')
+          ZNotification.error({ message: result.error || '刷新失败' })
           return
         }
-        toast.success('Token 已刷新')
+        ZNotification.success({ message: 'Token 已刷新' })
       }
       catch {}
     })
@@ -220,7 +219,7 @@ export function useAccountMutations(options: {
           selectedIds.delete(accountId)
           options.selectedIds.value = selectedIds
         }
-        toast.success('额度已刷新')
+        ZNotification.success({ message: '额度已刷新' })
       }
       catch {}
     })
@@ -230,15 +229,15 @@ export function useAccountMutations(options: {
     await revivingAccounts.run(accountId, async () => {
       try {
         await reviveGuanlanAccount({ accountId })
-        toast.success('guanlan 复活成功')
+        ZNotification.success({ message: 'guanlan 复活成功' })
         await loadAccounts()
       }
       catch {}
     })
   }
 
-  /** 行内调度开关与操作菜单共用：局部更新只提交调度字段，成功后按详情替换本行。 */
-  async function handleToggleScheduling(account: AccountRow, enabled = !account.enabled) {
+  /** fork: synced-switch — 行内调度开关与操作菜单共用：局部更新只提交调度字段，成功后按详情替换本行。 */
+  async function handleToggleScheduling(account: Account, enabled = !account.enabled) {
     await togglingSchedulingAccounts.run(account.id, async () => {
       try {
         // 局部更新只提交调度字段，避免覆盖其他管理员刚修改的账号配置。
@@ -248,7 +247,7 @@ export function useAccountMutations(options: {
         return
       }
 
-      toast.success(enabled ? '调度已启用' : '调度已停用')
+      ZNotification.success({ message: enabled ? '调度已启用' : '调度已停用' })
       try {
         const result = await getAccountDetail({ accountId: account.id })
         const remainsVisible = await options.replaceAccount(result.account)
@@ -272,10 +271,7 @@ export function useAccountMutations(options: {
       await options.replaceAccount(result.account)
     }
     catch (error: unknown) {
-      toast.warning(
-        `额度已重置，但最新额度加载失败：${errorMessage(error, '请手动刷新额度')}`,
-        { duration: 5000 },
-      )
+      ZNotification.warning({ message: `额度已重置，但最新额度加载失败：${errorMessage(error, '请手动刷新额度')}`, ...({ duration: 5000 }) })
     }
   }
 
@@ -289,7 +285,7 @@ export function useAccountMutations(options: {
           selectedIds.delete(accountId)
           options.selectedIds.value = selectedIds
         }
-        toast.success('账号状态已恢复')
+        ZNotification.success({ message: '账号状态已恢复' })
       }
       catch {}
     })
@@ -306,7 +302,7 @@ export function useAccountMutations(options: {
     return accounts
   }
 
-  async function deleteAccountBatch(accounts: AccountRow[], options?: RequestOptions) {
+  async function deleteAccountBatch(accounts: Account[], options?: RequestOptions) {
     const account = accounts[0]
     if (!account)
       return
@@ -319,8 +315,8 @@ export function useAccountMutations(options: {
       throw new Error(`不支持的 Provider：${account.provider}`)
   }
 
-  function accountDeletionGroups(accounts: AccountRow[]) {
-    const groups = new Map<string, AccountRow[]>()
+  function accountDeletionGroups(accounts: Account[]) {
+    const groups = new Map<string, Account[]>()
     for (const account of accounts) {
       const key = account.provider
       const group = groups.get(key)
@@ -337,6 +333,7 @@ export function useAccountMutations(options: {
     showDeleteModal,
     showSingleDeleteModal,
     pendingDeleteAccount,
+    deleteCount,
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,

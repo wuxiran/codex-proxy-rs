@@ -1,12 +1,16 @@
+//! 验证插件维护任务的资源创建、重试及事务归属和幂等性
+
 use crate::support::environment::{Environment, mutation};
 use gateway_admin::{
     model::{
         account_groups::{AccountGroupColor, CreateAccountGroup},
         plugin_resources::{GroupMembersChange, ManagedKeyConfig, PluginResourceOwner},
+        plugins::instances::PluginInstanceRuntimeStatus,
     },
     ports::plugin_resources::PluginResourceAccess,
 };
 use gateway_core::{
+    account::FastMode,
     lifecycle::CancellationToken,
     task::{WorkerContribution, WorkerRunnable},
 };
@@ -16,9 +20,10 @@ use std::{sync::Arc, time::Duration};
 
 fn group(name: &str) -> CreateAccountGroup {
     CreateAccountGroup {
+        allow_image_generation: true,
         name: name.into(),
         description: None,
-        disable_fast: false,
+        fast_mode: FastMode::Default,
         color: AccountGroupColor::parse("#2563EBFF").unwrap(),
     }
 }
@@ -109,6 +114,7 @@ async fn revision(environment: &Environment) -> gateway_admin::model::Revision {
 
 async fn start(
     environment: &Environment,
+    phase: &str,
 ) -> (
     Arc<PluginRuntime>,
     gateway_core::CoreBundle,
@@ -117,6 +123,32 @@ async fn start(
     tokio::task::JoinHandle<()>,
 ) {
     let (runtime, core) = environment.runtime().await;
+    // 集合就绪允许保留隔离的启动失败实例；维护测试必须确认插件本身正在运行
+    let snapshot = core.snapshots().snapshot_for_diagnostics().unwrap();
+    let extensions = snapshot.extensions().unwrap();
+    let instances = environment
+        .store
+        .admin_ports()
+        .plugins()
+        .load_instances()
+        .await
+        .unwrap();
+    let diagnostics = gateway_admin::ports::plugins::PluginRuntimeDiagnostics::runtime_diagnostics(
+        runtime.as_ref(),
+        &instances,
+        Some(snapshot.revision().get()),
+        Some(extensions),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !diagnostics.is_empty()
+            && diagnostics
+                .values()
+                .all(|instance| instance.status == PluginInstanceRuntimeStatus::Running),
+        "plugin was not ready during {phase}: {diagnostics:?}"
+    );
+    drop(snapshot);
     let resources = gateway_admin::initialize_plugin_resources(
         environment.store.admin_ports().plugin_resources(),
         core.snapshot_control(),
@@ -138,7 +170,7 @@ async fn start(
     (runtime, core, resources, stop, task)
 }
 
-async fn wait_done(path: &std::path::Path, after: usize) -> Value {
+async fn wait_done(path: &std::path::Path, after: usize, phase: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let entries: Vec<Value> = std::fs::read_to_string(path)
@@ -159,10 +191,53 @@ async fn wait_done(path: &std::path::Path, after: usize) -> Value {
     .await
     .unwrap_or_else(|error| {
         panic!(
-            "plugin reconciliation did not finish: {error}; observations: {}",
+            "plugin reconciliation did not finish during {phase}: {error}; observations: {}",
             std::fs::read_to_string(path).unwrap_or_default(),
         )
     })
+}
+
+#[tokio::test]
+async fn unused_maintenance_response_does_not_stop_the_host_worker() {
+    let Some(environment) = Environment::create().await else {
+        return;
+    };
+    let marker = environment.directory.path().join("invalid-response.jsonl");
+    environment
+        .install_plugin(
+            json!({"maintenance_fixture":true,"invalid_response_method":"plugin.reconcile","invalid_response_marker":marker}),
+        )
+        .await;
+    let (runtime, core, resources, stop, task) = start(&environment, "malformed response").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        core.snapshots()
+            .acquire()
+            .unwrap()
+            .extensions()
+            .unwrap()
+            .is_ready()
+    );
+    assert!(!task.is_finished(), "单个插件失败不能终止宿主维护任务");
+    for probe in core.health_probes() {
+        assert!(matches!(
+            probe.check().await,
+            gateway_core::health::HealthState::Healthy
+        ));
+    }
+    stop.cancel();
+    task.await.unwrap();
+    drop(resources);
+    environment.release_plugin_accounts(&runtime);
+    drop(core);
+    drop(runtime);
+    environment.close().await;
 }
 
 #[tokio::test]
@@ -176,8 +251,8 @@ async fn published_reconciliation_provisions_retries_imports_and_restores_withou
     let marker = environment.directory.path().join("maintenance.jsonl");
     let failed = environment.directory.path().join("failed-once");
     environment.install_plugin(json!({"maintenance_fixture":true, "maintenance_marker":marker, "maintenance_fail_once":failed})).await;
-    let (runtime, core, resources, stop, task) = start(&environment).await;
-    let first = wait_done(&marker, 0).await;
+    let (runtime, core, resources, stop, task) = start(&environment, "initial startup").await;
+    let first = wait_done(&marker, 0, "initial startup").await;
     assert!(failed.exists());
     let group_id =
         gateway_core::routing::AccountGroupId::new(first["group"].as_str().unwrap()).unwrap();
@@ -237,11 +312,11 @@ async fn published_reconciliation_provisions_retries_imports_and_restores_withou
     drop(resources);
     drop(core);
     drop(runtime);
-    // 离线新增账号后重新启动真实插件子进程；稳定资源键必须复用原分组与 Key。
+    // 离线新增账号后重新启动真实插件子进程；稳定资源键必须复用原分组与 Key
     let offline = environment.account(None).await;
     std::fs::write(&marker, "").unwrap();
-    let (runtime, core, resources, stop, task) = start(&environment).await;
-    let restored = wait_done(&marker, 0).await;
+    let (runtime, core, resources, stop, task) = start(&environment, "restoration").await;
+    let restored = wait_done(&marker, 0, "restoration").await;
     assert_eq!(restored["group"], first["group"]);
     assert_eq!(restored["key"], first["key"]);
     let members = environment

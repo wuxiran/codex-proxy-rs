@@ -1,4 +1,4 @@
-//! 可复用的账号出口配置，以及脱敏后的连通性测试结果。
+//! 可复用的账号出口配置，以及脱敏后的连通性测试结果
 
 use chrono::{DateTime, Utc};
 use gateway_core::account::{OutboundProxy, RequestLocation};
@@ -39,7 +39,7 @@ pub struct ProxyAccountRef {
     pub enabled: bool,
 }
 
-/// 按代理查询关联账号，分页与搜索均在存储层执行。
+/// 按代理查询关联账号，分页与搜索均在存储层执行
 #[derive(Debug, Clone)]
 pub struct ProxyAccountListQuery {
     pub proxy_id: String,
@@ -260,6 +260,7 @@ pub const fn quality_grade(score: u8) -> char {
 
 #[derive(Debug, Clone)]
 pub struct ProxyRecord {
+    pub enabled: bool,
     pub auto_location: bool,
     pub detected_location: Option<DetectedProxyLocation>,
     pub location: Option<gateway_core::account::RequestLocation>,
@@ -286,7 +287,7 @@ pub struct ProxyPage {
 #[derive(Debug, Clone)]
 pub struct NewProxy {
     pub auto_location: bool,
-    /// 由管理用例探测，随配置原子保存，不接受 HTTP 调用方提供结果。
+    /// 由管理用例探测，随配置原子保存，不接受 HTTP 调用方提供结果
     pub test: Option<ProxyTestResult>,
     pub location: Option<gateway_core::account::RequestLocation>,
     pub name: String,
@@ -295,9 +296,12 @@ pub struct NewProxy {
 
 #[derive(Debug, Clone)]
 pub struct UpdateProxy {
+    /// 省略保留配置，零值取消限制
+    pub max_websocket_connections: Option<u32>,
+    pub enabled: Option<bool>,
     pub auto_location: Option<bool>,
     pub test: Option<ProxyTestResult>,
-    /// 外层为空保留配置，内层为空恢复全局继承。
+    /// 外层为空保留配置，内层为空恢复全局继承
     pub location: Option<Option<gateway_core::account::RequestLocation>>,
     pub id: String,
     pub revision: Revision,
@@ -311,28 +315,18 @@ pub struct ProxyMutation {
     pub record: ProxyRecord,
 }
 
-/// 质量检测同时刷新连通性结果，返回完整报告与更新后的记录。
+/// 质量检测同时刷新连通性结果，返回完整报告与更新后的记录（fork）。
 #[derive(Debug, Clone)]
 pub struct ProxyQualityOutcome {
     pub record: ProxyRecord,
     pub report: ProxyQualityReport,
 }
 
-pub const MAX_PROXY_BATCH_ITEMS: usize = 200;
-
-/// 跳过项只保留脱敏端点，凭据不随结果回传。
+/// 批量删除的跳过项只保留 ID 或脱敏端点，凭据不随结果回传（fork）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyBatchSkip {
     pub reference: String,
     pub reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProxyBatchCreate {
-    /// 本批没有新建任何代理时配置修订号不变。
-    pub config_revision: Option<Revision>,
-    pub created: Vec<ProxyRecord>,
-    pub skipped: Vec<ProxyBatchSkip>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +335,7 @@ pub struct ProxyBatchDeleteItem {
     pub revision: Revision,
 }
 
+/// 批量删除结果：仍被账号使用或已被修改的条目跳过，不让整批失败（fork）。
 #[derive(Debug, Clone)]
 pub struct ProxyBatchDelete {
     pub config_revision: Option<Revision>,
@@ -348,7 +343,22 @@ pub struct ProxyBatchDelete {
     pub skipped: Vec<ProxyBatchSkip>,
 }
 
-/// 检测失败与连通性分开，双栈冲突不得继续应用旧位置。
+pub const MAX_PROXY_BATCH_SIZE: usize = 100;
+
+#[derive(Debug)]
+pub struct TestProxy {
+    pub id: String,
+    pub revision: Revision,
+    pub detect_location: bool,
+}
+
+#[derive(Debug)]
+pub enum ProxyBatchResult<T> {
+    Completed(Result<T, super::AdminError>),
+    Skipped,
+}
+
+/// 检测失败与连通性分开，双栈冲突不得继续应用旧位置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum ProxyLocationDetection {
@@ -384,7 +394,7 @@ impl ProxyRecord {
         }
     }
 
-    /// 未知出口可暂用上次成功结果，已知出口变化或时区冲突必须撤销旧覆盖。
+    /// 未知出口可暂用上次成功结果，已知出口变化或时区冲突必须撤销旧覆盖
     #[must_use]
     pub fn detected_location_after_test(
         &self,

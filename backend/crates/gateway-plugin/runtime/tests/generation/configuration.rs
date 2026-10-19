@@ -1,3 +1,5 @@
+//! 验证插件信任、配置 schema、敏感字段与贡献绑定约束
+
 use gateway_admin::{
     model::plugins::instances::{PluginCapabilityBinding, PluginFailurePolicy},
     ports::plugins::PluginPreparation,
@@ -9,7 +11,7 @@ async fn readiness_uses_validated_metadata_without_loading_the_archive() {
     let (_cache, store, runtime) = super::setup().await;
     let mut instance = store.snapshot.lock().unwrap().instances[0].clone();
     let mut metadata = store.artifacts[&instance.artifact_sha256].metadata.clone();
-    // Store 中没有这个摘要；只读校验只能消费传入的声明，不能退回整包加载。
+    // Store 中没有这个摘要；只读校验只能消费传入的声明，不能退回整包加载
     metadata.sha256 = "0".repeat(64);
     instance.artifact_sha256 = metadata.sha256.clone();
     metadata.configuration_schema = serde_json::json!({
@@ -164,4 +166,76 @@ async fn enabled_bindings_must_reference_the_exact_declared_contribution_and_sta
             "binding {contribution}/{stage} must be rejected"
         );
     }
+}
+
+#[tokio::test]
+async fn frontend_authentication_constraints_apply_to_validation_and_preparation() {
+    use gateway_admin::model::plugins::instances::PluginFrontendIdentityBinding;
+    let (cache, store, runtime) =
+        super::setup_with_contributions(Contributions::from([crate::support::contribution(
+            Capability::FrontendAuthentication,
+            vec![Stage::Authentication],
+            vec![],
+            vec![],
+        )]))
+        .await;
+    let mut valid = store.snapshot.lock().unwrap().clone();
+    valid.instances[0].bindings = vec![PluginCapabilityBinding {
+        contribution: "test.example.frontendAuthentication".into(),
+        stage: "authentication".into(),
+        order: 0,
+        failure_policy: PluginFailurePolicy::Reject,
+        client_key_ids: vec![],
+        account_group_ids: vec![],
+        provider_ids: vec![],
+        models: vec![],
+        event: None,
+        identity_bindings: vec![PluginFrontendIdentityBinding {
+            principal: "principal".into(),
+            client_key_id: "key-auth".into(),
+        }],
+    }];
+    assert!(runtime.validate(valid.instances[0].clone()).await.is_ok());
+    for scenario in [
+        "empty",
+        "duplicate",
+        "principal",
+        "key",
+        "policy",
+        "stage",
+        "client_scope",
+        "group_scope",
+        "provider_scope",
+        "model_scope",
+    ] {
+        let mut candidate = valid.clone();
+        let binding = &mut candidate.instances[0].bindings[0];
+        match scenario {
+            "empty" => binding.identity_bindings.clear(),
+            "duplicate" => binding
+                .identity_bindings
+                .push(binding.identity_bindings[0].clone()),
+            "principal" => binding.identity_bindings[0].principal = " invalid ".into(),
+            "key" => binding.identity_bindings[0].client_key_id.clear(),
+            "policy" => binding.failure_policy = PluginFailurePolicy::Observe,
+            "stage" => binding.stage = "request".into(),
+            "client_scope" => binding.client_key_ids.push("key-auth".into()),
+            "group_scope" => binding.account_group_ids.push("group".into()),
+            "provider_scope" => binding.provider_ids.push("openai".into()),
+            "model_scope" => binding.models.push("model".into()),
+            _ => unreachable!(),
+        }
+        assert!(
+            runtime
+                .validate(candidate.instances[0].clone())
+                .await
+                .is_err(),
+            "validate {scenario}"
+        );
+        assert!(
+            runtime.prepare(candidate).await.is_err(),
+            "prepare {scenario}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
 }

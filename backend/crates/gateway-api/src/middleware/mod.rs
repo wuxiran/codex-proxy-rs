@@ -1,4 +1,4 @@
-//! 路由外层只适配 HTTP 值和正文，不解释插件协议或业务策略。
+//! 路由外层只适配 HTTP 值和正文，不解释插件协议或业务策略
 
 pub(crate) mod headers;
 pub(crate) mod websocket;
@@ -17,23 +17,22 @@ use axum::{
     http::{HeaderName, HeaderValue, Request, StatusCode},
     response::{IntoResponse as _, Response},
 };
-use gateway_core::{
-    engine::middleware::FrozenMiddlewarePlan,
-    lifecycle::CancellationToken,
-    middleware::{
-        compose,
-        http::{self as contract, Settings},
-    },
-};
+use gateway_core::engine::middleware::http as contract;
+use gateway_core::engine::middleware::http::Settings;
+use gateway_core::engine::middleware::{FrozenMiddlewarePlan, MiddlewareError};
+use gateway_core::error::GatewayErrorKind;
+use gateway_core::lifecycle::CancellationToken;
+use gateway_core::middleware::compose;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt as _;
 use tokio::time::Instant;
 use tower::ServiceExt as _;
 
 tokio::task_local! { static CURRENT: contract::Context; }
-tokio::task_local! { static SETTINGS: Option<gateway_core::settings::RequestSettings>; }
+tokio::task_local! { static SETTINGS: Option<gateway_core::routing::request_settings::RequestSettings>; }
 
-pub(crate) fn current_settings() -> Option<gateway_core::settings::RequestSettings> {
+pub(crate) fn current_settings() -> Option<gateway_core::routing::request_settings::RequestSettings>
+{
     SETTINGS.try_with(Clone::clone).ok().flatten()
 }
 
@@ -52,7 +51,7 @@ pub(crate) async fn scope<T>(
 }
 
 pub(crate) type SettingsSource =
-    Arc<dyn Fn() -> Option<gateway_core::settings::RequestSettings> + Send + Sync>;
+    Arc<dyn Fn() -> Option<gateway_core::routing::request_settings::RequestSettings> + Send + Sync>;
 
 pub(crate) struct RouterDispatcher {
     pub(crate) router: Router,
@@ -60,7 +59,7 @@ pub(crate) struct RouterDispatcher {
 }
 
 impl contract::Dispatcher for RouterDispatcher {
-    fn request_settings(&self) -> Option<gateway_core::settings::RequestSettings> {
+    fn request_settings(&self) -> Option<gateway_core::routing::request_settings::RequestSettings> {
         (self.settings)()
     }
 
@@ -112,7 +111,7 @@ pub(crate) fn wrap(
     request_id_header: HeaderName,
     settings: SettingsSource,
 ) -> Router {
-    // Axum 的 route layer 在匹配后运行；外层 fallback service 才能让改写后的 URI 重新匹配内层路由。
+    // Axum 的 route layer 在匹配后运行；外层 fallback service 才能让改写后的 URI 重新匹配内层路由
     Router::new().fallback_service(tower::service_fn(move |mut request: Request<Body>| {
         let router = router.clone();
         let inherited = request.extensions().get::<contract::Context>().is_some();
@@ -152,19 +151,6 @@ async fn handle(
     if let Some(plan) = plan.as_ref().filter(|plan| plan.has_websocket()) {
         request.extensions_mut().insert(plan.clone());
     }
-    if inherited.is_none()
-        && !plan
-            .as_ref()
-            .is_some_and(|plan| plan.has_http() || plan.has_service())
-    {
-        let settings = request
-            .extensions()
-            .get::<Settings>()
-            .and_then(|settings| settings.runtime.clone());
-        return SETTINGS
-            .scope(settings, dispatch(router, request, started))
-            .await;
-    }
     let context = inherited.unwrap_or_else(|| {
         let request_id = request
             .headers()
@@ -177,7 +163,8 @@ async fn handle(
             call_id: request_id.clone(),
             request_id,
             parent_call_id: None,
-            extensions: Default::default(),
+            extensions: gateway_core::engine::extensions::ExtensionCallScope::default()
+                .with_request(crate::request_context::capture(&request)),
             cancellation: CancellationToken::new(),
             plan: plan.clone(),
         }
@@ -195,12 +182,12 @@ async fn handle(
     });
     request.extensions_mut().insert(guard.clone());
     request.extensions_mut().insert(context.clone());
-    let service_context = gateway_admin::service::Origin {
+    let service_context = gateway_admin::public_service::Origin {
         request_id: context.request_id.clone(),
         call_id: context.call_id.clone(),
         cancellation: context.cancellation.clone(),
         extensions: context.extensions.clone(),
-        plan: gateway_admin::service::Plan::Frozen(plan.clone()),
+        plan: gateway_admin::public_service::Plan::Frozen(plan.clone()),
     };
     request
         .extensions_mut()
@@ -220,7 +207,7 @@ async fn handle(
                     terminal_context,
                     SETTINGS.scope(
                         settings,
-                        gateway_admin::service::scope(
+                        gateway_admin::public_service::scope(
                             service_context,
                             dispatch(router, request.map(Body::new), started),
                         ),
@@ -230,6 +217,8 @@ async fn handle(
             Ok(response.map(|body| body.map_err(|error| Box::new(error) as _).boxed_unsync()))
         })
     });
+    let request_id = context.request_id.clone();
+    let call_id = context.call_id.clone();
     let result = match plan {
         Some(plan) => plan.handle_http(context, request, next).await,
         None => next.run(request).await,
@@ -253,11 +242,27 @@ async fn handle(
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {},
-                        _ = task => {},
+                        result = task => {
+                            if let Err(contract::upgrade::SessionError::Failed { kind, plugin_instance_id }) = result {
+                                tracing::warn!(
+                                    event = "middleware.session.failed",
+                                    request_id,
+                                    call_id,
+                                    plugin_instance_id,
+                                    kind,
+                                    "升级后的中间件会话失败"
+                                );
+                            }
+                        },
                     }
                 });
             }
             response.map(|body| Body::new(ResponseBody::new(body, guard)))
+        }
+        Err(MiddlewareError::Gateway(error))
+            if error.kind() == GatewayErrorKind::MiddlewareCapacityUnavailable =>
+        {
+            crate::openai::error::gateway_error_response(&error)
         }
         Err(error) => {
             let status = if error.is_rejected() {

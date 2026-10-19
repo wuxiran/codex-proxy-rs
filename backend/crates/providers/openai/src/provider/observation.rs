@@ -1,4 +1,4 @@
-//! OpenAI 请求、响应与 transport 观测事实归一化。
+//! OpenAI 请求、响应与 transport 观测事实归一化
 
 use super::*;
 
@@ -8,7 +8,7 @@ pub(super) fn endpoint_requested_model(
     if payload.protocol() != PROVIDER_NAME {
         return None;
     }
-    // 只读取 model，避免把编辑请求中的整张图片复制到观测数据。
+    // 选号与观测共用模型提取，跳过编辑请求中的图片且不改写原始正文
     #[derive(Deserialize)]
     struct RequestModel {
         model: Option<Value>,
@@ -19,10 +19,10 @@ pub(super) fn endpoint_requested_model(
     gateway_core::routing::PublicModelId::new(model.as_str()?.to_owned()).ok()
 }
 
-/// OpenAI Responses 的观测状态完全归 Provider 所有。
+/// OpenAI Responses 的观测状态完全归 Provider 所有
 ///
 /// 每次原始 SSE/WS 事件推进状态后重新生成不可变 observation，Core 只负责携带、
-/// 持久化和展示这份安全快照，不解释任何 OpenAI 协议字段。
+/// 持久化和展示这份安全快照，不解释任何 OpenAI 协议字段
 pub(super) struct OpenAiResponseObservationState {
     transport: CodexBackendTransport,
     diagnostics: CodexUpstreamDiagnostics,
@@ -97,7 +97,7 @@ impl OpenAiResponseObservationState {
         &self,
         failure: Option<&ProviderError>,
     ) -> Option<ProviderResponseObservation> {
-        // 失败快照的请求 ID 来自当前错误；连接诊断仍保持 opening 原貌，不维护第二份可变 ID。
+        // 失败快照的请求 ID 来自当前错误；连接诊断仍保持 opening 原貌，不维护第二份可变 ID
         let failure_diagnostics = failure
             .filter(|_| self.transport == CodexBackendTransport::WebSocket)
             .map(|error| {
@@ -122,7 +122,7 @@ impl OpenAiResponseObservationState {
         if let Some(metadata) = self.provider_metadata() {
             observation = observation.with_provider_metadata(metadata);
         }
-        // 统计与计费采用最终发送档位；响应回显只作为独立诊断事实保留。
+        // 统计与计费采用最终发送档位；响应回显只作为独立诊断事实保留
         if let Some(service_tier) = &self.requested_service_tier {
             observation = observation.with_service_tier_if_valid(service_tier.clone());
         }
@@ -156,8 +156,7 @@ impl OpenAiResponseObservationState {
         started_at: Instant,
     ) -> bool {
         let mut changed = false;
-        // 首个非前导输出事件（结构帧也算）开启首字计时；
-        // 真实语义首字由 first_reasoning_ms / first_text_ms 单独观测。
+        // 首字采用官方输出项边界，真实推理与正文仍分别计时
         if signals.output_start {
             changed |= insert_first_timing(&mut self.timings.first_token_ms, started_at);
         }
@@ -179,6 +178,43 @@ impl OpenAiResponseObservationState {
         }
         self.upstream_service_tier = Some(service_tier);
         true
+    }
+
+    pub(super) fn observe_upstream_response_ms(&mut self, duration_ms: Option<u64>) -> bool {
+        let Some(duration_ms) = duration_ms else {
+            return false;
+        };
+        if self.timings.upstream_response_ms == Some(duration_ms) {
+            return false;
+        }
+        self.timings.upstream_response_ms = Some(duration_ms);
+        true
+    }
+
+    pub(super) fn observe_upstream_timing_metrics(
+        &mut self,
+        metrics: crate::transport::protocol::responses::ResponseTimingMetrics,
+    ) -> bool {
+        let previous = self.timings;
+        if metrics.upstream_api_overhead_ms.is_some() {
+            self.timings.upstream_api_overhead_ms = metrics.upstream_api_overhead_ms;
+        }
+        if metrics.upstream_engine_ms.is_some() {
+            self.timings.upstream_engine_ms = metrics.upstream_engine_ms;
+        }
+        if metrics.upstream_engine_iapi_ttft_ms.is_some() {
+            self.timings.upstream_engine_iapi_ttft_ms = metrics.upstream_engine_iapi_ttft_ms;
+        }
+        if metrics.upstream_engine_service_ttft_ms.is_some() {
+            self.timings.upstream_engine_service_ttft_ms = metrics.upstream_engine_service_ttft_ms;
+        }
+        if metrics.upstream_engine_iapi_tbt_ms.is_some() {
+            self.timings.upstream_engine_iapi_tbt_ms = metrics.upstream_engine_iapi_tbt_ms;
+        }
+        if metrics.upstream_engine_service_tbt_ms.is_some() {
+            self.timings.upstream_engine_service_tbt_ms = metrics.upstream_engine_service_tbt_ms;
+        }
+        self.timings != previous
     }
 
     pub(super) fn merge_rate_limit_headers(&mut self, updates: &[(String, String)]) -> bool {
@@ -334,8 +370,8 @@ pub(super) fn codex_response_observation(
             WebSocketPoolKind::New
         });
     }
-    // WebSocket opening 的 101 是成功升级事实，不是业务请求的失败 HTTP 状态。
-    // opening 明确拒绝仍由 `codex_error_observation` 保存真实上游状态。
+    // WebSocket opening 的 101 是成功升级事实，不是业务请求的失败 HTTP 状态
+    // opening 明确拒绝仍由 `codex_error_observation` 保存真实上游状态
     if transport != CodexBackendTransport::WebSocket
         && let Some(status_code) = diagnostics.status_code
     {
@@ -580,8 +616,8 @@ pub(super) fn nonnegative_millis(value: Option<i64>) -> Option<u64> {
 }
 
 pub(super) fn compile_model_capabilities(model: &CodexCatalogModel) -> ProviderModelCapabilities {
-    // Catalog membership is enough to publish Generate. `supported_in_api` is advisory;
-    // the upstream response is authoritative for normal and diagnostic requests.
+    // 模型进入目录即可发布 Generate 能力，`supported_in_api` 仅作提示
+    // 普通请求和诊断请求均以上游响应为准
     let capabilities = ModelCapabilities::new(BTreeSet::from([OperationKind::Generate]), None)
         .with_upstream_feature_validation();
     ProviderModelCapabilities::new(model.request_model().clone(), capabilities)
@@ -591,7 +627,7 @@ pub(super) fn compile_model_capabilities(model: &CodexCatalogModel) -> ProviderM
 pub(super) fn codex_model_presentation(model: &CodexCatalogModel) -> ModelPresentation {
     let capabilities = model.capabilities();
     let reasoning_efforts = capabilities.reasoning_efforts().to_vec();
-    // Codex 目录不声明默认 effort；有 medium 时对齐官方 picker 缺省，否则取首项。
+    // Codex 目录不声明默认 effort；有 medium 时对齐官方 picker 缺省，否则取首项
     let default_reasoning = reasoning_efforts
         .iter()
         .find(|effort| effort.as_str() == "medium")
@@ -620,7 +656,7 @@ pub(super) fn codex_model_presentation(model: &CodexCatalogModel) -> ModelPresen
             .map(std::num::NonZeroU64::get),
     )
     .with_image_input(capabilities.image_input() == CodexCatalogCapabilityEvidence::DeclaredNative)
-    // Codex Responses 工具协议随 API 支持一并可用；只有明确不支持才关闭。
+    // Codex Responses 工具协议随 API 支持一并可用；只有明确不支持才关闭
     .with_agent_tools(
         capabilities.responses_api() != CodexCatalogCapabilityEvidence::DeclaredUnsupported,
         capabilities.parallel_tool_calls() == CodexCatalogCapabilityEvidence::DeclaredNative,
@@ -774,7 +810,30 @@ pub(super) fn map_request_error(error: CodexRequestEncodeError) -> ProviderError
 }
 
 pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderError {
-    match error {
+    selection_failure(&error).with_source(error)
+}
+
+fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
+    let diagnostic_code = match error {
+        CredentialSelectionError::InvalidCredential(_) => Some("account_credential_invalid"),
+        CredentialSelectionError::RevisionConflict(_) => {
+            Some("account_credential_revision_conflict")
+        }
+        CredentialSelectionError::Store(_) => Some("account_store_unavailable"),
+        CredentialSelectionError::Coordinator(_) => Some("account_coordinator_unavailable"),
+        CredentialSelectionError::CookiePolicy(_) => Some("account_cookie_policy_rejected"),
+        CredentialSelectionError::PolicyUnavailable => Some("account_policy_unavailable"),
+        CredentialSelectionError::PolicyFiltered => Some("account_policy_filtered"),
+        _ => None,
+    };
+    // 这些变体只含固定文案，不格式化可能承载外部正文的其他错误
+    let diagnostic = diagnostic_code.map(|code| {
+        ProviderDiagnostic::new(error.to_string()).with_classification("account_selection", code)
+    });
+    let mapped = match error {
+        CredentialSelectionError::Cancelled => provider_error(ProviderErrorKind::Cancelled, UpstreamSendState::NotSent).with_retry_prohibited(),
+        CredentialSelectionError::ContinuationOwnerChanged => continuation_replay_required_error("scope_unavailable"),
+        CredentialSelectionError::SessionBound(error) => selection_failure(error).with_retry_prohibited(),
         CredentialSelectionError::QueueRejected(error) => {
             provider_error(error.provider_kind(), UpstreamSendState::NotSent)
         }
@@ -784,10 +843,20 @@ pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderEr
                 UpstreamSendState::NotSent,
             );
             match retry_after {
-                Some(retry) => error.with_retry_after(retry),
+                Some(retry) => error.with_retry_after(*retry),
                 None => error,
             }
         }
+        CredentialSelectionError::SessionPolicyRestricted => provider_error(
+            ProviderErrorKind::SessionPolicyRestricted,
+            UpstreamSendState::NotSent,
+        )
+        .with_retry_prohibited()
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "No account is available for this session because of an earlier upstream cyber_policy rejection. Do not repeatedly retry this session. This does not indicate an account ban or a service-wide outage.",
+            Some("cyber_policy".to_owned()),
+            Some("invalid_request_error".to_owned()),
+        )),
         CredentialSelectionError::NoEligibleCredential => provider_error(
             ProviderErrorKind::NoEligibleAccount,
             UpstreamSendState::NotSent,
@@ -809,14 +878,15 @@ pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderEr
             ProviderDiagnostic::new("OpenAI account changed repeatedly during selection")
                 .with_classification("account_selection", "account_snapshot_conflict"),
         ),
-        CredentialSelectionError::InvalidCredential
-        | CredentialSelectionError::Store
-        | CredentialSelectionError::Coordinator
-        | CredentialSelectionError::CookiePolicy => provider_error(
+        CredentialSelectionError::InvalidCredential(_)
+        | CredentialSelectionError::RevisionConflict(_)
+        | CredentialSelectionError::Store(_)
+        | CredentialSelectionError::Coordinator(_)
+        | CredentialSelectionError::CookiePolicy(_) => provider_error(
             ProviderErrorKind::ProviderInfrastructureUnavailable,
             UpstreamSendState::NotSent,
         ),
-        CredentialSelectionError::PolicyRejected => provider_error(
+        CredentialSelectionError::PolicyRejected | CredentialSelectionError::PolicyFiltered => provider_error(
             ProviderErrorKind::RequestPolicyDenied,
             UpstreamSendState::NotSent,
         ),
@@ -824,5 +894,9 @@ pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderEr
             ProviderErrorKind::Unavailable,
             UpstreamSendState::NotSent,
         ),
+    };
+    match diagnostic {
+        Some(diagnostic) => mapped.with_diagnostic(diagnostic),
+        None => mapped,
     }
 }

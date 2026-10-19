@@ -1,3 +1,5 @@
+//! 验证请求级运维事件必须关联明确的执行尝试
+
 use chrono::Utc;
 use gateway_store::postgres::{OpsEvent, OpsEventLevel};
 
@@ -11,12 +13,12 @@ fn request_scoped_ops_event_requires_attempt_index() {
         component: "routing".to_owned(),
         operation: "fallback".to_owned(),
         provider_kind: None,
-        provider_account_id: None,
+        account_snapshot: None,
         provider_account_ref: None,
         upstream_model_id: None,
         failure_kind: "timeout".to_owned(),
         upstream_send_state: Some("not_sent".to_owned()),
-        raw_upstream_error: None,
+        error_details: None,
         status_code: None,
         provider_error_code: None,
         retry_after_ms: None,

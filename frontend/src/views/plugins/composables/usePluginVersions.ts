@@ -1,15 +1,16 @@
 import type { Ref } from 'vue'
+import type { PluginRefreshContext } from '../utils/actions'
 import type { InstalledPlugin } from '../utils/catalog'
-import type { PluginActionContext } from './usePluginActions'
 import type { PluginArtifact, PluginInstance, PluginRollbackPlan, PluginVersionPlan } from '@/api'
-import { toast } from '@codex-proxy/ui'
-import { computed, onScopeDispose, shallowRef, watch } from 'vue'
+import { ZNotification } from '@codex-proxy/ui'
+import { onScopeDispose, shallowRef, watch } from 'vue'
 import { getPluginRollbackPlan, getPluginVersionPlan, rollbackPluginInstance, switchPluginVersion } from '@/api'
 import { ApiError } from '@/api/request'
 import { errorMessage } from '@/utils/operation'
+import { notifyPluginError } from '../utils/actions'
 import { currentPluginInstance } from '../utils/catalog'
 
-interface VersionContext extends Pick<PluginActionContext, 'refresh' | 'notifyError'> {
+interface VersionContext extends PluginRefreshContext {
   catalog: Ref<InstalledPlugin[]>
   instances: Ref<PluginInstance[]>
   busyInstanceId: Ref<string>
@@ -17,20 +18,14 @@ interface VersionContext extends Pick<PluginActionContext, 'refresh' | 'notifyEr
   onConfigurationRequired: (instance: PluginInstance, artifact: PluginArtifact, plan: PluginVersionPlan, error: string) => void
 }
 
-export function usePluginVersions({ catalog, instances, busyInstanceId, refresh, notifyError, onApplied, onConfigurationRequired }: VersionContext) {
+export function usePluginVersions({ catalog, instances, busyInstanceId, refresh, onApplied, onConfigurationRequired }: VersionContext) {
   const showRollback = shallowRef(false)
   const rollbackInstance = shallowRef<PluginInstance | null>(null)
   const rollbackPlan = shallowRef<PluginRollbackPlan | null>(null)
   const loadingRollback = shallowRef(false)
 
   const pendingVersionSwitch = shallowRef<{ instance: PluginInstance, artifact: PluginArtifact, currentVersion: string } | null>(null)
-  const showVersionSwitch = computed({
-    get: () => pendingVersionSwitch.value !== null,
-    set: (open: boolean) => {
-      if (!open && !busyInstanceId.value)
-        pendingVersionSwitch.value = null
-    },
-  })
+  const showVersionSwitch = shallowRef(false)
   let rollbackController: AbortController | undefined
 
   function requestVersionSwitch(artifact: PluginArtifact) {
@@ -39,10 +34,11 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
     if (!plugin || !instance || !artifact.acceptedAt || busyInstanceId.value || instance.artifactSha256 === artifact.metadata.sha256)
       return
     pendingVersionSwitch.value = { instance, artifact, currentVersion: plugin.artifact.metadata.version }
+    showVersionSwitch.value = true
   }
 
   async function confirmVersionSwitch() {
-    if (!pendingVersionSwitch.value || busyInstanceId.value)
+    if (!showVersionSwitch.value || !pendingVersionSwitch.value || busyInstanceId.value)
       return
     const { instance, artifact } = pendingVersionSwitch.value
     await applyVersionSwitch(instance, artifact)
@@ -55,8 +51,8 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
         id: instance.id,
         target: { artifactSha256: artifact.metadata.sha256, expectedRevision: instance.revision },
       }, { silent: true })
-      pendingVersionSwitch.value = null
-      toast.success(`已切换至 ${artifact.metadata.version}`)
+      showVersionSwitch.value = false
+      ZNotification.success({ message: `已切换至 ${artifact.metadata.version}` })
       await refresh(true)
       onApplied()
     }
@@ -68,15 +64,15 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
           const plan = await getPluginVersionPlan(instance.id, artifact.metadata.sha256, { silent: true })
           if (plan.instanceRevision !== instance.revision)
             throw new Error('插件设置已变更，请刷新后重试')
-          pendingVersionSwitch.value = null
+          showVersionSwitch.value = false
           onConfigurationRequired(current, artifact, plan, errorMessage(error, '请调整不兼容的设置后重试'))
         }
         catch (planError) {
-          notifyError('版本设置加载失败', planError)
+          notifyPluginError('版本设置加载失败', planError)
         }
       }
       else {
-        notifyError('版本切换失败', error)
+        notifyPluginError('版本切换失败', error)
       }
     }
     finally {
@@ -99,7 +95,7 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
     }
     catch (error) {
       if (rollbackController === controller)
-        notifyError('回退版本加载失败', error)
+        notifyPluginError('回退版本加载失败', error)
     }
     finally {
       if (rollbackController === controller) {
@@ -119,13 +115,11 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
     try {
       await rollbackPluginInstance({ id: instance.id, target: { artifactSha256, expectedRevision: plan.instanceRevision } }, { silent: true })
       showRollback.value = false
-      rollbackInstance.value = null
-      rollbackPlan.value = null
-      toast.success(`已回退至 ${target.version}，并恢复对应设置`)
+      ZNotification.success({ message: `已回退至 ${target.version}，并恢复对应设置` })
       await refresh(true)
     }
     catch (error) {
-      notifyError('插件版本回退失败', error)
+      notifyPluginError('插件版本回退失败', error)
     }
     finally {
       busyInstanceId.value = ''
@@ -136,7 +130,6 @@ export function usePluginVersions({ catalog, instances, busyInstanceId, refresh,
     if (!open) {
       rollbackController?.abort()
       rollbackController = undefined
-      loadingRollback.value = false
     }
   })
 

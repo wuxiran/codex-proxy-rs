@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { KeyUsageVersion } from '@/api/modules/key-usage'
-import { BaseInput, BaseScrollbar } from '@codex-proxy/ui'
+import { ZInput, ZScrollbar } from '@codex-proxy/ui'
 import { Search } from '@lucide/vue'
 import { shallowRef } from 'vue'
 import { getKeyUsageVersion } from '@/api/modules/key-usage'
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
 import AppAboutModal from '@/components/AppAboutModal.vue'
-import RequestHealthTimelineCard from '@/views/dashboard/components/RequestHealthTimelineCard.vue'
+import RequestHealthTimelineCard from '@/components/usage/RequestHealthTimelineCard.vue'
 import KeyUsageBudget from './components/KeyUsageBudget.vue'
 import KeyUsageHeader from './components/KeyUsageHeader.vue'
 import KeyUsageRecords from './components/KeyUsageRecords.vue'
@@ -15,7 +15,6 @@ import KeyUsageSummary from './components/KeyUsageSummary.vue'
 import KeyUsageTrend from './components/KeyUsageTrend.vue'
 import { useKeyConfig } from './composables/useKeyConfig'
 import { useKeyUsage } from './composables/useKeyUsage'
-import { keyUsageTime } from './utils/format'
 
 const { period, model, kind, refreshInterval, overview, overviewLoading, overviewError, refreshing, recordsStale, records, refresh, changePageSize, changePage } = useKeyUsage()
 const { items, currentPage, pageSize, total, loading: recordsLoading, error: recordsError } = records
@@ -44,17 +43,17 @@ async function openAbout() {
 
 <template>
   <main class="h-dvh overflow-hidden bg-cp-bg-layout text-cp-text">
-    <BaseScrollbar>
-      <div class="mx-auto flex min-h-full w-full max-w-480 flex-col gap-5 p-4 min-[961px]:p-6">
+    <ZScrollbar>
+      <div class="flex min-h-full w-full flex-col gap-5 p-4 min-[961px]:p-6">
         <div class="flex flex-col gap-2">
           <KeyUsageHeader v-model:period="period" v-model:refresh-interval="refreshInterval" :name="overview?.key.name" :prefix="overview?.key.prefix" :refreshing="refreshing || overviewLoading" :configuring="configuring" @refresh="refresh" @configure="openConfig" @open-about="openAbout" />
           <div class="flex flex-wrap items-center justify-between gap-3">
-            <span v-if="overview" class="text-cp-sm text-cp-text-tertiary">更新于 {{ keyUsageTime(overview.asOf).slice(11) }}</span>
-            <BaseInput v-model="model" class="ml-auto w-60 max-w-full" placeholder="输入完整模型名称" aria-label="筛选统计和日志的模型" :maxlength="128">
+            <span v-if="overview" class="text-cp-sm text-cp-text-tertiary">更新于 {{ overview.asOfDisplay }}</span>
+            <ZInput v-model="model" class="ml-auto w-60 max-w-full" placeholder="输入完整模型名称" aria-label="筛选统计和日志的模型" :maxlength="128">
               <template #prefix>
                 <Search class="size-4" />
               </template>
-            </BaseInput>
+            </ZInput>
           </div>
         </div>
         <p v-if="overviewError" role="alert" class="m-0 rounded-cp-lg bg-cp-error-container px-4 py-3 text-cp-sm text-cp-error-text">
@@ -71,8 +70,8 @@ async function openAbout() {
         <KeyUsageSkeleton v-else-if="overviewLoading" />
         <KeyUsageRecords v-model:kind="kind" :rows="items" :pagination="{ currentPage, pageSize, total }" :loading="recordsLoading" :error="recordsError" :stale="recordsStale" @page-change="changePage" @page-size-change="changePageSize" />
       </div>
-    </BaseScrollbar>
-    <ApiKeyConfigModal v-model="showConfig" title="密钥配置" :api-key="configKey" :api-base-url="apiBaseUrl" @copy="copyConfig" />
+    </ZScrollbar>
+    <ApiKeyConfigModal v-model="showConfig" title="密钥配置" :api-key="configKey" :api-base-url="apiBaseUrl" @copy="copyConfig" @after-leave="configKey = null" />
     <AppAboutModal v-model="aboutOpen" :version="version" />
   </main>
 </template>

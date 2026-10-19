@@ -1,8 +1,10 @@
+//! 网关组合根测试入口，检查源码模块纪律与冻结的文件边界
+
 mod architecture;
 mod bootstrap;
 
-// 组合根是否混入业务策略由代码审查判断，行数和标识符/注释关键词不能证明职责越界。
-// 依赖 DAG、公开模块面和模块镜像继续由 architecture 检查，源码纪律由下方测试维护。
+// 组合根是否混入业务策略由代码审查判断，行数和标识符/注释关键词不能证明职责越界
+// 依赖 DAG、公开模块面和模块镜像继续由 architecture 检查，源码纪律由下方测试维护
 
 use std::{
     collections::BTreeSet,
@@ -18,7 +20,12 @@ fn app_tree_matches_frozen_terminal_manifest() {
     assert_eq!(
         rust_files(&root.join("src")),
         BTreeSet::from([
-            PathBuf::from("bootstrap.rs"),
+            PathBuf::from("bootstrap/command.rs"),
+            PathBuf::from("bootstrap/config.rs"),
+            PathBuf::from("bootstrap/mod.rs"),
+            PathBuf::from("bootstrap/plugins.rs"),
+            PathBuf::from("bootstrap/server.rs"),
+            PathBuf::from("bootstrap/startup.rs"),
             PathBuf::from("lib.rs"),
             PathBuf::from("main.rs"),
         ]),
@@ -27,7 +34,10 @@ fn app_tree_matches_frozen_terminal_manifest() {
         rust_files(&root.join("tests")),
         BTreeSet::from([
             PathBuf::from("architecture.rs"),
-            PathBuf::from("bootstrap.rs"),
+            PathBuf::from("bootstrap/command.rs"),
+            PathBuf::from("bootstrap/config.rs"),
+            PathBuf::from("bootstrap/mod.rs"),
+            PathBuf::from("bootstrap/server.rs"),
             PathBuf::from("main.rs"),
         ]),
     );
@@ -49,9 +59,16 @@ fn cargo_library_root_is_conventional_lib() {
 fn workspace_production_files_have_no_hidden_modules_or_test_hooks() {
     for member in architecture::WORKSPACE_MEMBERS {
         let root = architecture::backend_root().join(member).join("src");
-        for relative in rust_files(&root) {
+        let sources = rust_files(&root);
+        assert!(!sources.is_empty(), "{member} has no production sources");
+        for relative in sources {
             let path = root.join(relative);
             let source = fs::read_to_string(&path).expect("read production source");
+            assert!(
+                !source.contains("#[cfg(test)]"),
+                "{} hosts tests in production src",
+                path.display()
+            );
             assert!(
                 !source.contains("include!("),
                 "{} uses include!",

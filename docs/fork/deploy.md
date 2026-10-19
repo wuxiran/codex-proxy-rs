@@ -18,6 +18,10 @@
 默认拉取 `zyycn/codex-proxy-rs`，在管理端点一下就会用上游原版覆盖 fork。`fork` 构建的在线更新返回
 「在线更新需要官方发布构建」。
 
+`deploy/Dockerfile` 与上游只差一个 `ARG CARGO_BUILD_JOBS=2`（传给 `cargo build --jobs`），默认只并行编译两个 crate，
+避免桌面机构建时占满资源；服务器构建可用 `--build-arg CARGO_BUILD_JOBS=<N>` 放开。工具链版本（Rust 1.99.1、Node 26.12.0）
+以 Dockerfile 的 builder 镜像为准，CI 从这里读取。
+
 ## 回退与升级注意
 
 - 若启用过「固定自身 state」实验开关，回退到不支持该功能的旧版本前，先在当前版本关闭相关账号的开关并保存。

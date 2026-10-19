@@ -1,7 +1,7 @@
 // 测智台状态放 store：切走页面再回来，上一次的结果、进行中的生成都还在（收流循环挂在 store 上，
 // 不随页面卸载中断）。表单配置持久到 localStorage；结果持久到 sessionStorage（刷新不丢已完成的结果）。
 import type { Account, AccountGroup } from '@/api'
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { getAccountGroups, getAccounts } from '@/api'
@@ -141,7 +141,7 @@ export const useTestBenchStore = defineStore(
         selected.value = selected.value.filter(id => ids.has(id))
       }
       catch {
-        toast.error('账号列表加载失败')
+        ZNotification.error({ message: '账号列表加载失败' })
       }
       finally {
         accountsLoading.value = false
@@ -261,11 +261,11 @@ export const useTestBenchStore = defineStore(
         return
       const ids = accounts.value.filter(a => selectedSet.value.has(a.id)).map(a => a.id)
       if (!ids.length) {
-        toast.error('请先勾选至少一个账号')
+        ZNotification.error({ message: '请先勾选至少一个账号' })
         return
       }
       if (!prompt.value.trim()) {
-        toast.error('请填写测试 prompt')
+        ZNotification.error({ message: '请填写测试 prompt' })
         return
       }
       const nameOf = (id: string) => accounts.value.find(a => a.id === id)?.name || id

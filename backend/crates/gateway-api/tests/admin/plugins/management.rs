@@ -1,26 +1,35 @@
+//! 插件管理页面模型调用的认证、执行与响应交付测试
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use futures::future::BoxFuture;
-use gateway_core::{
-    engine::{
-        execution::{
-            AuthenticatedClient, ClientAuthenticationError, ExecutionService,
-            PreparedRootExecution, StartExecution, StartProviderExecution, StartedExecution,
-        },
-        middleware::{
-            FrozenMiddlewarePlan, MiddlewareBody, MiddlewareContext, MiddlewareError,
-            MiddlewareFrame, MiddlewareFraming, MiddlewareHeader, MiddlewareNext, MiddlewarePlan,
-            MiddlewareRequest, MiddlewareResponse,
-        },
-    },
-    error::GatewayError,
-    lifecycle::CancellationToken,
-    policy::ClientApiKeyId,
-    routing::PublicModelId,
-    runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference},
-};
+use gateway_core::engine::execution::AuthenticatedClient;
+use gateway_core::engine::execution::ClientAuthenticationError;
+use gateway_core::engine::execution::ExecutionService;
+use gateway_core::engine::execution::PreparedRootExecution;
+use gateway_core::engine::execution::StartExecution;
+use gateway_core::engine::execution::StartProviderExecution;
+use gateway_core::engine::execution::StartedExecution;
+use gateway_core::engine::middleware::FrozenMiddlewarePlan;
+use gateway_core::engine::middleware::MiddlewareBody;
+use gateway_core::engine::middleware::MiddlewareContext;
+use gateway_core::engine::middleware::MiddlewareError;
+use gateway_core::engine::middleware::MiddlewareFrame;
+use gateway_core::engine::middleware::MiddlewareFraming;
+use gateway_core::engine::middleware::MiddlewareHeader;
+use gateway_core::engine::middleware::MiddlewareNext;
+use gateway_core::engine::middleware::MiddlewarePlan;
+use gateway_core::engine::middleware::MiddlewareRequest;
+use gateway_core::engine::middleware::MiddlewareResponse;
+use gateway_core::error::GatewayError;
+use gateway_core::lifecycle::CancellationToken;
+use gateway_core::policy::ClientApiKeyId;
+use gateway_core::routing::PublicModelId;
+use gateway_core::routing::extensions::ExtensionSetId;
+use gateway_core::routing::extensions::ExtensionSetLease;
+use gateway_core::routing::extensions::ExtensionSetReference;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -366,10 +375,11 @@ pub(super) fn resource_fixture(
 }
 
 async fn published_fixture() -> AdminTestFixture {
-    use gateway_core::{
-        routing::{ConfigRevision, RuntimeSnapshot},
-        runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference},
-    };
+    use gateway_core::routing::ConfigRevision;
+    use gateway_core::routing::RuntimeSnapshot;
+    use gateway_core::routing::extensions::ExtensionSetId;
+    use gateway_core::routing::extensions::ExtensionSetLease;
+    use gateway_core::routing::extensions::ExtensionSetReference;
     use std::sync::Arc;
     struct Lease;
     impl ExtensionSetLease for Lease {
@@ -385,14 +395,7 @@ async fn published_fixture() -> AdminTestFixture {
     fixture.published_snapshot.publish(
         RuntimeSnapshot::new(
             ConfigRevision::new(7).unwrap(),
-            gateway_core::settings::SettingsValues::new(
-                1,
-                0,
-                "smart",
-                Default::default(),
-                None,
-                None,
-            ),
+            gateway_core::settings::SettingsValues::new(1, "smart", Default::default(), None, None),
             vec![],
             vec![],
             vec![],
@@ -430,6 +433,35 @@ async fn resource_request(
     .oneshot(request.body(Body::empty()).unwrap())
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn large_html_resource_should_remain_uncompressed() {
+    let fixture = published_fixture().await;
+    let path = format!("ui/{}.html", "a".repeat(2048));
+    let response = crate::openai::api_router_with_admin(fixture.services)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/admin/plugins/extensions/plugin-instance-diagnostic/{}/7/resources/{path}",
+                    "a".repeat(64)
+                ))
+                .header("cookie", "cpr_session=management-session")
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/html");
+    assert!(!response.headers().contains_key("content-encoding"));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+        path
+    );
 }
 
 #[tokio::test]
@@ -727,7 +759,7 @@ async fn public_callback_rejects_head_missing_duplicate_state_and_body_before_di
         ("GET", "state=one&state=two", "", StatusCode::BAD_REQUEST),
         ("GET", "state=one&%73tate=two", "", StatusCode::BAD_REQUEST),
         ("GET", "state=one", "body", StatusCode::BAD_REQUEST),
-        // 合法 GET 没有管理 Cookie 仍进入服务；当前测试未发布视图，返回 503 而不是 401。
+        // 合法 GET 没有管理 Cookie 仍进入服务；当前测试未发布视图，返回 503 而不是 401
         ("GET", "state=one", "", StatusCode::SERVICE_UNAVAILABLE),
     ] {
         let response = crate::openai::api_router_with_admin_and_execution(

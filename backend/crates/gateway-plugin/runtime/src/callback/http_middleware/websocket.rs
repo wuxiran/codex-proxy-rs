@@ -1,8 +1,8 @@
-//! 握手消费当前 HTTP 续体；收发继续使用同一调用的受管消息资源。
+//! 握手消费当前 HTTP 续体；收发继续使用同一调用的受管消息资源
 
 use super::*;
 use crate::callback::websocket_middleware::Invocation as Messages;
-use gateway_core::middleware::{http::upgrade, websocket as ws};
+use gateway_core::engine::middleware::{http::upgrade, websocket as ws};
 use gateway_plugin_sdk::call::middleware::websocket as message;
 use gateway_plugin_sdk::call::middleware::{BODY_CLOSE_METHOD, BODY_READ_METHOD};
 

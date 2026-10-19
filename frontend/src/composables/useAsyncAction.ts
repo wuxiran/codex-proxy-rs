@@ -1,4 +1,4 @@
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 
 import { shallowRef } from 'vue'
 import { ApiError } from '@/api/request'
@@ -21,15 +21,16 @@ function resolveErrorText(error: unknown, errorText: string | false | undefined)
   return errorMessage(error, errorText || '操作失败')
 }
 
-export function useAsyncAction() {
+export function useAsyncAction(defaults: AsyncActionRunOptions = {}) {
   const loading = shallowRef(false)
 
-  async function run<T>(task: () => MaybePromise<T>, options: AsyncActionRunOptions = {}) {
+  async function run<T>(task: () => MaybePromise<T>, overrides: AsyncActionRunOptions = {}) {
     if (loading.value) {
       return undefined
     }
 
     loading.value = true
+    const options = { ...defaults, ...overrides }
     try {
       const execute = async () => task()
       return options.minimumMs === undefined
@@ -41,7 +42,7 @@ export function useAsyncAction() {
 
       const message = resolveErrorText(error, options.errorText)
       if (message) {
-        toast.error(message)
+        ZNotification.error({ message })
       }
 
       if (options.rethrow) {

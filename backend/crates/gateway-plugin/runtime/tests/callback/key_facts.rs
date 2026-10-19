@@ -1,3 +1,5 @@
+//! 验证插件 Key 事实查询读取当前分组且不暴露密钥
+
 use gateway_admin::{
     model::{
         client_keys::{SetClientKeyEnabled, UpdateClientKey},
@@ -81,6 +83,7 @@ async fn key_facts_read_current_database_groups_without_secrets() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),

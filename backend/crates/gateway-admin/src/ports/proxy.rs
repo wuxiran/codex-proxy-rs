@@ -1,3 +1,5 @@
+//! 账号出站代理的持久化、导入占用与连通性探测端口
+
 use async_trait::async_trait;
 use gateway_core::account::{OutboundProxy, ProviderAccountId};
 
@@ -13,7 +15,7 @@ use crate::model::{
 
 #[async_trait]
 pub trait ProxyStore: Send + Sync {
-    /// 在凭据交换到提交期间保护选定代理的连接配置和测试结果。
+    /// 在凭据交换到提交期间保护选定代理的连接配置和测试结果
     async fn reserve_import(&self, id: &str) -> AdminStoreResult<ProxyImportReservation>;
     async fn list(&self, query: ProxyListQuery) -> AdminStoreResult<ProxyPage>;
     async fn list_accounts(
@@ -21,7 +23,7 @@ pub trait ProxyStore: Send + Sync {
         query: ProxyAccountListQuery,
     ) -> AdminStoreResult<ProxyAccountPage>;
     async fn get(&self, id: &str) -> AdminStoreResult<ProxyRecord>;
-    /// 仅在账号仍绑定指定代理时解除关联，并清除账号保存的连接地址。
+    /// 仅在账号仍绑定指定代理时解除关联，并清除账号保存的连接地址
     async fn remove_account(
         &self,
         proxy_id: &str,
@@ -72,7 +74,7 @@ pub trait ProxyStore: Send + Sync {
     }
 }
 
-/// 离开作用域时释放保护，错误返回和请求取消也遵循相同规则。
+/// 离开作用域时释放保护，错误返回和请求取消也遵循相同规则
 pub trait ProxyImportGuard: Send + Sync {}
 
 pub struct ProxyImportReservation {
@@ -82,12 +84,13 @@ pub struct ProxyImportReservation {
 
 #[async_trait]
 pub trait ProxyProbe: Send + Sync {
-    async fn test(&self, proxy: &OutboundProxy, detect_location: bool) -> ProxyTestResult;
-    /// 默认只有基础连通性；具备上游目标探测的实现覆盖此方法。
+    /// 未指定代理时探测服务器直连出口，不继承进程代理环境变量
+    async fn test(&self, proxy: Option<&OutboundProxy>, detect_location: bool) -> ProxyTestResult;
+    /// fork：默认只有基础连通性；具备上游目标探测的实现覆盖此方法。
     /// 质量检测不请求位置识别，已保存的自动位置保持不变。
     async fn quality(&self, proxy: &OutboundProxy) -> ProxyQualityProbe {
         ProxyQualityProbe {
-            base: self.test(proxy, false).await,
+            base: self.test(Some(proxy), false).await,
             items: Vec::new(),
         }
     }

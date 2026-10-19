@@ -1,3 +1,5 @@
+//! 验证 Grok 事件转换的模型、用量、首个输出与完成语义
+
 use gateway_core::error::ProviderError;
 use gateway_core::event::{ContentKind, FinishReason, GatewayEvent, ProviderEvent};
 use gateway_core::operation::{GenerateRequest, ProtocolPayload};
@@ -17,6 +19,7 @@ fn decoder_should_bill_the_sent_model_independently_of_the_response_model() {
         ("grok-4.5", Some("grok-4.3"), None, Some(2_175_000)),
         ("grok-4.5", None, None, Some(2_175_000)),
         ("grok-future", Some("grok-4.5"), None, None),
+        ("grok-latest", Some("grok-4.3"), Some(0), None),
         // fork 双成本：本地计算费用按发送模型独立保留，即使上游已报告真实费用也照常算出，
         // 二者并存（reported 才是结算口径，calculated 供观测/审计）。
         ("grok-4.5", Some("grok-future"), Some(123), Some(2_175_000)),
@@ -45,7 +48,10 @@ fn decoder_should_bill_the_sent_model_independently_of_the_response_model() {
             expected_cost,
             "{sent} -> {returned:?}"
         );
-        assert_eq!(provider_cost_ticks(&facts), reported_cost);
+        assert_eq!(
+            provider_cost_ticks(&facts),
+            reported_cost.filter(|ticks| *ticks > 0)
+        );
         assert_eq!(decoder.response_model(), returned);
         assert!(facts.iter().any(|event| matches!(
             event,
@@ -69,9 +75,27 @@ fn response_model_observation_preserves_raw_model_and_missing_values() {
 fn terminal_cost_events(
     model: &str,
     input_tokens: u64,
-    cached_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
     provider_cost_ticks: Option<u64>,
+) -> Vec<GatewayEvent> {
+    terminal_cost_events_with_pricing(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        provider_cost_ticks,
+        None,
+    )
+}
+
+fn terminal_cost_events_with_pricing(
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    provider_cost_ticks: Option<u64>,
+    pricing: Option<gateway_core::metering::ModelPriceOverride>,
 ) -> Vec<GatewayEvent> {
     let provider_cost = provider_cost_ticks
         .map(|ticks| format!(",\"cost_in_usd_ticks\":{ticks}"))
@@ -81,15 +105,21 @@ fn terminal_cost_events(
             "event: response.created\n",
             "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_cost\",\"model\":{model:?}}}}}\n\n",
             "event: response.completed\n",
-            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_cost\",\"model\":{model:?},\"status\":\"completed\",\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens},\"input_tokens_details\":{{\"cached_tokens\":{cached_tokens},\"cache_write_tokens\":0}}{provider_cost}}}}}}}\n\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_cost\",\"model\":{model:?},\"status\":\"completed\",\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens},\"input_tokens_details\":{{\"cached_tokens\":{cached_input_tokens},\"cache_write_tokens\":0}}{provider_cost}}}}}}}\n\n",
         ),
         model = model,
         input_tokens = input_tokens,
         output_tokens = output_tokens,
-        cached_tokens = cached_tokens,
+        cached_input_tokens = cached_input_tokens,
         provider_cost = provider_cost,
     );
-    decode_canonical(body.as_bytes(), model).expect("canonical cost response")
+    GrokCanonicalDecoder::new(model)
+        .with_pricing(pricing)
+        .push(body.as_bytes())
+        .expect("canonical cost response")
+        .into_iter()
+        .flat_map(|event| event.into_parts().0)
+        .collect()
 }
 
 fn decode_canonical(body: &[u8], upstream_model: &str) -> Result<Vec<GatewayEvent>, ProviderError> {
@@ -172,32 +202,6 @@ fn decoder_should_normalize_text_usage_and_completion() {
         events[5],
         GatewayEvent::Completed(ref meta) if meta.finish_reason() == Some(FinishReason::Stop)
     ));
-}
-
-#[test]
-fn decoder_output_start_should_ignore_preamble_frames() {
-    let mut decoder = GrokCanonicalDecoder::new("fallback");
-    let body = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_os\",\"model\":\"grok-test\"}}\n\n",
-        "event: response.in_progress\n",
-        "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_os\"}}\n\n",
-    );
-    let _ = decoder.push(body.as_bytes()).expect("preamble frames");
-    assert!(!decoder.take_output_start());
-}
-
-#[test]
-fn decoder_output_start_should_count_structural_output_item_added() {
-    let mut decoder = GrokCanonicalDecoder::new("fallback");
-    let body = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_os\",\"model\":\"grok-test\"}}\n\n",
-        "event: response.output_item.added\n",
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
-    );
-    let _ = decoder.push(body.as_bytes()).expect("output start frame");
-    assert!(decoder.take_output_start());
 }
 
 #[test]
@@ -297,17 +301,21 @@ fn decoder_should_price_official_grok_45_build_free_variant() {
 }
 
 #[test]
-fn zero_provider_cost_should_remain_an_authoritative_zero() {
-    let events = terminal_cost_events("grok-4.5", 1, 0, 1, Some(0));
+fn zero_provider_cost_should_use_available_token_pricing() {
+    for (model, calculated) in [("grok-4.5", Some(80_000)), ("grok-future", None)] {
+        let events = terminal_cost_events(model, 1, 0, 1, Some(0));
 
-    // 每百万输入 $2、输出 $6；各一个 Token 的模型计价与真实零费用同时保留。
-    assert_eq!(calculated_cost_ticks(&events), Some(80_000));
-    assert_eq!(provider_cost_ticks(&events), Some(0));
+        assert_eq!(
+            (calculated_cost_ticks(&events), provider_cost_ticks(&events)),
+            (calculated, None),
+            "{model}"
+        );
+    }
 }
 
 #[test]
 fn billing_should_price_grok_46_cache_and_priority_at_the_context_boundary() {
-    // 短、长上下文分别检查普通输入、缓存、输出的单价，Priority 只采用已确认档位。
+    // 短、长上下文分别检查普通输入、缓存、输出的单价，Priority 只采用已确认档位
     for (input, tier, expected) in [
         (199_999, None, ["2", "0.5", "6"]),
         (200_000, None, ["4", "1", "12"]),
@@ -429,7 +437,8 @@ fn billing_should_use_the_final_response_tier_and_preserve_provider_cost() {
         ("priority", None, Some(400_000_000), None),
         ("default", None, Some(200_000_000), None),
         ("future", None, None, None),
-        ("priority", Some(0), Some(400_000_000), Some(0)),
+        ("priority", Some(0), Some(400_000_000), None),
+        // fork 双成本：上游报告真实费用不抹掉本地按发送模型算出的 calculated
         ("priority", Some(123), Some(400_000_000), Some(123)),
     ] {
         let mut response = serde_json::json!({"service_tier": tier, "output": [], "usage": {"input_tokens": 10_000, "output_tokens": 0}});
@@ -455,16 +464,22 @@ fn billing_should_require_provider_totals_for_server_tools() {
         "image_generation_call",
         "future_tool_call",
     ] {
-        let response = serde_json::json!({"output": [{"type": kind, "id": "tool_1", "status": "completed"}], "usage": {"input_tokens": 100, "output_tokens": 1}});
-        assert_eq!(
-            calculated_cost_ticks(&pricing_events(response, None)),
-            None,
-            "{kind}"
-        );
+        for ticks in [None, Some(0)] {
+            let mut response = serde_json::json!({"output": [{"type": kind, "id": "tool_1", "status": "completed"}], "usage": {"input_tokens": 100, "output_tokens": 1}});
+            if let Some(ticks) = ticks {
+                response["usage"]["cost_in_usd_ticks"] = serde_json::json!(ticks);
+            }
+            let events = pricing_events(response, None);
+            assert_eq!(
+                (calculated_cost_ticks(&events), provider_cost_ticks(&events)),
+                (None, None),
+                "{kind}: {ticks:?}"
+            );
+        }
     }
     let request =
         tool_request(serde_json::json!({"input": "查资料", "tools": [{"type": "web_search"}]}));
-    // 工具结果可能被上游省略，允许调用收费工具时不能仅靠空 output 认定没有附加费。
+    // 工具结果可能被上游省略，允许调用收费工具时不能仅靠空 output 认定没有附加费
     let mut response =
         serde_json::json!({"output": [], "usage": {"input_tokens": 100, "output_tokens": 1}});
     assert_eq!(
@@ -472,9 +487,10 @@ fn billing_should_require_provider_totals_for_server_tools() {
         None
     );
     response["usage"]["cost_in_usd_ticks"] = serde_json::json!(0);
+    let events = pricing_events(response, Some(&request));
     assert_eq!(
-        provider_cost_ticks(&pricing_events(response, Some(&request))),
-        Some(0)
+        (calculated_cost_ticks(&events), provider_cost_ticks(&events)),
+        (None, None)
     );
     let response = serde_json::json!({"output": [], "usage": {"input_tokens": 100, "output_tokens": 1, "num_server_side_tool_calls": 1}});
     assert_eq!(calculated_cost_ticks(&pricing_events(response, None)), None);
@@ -524,6 +540,72 @@ fn decoder_should_leave_unpublished_model_pricing_unavailable() {
 }
 
 #[test]
+fn decoder_should_not_price_dynamic_or_compatibility_aliases_as_stable_models() {
+    for model in [
+        "grok",
+        "grok-latest",
+        "grok-build-latest",
+        "grok-4.6-latest",
+        "grok-4.5-latest",
+        "grok-4.3-latest",
+        "grok-code-fast",
+        "grok-4.20-multi-agent-latest",
+        "grok-4.20-beta",
+        "grok-4.20-beta-reasoning",
+        "grok-4.20-beta-non-reasoning",
+        "grok-4.20-reasoning-gv2",
+        "grok-4.20-non-reasoning-gv2",
+        "xai/grok-4.5",
+        "grok-4.7",
+    ] {
+        for reported in [None, Some(0), Some(123)] {
+            let events = terminal_cost_events(model, 100, 25, 10, reported);
+            assert_eq!(
+                calculated_cost_ticks(&events),
+                None,
+                "{model}, reported: {reported:?}"
+            );
+            assert_eq!(
+                provider_cost_ticks(&events),
+                reported.filter(|ticks| *ticks > 0).map(u128::from)
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, GatewayEvent::Completed(_)))
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_alias_pricing_still_applies_when_provider_cost_is_unreported() {
+    let pricing: gateway_core::metering::ModelPriceOverride =
+        serde_json::from_value(serde_json::json!({
+            "multiplierBps":15000,"bands":{"standard":{
+                "input":"3", "output":"12", "cacheRead":"0", "cacheWrite":"0"
+            }}
+        }))
+        .expect("manual price");
+    for reported in [None, Some(0), Some(123)] {
+        let events = terminal_cost_events_with_pricing(
+            "grok-latest",
+            100,
+            20,
+            10,
+            reported,
+            Some(pricing.clone()),
+        );
+        // fork 双费用：上游报告真实费用时本地按自定义计价算出的 calculated 仍保留
+        assert_eq!(calculated_cost_ticks(&events), Some(5_400_000));
+        assert_eq!(
+            provider_cost_ticks(&events),
+            reported.filter(|ticks| *ticks > 0).map(u128::from)
+        );
+    }
+}
+
+#[test]
 fn decoder_should_leave_incomplete_usage_pricing_unavailable() {
     let body = concat!(
         "event: response.created\n",
@@ -568,8 +650,8 @@ fn decoder_should_fail_closed_for_non_integer_provider_cost() {
 
 #[test]
 fn decoder_should_tolerate_content_field_error_without_breaking_stream() {
-    // 内容事件的字段校验失败（此处空 delta）不应打断已开始的客户端流。
-    // 旧行为在此断整条流；修复后跳过该事件的 canonical 提取、wire 原样转发，并继续解出终态。
+    // 内容事件的字段校验失败（此处空 delta）不应打断已开始的客户端流
+    // 旧行为在此断整条流；修复后跳过该事件的 canonical 提取、wire 原样转发，并继续解出终态
     let body = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a3\",\"model\":\"grok-code-test\"}}\n\n",
@@ -581,14 +663,14 @@ fn decoder_should_tolerate_content_field_error_without_breaking_stream() {
     let events = GrokCanonicalDecoder::new("fallback")
         .push(body.as_bytes())
         .expect("content field error must not break the stream");
-    // 空 delta 的 wire 帧仍原样转发给客户端（透明）。
+    // 空 delta 的 wire 帧仍原样转发给客户端（透明）
     assert!(
         wire_events(&events)
             .iter()
             .any(|wire| wire.data().get("delta") == Some(&serde_json::json!(""))),
         "malformed delta wire frame should still be forwarded to the client"
     );
-    // 终态仍被解出。
+    // 终态仍被解出
     let canonical: Vec<GatewayEvent> = events
         .into_iter()
         .flat_map(|event| event.into_parts().0)
@@ -693,6 +775,36 @@ fn decoder_should_restore_namespace_custom_search_and_apply_patch_wire_events() 
             .and_then(|event| event.data().pointer("/response/tools/0/type")),
         Some(&serde_json::json!("namespace"))
     );
+}
+
+#[test]
+fn decoder_should_restore_namespaced_custom_tool_identity_and_raw_input() {
+    use serde_json::json;
+    let request = tool_request(json!({"model":"client", "input":"run",
+        "tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]
+    }));
+    let item = json!({"type":"function_call","id":"fc_exec","call_id":"call_exec","name":"functions__exec","arguments":"{\"input\":\"echo hello\"}"});
+    let body = [
+        json!({"type":"response.created","response":{"id":"resp_exec"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":item}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        json!({"type":"response.completed","response":{"id":"resp_exec","status":"completed","output":[item]}}),
+    ].iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect::<String>();
+    let events = GrokCanonicalDecoder::for_request("grok-4.5", &request)
+        .push(body.as_bytes())
+        .unwrap();
+    let wire = wire_events(&events);
+    let done = wire
+        .iter()
+        .find(|event| event.event_type() == Some("response.output_item.done"))
+        .unwrap();
+    let item = &done.data()["item"];
+    assert_eq!(item["type"], "custom_tool_call");
+    assert_eq!(item["namespace"], "functions");
+    assert_eq!(item["name"], "exec");
+    assert_eq!(item["id"], "ctc_exec");
+    assert_eq!(item["call_id"], "call_exec");
+    assert_eq!(item["input"], "echo hello");
 }
 
 #[test]
@@ -884,7 +996,7 @@ fn decoder_should_reject_custom_arguments_beyond_the_buffer_limit() {
         }).to_string(),
     );
     decoder.push(added.as_bytes()).expect("custom item added");
-    // 分帧累计也必须受限，不能只限制单个 SSE frame。
+    // 分帧累计也必须受限，不能只限制单个 SSE frame
     for size in [1 << 20, 1] {
         let delta = encode_sse_event(
             "response.function_call_arguments.delta",
@@ -1408,20 +1520,38 @@ fn decoder_should_require_terminal_response() {
 }
 
 #[test]
-fn decoder_should_preserve_incomplete_length_reason() {
-    let body = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_short\"}}\n\n",
-        "event: response.incomplete\n",
-        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_short\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
-    );
-    let events = decode_canonical(body.as_bytes(), "fallback").expect("incomplete response");
+fn decoder_should_classify_incomplete_reasons_and_preserve_native_wire() {
+    for (reason, expected) in [
+        ("max_output_tokens", FinishReason::Length),
+        ("max_tokens", FinishReason::Length),
+        ("max_prompt_tokens", FinishReason::Length),
+        ("max_time_limit", FinishReason::Length),
+        ("content_filter", FinishReason::ContentFilter),
+        ("future_reason", FinishReason::Other),
+    ] {
+        let created = serde_json::json!({"type":"response.created","response":{"id":"resp_short"}});
+        let incomplete = serde_json::json!({
+            "type":"response.incomplete",
+            "response":{
+                "id":"resp_short","status":"incomplete",
+                "incomplete_details":{"reason":reason}
+            }
+        });
+        let body = format!("data: {created}\n\ndata: {incomplete}\n\n");
+        let events = GrokCanonicalDecoder::new("fallback")
+            .push(body.as_bytes())
+            .expect("incomplete response");
+        let completed = events
+            .iter()
+            .flat_map(ProviderEvent::canonical_facts)
+            .find_map(|fact| match fact {
+                GatewayEvent::Completed(meta) => meta.finish_reason(),
+                _ => None,
+            });
 
-    assert!(matches!(
-        events.last(),
-        Some(GatewayEvent::Completed(meta))
-            if meta.finish_reason() == Some(FinishReason::Length)
-    ));
+        assert_eq!(completed, Some(expected), "{reason}");
+        assert_eq!(wire_events(&events).last().unwrap().data(), &incomplete);
+    }
 }
 
 #[test]
@@ -1450,6 +1580,10 @@ fn decoder_should_classify_failed_event_without_retaining_body() {
     assert_eq!(visible.message(), "secret");
     assert_eq!(visible.code(), Some("rate_limit_exceeded"));
     assert_eq!(visible.error_type(), Some("server_error"));
+    let raw: serde_json::Value =
+        serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+    assert_eq!(raw["error"]["message"], "secret");
+    assert_eq!(raw["error"]["code"], "rate_limit_exceeded");
     assert!(!format!("{error:?}").contains("secret"));
 }
 

@@ -2,7 +2,7 @@
 
 use gateway_core::engine::ExecutionStore;
 use gateway_core::metering::CalculatedCost;
-use gateway_store::postgres::{ObservabilityRepository as _, PgExecutionStore};
+use gateway_store::postgres::PgExecutionStore;
 use serde_json::{Value, json};
 
 use super::{

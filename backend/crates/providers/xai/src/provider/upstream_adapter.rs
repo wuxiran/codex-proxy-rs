@@ -1,4 +1,4 @@
-//! xAI 已选 OAuth 会话的受管连接；插件不读取令牌或重新选号。
+//! xAI 已选 OAuth 会话的受管连接；插件不读取令牌或重新选号
 
 use super::*;
 use gateway_core::{
@@ -37,6 +37,7 @@ impl GrokBuildProvider {
             session.account_id().clone(),
             UpstreamTransport::new(adapter.transport()).map_err(|_| protocol_not_sent())?,
         )
+        .with_account_snapshot(session.account_snapshot().cloned())
         .with_selection_observation(ProviderSelectionObservation::new(
             selected.account_selection_wait_ms,
             session.capacity_snapshot(),
@@ -57,7 +58,7 @@ impl GrokBuildProvider {
         let mutation = session.allows_account_state_mutation();
         let stream = ProviderStream::new(metadata, events, session);
         Ok(if mutation {
-            // 插件协议或 RPC 故障不能降低原生账号评分；只接纳已解析的上游拒绝事实。
+            // 插件协议或 RPC 故障不能降低原生账号评分；只接纳已解析的上游拒绝事实
             stream.with_filtered_account_feedback(Arc::clone(&self.account_feedback), |error| {
                 error.client_visible_upstream_error().is_some()
             })
@@ -103,8 +104,8 @@ impl UpstreamAccountConnection for SelectedConnection {
             self.model.as_str(),
             usage.input_tokens?,
             usage.output_tokens?,
-            usage.cached_tokens.unwrap_or(0),
-            usage.cache_write_tokens.unwrap_or(0),
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_write_input_tokens.unwrap_or(0),
             tier,
             self.context
                 .pricing()

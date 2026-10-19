@@ -1,8 +1,7 @@
-import type { AccountImportInputMode } from '../components/AccountCreateModal/model'
-import type { AccountImportDocument } from '../utils/accountImport'
+import type { AccountImportInputMode } from '../utils/accountCreate'
 import type { ImportProvider } from '../utils/importDocuments'
-import type { AccountImportTask, getAccounts } from '@/api'
-import { toast } from '@codex-proxy/ui'
+import type { Account, AccountImportTask } from '@/api'
+import { ZNotification } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
 import {
   createAccountImportTask,
@@ -14,40 +13,40 @@ import {
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { errorMessage, generateRequestId } from '@/utils/operation'
 import { formatProviderLabel, isSupportedProvider } from '@/utils/providers'
-import { accountCreateProvider, accountCreateSourceKey, accountImportSettings, accountProxyError, emptyAccountCreateForm } from '../components/AccountCreateModal/model'
-import { accountImportModes } from '../components/AccountCreateModal/presenter'
-import { accountImportDocuments, MAX_ACCOUNT_IMPORT_COUNT } from '../utils/accountImport'
-import { parseImportJson, parseMixedImportDocuments, providerImportDocuments } from '../utils/importDocuments'
+import { accountCreateProvider, accountCreateSourceKey, accountImportModes, accountImportSettings, accountProxyError, emptyAccountCreateForm } from '../utils/accountCreate'
+import { accountImportBatches, accountImportDocuments, mixedImportDocuments } from '../utils/accountImport'
+import { isSub2apiAccountExport, parseImportJson } from '../utils/importDocuments' // fork: sub2api-import
 import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
 import { useAccountAuthorization } from './useAccountAuthorization'
 
-type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-
 export function useAccountOnboarding(options: {
   reload: () => Promise<unknown>
-  onImportTaskCreated: (task: AccountImportTask) => void
+  onImportTaskCreated: (task: AccountImportTask, reveal?: boolean) => void
 }) {
   const createModalOpen = shallowRef(false)
-  const reauthorizingAccount = shallowRef<AccountRow | null>(null)
+  const reauthorizingAccount = shallowRef<Account | null>(null)
   const creatingAccountAction = useAsyncAction()
   const createForm = ref(emptyAccountCreateForm())
   const authorization = useAccountAuthorization(() => finishCreate(reauthorizingAccount.value ? '账号重新授权成功' : '账号已添加'))
-  let submissionId: string | undefined
+  let submissionIds: string[] = []
   watch(createForm, () => {
-    submissionId = undefined
+    submissionIds = []
   }, { deep: true, flush: 'sync' })
 
   const showCreateModal = computed({
     get: () => createModalOpen.value,
     set: (value: boolean) => {
       createModalOpen.value = value
-      if (!value) {
-        authorization.reset()
-        reauthorizingAccount.value = null
-        createForm.value = emptyAccountCreateForm()
-      }
+      if (!value)
+        authorization.cancel()
     },
   })
+
+  function clearCreate() {
+    authorization.reset()
+    reauthorizingAccount.value = null
+    createForm.value = emptyAccountCreateForm()
+  }
 
   function requireImportProvider(provider: string | undefined) {
     if (!provider)
@@ -62,6 +61,7 @@ export function useAccountOnboarding(options: {
       await authorization.complete()
       return
     }
+    let submitted = 0
     await creatingAccountAction.run(async () => {
       const form = createForm.value
       const proxyError = accountProxyError(form)
@@ -90,20 +90,27 @@ export function useAccountOnboarding(options: {
       }
       // fork：批量文件额外识别 Sub2API 账号导出，单平台支持观澜 CDK 兑换。
       const documents = form.source?.kind === 'bundle'
-        ? parseMixedImportDocuments(parseImportJson(form.importTexts.json))
+        ? bundleImportDocuments(form.importTexts.json)
         : await providerImportDocumentsFor(requireImportProvider(provider), mode, form.importTexts[mode])
-      if (documents.length > MAX_ACCOUNT_IMPORT_COUNT)
-        throw new Error(`单次最多导入 ${MAX_ACCOUNT_IMPORT_COUNT} 个条目`)
       for (const document of documents)
         requireImportProvider(document.provider)
-      submissionId ??= generateRequestId()
-      const task = await createAccountImportTask({
-        submissionId,
-        items: documents.map(entry => ({ provider: entry.provider, data: entry.document, settings, outboundProxyId })),
-      })
-      showCreateModal.value = false
-      options.onImportTaskCreated(task)
-      toast.success('导入任务已创建')
+      const batches = accountImportBatches(documents.map(entry => ({ provider: entry.provider, data: entry.document, settings, outboundProxyId })))
+      // 同一输入重试时复用每批标识，恢复丢失响应或部分提交，不重复执行 RT 交换
+      const ids = submissionIds
+      for (const [index, items] of batches.entries()) {
+        const task = await createAccountImportTask({ submissionId: ids[index] ??= generateRequestId(), items })
+        submitted += 1
+        const finished = index === batches.length - 1
+        if (finished)
+          showCreateModal.value = false
+        options.onImportTaskCreated(task, finished)
+      }
+      ZNotification.success({ message: submitted > 1 ? `已创建 ${submitted} 个导入任务` : '导入任务已创建' })
+    }, {
+      onError: () => {
+        if (submitted)
+          ZNotification.warning({ message: '部分导入任务已创建，保持输入不变重试可继续提交' })
+      },
     })
   }
 
@@ -130,7 +137,7 @@ export function useAccountOnboarding(options: {
       })
     }
     catch (cause) {
-      toast.error(errorMessage(cause, '启动授权失败'))
+      ZNotification.error({ message: errorMessage(cause, '启动授权失败') })
     }
   }
 
@@ -141,7 +148,7 @@ export function useAccountOnboarding(options: {
     showCreateModal.value = true
   }
 
-  function openReauthorizeAccount(account: AccountRow) {
+  function openReauthorizeAccount(account: Account) {
     if (isSupportedProvider(account.provider) && account.authenticationKind !== 'oauth')
       return
     authorization.reset()
@@ -153,7 +160,7 @@ export function useAccountOnboarding(options: {
 
   async function finishCreate(message: string) {
     showCreateModal.value = false
-    toast.success(message)
+    ZNotification.success({ message })
     await options.reload()
   }
 
@@ -188,18 +195,29 @@ export function useAccountOnboarding(options: {
     handleAuthorizeOAuth,
     openCreateAccount,
     openReauthorizeAccount,
+    clearCreate,
   }
 }
 
+type ImportDocument = ReturnType<typeof accountImportDocuments>[number]
+
+/** fork：批量文件先识别 Sub2API 账号导出（整份交给 Provider）；其余交给上游解析，含逐账号拆分。 */
+function bundleImportDocuments(text: string): ImportDocument[] {
+  const value = parseImportJson(text)
+  if (isSub2apiAccountExport(value))
+    return [{ provider: 'openai', document: value }]
+  return mixedImportDocuments(text)
+}
+
 /**
- * fork：单平台导入的文档解析。观澜 CDK 先兑换成已签名账号；「账号文件」识别 Sub2API 导出与
- * CPR 多平台导出；AT/RT 等其余模式沿用上游解析。
+ * fork：单平台导入的文档解析。观澜 CDK 先兑换成已签名账号；「账号文件」识别 Sub2API 导出；
+ * CPR 多平台导出与 AT/RT 等其余模式沿用上游解析。
  */
 async function providerImportDocumentsFor(
   provider: ImportProvider,
   mode: AccountImportInputMode,
   value: string,
-): Promise<AccountImportDocument[]> {
+): Promise<ImportDocument[]> {
   if (mode === 'cdk') {
     if (provider !== 'openai')
       throw new Error('观澜 CDK 只能导入 OpenAI 账号')
@@ -207,8 +225,11 @@ async function providerImportDocumentsFor(
     const documents = await redeemGuanlanImport(value)
     return documents.map(document => ({ provider, document }))
   }
-  if (mode === 'json')
-    return providerImportDocuments(parseImportJson(value), provider)
+  if (mode === 'json' && isSub2apiAccountExport(parseImportJson(value))) {
+    if (provider !== 'openai')
+      throw new Error('Sub2API 导出只包含 OpenAI / Codex 账号，请选择 OpenAI')
+    return [{ provider, document: parseImportJson(value) }]
+  }
   return accountImportDocuments(provider, mode, value)
 }
 

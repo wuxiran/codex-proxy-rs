@@ -1,3 +1,5 @@
+//! 账号出站代理管理的 HTTP 请求校验、路由与展示投影
+
 use crate::auth::SessionState;
 
 use axum::{
@@ -8,14 +10,13 @@ use axum::{
     routing::{get, post},
 };
 use gateway_admin::model::{
-    PageSize, Revision,
+    AdminError as ServiceError, PageSize, Revision,
     proxies::{
-        MAX_PROXY_BATCH_ITEMS, NewProxy, ProxyAccountListQuery, ProxyBatchDeleteItem,
-        ProxyBatchSkip, ProxyExitGeo, ProxyListQuery, ProxyMutation, ProxyQualityReport,
-        ProxyQualitySnapshot, ProxyRecord, ProxyTestResult, UpdateProxy,
+        NewProxy, ProxyAccountListQuery, ProxyBatchDeleteItem, ProxyBatchResult, ProxyBatchSkip,
+        ProxyExitGeo, ProxyListQuery, ProxyMutation, ProxyQualityReport, ProxyQualitySnapshot,
+        ProxyRecord, ProxyTestResult, TestProxy, UpdateProxy,
     },
 };
-use gateway_core::account::OutboundProxy;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -51,6 +52,8 @@ struct RemoveAccountRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateRequest {
     #[serde(default)]
+    max_websocket_connections: u32,
+    #[serde(default)]
     auto_location: bool,
     location: Option<gateway_core::account::RequestLocation>,
     name: String,
@@ -60,6 +63,8 @@ struct CreateRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateRequest {
+    max_websocket_connections: Option<u32>,
+    enabled: Option<bool>,
     auto_location: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_location_update")]
     location: Option<Option<gateway_core::account::RequestLocation>>,
@@ -102,32 +107,21 @@ struct ProbeRequest {
     proxy_url: AccountProxyUpdate,
 }
 
+// fork: proxy quality
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QualityReportQuery {
     id: String,
 }
 
-// 批量条目逐条解析：一条地址不合法只跳过该条，不让整批 422。
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BatchCreateItem {
-    name: Option<String>,
-    proxy_url: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BatchCreateRequest {
-    items: Vec<BatchCreateItem>,
-}
-
+// fork: proxy batch —— 批量删除；批量添加已由上游 /proxies/create 的数组请求覆盖
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BatchDeleteRequest {
     items: Vec<IdRequest>,
 }
 
+// fork: proxy quality —— 出口地理
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExitGeoView {
@@ -155,12 +149,13 @@ struct ProxyTestView {
     success: bool,
     latency_ms: u64,
     exit_ip: Option<String>,
-    exit_geo: Option<ExitGeoView>,
+    exit_geo: Option<ExitGeoView>, // fork: proxy quality
     exit_ipv4: Option<String>,
     exit_ipv6: Option<String>,
     message: String,
 }
 
+// fork: proxy quality
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QualitySnapshotView {
@@ -284,6 +279,8 @@ struct ProxyAccountView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyView {
+    max_websocket_connections: u32,
+    enabled: bool,
     auto_location: bool,
     detected_location: Option<gateway_admin::model::proxies::DetectedProxyLocation>,
     location: Option<gateway_core::account::RequestLocation>,
@@ -294,17 +291,22 @@ struct ProxyView {
     revision: u64,
     account_count: u64,
     last_test_at: Option<String>,
+    last_test_at_display: Option<String>,
     last_test: Option<ProxyTestView>,
-    quality: Option<QualitySnapshotView>,
+    quality: Option<QualitySnapshotView>, // fork: proxy quality
     created_at: String,
+    created_at_display: String,
     updated_at: String,
+    updated_at_display: String,
 }
 
-impl From<ProxyRecord> for ProxyView {
-    fn from(record: ProxyRecord) -> Self {
+impl From<(ProxyRecord, crate::time::TimePresenter)> for ProxyView {
+    fn from((record, time): (ProxyRecord, crate::time::TimePresenter)) -> Self {
         let endpoint = record.proxy.endpoint();
         Self {
             auto_location: record.auto_location,
+            max_websocket_connections: record.proxy.max_websocket_connections(),
+            enabled: record.enabled,
             detected_location: record.detected_location,
             location: record.location,
             id: record.id,
@@ -313,10 +315,16 @@ impl From<ProxyRecord> for ProxyView {
             endpoint,
             revision: record.revision.get(),
             account_count: record.account_count,
+            last_test_at_display: record
+                .last_test_at
+                .as_ref()
+                .map(|value| time.datetime(value)),
             last_test_at: record.last_test_at.map(|at| at.to_rfc3339()),
             last_test: record.last_test.map(Into::into),
-            quality: record.quality.map(Into::into),
+            quality: record.quality.map(Into::into), // fork: proxy quality
+            created_at_display: time.datetime(&record.created_at),
             created_at: record.created_at.to_rfc3339(),
+            updated_at_display: time.datetime(&record.updated_at),
             updated_at: record.updated_at.to_rfc3339(),
         }
     }
@@ -341,10 +349,10 @@ struct MutationView {
     config_revision: u64,
 }
 
-impl From<ProxyMutation> for MutationView {
-    fn from(value: ProxyMutation) -> Self {
+impl From<(ProxyMutation, crate::time::TimePresenter)> for MutationView {
+    fn from((value, time): (ProxyMutation, crate::time::TimePresenter)) -> Self {
         Self {
-            record: value.record.into(),
+            record: ProxyView::from((value.record, time)),
             config_revision: value.config_revision.get(),
         }
     }
@@ -366,12 +374,12 @@ where
         .route("/api/admin/proxies/delete", post(delete::<S>))
         .route("/api/admin/proxies/test", post(test::<S>))
         .route("/api/admin/proxies/probe", post(probe::<S>))
+        // fork: proxy quality / proxy batch
         .route("/api/admin/proxies/quality-check", post(quality_check::<S>))
         .route(
             "/api/admin/proxies/quality-report",
             get(quality_report::<S>),
         )
-        .route("/api/admin/proxies/batch-create", post(batch_create::<S>))
         .route("/api/admin/proxies/batch-delete", post(batch_delete::<S>))
 }
 
@@ -394,6 +402,7 @@ async fn list<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let result = state
         .admin_services()
         .proxies()
@@ -409,7 +418,11 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(ProxyPageView {
-            items: result.items.into_iter().map(Into::into).collect(),
+            items: result
+                .items
+                .into_iter()
+                .map(|value| ProxyView::from((value, time)))
+                .collect(),
             page: PageMeta::new(
                 result.page,
                 u32::from(result.page_size),
@@ -458,12 +471,7 @@ where
                     groups: account
                         .groups
                         .into_iter()
-                        .map(|group| AccountGroupRefView {
-                            id: group.id.to_string(),
-                            name: group.name,
-                            color: group.color.as_str().to_owned(),
-                            enabled: group.enabled,
-                        })
+                        .map(AccountGroupRefView::from)
                         .collect(),
                     enabled: account.enabled,
                 })
@@ -478,37 +486,88 @@ where
     ))
 }
 
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+enum BatchView<T> {
+    Succeeded {
+        data: T,
+    },
+    Failed {
+        #[serde(rename = "httpStatus")]
+        http_status: u16,
+        #[serde(flatten)]
+        error: super::wire::AdminErrorBody,
+    },
+    Skipped,
+}
+
+fn batch_response<T, V: Serialize>(
+    results: Vec<ProxyBatchResult<T>>,
+    project: impl Fn(T) -> V,
+) -> axum::response::Response {
+    let diagnostic = results.iter().find_map(|result| match result {
+        ProxyBatchResult::Completed(Err(error)) if error.error_details().is_some() => {
+            Some(error.clone())
+        }
+        _ => None,
+    });
+    let items: Vec<BatchView<V>> = results
+        .into_iter()
+        .map(|result| match result {
+            ProxyBatchResult::Completed(Ok(value)) => BatchView::Succeeded {
+                data: project(value),
+            },
+            ProxyBatchResult::Completed(Err(error)) => {
+                let (http_status, error) = map_error(error).into_batch_error();
+                BatchView::Failed { http_status, error }
+            }
+            ProxyBatchResult::Skipped => BatchView::Skipped,
+        })
+        .collect();
+    let mut response = AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(items)).into_response();
+    if let Some(diagnostic) = diagnostic {
+        response.extensions_mut().insert(diagnostic);
+    }
+    response
+}
+
 async fn create<S>(
     auth: AdminAuth,
     State(state): State<S>,
-    AdminJson(request): AdminJson<CreateRequest>,
+    AdminJson(requests): AdminJson<Vec<serde_json::Value>>,
 ) -> Result<impl IntoResponse, AdminError>
 where
     S: SessionState + Send + Sync,
 {
-    let proxy = request
-        .proxy_url
-        .0
-        .ok_or_else(|| AdminError::bad_request("代理 URL 不能为空"))?;
-    let result = state
-        .admin_services()
-        .proxies()
-        .create(
-            NewProxy {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
+    let commands = requests
+        .into_iter()
+        .map(|value| {
+            // 每项单独解码，格式错误只拒绝当前项，错误文案不能回显代理认证
+            let request: CreateRequest = serde_json::from_value(value)
+                .map_err(|_| ServiceError::invalid("代理参数格式不正确"))?;
+            let proxy = request
+                .proxy_url
+                .0
+                .ok_or_else(|| ServiceError::invalid("代理 URL 不能为空"))?;
+            Ok(NewProxy {
                 auto_location: request.auto_location,
                 test: None,
                 location: request.location,
                 name: request.name,
-                proxy,
-            },
-            &auth.context().mutation_context(),
-        )
+                proxy: proxy.with_max_websocket_connections(request.max_websocket_connections),
+            })
+        })
+        .collect();
+    let results = state
+        .admin_services()
+        .proxies()
+        .create_batch(commands, &auth.context().mutation_context())
         .await
         .map_err(map_error)?;
-    Ok(AdminResponse::new(
-        StatusCode::CREATED,
-        AdminEnvelope::ok(MutationView::from(result)),
-    ))
+    Ok(batch_response(results, |value| {
+        MutationView::from((value, time))
+    }))
 }
 
 async fn remove_account<S>(
@@ -543,6 +602,7 @@ async fn update<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let proxy = request
         .proxy_url
         .map(|value| {
@@ -556,6 +616,8 @@ where
         .proxies()
         .update(
             UpdateProxy {
+                max_websocket_connections: request.max_websocket_connections,
+                enabled: request.enabled,
                 auto_location: request.auto_location,
                 test: None,
                 location: request.location,
@@ -570,7 +632,7 @@ where
         .map_err(map_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(MutationView::from(result)),
+        AdminEnvelope::ok(MutationView::from((result, time))),
     ))
 }
 
@@ -613,7 +675,7 @@ where
     let result = state
         .admin_services()
         .proxies()
-        .probe(&proxy, request.detect_location)
+        .probe(Some(&proxy), request.detect_location)
         .await
         .map_err(map_error)?;
     Ok(AdminResponse::new(
@@ -625,28 +687,37 @@ where
 async fn test<S>(
     auth: AdminAuth,
     State(state): State<S>,
-    AdminJson(request): AdminJson<TestRequest>,
+    AdminJson(requests): AdminJson<Vec<serde_json::Value>>,
 ) -> Result<impl IntoResponse, AdminError>
 where
     S: SessionState + Send + Sync,
 {
-    let result = state
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
+    let commands = requests
+        .into_iter()
+        .map(|value| {
+            let request: TestRequest = serde_json::from_value(value)
+                .map_err(|_| ServiceError::invalid("代理参数格式不正确"))?;
+            Ok(TestProxy {
+                id: request.id,
+                revision: revision(request.revision)
+                    .map_err(|error| ServiceError::invalid(error.to_string()))?,
+                detect_location: request.detect_location,
+            })
+        })
+        .collect();
+    let results = state
         .admin_services()
         .proxies()
-        .test(
-            &request.id,
-            revision(request.revision)?,
-            request.detect_location,
-            &auth.context().mutation_context(),
-        )
+        .test_batch(commands, &auth.context().mutation_context())
         .await
         .map_err(map_error)?;
-    Ok(AdminResponse::new(
-        StatusCode::OK,
-        AdminEnvelope::ok(ProxyView::from(result)),
-    ))
+    Ok(batch_response(results, |value| {
+        ProxyView::from((value, time))
+    }))
 }
 
+// fork: proxy quality
 async fn quality_check<S>(
     auth: AdminAuth,
     State(state): State<S>,
@@ -655,6 +726,7 @@ async fn quality_check<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let result = state
         .admin_services()
         .proxies()
@@ -668,7 +740,7 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(serde_json::json!({
-            "record": ProxyView::from(result.record),
+            "record": ProxyView::from((result.record, time)),
             "report": QualityReportView::from(result.report),
         })),
     ))
@@ -696,74 +768,7 @@ where
     ))
 }
 
-/// 名称缺省为脱敏端点的 `host:port`，与单条添加时用户通常的命名一致。
-fn default_batch_name(proxy: &OutboundProxy) -> String {
-    let endpoint = proxy.endpoint();
-    endpoint
-        .split_once("://")
-        .map_or(endpoint.as_str(), |(_, rest)| rest)
-        .trim_end_matches('/')
-        .chars()
-        .take(100)
-        .collect()
-}
-
-async fn batch_create<S>(
-    auth: AdminAuth,
-    State(state): State<S>,
-    AdminJson(request): AdminJson<BatchCreateRequest>,
-) -> Result<impl IntoResponse, AdminError>
-where
-    S: SessionState + Send + Sync,
-{
-    if request.items.is_empty() || request.items.len() > MAX_PROXY_BATCH_ITEMS {
-        return Err(AdminError::bad_request("批量添加需要 1 至 200 条代理"));
-    }
-    let mut commands = Vec::new();
-    let mut skipped = Vec::new();
-    for (index, item) in request.items.into_iter().enumerate() {
-        // 解析失败的原文可能带凭据，只回报行号。
-        match OutboundProxy::parse(item.proxy_url.trim()) {
-            Ok(proxy) => commands.push(NewProxy {
-                // 批量添加沿用 fork 语义：手动地区模式，出口地理由后续探测回填。
-                auto_location: false,
-                test: None,
-                location: None,
-                name: item
-                    .name
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| default_batch_name(&proxy)),
-                proxy,
-            }),
-            Err(_) => skipped.push(BatchSkipView {
-                reference: format!("第 {} 条", index + 1),
-                reason: "代理地址不合法".to_owned(),
-            }),
-        }
-    }
-    let mut created = Vec::new();
-    let mut config_revision = None;
-    if !commands.is_empty() {
-        let result = state
-            .admin_services()
-            .proxies()
-            .create_batch(commands, &auth.context().mutation_context())
-            .await
-            .map_err(map_error)?;
-        created = result.created.into_iter().map(ProxyView::from).collect();
-        skipped.extend(result.skipped.into_iter().map(BatchSkipView::from));
-        config_revision = result.config_revision.map(|revision| revision.get());
-    }
-    Ok(AdminResponse::new(
-        StatusCode::OK,
-        AdminEnvelope::ok(serde_json::json!({
-            "created": created,
-            "skipped": skipped,
-            "configRevision": config_revision,
-        })),
-    ))
-}
-
+// fork: proxy batch
 async fn batch_delete<S>(
     auth: AdminAuth,
     State(state): State<S>,

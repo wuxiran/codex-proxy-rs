@@ -1,3 +1,5 @@
+//! 验证 xAI 管理能力、账号清理与后台目录任务的组装和错误处理
+
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
@@ -85,6 +87,7 @@ async fn account_unavailable_clears_real_selector_cooldowns_only_for_deleted_acc
         cooldowns.clone(),
         Arc::new(TestRuntimePolicy),
         Arc::new(TestOAuthPending::default()),
+        Arc::new(RecordingDiagnostics::default()),
     );
     let repository = GrokCredentialRepository::new(store.clone());
     let selector = GrokAccountSessionSelector::new(
@@ -117,7 +120,7 @@ async fn account_unavailable_clears_real_selector_cooldowns_only_for_deleted_acc
             (),
         )
         .unwrap();
-        // cooldown 必须来自生产 selector 对真实反馈类型的处理，不能由 mock 手工伪造。
+        // cooldown 必须来自生产 selector 对真实反馈类型的处理，不能由 mock 手工伪造
         selector
             .record_failure(
                 &session,
@@ -189,7 +192,9 @@ async fn xai_quota_catalog_worker_treats_empty_account_pool_as_idle() {
         .await
         .expect("xAI bundle");
 
-    assert_eq!(run_quota_catalog_cycle(&mut bundle).await, Ok(()));
+    run_quota_catalog_cycle(&mut bundle)
+        .await
+        .expect("idle quota cycle");
 }
 
 #[tokio::test]
@@ -207,6 +212,67 @@ async fn xai_quota_catalog_worker_preserves_store_failures() {
         .await
         .expect_err("Provider account Store failure");
     assert_eq!(error.as_safe_str(), "xAI Provider accounts unavailable");
+}
+
+#[tokio::test]
+async fn xai_quota_catalog_worker_retains_both_failure_stages_and_finishes_the_batch() {
+    for refresh_due in [true, false] {
+        let store = MemoryProviderAccountStore::shared();
+        for suffix in ["broken_one", "broken_two"] {
+            let input = create_input(suffix, "synthetic-subject");
+            let mut account = crate::support::prepare_input(&input).unwrap();
+            // 模拟历史持久化凭据损坏，额度与目录读取均应保留各自的失败分类
+            account.credential = gateway_core::account::PlaintextCredential::new(Map::new());
+            let revision = account.account.revision();
+            store.create_account(account).await.unwrap();
+            if refresh_due {
+                store
+                    .apply_quota_access(gateway_core::account::QuotaAccessChange {
+                        account_id: input.account_id,
+                        expected_revision: revision,
+                        state: gateway_core::account::QuotaState::exhausted(
+                            gateway_core::account::QuotaEvidence::ProviderDenied,
+                            SystemTime::UNIX_EPOCH,
+                            None,
+                        ),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut bundle = provider_xai::initialize(provider_ports_with(
+            store,
+            Arc::new(TestOAuthPending::default()),
+        ))
+        .await
+        .unwrap();
+
+        let error = run_quota_catalog_cycle(&mut bundle)
+            .await
+            .expect_err("invalid stored credentials");
+        assert_eq!(
+            error.as_safe_str(),
+            "xAI quota or catalog synchronization failed"
+        );
+        let details = error.error_details().expect("synchronization causes");
+        let details: Value = serde_json::from_str(details.as_str()).unwrap();
+        let cause = details["causes"]["messages"][0].as_str().unwrap();
+        assert!(
+            cause.contains("catalog error: Grok provider account store is unavailable"),
+            "{cause}"
+        );
+        if refresh_due {
+            assert!(cause.contains("quota failures=2"), "{cause}");
+            assert!(
+                cause
+                    .contains("first quota error: xAI quota credential or billing data is invalid"),
+                "{cause}"
+            );
+        } else {
+            assert!(cause.contains("quota failures=0"), "{cause}");
+            assert!(!cause.contains("first quota error"), "{cause}");
+        }
+    }
 }
 
 async fn run_quota_catalog_cycle(
@@ -257,8 +323,8 @@ async fn xai_admin_provider_validates_known_billing_breakdown() {
             service_tier: None,
             input_tokens: Some(100),
             output_tokens: Some(10),
-            cached_tokens: Some(25),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(25),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "0.0002175".parse().expect("amount"),
@@ -277,8 +343,8 @@ async fn xai_admin_provider_validates_known_billing_breakdown() {
             service_tier: Some("priority".to_owned()),
             input_tokens: Some(100),
             output_tokens: Some(10),
-            cached_tokens: Some(20),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(20),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "0.00046".parse().expect("amount"),
@@ -304,8 +370,8 @@ async fn xai_legacy_billing_should_not_infer_long_context_flag() {
             service_tier: None,
             input_tokens: Some(200_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "0.8".parse().expect("stored total"),
@@ -480,7 +546,12 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
             quota: OpaqueProviderData::new(
                 serde_json::from_value(serde_json::json!({
                     "subscriptionTier": "Free",
-                    "config": {}
+                    "config": {
+                        "creditUsagePercent": 25,
+                        "onDemandCap": {"val": 500},
+                        "onDemandUsed": {"val": 100},
+                        "prepaidBalance": {"val": -500}
+                    }
                 }))
                 .expect("quota document"),
             ),
@@ -498,6 +569,19 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
         .await
         .expect("cached subscription");
     assert_eq!(quota.plan_type.as_deref(), Some("Free"));
+    assert_eq!(quota.windows.len(), 1);
+    assert_eq!(quota.windows[0].used_percent, Some(25.0));
+    let window_data = quota.windows[0]
+        .provider_data
+        .as_ref()
+        .expect("quota details")
+        .expose_to_provider()
+        .expose_to_provider();
+    assert_eq!(window_data["onDemandCapCents"], 500);
+    assert_eq!(window_data["onDemandUsedCents"], 100);
+    assert_eq!(window_data["prepaidBalanceCents"], -500);
+    assert!(!window_data.contains_key("monthlyLimitCents"));
+    assert!(!window_data.contains_key("includedUsedCents"));
     let models = admin
         .models(account.id(), false)
         .await
@@ -648,12 +732,14 @@ fn provider_ports_with_catalog(
         Arc::new(TestCooldown),
         Arc::new(TestRuntimePolicy),
         pending,
+        Arc::new(RecordingDiagnostics::default()),
     )
 }
 
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        outbound_proxy_enabled: true,
         notes: None,
         model_access: Default::default(),
         outbound_proxy: None,
@@ -691,6 +777,7 @@ impl ProviderLeasePort for TestLeases {
         _: &'a gateway_core::policy::ClientApiKeyId,
         _: &'a gateway_core::routing::ProviderKind,
         accounts: &'a [ProviderAccountId],
+        _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> BoxFuture<
         'a,
         Result<gateway_core::provider_ports::ProviderSchedulingState, ProviderStoreError>,
@@ -1104,7 +1191,7 @@ mod errors {
             }
             seed_input(&store, &input).await.unwrap();
             if expired {
-                // 新导入不接受已过期凭据；等待合法存入的短期凭据自然过期，验证历史账号刷新。
+                // 新导入不接受已过期凭据；等待合法存入的短期凭据自然过期，验证历史账号刷新
                 let remaining = input.account.refresh_token_expires_at.unwrap() - Utc::now();
                 tokio::time::sleep(
                     remaining.to_std().unwrap_or_default() + Duration::from_millis(10),
@@ -1152,7 +1239,7 @@ mod errors {
         let store = MemoryProviderAccountStore::shared();
         let input = create_input("refresh_busy", "synthetic-subject");
         seed_input(&store, &input).await.unwrap();
-        // 账号使用出站代理时不提前准备直连 discovery；占用失败不得触发任何代理请求。
+        // 账号使用出站代理时不提前准备直连 discovery；占用失败不得触发任何代理请求
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let proxy =
@@ -1172,6 +1259,7 @@ mod errors {
             Arc::new(TestCooldown),
             Arc::new(TestRuntimePolicy),
             Arc::new(TestOAuthPending::default()),
+            Arc::new(RecordingDiagnostics::default()),
         );
         let bundle = provider_xai::initialize(ports).await.unwrap();
         let error = bundle
@@ -1230,6 +1318,7 @@ mod errors {
             _: &'a ClientApiKeyId,
             _: &'a ProviderKind,
             _: &'a [ProviderAccountId],
+            _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
         ) -> BoxFuture<
             'a,
             Result<gateway_core::provider_ports::ProviderSchedulingState, ProviderStoreError>,
@@ -1282,4 +1371,40 @@ async fn client_profile_preview_and_dashboard_use_saved_configuration() {
     );
     assert!(dashboard.release.is_none());
     assert!(dashboard.verified_at.is_none());
+}
+
+#[derive(Default)]
+struct RecordingDiagnostics(std::sync::Mutex<Vec<gateway_core::diagnostics::OperationalFailure>>);
+#[async_trait::async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        self.0.lock().unwrap().push(failure);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn usage_quote_reuses_native_priority_prices() {
+    use gateway_admin::ports::provider::ProviderUsagePricingInput;
+    use gateway_core::metering::Usage;
+    let bundle = provider_xai::initialize(provider_ports()).await.unwrap();
+    let admin = bundle.admin_provider();
+    let input = ProviderUsagePricingInput {
+        upstream_model_id: "grok-4.5".into(),
+        service_tier: Some("priority".into()),
+        usage: Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cached_input_tokens: Some(25),
+            cache_write_input_tokens: Some(0),
+            image_input_tokens: Some(0),
+            image_output_tokens: Some(0),
+            ..Default::default()
+        },
+    };
+    let price = admin.evaluate_usage_pricing(&input, None).unwrap().unwrap();
+    assert_eq!(price.total_amount().amount().canonical(), "0.000435");
 }

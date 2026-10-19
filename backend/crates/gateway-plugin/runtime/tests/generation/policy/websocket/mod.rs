@@ -1,5 +1,7 @@
+//! 验证真实插件 WebSocket 消息转发、改写与控制消息处理
+
 use super::*;
-use gateway_core::middleware::{compose, websocket as core};
+use gateway_core::{engine::middleware::websocket as core, middleware::compose};
 
 #[derive(Default)]
 struct Sender(std::sync::Mutex<Vec<core::Message>>);
@@ -44,12 +46,16 @@ async fn websocket_plugin(
     )
     .await;
     let generation = prepare(&runtime).await;
-    let plan = runtime.middleware_registry().resolve(&generation).unwrap();
+    let plan = runtime
+        .execution_registry()
+        .middleware(&generation)
+        .unwrap();
     assert!(plan.has_websocket());
     (cache, runtime, generation, plan)
 }
 fn context(direction: core::Direction, sender: Arc<Sender>) -> core::Context {
     core::Context {
+        extensions: Default::default(),
         plan: None,
         connection_id: "ws-fixture".into(),
         direction,

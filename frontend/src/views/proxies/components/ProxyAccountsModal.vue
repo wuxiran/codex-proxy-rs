@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { OutboundProxyAccount, OutboundProxyRecord } from '@/api'
-import { BaseConfirmModal, BaseIconButton, BaseInput, BaseModal, BaseTable, BaseTablePagination, defineTableColumns } from '@codex-proxy/ui'
+import { defineTableColumns, ZConfirmDialog, ZDialog, ZIconButton, ZInput, ZPagination, ZTable } from '@codex-proxy/ui'
 import { Search, Unlink } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
+import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
-import AccountPlanBadge from '@/views/accounts/components/AccountPlanBadge.vue'
-import { stablePresetVisualToneClass } from '@/views/accounts/utils/visualTone'
+import { stablePresetVisualToneClass } from '@/utils/color'
 import { useProxyAccounts } from '../composables/useProxyAccounts'
 
 const props = defineProps<{
@@ -15,13 +15,8 @@ const props = defineProps<{
 const emit = defineEmits<{ removed: [] }>()
 const open = defineModel<boolean>({ required: true })
 const pendingRemove = shallowRef<OutboundProxyAccount | null>(null)
-const showRemove = computed({
-  get: () => pendingRemove.value !== null,
-  set: (value: boolean) => {
-    if (!value)
-      pendingRemove.value = null
-  },
-})
+const showRemove = shallowRef(false)
+const removeProxyName = shallowRef('')
 const { accounts, loading, error, pagination, search, setPage, setPageSize, removing, removeAccount } = useProxyAccounts({
   isOpen: () => open.value,
   proxyId: () => props.proxy?.id,
@@ -57,24 +52,30 @@ const tableHeight = computed(() => {
 
 async function confirmRemove() {
   const account = pendingRemove.value
-  if (account && await removeAccount(account.id))
-    pendingRemove.value = null
+  if (showRemove.value && account && await removeAccount(account.id))
+    showRemove.value = false
+}
+
+function requestRemove(account: OutboundProxyAccount) {
+  pendingRemove.value = account
+  removeProxyName.value = props.proxy?.name ?? ''
+  showRemove.value = true
 }
 
 watch([open, () => props.proxy?.id], () => {
-  pendingRemove.value = null
+  showRemove.value = false
 })
 </script>
 
 <template>
-  <BaseModal v-model="open" title="关联账号" :description="description" size="lg" :dismissible="!removing">
+  <ZDialog v-model="open" title="关联账号" :description="description" width="48rem" :show-close="!removing" :close-on-click-modal="!removing" :close-on-press-escape="!removing">
     <div class="flex min-h-0 flex-col">
-      <BaseInput v-model="search" class="mb-4 shrink-0 sm:w-80" :disabled="removing" aria-label="搜索关联账号" placeholder="搜索账号名称或邮箱...">
+      <ZInput v-model="search" class="mb-4 shrink-0 sm:w-80" :disabled="removing" aria-label="搜索关联账号" placeholder="搜索账号名称或邮箱...">
         <template #prefix>
           <Search class="size-4.5 text-cp-text-tertiary" />
         </template>
-      </BaseInput>
-      <BaseTable :key="proxy?.id" class="min-h-0 shrink-0 [--cp-table-row-height:64px]" :style="{ height: tableHeight }" :columns="columns" :rows="rows" :loading="loading" :empty-text="emptyText">
+      </ZInput>
+      <ZTable :key="proxy?.id" class="min-h-0 shrink-0 [--cp-table-row-height:64px]" :style="{ height: tableHeight }" :columns="columns" :data="rows" :loading="loading" :empty-text="emptyText">
         <template #identity="{ row }">
           <div class="flex min-w-0 items-center gap-3">
             <span class="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-cp font-extrabold" :class="row.avatarTone" aria-hidden="true">
@@ -103,23 +104,23 @@ watch([open, () => props.proxy?.id], () => {
           </div>
         </template>
         <template #actions="{ row }">
-          <BaseIconButton
-            size="sm"
-            label="从当前代理移除账号"
+          <ZIconButton
+            size="small"
+            aria-label="从当前代理移除账号"
             :disabled="removing"
             :loading="removing && pendingRemove?.id === row.id"
-            @click="pendingRemove = row"
+            @click="requestRemove(row)"
           >
             <Unlink class="size-3.5 text-cp-error" />
-          </BaseIconButton>
+          </ZIconButton>
         </template>
-      </BaseTable>
-      <BaseTablePagination :pagination="pagination" :loading="loading || removing" @page-change="setPage" @page-size-change="setPageSize" />
+      </ZTable>
+      <ZPagination v-bind="pagination" :disabled="loading || removing" @current-change="setPage" @size-change="setPageSize" />
     </div>
-  </BaseModal>
-  <BaseConfirmModal v-model="showRemove" title="移除关联账号" confirm-text="移除" :loading="removing" @confirm="confirmRemove">
-    <p class="m-0 break-words">
-      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连
+  </ZDialog>
+  <ZConfirmDialog v-model="showRemove" title="移除关联账号" confirm-text="移除" :loading="removing" @confirm="confirmRemove">
+    <p class="m-0 wrap-break-word">
+      将“{{ pendingRemove?.name }}”从“{{ removeProxyName }}”移除后，该账号将改为直连
     </p>
-  </BaseConfirmModal>
+  </ZConfirmDialog>
 </template>

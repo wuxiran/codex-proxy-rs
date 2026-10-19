@@ -1,19 +1,19 @@
-//! 管理控制面所需的持久化能力。
+//! 管理控制面所需的持久化能力
 //!
-//! 端口按业务资源拆分，方法使用领域模型，不暴露连接池、事务或 Redis client。
+//! 端口按业务资源拆分，方法使用领域模型，不暴露连接池、事务或 Redis client
 
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::stream::BoxStream;
 
 use super::backup::BackupStorePorts;
 use crate::model::{
     MutationContext, Revision,
     account_groups::{
-        AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-        DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled, UpdateAccountGroup,
+        AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+        AccountGroupOptionsPage, AccountGroupPage, DeleteAccountGroup, NewAccountGroup,
+        SetAccountGroupEnabled, UpdateAccountGroup,
     },
     accounts::{
         AccountListQuery, AccountPage, AccountPageItem, AccountRuntimeSnapshot,
@@ -27,9 +27,10 @@ use crate::model::{
         UpdateClientKey, UpdateClientKeyBudgetLimits,
     },
     observability::{
-        DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticsObservation,
-        OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageCalculatedBillingFact,
-        UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+        DashboardObservation, DashboardQuery, DiagnosticDimension, DiagnosticsObservation,
+        Granularity, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
+        UsageBillingProjection, UsageCalculatedBillingFact, UsageDetail, UsageFilter,
+        UsageInsightsObservation, UsageOverview, UsagePage, UsageQuery,
     },
     provider_credentials::{
         AuthorizationCommit, CredentialDetails, CredentialImportCommit, CredentialImportResult,
@@ -40,7 +41,7 @@ use crate::model::{
     settings::{AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings},
 };
 
-/// 管理端可判定的持久化失败类型。
+/// 管理端可判定的持久化失败类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminStoreErrorKind {
     Invalid,
@@ -51,13 +52,14 @@ pub enum AdminStoreErrorKind {
     Unavailable,
 }
 
-/// 隐藏数据库实现细节的持久化错误。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// 隐藏数据库实现细节的持久化错误
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{resource} store operation failed: {message}")]
 pub struct AdminStoreError {
     kind: AdminStoreErrorKind,
     resource: &'static str,
     message: String,
+    source: Option<gateway_core::error::ErrorSource>,
 }
 
 impl AdminStoreError {
@@ -71,7 +73,25 @@ impl AdminStoreError {
             kind,
             resource,
             message: message.into(),
+            source: None,
         }
+    }
+
+    /// 来源留在内部诊断链，公开消息不展开基础设施错误
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<gateway_core::error::ErrorSource>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// 清理失败不覆盖最初操作的分类与原因
+    #[must_use]
+    pub fn with_cleanup(mut self, cleanup: impl Into<gateway_core::error::ErrorSource>) -> Self {
+        self.source = Some(gateway_core::error::ErrorSource::cleanup(
+            self.source.take(),
+            cleanup,
+        ));
+        self
     }
 
     #[must_use]
@@ -87,10 +107,12 @@ impl AdminStoreError {
 
 pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
 
-/// 账号目录与公共账号写操作。
+/// 账号目录与公共账号写操作
 #[async_trait]
-pub trait AccountStore: Send + Sync {
-    /// 插件回调按授权 Provider/账号在数据库过滤后做稳定 cursor 分页。
+pub trait AccountStore:
+    super::reset_credit_automation::ResetCreditAutomationStore + Send + Sync
+{
+    /// 插件回调按授权 Provider/账号在数据库过滤后做稳定 cursor 分页
     async fn list_plugin_accounts(
         &self,
         query: PluginAccountListQuery,
@@ -108,6 +130,8 @@ pub trait AccountStore: Send + Sync {
         runtime: AccountRuntimeSnapshot,
     ) -> AdminStoreResult<Option<AccountPageItem>>;
 
+    async fn account_exists(&self, account_id: &str) -> AdminStoreResult<bool>;
+
     async fn load_account_usage(
         &self,
         range: TimeRange,
@@ -121,6 +145,7 @@ pub trait AccountStore: Send + Sync {
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
 
+    // fork: 票据、复活与近 24h 报错统计
     /// 账号成本、到期与票据状态（fork 子表 `account_tickets`）；没有记录的账号不出现在结果里。
     async fn load_account_tickets(
         &self,
@@ -180,7 +205,7 @@ pub trait AccountStore: Send + Sync {
         Ok(BTreeMap::new())
     }
 
-    /// 从同一数据库语句取得截止快照的累计用量和有界历史观测。
+    /// 从同一数据库语句取得截止快照的累计用量和有界历史观测
     async fn load_quota_forecast_history(
         &self,
         window: &AccountUsageWindowQuery,
@@ -192,7 +217,7 @@ pub trait AccountStore: Send + Sync {
         account_id: &gateway_core::account::ProviderAccountId,
     ) -> AdminStoreResult<Option<CredentialDetails>>;
 
-    /// 插件按全局账号 ID 读取时，由数据库记录提供权威 Provider 归属。
+    /// 插件按全局账号 ID 读取时，由数据库记录提供权威 Provider 归属
     async fn credential_details_by_id(
         &self,
         account_id: &gateway_core::account::ProviderAccountId,
@@ -204,7 +229,7 @@ pub trait AccountStore: Send + Sync {
         account_ids: &[gateway_core::account::ProviderAccountId],
     ) -> AdminStoreResult<Vec<ProviderExportCredentialInput>>;
 
-    /// 插件凭据读取只接收账号 ID，不接受调用方另行声明 Provider。
+    /// 插件凭据读取只接收账号 ID，不接受调用方另行声明 Provider
     async fn load_credential_for_plugin(
         &self,
         account_id: &gateway_core::account::ProviderAccountId,
@@ -222,7 +247,7 @@ pub trait AccountStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<crate::model::provider_credentials::AuthorizationCommitResult>;
 
-    /// 已提交的授权结果独立于 Redis 临时状态；只有原管理员身份可读。
+    /// 已提交的授权结果独立于 Redis 临时状态；只有原管理员身份可读
     async fn authorization_receipt(
         &self,
         key: &crate::model::provider_credentials::AuthorizationReceiptKey,
@@ -246,7 +271,7 @@ pub trait AccountStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<AccountUpdateResult>;
 
-    /// 在事务内按最新启用状态、账号上限和全局默认值判断，只降低并发上限。
+    /// 在事务内按最新启用状态、账号上限和全局默认值判断，只降低并发上限
     async fn lower_concurrency_limit(
         &self,
         account_id: &gateway_core::account::ProviderAccountId,
@@ -279,9 +304,16 @@ pub trait AccountStore: Send + Sync {
     ) -> AdminStoreResult<()>;
 }
 
-/// 可丢失账号运行态的管理读端口；跨存储编排由 Admin application service 拥有。
+/// 可丢失账号运行态的管理读端口；跨存储编排由 Admin application service 拥有
 #[async_trait]
 pub trait AccountRuntimeStore: Send + Sync {
+    async fn account_concurrency(
+        &self,
+        account_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> AdminStoreResult<crate::model::accounts::AccountConcurrencyPage>;
+
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot>;
 
     async fn account_runtime(
@@ -289,18 +321,18 @@ pub trait AccountRuntimeStore: Send + Sync {
         account_ids: &[String],
     ) -> AdminStoreResult<AccountRuntimeSnapshot>;
 
-    /// 容量熔断自动冻结中的账号与其冻结截止时间；429 临时限流不包含在内。
+    /// 容量熔断自动冻结中的账号与其冻结截止时间；429 临时限流不包含在内
     async fn active_freezes(
         &self,
     ) -> AdminStoreResult<BTreeMap<String, crate::model::accounts::AccountFreeze>>;
 
-    /// 读取容量失败窗口内观测到的在途并发峰值（自适应并发下调的证据）。
+    /// 读取容量失败窗口内观测到的在途并发峰值（自适应并发下调的证据）
     async fn capacity_peaks(
         &self,
         account_ids: &[String],
     ) -> AdminStoreResult<BTreeMap<String, u32>>;
 
-    /// 仅当冻结快照仍匹配时解除或顺延；旧探测不得覆盖手动恢复或新一轮冻结。
+    /// 仅当冻结快照仍匹配时解除或顺延；旧探测不得覆盖手动恢复或新一轮冻结
     async fn finish_freeze(
         &self,
         account_id: &str,
@@ -309,12 +341,12 @@ pub trait AccountRuntimeStore: Send + Sync {
     ) -> AdminStoreResult<bool>;
 }
 
-/// 控制面凭据、统一会话、登录限流与管理员安全审计。
+/// 控制面凭据、统一会话、登录限流与管理员安全审计
 #[async_trait]
 pub trait AuthStore: Send + Sync {
     async fn load_password_hash(&self, admin_user_id: &str) -> AdminStoreResult<Option<String>>;
 
-    /// 密码更新与审计必须在同一事务提交；旧哈希不匹配时不写入。
+    /// 密码更新与审计必须在同一事务提交；旧哈希不匹配时不写入
     async fn change_password(
         &self,
         admin_user_id: &str,
@@ -335,6 +367,14 @@ pub trait AuthStore: Send + Sync {
 
     async fn store_session(&self, session_id: &str, session: &AuthSession) -> AdminStoreResult<()>;
 
+    /// 原子替换或撤销仍匹配的会话并返回当前值；过期或退出后不重新创建
+    async fn compare_exchange_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        replacement: Option<&AuthSession>,
+    ) -> AdminStoreResult<Option<AuthSession>>;
+
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>>;
 
     async fn client_key_enabled(
@@ -342,7 +382,7 @@ pub trait AuthStore: Send + Sync {
         id: &gateway_core::policy::ClientApiKeyId,
     ) -> AdminStoreResult<bool>;
 
-    /// 原子消费来源桶与全局桶的一次登录尝试；被拒绝时返回建议重试间隔。
+    /// 原子消费来源桶与全局桶的一次登录尝试；被拒绝时返回建议重试间隔
     async fn consume_login_attempt(
         &self,
         source_ip: IpAddr,
@@ -354,10 +394,10 @@ pub trait AuthStore: Send + Sync {
     async fn append_audit_event(&self, event: AdminAuditEvent) -> AdminStoreResult<()>;
 }
 
-/// Client API Key 资料读取与管理写入。
+/// Client API Key 资料读取与管理写入
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
-    /// 按已验证的 ID 读取资料，不读取完整明文 Key。
+    /// 按已验证的 ID 读取资料，不读取完整明文 Key
     async fn get_client_key(
         &self,
         id: &gateway_core::policy::ClientApiKeyId,
@@ -394,7 +434,7 @@ pub trait ClientKeyStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<Revision>;
 
-    /// 局部更新预算上限，保留其他策略和账本；无变化时不产生配置版本或审计。
+    /// 局部更新预算上限，保留其他策略和账本；无变化时不产生配置版本或审计
     async fn update_client_key_budget_limits(
         &self,
         command: UpdateClientKeyBudgetLimits,
@@ -402,7 +442,7 @@ pub trait ClientKeyStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<Option<Revision>>;
 
-    /// 仅修改运行时账本并原子记录审计，不推进配置版本。
+    /// 仅修改运行时账本并原子记录审计，不推进配置版本
     async fn reset_client_key_budget(
         &self,
         command: ResetClientKeyBudget,
@@ -411,13 +451,18 @@ pub trait ClientKeyStore: Send + Sync {
     ) -> AdminStoreResult<()>;
 }
 
-/// Provider-neutral account group management transactions.
+/// 跨 Provider 的账号分组管理事务
 #[async_trait]
 pub trait AccountGroupStore: Send + Sync {
     async fn list_account_groups(
         &self,
         query: AccountGroupListQuery,
     ) -> AdminStoreResult<AccountGroupPage>;
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage>;
 
     async fn load_account_group_members(
         &self,
@@ -449,46 +494,50 @@ pub trait AccountGroupStore: Send + Sync {
     ) -> AdminStoreResult<AccountGroupMutation>;
 }
 
-/// 逐条读取的已计算费用事实；消费结束或丢弃时释放查询资源。
-pub type UsageCalculatedBillingStream<'a> =
-    BoxStream<'a, AdminStoreResult<UsageCalculatedBillingFact>>;
+/// 后台投影复用 Admin 与 Provider 的费用规则，Store 不重新解释价格
+pub trait UsageBillingProjector: Send + Sync {
+    fn project(
+        &self,
+        fact: &UsageCalculatedBillingFact,
+    ) -> Result<UsageBillingProjection, crate::model::AdminError>;
+}
 
-/// 用量、趋势、诊断与运维错误的只读能力。
+/// 用量、趋势、诊断与运维错误的只读能力
 #[async_trait]
 pub trait ObservabilityStore: Send + Sync {
-    /// 返回历史统计区间和指定观测时刻下的实时账号状态。
+    /// 读取实现声明的总预算，缓存等待沿用同一配置，避免外层提前截断
+    fn query_timeout(&self) -> std::time::Duration;
+
+    /// 缓存必须与删除和后台投影提交的版本一致
+    async fn analytics_cache_generation(&self) -> AdminStoreResult<u64>;
+
+    /// 返回历史统计区间和指定观测时刻下的实时账号状态
     async fn dashboard_summary(
         &self,
-        range: TimeRange,
+        query: DashboardQuery,
         observed_at: DateTime<Utc>,
     ) -> AdminStoreResult<DashboardObservation>;
 
-    /// 返回 Dashboard 可选的实时槽位事实。
-    ///
-    /// 该状态来自可丢失的运行时存储；无实现或运行时存储不可用时返回 `None`，不影响
-    /// 持久观测数据的读取。
-    async fn dashboard_runtime_slots(
+    async fn dashboard_trend(
         &self,
-        _observed_at: DateTime<Utc>,
-    ) -> AdminStoreResult<Option<DashboardRuntimeSlots>> {
-        Ok(None)
-    }
-
-    async fn dashboard_trend(&self, range: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>>;
+        range: TimeRange,
+        granularity: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>>;
 
     async fn usage_trend(
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        granularity: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>>;
 
-    /// 流式返回可由 Provider 重新校验的已计算费用事实，不保证顺序。
-    /// 查询及解码错误由流返回；调用方应逐条聚合，避免收集整个区间。
-    fn usage_calculated_billing_facts(
+    /// 同一读取快照中的汇总、趋势和已投影情景费用
+    async fn usage_insights_observation(
         &self,
         range: TimeRange,
         filter: UsageFilter,
-    ) -> UsageCalculatedBillingStream<'_>;
+        granularity: Granularity,
+    ) -> AdminStoreResult<UsageInsightsObservation>;
 
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage>;
 
@@ -505,12 +554,20 @@ pub trait ObservabilityStore: Send + Sync {
         range: TimeRange,
         filter: UsageFilter,
         dimension: DiagnosticDimension,
+        limit: u16,
     ) -> AdminStoreResult<DiagnosticsObservation>;
 
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage>;
+
+    /// 按精确目标读取受控错误，不受列表时间窗口与当前页面影响
+    async fn diagnostic_errors(
+        &self,
+        target: &crate::model::diagnostics::DiagnosticTarget,
+        limit: u16,
+    ) -> AdminStoreResult<Vec<crate::model::observability::OpsError>>;
 }
 
-/// Runtime settings 与管理员 API Key 写入。
+/// Runtime settings 与管理员 API Key 写入
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
@@ -547,7 +604,7 @@ pub trait SettingsStore: Send + Sync {
     ) -> AdminStoreResult<AdminApiKeyMutation>;
 }
 
-/// 账号目录、运行态与分组所需的 Store 能力集合。
+/// 账号目录、运行态与分组所需的 Store 能力集合
 #[derive(Clone)]
 pub struct AdminAccountStorePorts {
     accounts: Arc<dyn AccountStore>,
@@ -573,9 +630,10 @@ impl AdminAccountStorePorts {
     }
 }
 
-/// 管理用例所需能力的封闭集合。
+/// 管理用例所需能力的封闭集合
 ///
-/// 字段保持私有，每个 getter 只交出一种明确能力。该类型不提供通用拆包入口。
+/// 字段保持私有，每个 getter 只交出一种明确能力
+/// 该类型不提供通用拆包入口
 #[derive(Clone)]
 pub struct AdminStorePorts {
     accounts: AdminAccountStorePorts,
@@ -588,9 +646,15 @@ pub struct AdminStorePorts {
     plugins: Arc<dyn super::plugins::PluginStore>,
     plugin_state: Arc<dyn super::plugins::PluginStateStore>,
     plugin_resources: Arc<dyn super::plugin_resources::PluginResourceStore>,
+    usage_data: Arc<dyn super::usage_data::UsageDataStore>,
 }
 
 impl AdminStorePorts {
+    #[must_use]
+    pub fn usage_data(&self) -> Arc<dyn super::usage_data::UsageDataStore> {
+        self.usage_data.clone()
+    }
+
     #[must_use]
     pub fn plugin_resources(&self) -> Arc<dyn super::plugin_resources::PluginResourceStore> {
         self.plugin_resources.clone()
@@ -621,6 +685,7 @@ impl AdminStorePorts {
         plugins: Arc<dyn super::plugins::PluginStore>,
         plugin_state: Arc<dyn super::plugins::PluginStateStore>,
         plugin_resources: Arc<dyn super::plugin_resources::PluginResourceStore>,
+        usage_data: Arc<dyn super::usage_data::UsageDataStore>,
     ) -> Self {
         Self {
             accounts,
@@ -633,6 +698,7 @@ impl AdminStorePorts {
             plugins,
             plugin_state,
             plugin_resources,
+            usage_data,
         }
     }
 

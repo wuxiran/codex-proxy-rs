@@ -1,0 +1,72 @@
+import type { DashboardHealthStatus, DashboardHealthTimelinePoint } from '@/api'
+import { formatInteger } from '@/utils/format'
+
+interface DashboardHealthStatusMeta {
+  label: string
+  cellClass: string
+  badgeClass: string
+  valueClass: string
+}
+
+export const healthLegend = [
+  { status: 'no_data', label: '无有效样本' },
+  { status: 'unavailable', label: '不可达' },
+  { status: 'unstable', label: '不稳定' },
+  { status: 'low_sample', label: '低样本' },
+  { status: 'stable', label: '稳定' },
+] satisfies { status: DashboardHealthStatus, label: string }[]
+
+export const healthStatusMeta: Record<DashboardHealthStatus, DashboardHealthStatusMeta> = {
+  future: {
+    label: '未来',
+    cellClass: 'bg-cp-bg-container-disabled opacity-60',
+    badgeClass: 'bg-cp-fill-tertiary text-cp-text-quaternary',
+    valueClass: 'text-cp-text-quaternary',
+  },
+  no_data: {
+    label: '无有效样本',
+    cellClass: 'bg-cp-border',
+    badgeClass: 'bg-cp-fill-tertiary text-cp-text-secondary',
+    valueClass: 'text-cp-text-quaternary',
+  },
+  unavailable: {
+    label: '不可达',
+    cellClass: 'bg-cp-error',
+    badgeClass: 'bg-cp-error-container text-cp-error-on-container',
+    valueClass: 'text-cp-error-text',
+  },
+  unstable: {
+    label: '不稳定',
+    cellClass: 'bg-cp-warning',
+    badgeClass: 'bg-cp-warning-container text-cp-warning-on-container',
+    valueClass: 'text-cp-warning-text',
+  },
+  low_sample: {
+    label: '低样本',
+    cellClass: 'bg-cp-cyan-solid',
+    badgeClass: 'bg-cp-cyan-container text-cp-cyan-on-container',
+    valueClass: 'text-cp-cyan-text',
+  },
+  stable: {
+    label: '稳定',
+    cellClass: 'bg-cp-success',
+    badgeClass: 'bg-cp-success-container text-cp-success-on-container',
+    valueClass: 'text-cp-success-text',
+  },
+}
+
+export function healthServiceFailureCount(point: Pick<DashboardHealthTimelinePoint, 'failedRequests' | 'incompleteRequests'>) {
+  return point.failedRequests + point.incompleteRequests
+}
+
+export function healthEligibleRequestCount(point: Pick<DashboardHealthTimelinePoint, 'successRequests' | 'failedRequests' | 'incompleteRequests'>) {
+  return point.successRequests + healthServiceFailureCount(point)
+}
+
+export function healthObservedRequestCount(point: DashboardHealthTimelinePoint) {
+  return healthEligibleRequestCount(point) + point.cancelledRequests + point.callerErrorRequests
+}
+
+export function formatHealthCount(value: number) {
+  return formatInteger(Math.max(0, value))
+}

@@ -59,6 +59,7 @@ async fn fixture(pool: Vec<ProxyRecord>) -> Fixture {
 fn proxy(id: &str, tested: Option<bool>) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        enabled: true,
         auto_location: false,
         detected_location: None,
         location: None,

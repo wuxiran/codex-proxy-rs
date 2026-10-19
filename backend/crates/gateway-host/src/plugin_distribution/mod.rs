@@ -1,4 +1,4 @@
-//! 插件来源查询和受控下载；不解析插件包，不持有数据库或管理事务。
+//! 插件来源查询和受控下载；不解析插件包，不持有数据库或管理事务
 
 mod github;
 mod http;
@@ -29,7 +29,7 @@ use self::{github::CachedRelease, http::Downloads};
 const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
-/// 插件分发服务复用宿主受控 HTTP；缓存与限流不会跨出站身份共享。
+/// 插件分发服务复用宿主受控 HTTP；缓存与限流不会跨出站身份共享
 pub struct HttpPluginDistribution {
     downloads: Downloads,
     api_base: Url,
@@ -39,10 +39,14 @@ pub struct HttpPluginDistribution {
 
 impl HttpPluginDistribution {
     pub fn new(http: Arc<HttpClient>) -> Result<Self, AdminError> {
-        Self::with_transport("https://api.github.com/", http, source_network()?)
+        Self::with_transport(
+            "https://api.github.com/",
+            http,
+            NetworkPolicy::unrestricted(),
+        )
     }
 
-    /// 测试可注入受限网络；生产来源由管理员显式配置，因此保持既有内外网可达范围。
+    /// 测试可注入受限网络；生产来源由管理员显式配置，因此保持既有内外网可达范围
     pub fn with_transport(
         api_base: &str,
         http: Arc<HttpClient>,
@@ -171,10 +175,6 @@ impl PluginDistribution for HttpPluginDistribution {
         .await
         .map_err(|_| AdminError::bad_gateway("插件下载超时，请重试"))?
     }
-}
-
-fn source_network() -> Result<NetworkPolicy, AdminError> {
-    NetworkPolicy::new(&["0.0.0.0/0".into(), "::/0".into()]).map_err(|_| source_error())
 }
 
 fn credential_ids(credentials: &[SourceCredential]) -> Vec<String> {

@@ -1,3 +1,8 @@
+//! API 层测试入口，以及静态页面资源解析与服务测试
+
+// fork: request-log —— 运行设置合同多了两个键，json! 宏展开超过默认递归上限
+#![recursion_limit = "256"]
+
 mod admin;
 mod architecture;
 mod auth;

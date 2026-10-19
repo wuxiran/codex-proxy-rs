@@ -1,17 +1,27 @@
+//! 准备单个插件实例的进程、RPC 会话与能力贡献
+
+use super::super::restart_circuit::RestartIdentity;
 use super::{
-    AdminError, Arc, Duration, Handshake, PluginCallbackPorts, PluginCallbacks, PluginInstance,
-    PluginPrivateState, PluginRuntime, PluginStateStoreErrorKind, PreparedContributions,
-    PreparedInstance, Registration, RestartIdentity, Revision, RpcSession, Stage, ValidatedPackage,
-    instance_fingerprint,
+    PluginRuntime,
+    set::{PreparedContributions, PreparedInstance, instance_fingerprint},
 };
+use crate::{
+    RpcSession, ValidatedPackage,
+    callback::{PluginCallbackPorts, PluginCallbacks, private_state::PluginPrivateState},
+};
+use gateway_admin::{
+    model::{AdminError, Revision, plugins::instances::PluginInstance},
+    ports::plugins::PluginStateStoreErrorKind,
+};
+use gateway_plugin_sdk::{Handshake, Stage, call::registration::Registration};
+use std::{sync::Arc, time::Duration};
 
 impl PluginRuntime {
     pub(super) async fn prepare_instance(
         &self,
         instance: PluginInstance,
         target_revision: Revision,
-    ) -> Result<PreparedContributions, AdminError> {
-        let mut sessions = Vec::new();
+    ) -> Result<Arc<PreparedInstance>, AdminError> {
         let mut observer_entries = Vec::new();
         let mut commands = Vec::new();
         let mut management = Vec::new();
@@ -26,6 +36,12 @@ impl PluginRuntime {
                 "插件实例连续异常退出，已暂停自动重启；请检查配置后重新启用",
             ));
         }
+        let validation_slot = self
+            .validators
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AdminError::unavailable("插件校验已停止"))?;
         let artifact = self
             .store
             .load_artifact(&instance.artifact_sha256)
@@ -34,11 +50,7 @@ impl PluginRuntime {
         let limits = self.config.package_limits;
         let directory = self.config.cache_directory.clone();
         let host_version = self.config.host_version.clone();
-        let validation_slot = self
-            .validators
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AdminError::unavailable("插件校验繁忙"))?;
+        let schemas = Arc::clone(&self.configuration_schemas);
         let (package, configuration, instance, state_configuration) =
             tokio::task::spawn_blocking(move || {
                 let _validation_slot = validation_slot;
@@ -51,12 +63,16 @@ impl PluginRuntime {
                     .map_err(|_| AdminError::invalid("插件恢复包校验失败"))?,
                 );
                 let (configuration, state_configuration) =
-                    super::super::configuration::validate(&instance, package.manifest())?;
+                    super::super::configuration::validate(&instance, package.manifest(), &schemas)?;
                 crate::adapter::observer::validate_bindings(
                     package.manifest(),
                     &instance.bindings,
                 )?;
                 crate::adapter::policy::validate_bindings(package.manifest(), &instance.bindings)?;
+                crate::adapter::middleware::validate_bindings(
+                    package.manifest(),
+                    &instance.bindings,
+                )?;
                 crate::adapter::upstream_adapter::validate_bindings(
                     package.manifest(),
                     &instance.bindings,
@@ -65,25 +81,19 @@ impl PluginRuntime {
                     package.manifest(),
                     &instance.bindings,
                 )?;
-                // 发行清单与当前 Runtime 共用同一份能力声明，不能让二者分别漂移。
-                if !crate::package::host_supports(package.manifest())? {
-                    return Err(AdminError::invalid("该插件声明的业务能力尚未接入运行时"));
-                }
-                if !package
-                    .manifest()
-                    .engines
-                    .codex_proxy_rs
-                    .matches(&host_version)
+                let requirements = crate::package::compatibility_requirements(package.manifest())?;
+                if let Some(warning) =
+                    crate::package::compatibility_warning(&requirements, &host_version)?
                 {
-                    return Err(AdminError::invalid(format!(
-                        "插件要求宿主 {}，当前为 {}",
-                        package.manifest().engines.codex_proxy_rs,
-                        host_version
-                    )));
+                    tracing::warn!(
+                        instance_id = instance.id,
+                        warning,
+                        "插件版本未经宿主保证，尝试启动"
+                    );
                 }
                 let package = Arc::new(
                     package
-                        .prepare(&directory, &host_version)
+                        .prepare(&directory)
                         .map_err(|_| AdminError::unavailable("插件制品准备失败"))?,
                 );
                 Ok((package, configuration, instance, state_configuration))
@@ -95,6 +105,7 @@ impl PluginRuntime {
             .plugin_id()
             .map_err(|_| AdminError::invalid("插件身份无效"))?;
         let instance_id = instance.id.clone();
+        crate::compatibility::report(&manifest, &instance_id)?;
         let restart_identity =
             RestartIdentity::new(instance_id.clone(), authorization_binding.clone());
         let bindings = instance.bindings.clone();
@@ -168,6 +179,17 @@ impl PluginRuntime {
             .await
             .map_err(|_| AdminError::unavailable("插件进程握手失败"))?,
         );
+        let mut prepared = PreparedInstance {
+            instance_id: instance_id.clone(),
+            artifact_sha256: instance.artifact_sha256.clone(),
+            revision: instance.revision,
+            session: session.clone(),
+            private_state: private_state.clone(),
+            maintenance: manifest
+                .contributes
+                .contains_key(&gateway_plugin_sdk::Capability::Maintenance),
+            contributions: PreparedContributions::default(),
+        };
         let registration = session
             .call(
                 "plugin.register",
@@ -228,6 +250,13 @@ impl PluginRuntime {
             session.clone(),
             callbacks.clone(),
         )?);
+        let middleware_entries = crate::adapter::middleware::compile_entries(
+            &manifest,
+            &instance_id,
+            &bindings,
+            session.clone(),
+            callbacks.clone(),
+        )?;
         let model_aliases =
             crate::adapter::catalog::prepare(&manifest, &instance, &session).await?;
         let upstream_entries = crate::adapter::upstream_adapter::prepare(
@@ -237,25 +266,16 @@ impl PluginRuntime {
             Arc::clone(&callbacks),
         )
         .await?;
-        sessions.push(PreparedInstance {
-            instance_id,
-            artifact_sha256: instance.artifact_sha256,
-            revision: instance.revision,
-            session,
-            private_state,
-            maintenance: manifest
-                .contributes
-                .contains_key(&gateway_plugin_sdk::Capability::Maintenance),
-        });
-        Ok(PreparedContributions {
-            sessions,
+        prepared.contributions = PreparedContributions {
             observer_entries,
             commands,
             management,
             policy_entries,
+            middleware_entries,
             upstream_entries,
             authentication_entries,
             model_aliases,
-        })
+        };
+        Ok(Arc::new(prepared))
     }
 }

@@ -1,4 +1,4 @@
-//! 控制面统一会话与双层固定窗口登录限流。
+//! 控制面统一会话与双层固定窗口登录限流
 
 use std::time::Duration;
 
@@ -21,13 +21,13 @@ end
 return 0
 "#;
 
-/// Redis 身份标签只由认证服务写入，不能从请求中的角色声明构造。
+/// Redis 身份标签只由认证服务写入，不能从请求中的角色声明构造
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionSubjectRecord {
     Admin {
         admin_user_id: String,
-        // 旧会话没有指纹，按未认证处理并要求重新登录。
+        // 旧会话没有指纹，按未认证处理并要求重新登录
         #[serde(default)]
         credential_fingerprint: String,
     },
@@ -49,18 +49,34 @@ impl SessionSubjectRecord {
     }
 }
 
-/// Redis 中不含密码或原始 API Key 的统一会话事实。
+/// Redis 中不含密码或原始 API Key 的统一会话事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSessionRecord {
     pub subject: SessionSubjectRecord,
     pub expires_at: DateTime<Utc>,
+    pub absolute_expires_at: Option<DateTime<Utc>>,
+    pub renewal: Option<gateway_admin::model::auth::SessionRenewal>,
 }
 
 impl AuthSessionRecord {
     fn validate(&self) -> StoreResult<u64> {
         self.subject.validate()?;
-        let expires_at_millis = u64::try_from(self.expires_at.timestamp_millis())
-            .map_err(|_| auth_invalid("session expiry must be after the Unix epoch"))?;
+        if let Some(renewal) = &self.renewal
+            && (!matches!(self.subject, SessionSubjectRecord::Admin { .. })
+                || self.expires_at > renewal.expires_at
+                || self
+                    .absolute_expires_at
+                    .is_none_or(|limit| renewal.expires_at > limit))
+        {
+            return Err(auth_invalid("invalid renewable session lifetime"));
+        }
+        let expires_at_millis = u64::try_from(
+            self.renewal
+                .as_ref()
+                .map_or(self.expires_at, |renewal| renewal.expires_at)
+                .timestamp_millis(),
+        )
+        .map_err(|_| auth_invalid("session expiry must be after the Unix epoch"))?;
         if expires_at_millis > MAX_REDIS_EXACT_INTEGER {
             return Err(auth_invalid(
                 "session expiry is outside the supported range",
@@ -81,6 +97,12 @@ pub trait AuthStateRepository: Send + Sync {
     async fn store_session(&self, session_id: &str, session: &AuthSessionRecord)
     -> StoreResult<()>;
     async fn delete_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
+    async fn compare_exchange_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        replacement: Option<&AuthSessionRecord>,
+    ) -> StoreResult<Option<AuthSessionRecord>>;
     async fn consume_login_attempt(
         &self,
         source: &str,
@@ -120,6 +142,42 @@ impl RedisAuthStateRepository {
 
 #[async_trait]
 impl AuthStateRepository for RedisAuthStateRepository {
+    async fn compare_exchange_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        replacement: Option<&AuthSessionRecord>,
+    ) -> StoreResult<Option<AuthSessionRecord>> {
+        let payload = replacement.map(encode_session).transpose()?;
+        let expiry = replacement
+            .map(AuthSessionRecord::validate)
+            .transpose()?
+            .unwrap_or(0);
+        // 比较和写入在同一脚本完成；GET 会检查 Redis 到期，退出后的键不能复活
+        let payload: Option<String> = Script::new(
+            r#"
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+    if ARGV[2] == '' then
+        redis.call('DEL', KEYS[1])
+        return nil
+    end
+    redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ARGV[3], 'XX')
+    return ARGV[2]
+end
+return current
+"#,
+        )
+        .key(self.session_key(session_id)?)
+        .arg(encode_session(expected)?)
+        .arg(payload.unwrap_or_default())
+        .arg(expiry)
+        .invoke_async(&mut self.connection.clone())
+        .await
+        .map_err(|source| redis_unavailable("renew authentication session", source))?;
+        payload.map(|value| decode_session(&value)).transpose()
+    }
+
     async fn load_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>> {
         let key = self.session_key(session_id)?;
         let mut connection = self.connection.clone();
@@ -127,7 +185,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
             .arg(key)
             .query_async::<Option<String>>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("load authentication session"))?;
+            .map_err(|source| redis_unavailable("load authentication session", source))?;
         payload.map(|value| decode_session(&value)).transpose()
     }
 
@@ -147,7 +205,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
             .arg(expires_at_millis)
             .query_async::<String>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("store authentication session"))?;
+            .map_err(|source| redis_unavailable("store authentication session", source))?;
         Ok(())
     }
 
@@ -158,7 +216,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
             .arg(key)
             .query_async::<Option<String>>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("delete authentication session"))?;
+            .map_err(|source| redis_unavailable("delete authentication session", source))?;
         payload.map(|value| decode_session(&value)).transpose()
     }
 
@@ -186,7 +244,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
             .arg(window_millis)
             .invoke_async(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("rate limit authentication login"))?;
+            .map_err(|source| redis_unavailable("rate limit authentication login", source))?;
         if retry_after_millis <= 0 {
             Ok(None)
         } else {
@@ -202,14 +260,22 @@ impl AuthStateRepository for RedisAuthStateRepository {
 struct AuthSessionWire {
     subject: SessionSubjectRecord,
     expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    absolute_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renewal: Option<gateway_admin::model::auth::SessionRenewal>,
 }
 
 fn encode_session(session: &AuthSessionRecord) -> StoreResult<String> {
     serde_json::to_string(&AuthSessionWire {
         subject: session.subject.clone(),
+        renewal: session.renewal.clone(),
         expires_at: session
             .expires_at
             .to_rfc3339_opts(SecondsFormat::Nanos, true),
+        absolute_expires_at: session
+            .absolute_expires_at
+            .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
     })
     .map_err(|_| auth_invalid("session value cannot be encoded"))
 }
@@ -226,12 +292,15 @@ fn decode_session(value: &str) -> StoreResult<AuthSessionRecord> {
     let expires_at = parse(&wire.expires_at)?;
     Ok(AuthSessionRecord {
         subject: wire.subject,
+        renewal: wire.renewal,
         expires_at,
+        absolute_expires_at: wire.absolute_expires_at.as_deref().map(parse).transpose()?,
     })
 }
 
 fn auth_invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "authentication state",
         message: message.to_owned(),
     }

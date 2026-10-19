@@ -1,9 +1,10 @@
+//! 将插件 RPC 流消息桥接为有界接收流，并归还消费信用
+
 use std::sync::Arc;
 
-use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
-    time::Instant,
-};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+
+use gateway_plugin_sdk::client::CallDeadline;
 
 use crate::{RpcError, RpcReply, RpcSession, rpc::Shared};
 
@@ -41,7 +42,7 @@ impl StreamIngress {
         self.window.receive(sequence, payload.len())?;
         self.chunks
             .try_send(payload)
-            .map_err(|_| RpcError::Protocol)
+            .map_err(|_| RpcError::Protocol(None))
     }
 
     pub fn release(&mut self, bytes: u32) -> Result<(), RpcError> {
@@ -53,15 +54,15 @@ impl StreamIngress {
     }
 }
 
-/// 消费者读取后才补充窗口；终态走独立通道，不会排在满数据队列后等待。
+/// 消费者读取后才补充窗口；终态走独立通道，不会排在满数据队列后等待
 pub struct RpcStream {
     pub initial: RpcReply,
     pub(crate) chunks: mpsc::Receiver<Vec<u8>>,
     pub(crate) terminal: Option<oneshot::Receiver<Result<(), RpcError>>>,
-    pub(crate) deadline: Option<Instant>,
+    pub(crate) deadline: CallDeadline,
     pub(crate) id: u64,
     pub(crate) shared: Arc<Shared>,
-    pub(crate) _slot: OwnedSemaphorePermit,
+    pub(crate) _slot: Arc<OwnedSemaphorePermit>,
     pub(crate) _session: Arc<RpcSession>,
 }
 
@@ -70,9 +71,10 @@ impl RpcStream {
         if self.terminal.is_none() {
             return Ok(None);
         }
-        let result = match self.deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, self.chunks.recv()).await,
-            None => Ok(self.chunks.recv().await),
+        let result = tokio::select! {
+            biased;
+            () = self.deadline.wait() => Err(()),
+            chunk = self.chunks.recv() => Ok(chunk),
         };
         match result {
             Ok(Some(chunk)) => {
@@ -84,7 +86,7 @@ impl RpcStream {
                 let Some(terminal) = self.terminal.take() else {
                     return Ok(None);
                 };
-                terminal.await.map_err(|_| RpcError::Closed)??;
+                terminal.await.map_err(|_| RpcError::Closed(None))??;
                 Ok(None)
             }
             Err(_) => {

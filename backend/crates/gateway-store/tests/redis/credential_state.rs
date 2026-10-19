@@ -1,17 +1,10 @@
+//! 验证凭据状态与目录缓存保持 Provider 中立的键和值合同
+
 use chrono::Utc;
 use gateway_store::{
     Revision,
-    redis::{
-        CredentialStateCache, ProviderCatalogCacheRepository, RedisCredentialStateRepository,
-        RedisProviderCatalogCacheKey,
-    },
+    redis::{CredentialStateCache, RedisProviderCatalogCacheKey},
 };
-
-#[test]
-fn credential_state_adapter_implements_opaque_catalog_cache_port() {
-    fn assert_port<T: ProviderCatalogCacheRepository>() {}
-    assert_port::<RedisCredentialStateRepository>();
-}
 
 #[test]
 fn credential_state_rejects_provider_specific_status() {

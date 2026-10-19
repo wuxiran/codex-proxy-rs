@@ -1,9 +1,8 @@
-//! Key 自助查询从统一会话或只读 Key 校验取得范围，复用现有观测和额度账本。
+//! Key 自助查询从统一会话或只读 Key 校验取得范围，复用现有观测和额度账本
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 
 use crate::{
     AuthService, SystemService,
@@ -15,9 +14,7 @@ use crate::{
             KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
             KeyUsageRecordsQuery,
         },
-        observability::{
-            OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery, china_day_start,
-        },
+        observability::{Granularity, TimeRange, UsageFilter, UsageQuery, UsageRecordStatus},
         system::SystemVersion,
     },
     ports::store::{ClientKeyStore, ObservabilityStore},
@@ -34,10 +31,10 @@ use super::{map_store_error, observability::health_timeline_at};
 
 #[async_trait]
 pub trait KeyUsageService: Send + Sync {
-    /// 验证 Key 并只读查询当前额度，不记录 Key 使用或执行推理准入。
+    /// 验证 Key 并只读查询当前额度，不记录 Key 使用或执行推理准入
     async fn budget(&self, plaintext: &str) -> Result<Option<ClientBudgetStatus>, AdminError>;
 
-    /// 使用 Core 已认证的宿主身份查询额度，不接收插件自报的 Key ID。
+    /// 使用 Core 已认证的宿主身份查询额度，不接收插件自报的 Key ID
     async fn budget_for_client(
         &self,
         id: &ClientApiKeyId,
@@ -62,6 +59,7 @@ pub trait KeyUsageService: Send + Sync {
 }
 
 pub(crate) struct DefaultKeyUsageService {
+    timezone: gateway_core::time::DeploymentTimeZone,
     auth: Arc<dyn AuthService>,
     verifier: Arc<dyn ClientKeyVerifier>,
     keys: Arc<dyn ClientKeyStore>,
@@ -76,8 +74,10 @@ impl DefaultKeyUsageService {
         keys: Arc<dyn ClientKeyStore>,
         observations: Arc<dyn ObservabilityStore>,
         system: Arc<dyn SystemService>,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         Self {
+            timezone,
             auth,
             verifier,
             keys,
@@ -155,7 +155,7 @@ impl KeyUsageService for DefaultKeyUsageService {
         let Some(id) = self.key_id(session_id).await? else {
             return Ok(None);
         };
-        // 明文只按服务端会话绑定的 Key 读取，禁用或删除后不再提供配置。
+        // 明文只按服务端会话绑定的 Key 读取，禁用或删除后不再提供配置
         self.keys
             .reveal_client_key(&id)
             .await
@@ -181,24 +181,33 @@ impl KeyUsageService for DefaultKeyUsageService {
             return Ok(None);
         };
         let filter = usage_filter(&id, query.model);
-        let now = Utc::now();
-        // 健康条始终展示北京时间今日，不随历史范围或模型筛选改变。
+        let now = query.range.end;
+        // 健康条始终展示部署时区今日，不随历史范围或模型筛选改变
         let today = TimeRange {
-            start: china_day_start(now),
+            start: self
+                .timezone
+                .day_start(now)
+                .ok_or_else(|| AdminError::internal("时间超出支持范围"))?,
             end: now,
         };
-        let (overview, trend, health_points) = futures::try_join!(
-            self.observations.usage_summary(query.range, filter.clone()),
-            self.observations.usage_trend(query.range, filter),
-            self.observations
-                .usage_trend(today, usage_filter(&id, None)),
+        let (observation, health_points) = futures::try_join!(
+            self.observations.usage_insights_observation(
+                query.range,
+                filter,
+                Granularity::for_range(query.range)
+            ),
+            self.observations.usage_trend(
+                today,
+                usage_filter(&id, None),
+                Granularity::for_range(today)
+            ),
         )
         .map_err(|error| map_store_error(error, "key usage overview"))?;
         Ok(Some(KeyUsageOverview {
             key,
-            overview,
-            trend,
-            health_timeline: health_timeline_at(&health_points, now),
+            overview: observation.overview,
+            trend: observation.trend,
+            health_timeline: health_timeline_at(&health_points, now, self.timezone)?,
         }))
     }
 
@@ -210,34 +219,21 @@ impl KeyUsageService for DefaultKeyUsageService {
         let Some(id) = self.key_id(session_id).await? else {
             return Ok(None);
         };
-        let result = match query.kind {
-            KeyUsageRecordKind::Success => KeyUsageRecords::Success(
-                self.observations
-                    .list_usage_records(UsageQuery {
-                        range: query.usage.range,
-                        filter: usage_filter(&id, query.usage.model),
-                        current_page: query.current_page,
-                        page_size: query.page_size,
-                    })
-                    .await
-                    .map_err(|error| map_store_error(error, "key usage records"))?,
-            ),
-            KeyUsageRecordKind::Error => KeyUsageRecords::Error(
-                self.observations
-                    .list_ops_errors(OpsErrorQuery {
-                        range: query.usage.range,
-                        filter: OpsErrorFilter {
-                            client_api_key_ref: Some(id.as_str().to_owned()),
-                            model: query.usage.model,
-                            ..OpsErrorFilter::default()
-                        },
-                        current_page: query.current_page,
-                        page_size: query.page_size,
-                    })
-                    .await
-                    .map_err(|error| map_store_error(error, "key usage errors"))?,
-            ),
-        };
+        let result = self
+            .observations
+            .list_usage_records(UsageQuery {
+                status: match query.kind {
+                    KeyUsageRecordKind::Success => UsageRecordStatus::Success,
+                    KeyUsageRecordKind::Error => UsageRecordStatus::Error,
+                    KeyUsageRecordKind::All => UsageRecordStatus::All,
+                },
+                range: query.usage.range,
+                filter: usage_filter(&id, query.usage.model),
+                current_page: query.current_page,
+                page_size: query.page_size,
+            })
+            .await
+            .map_err(|error| map_store_error(error, "key usage records"))?;
         Ok(Some(result))
     }
 }

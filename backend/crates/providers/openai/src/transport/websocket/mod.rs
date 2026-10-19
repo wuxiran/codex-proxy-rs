@@ -1,11 +1,13 @@
-//! Codex Responses WebSocket 传输。
+//! Codex Responses WebSocket 传输
 
 mod audit;
 mod breaker;
+mod control;
 mod coordinator;
 mod error;
 mod exchange;
 mod handshake;
+mod live;
 mod model;
 mod pool;
 mod pump;
@@ -22,7 +24,7 @@ pub use self::{
     error::{CodexWebSocketCloseError, CodexWebSocketExchangeError, CodexWebSocketUpstreamError},
     exchange::{
         CodexWebSocketRateLimitUpdates, CodexWebSocketResponseMetadataUpdates,
-        CodexWebSocketSseStream, CodexWebSocketStreamingExchange,
+        CodexWebSocketStreamingExchange, CodexWebSocketTextStream,
     },
     handshake::responses_websocket_endpoint,
     model::{
@@ -35,6 +37,11 @@ pub use self::{
     },
     pump::WebSocketConnectionObservation,
 };
+// fork: served-mismatch 终态归约的测试缝
+#[doc(hidden)]
+pub use self::exchange::{
+    TerminalRelease, WebSocketTerminalKind, note_served_model, terminal_release,
+};
 pub(crate) use self::{
     coordinator::{
         PreparedWebSocket, WEBSOCKET_FAST_PATH_BUDGET, WebSocketFastPath,
@@ -42,5 +49,6 @@ pub(crate) use self::{
         prepare_response_create_request_with_pool,
     },
     error::WEBSOCKET_CLOSE_MESSAGE_TOO_BIG,
+    live::{connect_live_sideband, into_live_relay},
     pool::{DEFAULT_STREAM_IDLE_TIMEOUT, WARM_CONVERSATION_PREFIX},
 };

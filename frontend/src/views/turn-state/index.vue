@@ -9,7 +9,7 @@ import type {
   TurnStateServedMismatchAction,
   TurnStateSettings,
 } from '@/api'
-import { BaseButton, BaseCard, BaseCheckbox, BaseInput, BaseNumberInput, BasePageHeader, BaseSelect, toast } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZCheckbox, ZInput, ZInputNumber, ZNotification, ZPageHeader, ZSelect } from '@codex-proxy/ui'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   clearTurnStateBucket,
@@ -187,10 +187,10 @@ async function saveSettings() {
   try {
     settings.value = await updateTurnStateSettings(settings.value)
     settingsDirty.value = false
-    toast.success('设置已保存')
+    ZNotification.success({ message: '设置已保存' })
   }
   catch (error) {
-    toast.error(error instanceof Error ? error.message : '保存失败')
+    ZNotification.error({ message: error instanceof Error ? error.message : '保存失败' })
   }
   finally {
     saving.value = false
@@ -207,7 +207,7 @@ function addLength(kind: 'template' | 'degraded', len: number) {
   const own = kind === 'template' ? settings.value.templateLengths : settings.value.degradedLengths
   const other = kind === 'template' ? settings.value.degradedLengths : settings.value.templateLengths
   if (other.includes(len)) {
-    toast.error(`${len} 已在${kind === 'template' ? '受限' : '模板'}表里，两表不能重叠`)
+    ZNotification.error({ message: `${len} 已在${kind === 'template' ? '受限' : '模板'}表里，两表不能重叠` })
     return
   }
   if (!own.includes(len)) {
@@ -231,11 +231,11 @@ function removeLength(kind: 'template' | 'degraded', len: number) {
 async function clearBucket(bucket: TurnStateBucket) {
   try {
     const res = await clearTurnStateBucket({ account: bucket.account, model: bucket.model })
-    toast.success(`已清除 ${res.cleared} 条`)
+    ZNotification.success({ message: `已清除 ${res.cleared} 条` })
     await loadData()
   }
   catch {
-    toast.error('清除失败')
+    ZNotification.error({ message: '清除失败' })
   }
 }
 
@@ -328,20 +328,20 @@ onBeforeUnmount(() => {
 <template>
   <div class="flex w-full flex-col gap-5 py-6 pr-4 pl-6 sm:px-4">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <BasePageHeader title="票据管理" description="管理账号票据、预热连接和打票代理" />
+      <ZPageHeader title="票据管理" description="管理账号票据、预热连接和打票代理" />
       <div class="flex items-center gap-3">
         <span v-if="settingsDirty" class="text-cp-sm text-cp-text-secondary">有未保存的修改</span>
-        <BaseButton variant="primary" :loading="saving" :disabled="!canSave" @click="saveSettings">
+        <ZButton type="primary" :loading="saving" :disabled="!canSave" @click="saveSettings">
           保存设置
-        </BaseButton>
+        </ZButton>
       </div>
     </div>
 
     <div v-if="settingsError" class="flex items-center gap-3 text-cp-sm text-cp-danger" role="alert">
       <span>{{ settingsError }}</span>
-      <BaseButton size="sm" @click="loadSettings">
+      <ZButton size="small" @click="loadSettings">
         重新读取
-      </BaseButton>
+      </ZButton>
     </div>
     <p v-else-if="!settings" class="text-cp-sm text-cp-text-secondary" role="status">
       正在读取设置
@@ -350,7 +350,7 @@ onBeforeUnmount(() => {
     <PoolOverview :snapshot="pool.snapshot.value" :loading="pool.loading.value" :stale="pool.stale.value" :paused="pool.paused.value" :error="pool.error.value" :now="pool.now.value" @refresh="pool.refresh" />
     <AccountTicketManager :pool-accounts="pool.accounts.value" :pool-stale="pool.stale.value" :pool-paused="pool.paused.value" :pool-now="pool.now.value" @changed="refreshRuntime" />
 
-    <BaseCard v-if="settings" title="自动打票" description="用于已开启「票与预热」的账号">
+    <ZCard v-if="settings" title="自动打票" description="用于已开启「票与预热」的账号">
       <div class="flex flex-col gap-4">
         <div class="flex flex-wrap items-center gap-5">
           <SyncedSwitch v-model="settings.cloudMint.enabled" label="缺票时自动补充" show-label @update:model-value="markDirty" />
@@ -361,10 +361,10 @@ onBeforeUnmount(() => {
           <div v-if="settings.cloudMint.mode === 'native'" class="min-w-0">
             <span id="mint-proxy-label" class="mb-1 block text-cp-sm text-cp-text">专用打票代理</span>
             <div class="flex items-center gap-2">
-              <BaseInput id="mint-proxy" v-model="mintProxyInput" type="password" autocomplete="new-password" aria-label="专用打票代理" aria-labelledby="mint-proxy-label" :placeholder="settings.cloudMint.upstreamProxyUrl === '<set>' ? '已保存，输入新地址可更换' : 'socks5h://用户名:密码@地址:端口'" class="min-w-0 flex-1" />
-              <BaseButton v-if="hasMintProxy" size="sm" variant="soft" @click="clearMintProxy">
+              <ZInput id="mint-proxy" v-model="mintProxyInput" type="password" autocomplete="new-password" aria-label="专用打票代理" aria-labelledby="mint-proxy-label" :placeholder="settings.cloudMint.upstreamProxyUrl === '<set>' ? '已保存，输入新地址可更换' : 'socks5h://用户名:密码@地址:端口'" class="min-w-0 flex-1" />
+              <ZButton v-if="hasMintProxy" size="small" type="primary" variant="plain" @click="clearMintProxy">
                 清除
-              </BaseButton>
+              </ZButton>
             </div>
             <p v-if="proxyError" class="mt-1 text-cp-sm text-cp-danger" role="alert">
               {{ proxyError }}
@@ -375,7 +375,7 @@ onBeforeUnmount(() => {
           </div>
           <div>
             <span id="mint-models-label" class="mb-1 block text-cp-sm text-cp-text">打票模型</span>
-            <BaseInput id="mint-models" v-model="mintModelsText" aria-label="打票模型" aria-labelledby="mint-models-label" placeholder="留空时跟随业务请求" />
+            <ZInput id="mint-models" v-model="mintModelsText" aria-label="打票模型" aria-labelledby="mint-models-label" placeholder="留空时跟随业务请求" />
           </div>
         </div>
         <details class="text-cp-sm text-cp-text-secondary">
@@ -383,37 +383,37 @@ onBeforeUnmount(() => {
             高级打票设置
           </summary>
           <div class="mt-3 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <div><span class="mb-1 block">打票方式</span><BaseSelect v-model="settings.cloudMint.mode" :options="mintModeOptions" aria-label="打票方式" @update:model-value="markDirty" /></div>
+            <div><span class="mb-1 block">打票方式</span><ZSelect v-model="settings.cloudMint.mode" :options="mintModeOptions" aria-label="打票方式" @update:model-value="markDirty" /></div>
             <template v-if="settings.cloudMint.mode === 'relay'">
-              <div><span class="mb-1 block">中继地址</span><BaseInput v-model="settings.cloudMint.relayUrl" placeholder="https://relay.example.com" aria-label="中继地址" @update:model-value="markDirty" /></div>
-              <div><span class="mb-1 block">中继密钥</span><BaseInput v-model="relayKeyInput" type="password" autocomplete="new-password" aria-label="中继密钥" /></div>
-              <div><span class="mb-1 block">连接中继的代理</span><BaseInput v-model="settings.cloudMint.proxyUrl" type="password" aria-label="连接中继的代理" placeholder="留空时直接连接中继" @update:model-value="markDirty" /></div>
-              <div><span class="mb-1 block">中继打票协议</span><BaseSelect v-model="settings.cloudMint.transport" :options="transportOptions" @update:model-value="markDirty" /></div>
+              <div><span class="mb-1 block">中继地址</span><ZInput v-model="settings.cloudMint.relayUrl" placeholder="https://relay.example.com" aria-label="中继地址" @update:model-value="markDirty" /></div>
+              <div><span class="mb-1 block">中继密钥</span><ZInput v-model="relayKeyInput" type="password" autocomplete="new-password" aria-label="中继密钥" /></div>
+              <div><span class="mb-1 block">连接中继的代理</span><ZInput v-model="settings.cloudMint.proxyUrl" type="password" aria-label="连接中继的代理" placeholder="留空时直接连接中继" @update:model-value="markDirty" /></div>
+              <div><span class="mb-1 block">中继打票协议</span><ZSelect v-model="settings.cloudMint.transport" :options="transportOptions" @update:model-value="markDirty" /></div>
               <p class="col-span-full m-0">
                 中继到上游的出口由中继服务配置，专用打票代理用于本机打票
               </p>
             </template>
-            <div><span class="mb-1 block">票据有效期（秒）</span><BaseNumberInput v-model="settings.cloudMint.ticketTtlSeconds" label="票据有效期" :min="30" :max="86400" :step="30" @update:model-value="markDirty" /></div>
-            <div><span class="mb-1 block">每模型尝试上限</span><BaseNumberInput v-model="settings.cloudMint.maxAttempts" label="每模型尝试上限" :min="1" :max="24" @update:model-value="markDirty" /></div>
-            <div><span class="mb-1 block">失败后等待（秒）</span><BaseNumberInput v-model="settings.cloudMint.cooldownSeconds" label="失败后等待" :min="5" :max="3600" @update:model-value="markDirty" /></div>
-            <div><span class="mb-1 block">目标节点</span><BaseInput v-model="settings.cloudMint.gateway" placeholder="留空时不限节点" aria-label="目标节点" @update:model-value="markDirty" /></div>
-            <div><span class="mb-1 block">预期票据长度</span><BaseNumberInput v-model="settings.cloudMint.ticketLen" label="预期票据长度" :min="0" :max="4096" @update:model-value="markDirty" /></div>
-            <BaseCheckbox v-model="settings.cloudMint.observeOnly" label="只验证打票，不应用结果" show-label @update:model-value="markDirty" />
+            <div><span class="mb-1 block">票据有效期（秒）</span><ZInputNumber v-model="settings.cloudMint.ticketTtlSeconds" aria-label="票据有效期" :min="30" :max="86400" :step="30" @update:model-value="markDirty" /></div>
+            <div><span class="mb-1 block">每模型尝试上限</span><ZInputNumber v-model="settings.cloudMint.maxAttempts" aria-label="每模型尝试上限" :min="1" :max="24" @update:model-value="markDirty" /></div>
+            <div><span class="mb-1 block">失败后等待（秒）</span><ZInputNumber v-model="settings.cloudMint.cooldownSeconds" aria-label="失败后等待" :min="5" :max="3600" @update:model-value="markDirty" /></div>
+            <div><span class="mb-1 block">目标节点</span><ZInput v-model="settings.cloudMint.gateway" placeholder="留空时不限节点" aria-label="目标节点" @update:model-value="markDirty" /></div>
+            <div><span class="mb-1 block">预期票据长度</span><ZInputNumber v-model="settings.cloudMint.ticketLen" aria-label="预期票据长度" :min="0" :max="4096" @update:model-value="markDirty" /></div>
+            <ZCheckbox v-model="settings.cloudMint.observeOnly" label="只验证打票，不应用结果" @update:model-value="markDirty" />
           </div>
         </details>
       </div>
-    </BaseCard>
+    </ZCard>
 
-    <BaseCard v-if="settings" title="响应处理">
+    <ZCard v-if="settings" title="响应处理">
       <div class="flex flex-wrap items-center gap-4">
         <div class="w-full sm:w-72">
-          <BaseSelect v-model="settings.servedMismatchAction" :options="servedMismatchOptions" aria-label="模型不一致时" @update:model-value="markDirty" />
+          <ZSelect v-model="settings.servedMismatchAction" :options="servedMismatchOptions" aria-label="模型不一致时" @update:model-value="markDirty" />
         </div>
-        <BaseCheckbox v-model="settings.dryRun" label="模拟运行" show-label @update:model-value="markDirty" />
+        <ZCheckbox v-model="settings.dryRun" label="模拟运行" @update:model-value="markDirty" />
         <span class="text-cp-sm text-cp-text-secondary">累计 {{ mismatchCount }} 次模型声明不一致</span>
       </div>
-    </BaseCard>
-    <BaseCard title="有效票据" :description="`共 ${activeBuckets.length} 条`">
+    </ZCard>
+    <ZCard title="有效票据" :description="`共 ${activeBuckets.length} 条`">
       <div class="overflow-auto">
         <table class="w-full text-sm whitespace-nowrap">
           <thead class="text-left text-xs text-neutral-500">
@@ -449,9 +449,9 @@ onBeforeUnmount(() => {
                 {{ sourceText[b.source] }}
               </td>
               <td class="px-2 py-1.5 text-right">
-                <BaseButton v-if="b.scope === 'account'" size="sm" variant="soft" @click="clearBucket(b)">
+                <ZButton v-if="b.scope === 'account'" size="small" type="primary" variant="plain" @click="clearBucket(b)">
                   清除
-                </BaseButton>
+                </ZButton>
               </td>
             </tr>
             <tr v-if="!activeBuckets.length">
@@ -462,8 +462,8 @@ onBeforeUnmount(() => {
           </tbody>
         </table>
       </div>
-    </BaseCard>
-    <BaseCard title="模型声明">
+    </ZCard>
+    <ZCard title="模型声明">
       <div class="overflow-x-auto">
         <table class="w-full text-left text-cp-sm whitespace-nowrap">
           <thead class="text-cp-text-secondary">
@@ -503,22 +503,22 @@ onBeforeUnmount(() => {
           </tbody>
         </table>
       </div>
-    </BaseCard>
+    </ZCard>
     <details class="text-cp-sm text-cp-text-secondary">
       <summary class="cursor-pointer py-2">
         高级设置与诊断
       </summary>
       <div class="mt-3 flex flex-col gap-5">
-        <BaseCard>
+        <ZCard>
           <div v-if="settings" class="flex flex-col gap-4">
             <div class="flex flex-wrap items-end gap-3">
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">被动捕获有效期（秒）</span>
-                <BaseNumberInput v-model="settings.ttlSeconds" label="模板寿命" :min="30" :max="86400" :step="60" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.ttlSeconds" aria-label="模板寿命" :min="30" :max="86400" :step="60" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-80">
                 <span class="block text-xs text-neutral-500">注入模式</span>
-                <BaseSelect v-model="settings.injectMode" :options="injectModeOptions" class="mt-1" @update:model-value="markDirty" />
+                <ZSelect v-model="settings.injectMode" :options="injectModeOptions" class="mt-1" @update:model-value="markDirty" />
               </div>
             </div>
 
@@ -534,10 +534,10 @@ onBeforeUnmount(() => {
                     <button type="button" class="opacity-70 hover:opacity-100" :aria-label="`移除 ${len}`" @click="removeLength('template', len)">×</button>
                   </span>
                   <span v-if="!settings.templateLengths.length" class="text-xs text-neutral-400">空（下限规则）</span>
-                  <BaseNumberInput v-model="newTemplateLen" label="新增模板长度" :min="MIN_LEN" :max="4096" class="w-32" />
-                  <BaseButton size="sm" @click="addLength('template', newTemplateLen)">
+                  <ZInputNumber v-model="newTemplateLen" aria-label="新增模板长度" :min="MIN_LEN" :max="4096" class="w-32" />
+                  <ZButton size="small" @click="addLength('template', newTemplateLen)">
                     加入
-                  </BaseButton>
+                  </ZButton>
                 </div>
               </div>
               <div>
@@ -551,10 +551,10 @@ onBeforeUnmount(() => {
                     <button type="button" class="opacity-70 hover:opacity-100" :aria-label="`移除 ${len}`" @click="removeLength('degraded', len)">×</button>
                   </span>
                   <span v-if="!settings.degradedLengths.length" class="text-xs text-neutral-400">空</span>
-                  <BaseNumberInput v-model="newDegradedLen" label="新增受限长度" :min="MIN_LEN" :max="4096" class="w-32" />
-                  <BaseButton size="sm" @click="addLength('degraded', newDegradedLen)">
+                  <ZInputNumber v-model="newDegradedLen" aria-label="新增受限长度" :min="MIN_LEN" :max="4096" class="w-32" />
+                  <ZButton size="small" @click="addLength('degraded', newDegradedLen)">
                     加入
-                  </BaseButton>
+                  </ZButton>
                 </div>
               </div>
             </div>
@@ -562,8 +562,8 @@ onBeforeUnmount(() => {
           <p v-else class="m-0 text-sm text-neutral-400">
             设置读取中…
           </p>
-        </BaseCard>
-        <BaseCard title="连接预热">
+        </ZCard>
+        <ZCard title="连接预热">
           <div v-if="settings" class="flex flex-col gap-4">
             <div class="flex flex-wrap items-center gap-5">
               <SyncedSwitch v-model="settings.warmPool.enabled" label="启用连接预热" show-label @update:model-value="markDirty" />
@@ -580,43 +580,43 @@ onBeforeUnmount(() => {
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">每账号、每模型连接数</span>
-                <BaseNumberInput v-model="settings.warmPool.connectionsPerAccount" label="每账号每模型连接数" :min="1" :max="16" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.connectionsPerAccount" aria-label="每账号每模型连接数" :min="1" :max="16" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">探针失败重试次数</span>
-                <BaseNumberInput v-model="settings.warmPool.probeRetries" label="探针失败重试" :min="0" :max="16" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.probeRetries" aria-label="探针失败重试" :min="0" :max="16" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">复探间隔（秒）</span>
-                <BaseNumberInput v-model="settings.warmPool.reprobeSeconds" label="复探间隔" :min="15" :max="1800" :step="15" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.reprobeSeconds" aria-label="复探间隔" :min="15" :max="1800" :step="15" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">连接寿命（秒，&lt;55min）</span>
-                <BaseNumberInput v-model="settings.warmPool.maxAgeSeconds" label="连接寿命" :min="60" :max="3300" :step="60" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.maxAgeSeconds" aria-label="连接寿命" :min="60" :max="3300" :step="60" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">失败冷却（秒）</span>
-                <BaseNumberInput v-model="settings.warmPool.cooldownSeconds" label="失败冷却" :min="30" :max="86400" :step="30" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.cooldownSeconds" aria-label="失败冷却" :min="30" :max="86400" :step="30" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">进程连接总上限</span>
-                <BaseNumberInput v-model="settings.warmPool.maxTotalConnections" label="总上限" :min="1" :max="1024" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.maxTotalConnections" aria-label="总上限" :min="1" :max="1024" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">探针整次上限（秒）</span>
-                <BaseNumberInput v-model="settings.warmPool.probeTimeoutSeconds" label="探针上限" :min="30" :max="600" :step="10" class="mt-1" @update:model-value="markDirty" />
+                <ZInputNumber v-model="settings.warmPool.probeTimeoutSeconds" aria-label="探针上限" :min="30" :max="600" :step="10" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">探针 effort</span>
-                <BaseSelect v-model="settings.warmPool.probeEffort" :options="effortOptions" class="mt-1" @update:model-value="markDirty" />
+                <ZSelect v-model="settings.warmPool.probeEffort" :options="effortOptions" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="w-40">
                 <span class="block text-xs text-neutral-500">验证通过判据（完整答案）</span>
-                <BaseInput v-model="settings.warmPool.probeExpect" placeholder="21" class="mt-1" @update:model-value="markDirty" />
+                <ZInput v-model="settings.warmPool.probeExpect" placeholder="21" class="mt-1" @update:model-value="markDirty" />
               </div>
               <div class="md:col-span-2">
                 <span class="block text-xs text-neutral-500">预热模型（逗号分隔，留空跟随业务）</span>
-                <BaseInput v-model="warmModelsText" aria-label="预热模型" placeholder="gpt-6-astra" class="mt-1" />
+                <ZInput v-model="warmModelsText" aria-label="预热模型" placeholder="gpt-6-astra" class="mt-1" />
               </div>
             </div>
             <p class="m-0 text-xs text-neutral-500">
@@ -625,8 +625,8 @@ onBeforeUnmount(() => {
               多个模型分别验证，失败按重试次数继续，耗尽后冷却再试
             </p>
           </div>
-        </BaseCard>
-        <BaseCard title="上游签发长度直方图" description="来自业务流量与探测的响应头，点「设为」把某个长度加进对应表，再保存设置">
+        </ZCard>
+        <ZCard title="上游签发长度直方图" description="来自业务流量与探测的响应头，点「设为」把某个长度加进对应表，再保存设置">
           <div v-if="histogram.length" class="flex flex-col gap-1.5">
             <div v-for="row in histogram" :key="row.len" class="flex items-center gap-3 text-sm">
               <span class="w-16 shrink-0 text-right font-mono">{{ row.len }}</span>
@@ -641,19 +641,19 @@ onBeforeUnmount(() => {
               <span class="w-14 shrink-0 text-xs" :class="row.cls === 'normal' ? 'text-emerald-500' : row.cls === 'degraded' ? 'text-rose-500' : 'text-amber-500'">
                 {{ row.cls === 'normal' ? '符合收录规则' : row.cls === 'degraded' ? '不收录' : '未知' }}
               </span>
-              <BaseButton size="sm" variant="soft" @click="addLength('template', row.len)">
+              <ZButton size="small" type="primary" variant="plain" @click="addLength('template', row.len)">
                 设为模板
-              </BaseButton>
-              <BaseButton size="sm" variant="soft" @click="addLength('degraded', row.len)">
+              </ZButton>
+              <ZButton size="small" type="primary" variant="plain" @click="addLength('degraded', row.len)">
                 设为不收录
-              </BaseButton>
+              </ZButton>
             </div>
           </div>
           <p v-else class="m-0 text-sm text-neutral-400">
             还没有观测到任何上游签发的 state
           </p>
-        </BaseCard>
-        <BaseCard title="最近 48 小时" description="每小时上游签发分布：绿=符合收录规则，红=不收录，黄=未知，灰=未签发">
+        </ZCard>
+        <ZCard title="最近 48 小时" description="每小时上游签发分布：绿=符合收录规则，红=不收录，黄=未知，灰=未签发">
           <div v-if="hourly.length" class="flex h-28 items-end gap-0.5">
             <div
               v-for="h in hourly" :key="h.hour"
@@ -670,8 +670,8 @@ onBeforeUnmount(() => {
           <p v-else class="m-0 text-sm text-neutral-400">
             暂无数据
           </p>
-        </BaseCard>
-        <BaseCard title="最近事件" :description="`最近 ${events.length} 条请求决策与上游签发（只记长度，不含票值）`">
+        </ZCard>
+        <ZCard title="最近事件" :description="`最近 ${events.length} 条请求决策与上游签发（只记长度，不含票值）`">
           <div class="max-h-96 overflow-auto">
             <table class="w-full text-sm">
               <thead class="text-left text-xs text-neutral-500">
@@ -725,7 +725,7 @@ onBeforeUnmount(() => {
               </tbody>
             </table>
           </div>
-        </BaseCard>
+        </ZCard>
       </div>
     </details>
   </div>

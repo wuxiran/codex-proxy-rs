@@ -1,3 +1,5 @@
+//! 插件管理页面、资源、授权回调与页面模型请求的 HTTP 边界
+
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -42,7 +44,7 @@ use crate::{
 
 const MAXIMUM_BODY_BYTES: usize = 1024 * 1024;
 const MAXIMUM_MODEL_BODY_BYTES: usize = 8 * 1024 * 1024;
-// HTML/SVG 即使被直接导航打开也不能获得管理端 origin；执行入口由隔离 iframe 的消息桥承载。
+// HTML/SVG 即使被直接导航打开也不能获得管理端 origin；执行入口由隔离 iframe 的消息桥承载
 const RESOURCE_CSP: &str = "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline' blob:; img-src data: blob:; font-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 pub(super) fn router<S: SessionState + Clone + Send + Sync + 'static>() -> Router<S> {
@@ -51,8 +53,19 @@ pub(super) fn router<S: SessionState + Clone + Send + Sync + 'static>() -> Route
         .route("/api/admin/plugins/extensions/{instance_id}/{artifact_sha256}/{revision}/callback-tickets", post(start_callback::<S>))
         .route("/api/admin/plugins/extensions/{instance_id}/{artifact_sha256}/{revision}/api/{*path}", any(handle::<S>))
         .route("/api/admin/plugins/extensions/{instance_id}/{artifact_sha256}/{revision}/resources/{*path}", get(resource::<S>))
-        .route("/plugins/resources/{instance_id}/{artifact_sha256}/{revision}/{*path}", get(public_resource::<S>))
-        .route("/plugins/callbacks/{instance_id}/{artifact_sha256}/{revision}/{*path}", get(callback::<S>))
+}
+
+pub(in crate::admin) fn public_router<S: SessionState + Clone + Send + Sync + 'static>() -> Router<S>
+{
+    Router::new()
+        .route(
+            "/plugins/resources/{instance_id}/{artifact_sha256}/{revision}/{*path}",
+            get(public_resource::<S>),
+        )
+        .route(
+            "/plugins/callbacks/{instance_id}/{artifact_sha256}/{revision}/{*path}",
+            get(callback::<S>),
+        )
 }
 
 pub(in crate::admin) fn model_router() -> Router<crate::ApiState> {
@@ -105,7 +118,7 @@ async fn model_responses(
         .map_err(map_admin_service_error)?;
     let client_key_id = ClientApiKeyId::new(query.client_key_id)
         .map_err(|_| AdminError::bad_request("Client Key 标识不合法"))?;
-    // 推理身份由显式 Key 决定；原始 HTTP 头仍完整交给插件，原生上游自行构造认证。
+    // 推理身份由显式 Key 决定；原始 HTTP 头仍完整交给插件，原生上游自行构造认证
     let headers = parts.headers;
     let (decoded, middleware_body) =
         match decode_request_with_body(&body, &headers, MAXIMUM_MODEL_BODY_BYTES) {
@@ -209,7 +222,7 @@ async fn callback<S: SessionState + Send + Sync>(
     Path(path): Path<ResourcePath>,
     request: Request,
 ) -> Result<Response, AdminError> {
-    // Axum 为 GET 路由自动提供 HEAD；预取或探测不能消耗一次性登录票据。
+    // Axum 为 GET 路由自动提供 HEAD；预取或探测不能消耗一次性登录票据
     if request.method() != axum::http::Method::GET {
         return Err(AdminError::invalid_request(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -238,6 +251,8 @@ async fn callback<S: SessionState + Send + Sync>(
             &path.target(),
             &nonce,
             PluginManagementRequest {
+                request_context: crate::middleware::current()
+                    .and_then(|context| context.extensions.shared_request()),
                 method: "GET".into(),
                 path: path.path,
                 query,
@@ -310,6 +325,8 @@ async fn handle<S: SessionState + Send + Sync>(
         .handle(
             &target,
             PluginManagementRequest {
+                request_context: crate::middleware::current()
+                    .and_then(|context| context.extensions.shared_request()),
                 method,
                 path: path.path,
                 query,
@@ -338,7 +355,7 @@ async fn public_resource<S: SessionState + Send + Sync>(
     Path(path): Path<ResourcePath>,
     headers: HeaderMap,
 ) -> Result<Response, AdminError> {
-    // 只分派已授予 public_resource 的不可变静态字节，不启动 handler 或继承 Cookie 权限。
+    // 只分派已授予 public_resource 的不可变静态字节，不启动 handler 或继承 Cookie 权限
     load_resource(&state, path, true, &headers).await
 }
 
@@ -354,7 +371,7 @@ async fn load_resource<S: SessionState + Send + Sync>(
         .resource(&path.target(), &path.path, public)
         .await
         .map_err(map_admin_service_error)?;
-    // 先复核会话、实例版本和资源授权；条件请求不能绕过撤销检查。
+    // 先复核会话、实例版本和资源授权；条件请求不能绕过撤销检查
     if result.status != 200 || result.body.len() > MAXIMUM_BODY_BYTES {
         return raw_response(result);
     }
@@ -412,7 +429,7 @@ fn raw_response(result: PluginManagementResponse) -> Result<Response, AdminError
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
     );
-    // 宿主提供默认值，插件显式字段随后覆盖；保留同名多值，只验证 HTTP 语法。
+    // 宿主提供默认值，插件显式字段随后覆盖；保留同名多值，只验证 HTTP 语法
     headers.extend(decode_headers(result.headers).map_err(|_| AdminError::bad_gateway())?);
     Ok(response)
 }

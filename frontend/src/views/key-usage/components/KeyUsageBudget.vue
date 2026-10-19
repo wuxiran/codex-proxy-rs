@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import type { KeyUsageBudget } from '@/api/modules/key-usage'
-import { BaseCard } from '@codex-proxy/ui'
+import { ZCard } from '@codex-proxy/ui'
 import { Clock3, Gauge, Network } from '@lucide/vue'
 import { computed } from 'vue'
-import { keyUsageTime, money } from '../utils/format'
+import { money } from '../utils/format'
 
 const props = defineProps<{ budget: KeyUsageBudget }>()
 const windows = computed(() => [
-  { label: '今日额度', limit: props.budget.dailyLimitUsd, used: props.budget.dailyUsedUsd, reset: props.budget.dailyResetsAt },
-  { label: '周额度', limit: props.budget.weeklyLimitUsd, used: props.budget.weeklyUsedUsd, reset: props.budget.weeklyResetsAt },
+  { label: '今日额度', limit: props.budget.dailyLimitUsd, used: props.budget.dailyUsedUsd, reset: props.budget.dailyResetsAt, resetDisplay: props.budget.dailyResetsAtDisplay },
+  { label: '周额度', limit: props.budget.weeklyLimitUsd, used: props.budget.weeklyUsedUsd, reset: props.budget.weeklyResetsAt, resetDisplay: props.budget.weeklyResetsAtDisplay },
 ].map(window => ({
   ...window,
   limited: Number(window.limit) > 0,
@@ -18,7 +18,7 @@ const windows = computed(() => [
 </script>
 
 <template>
-  <BaseCard title="额度概览">
+  <ZCard title="额度概览">
     <div class="flex flex-1 flex-col justify-between gap-6">
       <div class="grid flex-1 gap-6 sm:grid-cols-2">
         <div v-for="window in windows" :key="window.label" class="flex min-w-0 flex-col justify-between gap-4">
@@ -32,7 +32,7 @@ const windows = computed(() => [
             </div>
           </div>
           <div>
-            <div class="grid grid-cols-[repeat(20,minmax(0,1fr))] gap-0.75" :aria-label="window.limited ? `已用 ${window.percentage.toFixed(1)}%` : '不限额'">
+            <div class="grid grid-cols-20 gap-0.75" :aria-label="window.limited ? `已用 ${window.percentage.toFixed(1)}%` : '不限额'">
               <span v-for="block in 20" :key="block" class="h-7 rounded-xs" :class="block <= Math.ceil(Math.min(100, window.percentage) / 5) ? (window.percentage >= 100 ? 'bg-cp-error' : 'bg-cp-success') : 'bg-cp-fill-secondary'" />
             </div>
             <div class="mt-2 flex justify-between gap-2 font-mono text-cp-xs text-cp-text-secondary">
@@ -41,7 +41,7 @@ const windows = computed(() => [
           </div>
           <div class="text-cp-xs leading-relaxed text-cp-text-tertiary">
             <span class="flex items-center gap-1.5"><Clock3 class="size-3" />重置时间</span>
-            <span class="mt-1 block font-mono">{{ window.reset ? keyUsageTime(window.reset) : '首次使用后开始计时' }}</span>
+            <span class="mt-1 block font-mono">{{ window.reset ? window.resetDisplay ?? '—' : '首次使用后开始计时' }}</span>
           </div>
         </div>
       </div>
@@ -54,5 +54,5 @@ const windows = computed(() => [
         </div>
       </div>
     </div>
-  </BaseCard>
+  </ZCard>
 </template>

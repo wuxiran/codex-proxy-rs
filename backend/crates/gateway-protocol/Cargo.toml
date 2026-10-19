@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-rust-version = "1.97"
+rust-version = "1.99.1"
 autotests = false
 
 [[test]]
@@ -12,6 +12,8 @@ name = "main"
 path = "tests/main.rs"
 
 [dependencies]
+http = "1.5.0"
+httpdate = "1.0.3"
 memchr = "2.8.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision", "preserve_order"] }

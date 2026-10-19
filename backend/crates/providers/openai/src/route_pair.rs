@@ -135,7 +135,7 @@ pub(crate) async fn drop_if_current(
         cookies.retain(|cookie| cookie.name != CFLB && cookie.name != OAILB);
         match repository.compare_and_swap_data(&current, data).await {
             Ok(_) => return true,
-            Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => {}
+            Err(CredentialRepositoryError::RevisionConflict(_)) if attempt == 0 => {}
             Err(_) => return false,
         }
     }

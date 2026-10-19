@@ -1,4 +1,4 @@
-//! Admin query service 使用的账号运行态组合 adapter。
+//! Admin query service 使用的账号运行态组合 adapter
 
 use std::collections::BTreeMap;
 
@@ -15,7 +15,7 @@ use super::{
     RedisCredentialCooldownRepository, RedisCredentialLeaseRepository,
 };
 
-/// 只组合可丢失 Redis 事实；不持有 PostgreSQL，也不执行状态投影。
+/// 只组合可丢失 Redis 事实；不持有 PostgreSQL，也不执行状态投影
 #[derive(Clone)]
 pub struct RedisAdminAccountRuntimeStore {
     cooldowns: RedisCredentialCooldownRepository,
@@ -34,6 +34,18 @@ impl RedisAdminAccountRuntimeStore {
 
 #[async_trait]
 impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
+    async fn account_concurrency(
+        &self,
+        account_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> AdminStoreResult<gateway_admin::model::accounts::AccountConcurrencyPage> {
+        self.leases
+            .account_concurrency(account_id, offset, limit)
+            .await
+            .map_err(|error| crate::admin_store_error("account concurrency", error))
+    }
+
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
         self.cooldowns
             .active_cooldowns()

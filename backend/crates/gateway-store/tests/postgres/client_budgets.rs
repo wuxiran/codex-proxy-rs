@@ -1,3 +1,5 @@
+//! 验证 Key 预算重置、在途结算、时间窗口与审计事务
+
 use std::{collections::BTreeMap, time::SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -75,6 +77,142 @@ fn context() -> MutationContext {
 }
 
 #[tokio::test]
+async fn open_budget_windows_only_write_for_new_charges() {
+    let Some(database) = TestDatabase::create("budget_window_writes").await else {
+        return;
+    };
+    sqlx::raw_sql(
+        "create table budget_window_writes (operation text not null);
+        create function record_budget_window_write() returns trigger language plpgsql as $$
+        begin
+            insert into budget_window_writes (operation) values (tg_op);
+            return new;
+        end $$;
+        create trigger record_budget_window_write after insert or update
+            on client_api_key_budget_windows for each row
+            execute function record_budget_window_write();",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let first = PgClientBudgetStore::new(database.pool.clone());
+    let second = PgClientBudgetStore::new(database.pool.clone());
+    for (key, limit) in [("unlimited", "0"), ("limited", "10")] {
+        seed(&database, key, limit, limit).await;
+        first.admit(key_id(key)).await.unwrap();
+        for _ in 0..4 {
+            let (a, b) = tokio::join!(first.admit(key_id(key)), second.admit(key_id(key)));
+            a.unwrap();
+            b.unwrap();
+        }
+        let billed = charge(key, key, "0.25");
+        let (a, b) = tokio::join!(first.settle(billed.clone()), second.settle(billed));
+        a.unwrap();
+        b.unwrap();
+        let budget = status(&database, key).await;
+        assert_eq!(budget.daily_used_usd.canonical(), "0.25");
+        assert_eq!(budget.weekly_used_usd.canonical(), "0.25");
+    }
+    let writes: (i64, i64) = sqlx::query_as(
+        "select count(*) filter (where operation = 'INSERT'),
+            count(*) filter (where operation = 'UPDATE') from budget_window_writes",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        writes,
+        (2, 2),
+        "only creation and amount accumulation write rows"
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn indexed_charge_cleanup_keeps_other_keys_and_rolls_back_with_key_deletion() {
+    let Some(database) = TestDatabase::create("budget_key_cleanup").await else {
+        return;
+    };
+    let store = PgClientBudgetStore::new(database.pool.clone());
+    for key in ["deleted", "retained"] {
+        seed(&database, key, "0", "0").await;
+        store.settle(charge(key, key, "1.25")).await.unwrap();
+    }
+    let mut tx = database.pool.begin().await.unwrap();
+    sqlx::query("delete from client_api_keys where id = 'deleted'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let remaining: Vec<String> = sqlx::query_scalar(
+        "select client_api_key_id from client_api_key_charge_events order by client_api_key_id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(remaining, ["retained"]);
+    tx.rollback().await.unwrap();
+    let restored: i64 = sqlx::query_scalar("select count(*) from client_api_key_charge_events")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(restored, 2);
+    sqlx::query("delete from client_api_keys where id = 'deleted'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&database, "retained")
+            .await
+            .daily_used_usd
+            .canonical(),
+        "1.25"
+    );
+    let remaining: Vec<String> = sqlx::query_scalar(
+        "select client_api_key_id from client_api_key_charge_events order by client_api_key_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, ["retained"]);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn unopened_future_budget_windows_do_not_report_usage_or_reset_times() {
+    let Some(database) = TestDatabase::create("budget_unopened_future").await else {
+        return;
+    };
+    seed(&database, "key", "10", "20").await;
+    PgClientBudgetStore::new(database.pool.clone())
+        .settle(charge("key", "before", "3"))
+        .await
+        .unwrap();
+    // 起止相等表示窗口未开启；未来边界确定性覆盖应用时钟领先数据库的场景
+    sqlx::query(
+        "update client_api_key_budget_windows set
+        daily_start = now() + interval '1 hour', daily_end = now() + interval '1 hour',
+        weekly_start = now() + interval '1 hour', weekly_end = now() + interval '1 hour'
+        where client_api_key_id = $1",
+    )
+    .bind("key")
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let budget = status(&database, "key").await;
+    assert_eq!(
+        (
+            budget.daily_used_usd.canonical(),
+            budget.weekly_used_usd.canonical(),
+            budget.daily_resets_at,
+            budget.weekly_resets_at,
+        ),
+        ("0".to_owned(), "0".to_owned(), None, None)
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn manual_reset_clears_selected_windows_and_preserves_policy_and_history() {
     let Some(database) = TestDatabase::create("budget_manual_reset").await else {
         return;
@@ -124,7 +262,7 @@ async fn manual_reset_clears_selected_windows_and_preserves_policy_and_history()
                 .then_some(before.weekly_resets_at)
                 .flatten()
         );
-        // 同一费用重试既不重复扣额，也不能重新开启已重置的窗口。
+        // 同一费用重试既不重复扣额，也不能重新开启已重置的窗口
         store.settle(billed).await.unwrap();
         assert_eq!(status(&database, key).await, after);
         assert_eq!(
@@ -133,7 +271,7 @@ async fn manual_reset_clears_selected_windows_and_preserves_policy_and_history()
         );
     }
     let counts: (i64, i64, i64) = sqlx::query_as(
-        "select (select count(*) from client_key_charge_events),
+        "select (select count(*) from client_api_key_charge_events),
         (select count(*) from admin_audit_events where action = 'reset_budget' and config_revision is null and actor_kind = 'system'),
         (select config_revision from runtime_settings where id = 1)"
     ).fetch_one(&database.pool).await.unwrap();
@@ -156,7 +294,7 @@ async fn manual_reset_restarts_selected_windows_only_after_new_usage() {
         seed(&database, key, "10", "20").await;
         store.admit(key_id(key)).await.unwrap();
         store.settle(charge(key, key, "1")).await.unwrap();
-        sqlx::query("update client_key_budget_windows set weekly_start = weekly_start - interval '3 days', weekly_end = weekly_end - interval '3 days' where client_api_key_id = $1")
+        sqlx::query("update client_api_key_budget_windows set weekly_start = weekly_start - interval '3 days', weekly_end = weekly_end - interval '3 days' where client_api_key_id = $1")
             .bind(key).execute(&database.pool).await.unwrap();
         let before = status(&database, key).await;
         let delayed = charge(key, &format!("{key}-delayed"), "0.5");
@@ -173,7 +311,7 @@ async fn manual_reset_restarts_selected_windows_only_after_new_usage() {
             .await
             .unwrap();
         let reset = status(&database, key).await;
-        // 重置前完成的迟到费用保留历史，但不能开启窗口或重新扣入所选周期。
+        // 重置前完成的迟到费用保留历史，但不能开启窗口或重新扣入所选周期
         store.settle(delayed).await.unwrap();
         let delayed = status(&database, key).await;
         assert_eq!(delayed.daily_resets_at, reset.daily_resets_at);
@@ -207,7 +345,7 @@ async fn manual_reset_restarts_selected_windows_only_after_new_usage() {
             );
             assert_ne!(restarted.weekly_resets_at, before.weekly_resets_at);
         }
-        // 开启窗口后仍保留重置边界，另一笔重置前的迟到费用也不能重新扣额。
+        // 开启窗口后仍保留重置边界，另一笔重置前的迟到费用也不能重新扣额
         store.settle(old).await.unwrap();
         let after_old = status(&database, key).await;
         assert_eq!(after_old.daily_resets_at, restarted.daily_resets_at);
@@ -268,7 +406,7 @@ async fn manual_reset_excludes_old_completions_but_counts_inflight_requests_afte
         .unwrap();
     let delayed = charge("key", "delayed", "0.3");
     let reset_context = context();
-    // 无论迟到结算还是重置先取得锁，重置前完成的费用都不应重新进入日额度。
+    // 无论迟到结算还是重置先取得锁，重置前完成的费用都不应重新进入日额度
     let (reset, settled) = tokio::join!(
         admin.reset_client_key_budget(
             ResetClientKeyBudget {
@@ -307,7 +445,7 @@ async fn manual_reset_leaves_unused_and_expired_windows_inactive_and_reports_mis
     }
     store.admit(key_id("expired")).await.unwrap();
     store.settle(charge("expired", "old", "2")).await.unwrap();
-    sqlx::query("update client_key_budget_windows set daily_end = now() - interval '1 second', weekly_end = now() - interval '1 second'")
+    sqlx::query("update client_api_key_budget_windows set daily_end = now() - interval '1 second', weekly_end = now() - interval '1 second'")
         .execute(&database.pool).await.unwrap();
     for key in ["unused", "expired"] {
         admin
@@ -326,7 +464,7 @@ async fn manual_reset_leaves_unused_and_expired_windows_inactive_and_reports_mis
         assert!(after.weekly_resets_at.is_none());
         assert_eq!(after.daily_used_usd.canonical(), "0");
     }
-    let windows: i64 = sqlx::query_scalar("select count(*) from client_key_budget_windows")
+    let windows: i64 = sqlx::query_scalar("select count(*) from client_api_key_budget_windows")
         .fetch_one(&database.pool)
         .await
         .unwrap();
@@ -406,12 +544,12 @@ async fn key_usage_profile_reuses_current_budget_without_revealing_or_advancing_
     assert_eq!(current.budget, status(&database, "profile").await);
     assert_eq!(current.budget.daily_used_usd.canonical(), "0.640001");
     assert!(!format!("{current:?}").contains(&format!("sk_{:a<43}", "profile")));
-    sqlx::query("update client_key_budget_windows set daily_end = now() - interval '1 second' where client_api_key_id = 'profile'")
+    sqlx::query("update client_api_key_budget_windows set daily_end = now() - interval '1 second' where client_api_key_id = 'profile'")
         .execute(&database.pool).await.unwrap();
     let after_reset = keys.get_client_key(&id).await.unwrap().unwrap();
     assert_eq!(after_reset.budget.daily_used_usd.canonical(), "0");
     assert_eq!(after_reset.budget.weekly_used_usd.canonical(), "0.640001");
-    let persisted: String = sqlx::query_scalar("select daily_used_usd::text from client_key_budget_windows where client_api_key_id = 'profile'")
+    let persisted: String = sqlx::query_scalar("select daily_used_usd::text from client_api_key_budget_windows where client_api_key_id = 'profile'")
         .fetch_one(&database.pool).await.unwrap();
     assert_eq!(
         persisted
@@ -434,7 +572,7 @@ async fn budgets_settle_exactly_once_and_enforce_each_threshold_across_store_ins
     let second = PgClientBudgetStore::new(database.pool.clone());
     for (key, prefix, amount) in [("day", "d", "0.1"), ("week", "w", "0.1")] {
         for _ in 0..3 {
-            // 已准入请求可完成并超过限额，不预占估算费用。
+            // 已准入请求可完成并超过限额，不预占估算费用
             first.admit(key_id(key)).await.unwrap();
         }
         for index in 0..3 {
@@ -462,7 +600,7 @@ async fn budgets_settle_exactly_once_and_enforce_each_threshold_across_store_ins
         week_error.client_error_code(),
         Some("key_weekly_budget_exceeded")
     );
-    let event_count: i64 = sqlx::query_scalar("select count(*) from client_key_charge_events")
+    let event_count: i64 = sqlx::query_scalar("select count(*) from client_api_key_charge_events")
         .fetch_one(&database.pool)
         .await
         .unwrap();
@@ -479,13 +617,13 @@ async fn window_rollover_is_shanghai_midnight_and_seven_days_with_late_settlemen
     let store = PgClientBudgetStore::new(database.pool.clone());
     store.admit(key_id("key")).await.unwrap();
     let (day_start, day_end, week_end): (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) =
-        sqlx::query_as("select daily_start, daily_end, weekly_end from client_key_budget_windows where client_api_key_id = 'key'")
+        sqlx::query_as("select daily_start, daily_end, weekly_end from client_api_key_budget_windows where client_api_key_id = 'key'")
             .fetch_one(&database.pool).await.unwrap();
     assert_eq!(day_start.timestamp().rem_euclid(86400), 16 * 3600);
     assert_eq!((day_end - day_start).num_hours(), 24);
     assert_eq!((week_end - day_start).num_hours(), 168);
     store.settle(charge("key", "first", "1")).await.unwrap();
-    sqlx::query("update client_key_budget_windows set daily_start = daily_start - interval '1 day', daily_end = daily_start")
+    sqlx::query("update client_api_key_budget_windows set daily_start = daily_start - interval '1 day', daily_end = daily_start")
         .execute(&database.pool).await.unwrap();
     store.admit(key_id("key")).await.unwrap();
     assert_eq!(
@@ -497,7 +635,7 @@ async fn window_rollover_is_shanghai_midnight_and_seven_days_with_late_settlemen
         "1"
     );
     store.settle(charge("key", "second", "1")).await.unwrap();
-    sqlx::query("update client_key_budget_windows set daily_end = now() - interval '1 second', weekly_end = now() - interval '1 second'")
+    sqlx::query("update client_api_key_budget_windows set daily_end = now() - interval '1 second', weekly_end = now() - interval '1 second'")
         .execute(&database.pool).await.unwrap();
     let virtual_reset = status(&database, "key").await;
     assert_eq!(virtual_reset.daily_used_usd.canonical(), "0");
@@ -524,11 +662,11 @@ async fn zero_cost_and_interrupted_requests_never_block_limited_keys() {
     let store = PgClientBudgetStore::new(database.pool.clone());
     store.admit(key_id("key")).await.unwrap();
     store.settle(charge("key", "no-cost", "0")).await.unwrap();
-    // 模拟准入后进程退出，没有费用可结算；重启后仍应允许同一 Key 使用。
+    // 模拟准入后进程退出，没有费用可结算；重启后仍应允许同一 Key 使用
     store.admit(key_id("key")).await.unwrap();
     let restarted = PgClientBudgetStore::new(database.pool.clone());
     restarted.admit(key_id("key")).await.unwrap();
-    let events: i64 = sqlx::query_scalar("select count(*) from client_key_charge_events")
+    let events: i64 = sqlx::query_scalar("select count(*) from client_api_key_charge_events")
         .fetch_one(&database.pool)
         .await
         .unwrap();
@@ -556,21 +694,21 @@ async fn transient_settlement_failure_rolls_back_and_retries_exact_cost_before_a
     seed(&database, "key", "1", "5").await;
     let store = PgClientBudgetStore::new(database.pool.clone());
     store.admit(key_id("key")).await.unwrap();
-    // 在费用事件插入后让窗口写入失败，验证整个事务回滚。
+    // 在费用事件插入后让窗口写入失败，验证整个事务回滚
     sqlx::raw_sql(
         "create function reject_budget_update() returns trigger language plpgsql as $$
         begin
             if new.daily_used_usd > 0 then raise exception 'temporary test failure'; end if;
             return new;
         end $$;
-        create trigger reject_budget_update before update on client_key_budget_windows
+        create trigger reject_budget_update before update on client_api_key_budget_windows
         for each row execute function reject_budget_update();",
     )
     .execute(&database.pool)
     .await
     .unwrap();
     assert!(store.settle(charge("key", "retry", "1.25")).await.is_err());
-    let events: i64 = sqlx::query_scalar("select count(*) from client_key_charge_events")
+    let events: i64 = sqlx::query_scalar("select count(*) from client_api_key_charge_events")
         .fetch_one(&database.pool)
         .await
         .unwrap();
@@ -579,7 +717,7 @@ async fn transient_settlement_failure_rolls_back_and_retries_exact_cost_before_a
         status(&database, "key").await.daily_used_usd.canonical(),
         "0"
     );
-    sqlx::query("drop trigger reject_budget_update on client_key_budget_windows")
+    sqlx::query("drop trigger reject_budget_update on client_api_key_budget_windows")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -792,7 +930,7 @@ async fn plugin_resets_share_the_native_ledger_and_each_call_resets_again() {
     assert!(after.weekly_resets_at.is_none());
     let (audits, charges, current_revision): (i64, i64, i64) = sqlx::query_as(
         "select (select count(*) from admin_audit_events where action='reset_budget' and config_revision is null),
-                (select count(*) from client_key_charge_events),
+                (select count(*) from client_api_key_charge_events),
                 (select config_revision from runtime_settings where id=1)"
     ).fetch_one(&database.pool).await.unwrap();
     assert_eq!((audits, charges, current_revision), (2, 2, revision));
@@ -874,7 +1012,7 @@ async fn plugin_reset_revalidates_current_revision_without_changing_the_ledger()
             .kind(),
         AdminStoreErrorKind::NotFound
     );
-    // 验证拒绝后的事务和锁已释放，当前身份仍可正常执行。
+    // 验证拒绝后的事务和锁已释放，当前身份仍可正常执行
     store
         .reset_client_key_budget(
             ResetClientKeyBudget {
@@ -927,7 +1065,7 @@ async fn plugin_reset_rolls_back_with_audit_and_serializes_with_late_settlement(
         .await
         .unwrap();
     let mutation = context();
-    // 完成时间在重置前，无论谁先拿到行锁，周用量都不能被迟到结算重新扣回。
+    // 完成时间在重置前，无论谁先拿到行锁，周用量都不能被迟到结算重新扣回
     let delayed = charge("key", "delayed", "1");
     let (reset, settlement) = tokio::join!(
         store.reset_client_key_budget(
@@ -1071,7 +1209,7 @@ async fn plugin_budget_limits_revalidate_authority_and_rollback_with_audit() {
     seed(&database, "key", "10", "20").await;
     let store = PgAdminClientKeyStore::new(database.pool.clone());
     let before = status(&database, "key").await;
-    // 读取和配置赋值都不能开启未使用 Key 的窗口。
+    // 读取和配置赋值都不能开启未使用 Key 的窗口
     assert_eq!(before.daily_resets_at, None);
     let mut stale_owner = owner.clone();
     stale_owner.revision = Revision::new(owner.revision.get() + 1).unwrap();
@@ -1143,5 +1281,109 @@ async fn plugin_budget_limits_revalidate_authority_and_rollback_with_audit() {
     assert_eq!(after.limits.daily_usd.canonical(), "2");
     assert_eq!(after.daily_resets_at, None);
     assert_eq!(after.weekly_resets_at, None);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn timezone_cutover_preserves_open_windows_and_resumes_without_overlap() {
+    use gateway_core::time::DeploymentTimeZone;
+    let Some(database) = TestDatabase::create("budget_timezone_cutover").await else {
+        return;
+    };
+    seed(&database, "key", "10", "20").await;
+    let original = PgClientBudgetStore::new(database.pool.clone());
+    original.admit(key_id("key")).await.unwrap();
+    original
+        .settle(charge("key", "before-cutover", "1"))
+        .await
+        .unwrap();
+    let before: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_api_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    let timezone: DeploymentTimeZone = "UTC".parse().unwrap();
+    let changed = PgClientBudgetStore::new(database.pool.clone()).with_timezone(timezone);
+    changed.admit(key_id("key")).await.unwrap();
+    let after: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_api_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "1"
+    );
+    let now = Utc::now();
+    let old_end = chrono::DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap()
+        - chrono::Duration::seconds(1);
+    sqlx::query("update client_api_key_budget_windows set daily_start = $1, daily_end = $2, weekly_start = $1, weekly_end = $2")
+        .bind(old_end - chrono::Duration::hours(1)).bind(old_end).execute(&database.pool).await.unwrap();
+    changed.admit(key_id("key")).await.unwrap();
+    let resumed: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_api_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(resumed.0, old_end);
+    assert_eq!(resumed.2, old_end);
+    assert_eq!(resumed.1, timezone.days_after(now, 1).unwrap());
+    assert_eq!(resumed.3, timezone.days_after(now, 7).unwrap());
+    changed
+        .settle(ClientBudgetCharge {
+            completed_at: (old_end - chrono::Duration::seconds(1)).into(),
+            ..charge("key", "late-cutover", "2")
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "0"
+    );
+    changed
+        .settle(charge("key", "after-cutover", "3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "3"
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn failed_settlement_retains_native_database_code_through_the_next_admission() {
+    let Some(database) = TestDatabase::create("budget_native_failure").await else {
+        return;
+    };
+    sqlx::query("alter table client_api_keys rename to hidden_test_keys")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let budgets = PgClientBudgetStore::new(database.pool.clone());
+    let error = budgets
+        .settle(charge("missing-key", "native-error", "1"))
+        .await
+        .unwrap_err();
+    fn assert_native_code(error: &(dyn std::error::Error + 'static)) {
+        let mut source = Some(error);
+        while let Some(error) = source {
+            if let Some(sqlx::Error::Database(error)) = error.downcast_ref::<sqlx::Error>() {
+                assert_eq!(error.code().as_deref(), Some("42P01"));
+                return;
+            }
+            source = error.source();
+        }
+        panic!("native database failure was lost");
+    }
+    assert_native_code(&error);
+    let retried = budgets.admit(key_id("missing-key")).await.unwrap_err();
+    assert_eq!(
+        retried.kind(),
+        GatewayErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_native_code(&retried);
+    assert!(
+        retried
+            .error_details()
+            .unwrap()
+            .as_str()
+            .contains("client_api_keys")
+    );
     database.close().await;
 }

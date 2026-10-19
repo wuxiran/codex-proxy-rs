@@ -1,4 +1,4 @@
-//! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
+//! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -24,9 +24,9 @@ use gateway_admin::model::provider_credentials::{
     ProviderExportCredentialInput, ProviderModel, ProviderModelCatalogDocument, ProviderModels,
     ProviderProfileActivityInsights, ProviderProfileAvatar, ProviderProfileAvatarStreamError,
     ProviderProfileDailyUsage, ProviderProfileInvocation, ProviderProfileStatistics,
-    ProviderProfileStatisticsSummary, ProviderQuota, ProviderQuotaRequest, ProviderQuotaWindow,
-    ProviderQuotaWindowRole, ProviderResetCredit, ProviderResetCreditResult, ProviderResetCredits,
-    ProviderSubscription, QuotaLocalUsageAttribution,
+    ProviderProfileStatisticsSummary, ProviderQuota, ProviderQuotaCredits, ProviderQuotaRequest,
+    ProviderQuotaWindow, ProviderQuotaWindowRole, ProviderResetCredit, ProviderResetCreditResult,
+    ProviderResetCredits, ProviderSubscription, QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
 use gateway_admin::ports::provider::{
@@ -76,7 +76,7 @@ use crate::transport::{
 const PROVIDER_NAME: &str = "openai";
 const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
-/// OpenAI 对终态 Admin port 的唯一实现。
+/// OpenAI 对终态 Admin port 的唯一实现
 pub(crate) struct OpenAiAdminProvider {
     turn_state_pins: crate::turn_state_pin::TurnStatePins,
     auto_hunt: crate::turn_state_auto_hunt::AutoHuntStore,
@@ -306,6 +306,26 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
+    fn compile_privacy_policy(
+        &self,
+        policy: &gateway_core::settings::privacy::CodexPrivacyPolicy,
+    ) -> Result<
+        Arc<dyn gateway_core::settings::privacy::CompiledPrivacyPolicy>,
+        gateway_core::settings::privacy::PrivacyError,
+    > {
+        crate::transport::privacy::compile(policy)
+    }
+
+    fn preview_privacy_policy(
+        &self,
+        request: gateway_core::settings::privacy::PrivacyPreviewRequest,
+    ) -> Result<
+        gateway_core::settings::privacy::PrivacyPreviewResult,
+        gateway_core::settings::privacy::PrivacyError,
+    > {
+        crate::transport::privacy::preview(request)
+    }
+
     fn account_capabilities(
         &self,
         _account_id: &ProviderAccountId,
@@ -349,21 +369,22 @@ impl ProviderAdmin for OpenAiAdminProvider {
     }
 
     fn plan_type_display(&self, plan_type: &str) -> String {
-        // 与官方 Desktop 的套餐名称映射一致；原始子类型继续由 plan_type 保留。
+        // Pro 系列按套餐类型区分展示，其他套餐遵循官方 KnownPlan::display_name
+        // 只映射展示名称，原始套餐值与未知套餐保持不变
         match plan_type.to_ascii_lowercase().as_str() {
-            "free" | "free_workspace" | "guest" => "Free",
+            "free" => "Free",
             "go" => "Go",
             "plus" => "Plus",
-            "pro" | "prolite" => "Pro",
-            "team" | "self_serve_business_prolite" | "self_serve_business_usage_based" => {
-                "Business"
-            }
-            "business"
-            | "ent26"
-            | "enterprise_cbp_automation"
-            | "enterprise_cbp_usage_based"
-            | "enterprise"
-            | "hc" => "Enterprise",
+            "pro" => "Pro",
+            "prolite" => "ProLite",
+            "promax" => "ProMax",
+            "team" => "Team",
+            "self_serve_business_prolite" => "Self Serve Business ProLite",
+            "self_serve_business_usage_based" => "Self Serve Business Usage Based",
+            "business" => "Business",
+            "ent26" | "enterprise" | "hc" => "Enterprise",
+            "enterprise_cbp_automation" => "Enterprise (Automation)",
+            "enterprise_cbp_usage_based" => "Enterprise CBP Usage Based",
             "edu" | "education" => "Edu",
             "edu_plus" => "Edu Plus",
             "edu_pro" => "Edu Pro",
@@ -542,8 +563,8 @@ impl ProviderAdmin for OpenAiAdminProvider {
             OpenAiBillingUsage::new(
                 input_tokens,
                 output_tokens,
-                input.cached_tokens.unwrap_or_default(),
-                input.cache_write_tokens.unwrap_or_default(),
+                input.cached_input_tokens.unwrap_or_default(),
+                input.cache_write_input_tokens.unwrap_or_default(),
             ),
             input.service_tier.as_deref(),
         ) else {
@@ -554,7 +575,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return Ok(None);
         }
         Ok(Some(CalculatedBillingBreakdown {
-            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记。
+            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记
             long_context_billing_applied: false,
             image: None,
             custom_multiplier_bps: breakdown.custom_multiplier_bps(),
@@ -573,6 +594,33 @@ impl ProviderAdmin for OpenAiAdminProvider {
             service_tier: breakdown.service_tier().map(str::to_owned),
             multiplier_percent: breakdown.multiplier_percent(),
         }))
+    }
+
+    fn evaluate_usage_pricing(
+        &self,
+        input: &gateway_admin::ports::provider::ProviderUsagePricingInput,
+        pricing: Option<&gateway_core::metering::ModelPriceOverride>,
+    ) -> Result<Option<gateway_core::metering::CalculatedCostBreakdown>, ProviderAdminError> {
+        let (Some(input_tokens), Some(output_tokens), Some(cached), Some(written)) = (
+            input.usage.input_tokens,
+            input.usage.output_tokens,
+            input.usage.cached_input_tokens,
+            input.usage.cache_write_input_tokens,
+        ) else {
+            return Ok(None);
+        };
+        if input.usage.image_input_tokens != Some(0) || input.usage.image_output_tokens != Some(0) {
+            return Ok(None);
+        }
+        let usage = OpenAiBillingUsage::new(input_tokens, output_tokens, cached, written);
+        Ok(
+            crate::transport::usage::openai_billing_breakdown_with_override(
+                &input.upstream_model_id,
+                usage,
+                input.service_tier.as_deref(),
+                pricing,
+            ),
+        )
     }
 
     async fn prepare_import(
@@ -661,13 +709,13 @@ impl ProviderAdmin for OpenAiAdminProvider {
             (
                 AuthorizationMutationTarget::Create { .. },
                 CompletedCodexOAuthCredential::Create(credential),
-            ) => prepared_create(credential, Utc::now())
+            ) => prepared_create(*credential, Utc::now())
                 .map(|credential| PreparedAuthorizationCredential::Create(Box::new(credential))),
             (
                 AuthorizationMutationTarget::Reauthorize { .. },
                 CompletedCodexOAuthCredential::Reauthorize(credential),
             ) => {
-                prepared_rotation(credential, mutation.provider_kind().clone()).map(|credential| {
+                prepared_rotation(*credential, mutation.provider_kind().clone()).map(|credential| {
                     PreparedAuthorizationCredential::Reauthorize(Box::new(credential))
                 })
             }
@@ -1446,7 +1494,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             .await
             .map_err(map_catalog_error)?;
         // 只有 Codex 原生对象带齐推理强度、上下文窗口等元数据；API 目录只有模型 ID，
-        // 拼出来的文件不满足 Codex `model_catalog_json` 的加载要求，这里直接拒绝而不降格。
+        // 拼出来的文件不满足 Codex `model_catalog_json` 的加载要求，这里直接拒绝而不降格
         let mut entries = Vec::with_capacity(models.len());
         for model in &models {
             if model.document().protocol() != "codex" {
@@ -1777,6 +1825,7 @@ fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, Provi
         account.access_token_expires_at.map(SystemTime::from),
     )
     .with_outbound_proxy(account.outbound_proxy.clone())
+    .with_notes(account.notes.clone())
     .with_profile(
         account.email.clone(),
         account.upstream_account_id.clone(),
@@ -1845,6 +1894,7 @@ fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> 
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -1903,13 +1953,18 @@ fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota 
         })
         .collect();
     // 快照级 limit_reached 只看滚动后的窗口触顶：顶层标记是观测事实，不能
-    // 在窗口全部过期后继续维持限流。
+    // 在窗口全部过期后继续维持限流
     let limit_reached = quota_windows_limit_reached(&windows);
     ProviderQuota {
         plan_type: snapshot.plan_type().map(str::to_owned),
         observed_at: Some(DateTime::<Utc>::from(snapshot.observed_at())),
         refresh_token_expires_at: None,
         windows,
+        credits: snapshot.credits().map(|credits| ProviderQuotaCredits {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            balance: credits.balance.clone(),
+        }),
         limit_reached,
         provider_data: Some(ProviderDocument::new(OpaqueProviderData::new(
             provider_data,
@@ -1997,9 +2052,9 @@ fn project_reset_credit(
     }
 }
 
-/// `secondary_window` 有时只是上游的空占位：没有时长、重置时间，也没有用量。
+/// `secondary_window` 有时只是上游的空占位：没有时长、重置时间，也没有用量
 /// 它不能被可靠翻译成 5 小时或周额度，因此不应占用账号面板；带有实际事实的
-/// 次级窗口（时长、重置、非零用量或触顶）仍完整保留。
+/// 次级窗口（时长、重置、非零用量或触顶）仍完整保留
 fn should_project_quota_window(window: &CodexQuotaWindow) -> bool {
     window.role() != CodexQuotaWindowRole::Secondary
         || window.window_seconds().is_some()
@@ -2028,7 +2083,7 @@ const fn quota_role(role: CodexQuotaWindowRole) -> ProviderQuotaWindowRole {
     }
 }
 
-/// 按窗口时长显示汉化额度名；额度桶名称通过独立字段投影。
+/// 按窗口时长显示汉化额度名；额度桶名称通过独立字段投影
 fn codex_quota_window_label(
     kind: CodexQuotaWindowKind,
     role: CodexQuotaWindowRole,
@@ -2045,7 +2100,7 @@ fn codex_quota_window_label(
 fn custom_quota_window_label(window_seconds: Option<u64>, role: CodexQuotaWindowRole) -> String {
     let Some(seconds) = window_seconds.filter(|seconds| *seconds > 0) else {
         // 与官方客户端一致：没有时长时不臆测为 5 小时或周额度；保留
-        // primary/secondary 语义，让用户知道这是上游未标明时长的独立窗口。
+        // primary/secondary 语义，让用户知道这是上游未标明时长的独立窗口
         return match role {
             CodexQuotaWindowRole::Primary => "主额度".to_owned(),
             CodexQuotaWindowRole::Secondary => "次级额度".to_owned(),
@@ -2061,7 +2116,7 @@ fn custom_quota_window_label(window_seconds: Option<u64>, role: CodexQuotaWindow
     }
 }
 
-/// 将 Provider-owned PKCE/OIDC 状态保存到 Store 提供的 Redis 原子端口。
+/// 将 Provider-owned PKCE/OIDC 状态保存到 Store 提供的 Redis 原子端口
 pub(crate) struct OpenAiOAuthPendingStore {
     port: Arc<dyn OAuthPendingFlowPort>,
     provider_kind: ProviderKind,
@@ -2428,6 +2483,7 @@ fn map_store_error(error: gateway_core::error::StoreError) -> ProviderAdminError
         StoreErrorKind::Unavailable => ProviderAdminErrorKind::Unavailable,
         _ => ProviderAdminErrorKind::Internal,
     })
+    .with_source(error)
 }
 
 fn map_credential_admin_error(error: CodexCredentialAdminError) -> ProviderAdminError {
@@ -2514,12 +2570,12 @@ fn cdk_redeem_public_message(message: &str) -> &'static str {
 }
 
 fn refresh_rejection_message(code: Option<&str>) -> Option<&'static str> {
-    // 与官方 Codex 的失败原因对齐；只解释管理提示，不改动 Worker 的终态/退避判定。
+    // 与官方 Codex 的失败原因对齐；只解释管理提示，不改动 Worker 的终态/退避判定
     match code.map(str::to_ascii_lowercase).as_deref() {
         Some("refresh_token_expired") => Some("刷新令牌已过期，请重新授权"),
         Some("refresh_token_reused") => Some("刷新令牌已被使用，请重新授权"),
         Some("refresh_token_invalidated") => Some("刷新令牌已被撤销，请重新授权"),
-        // token_expired 也用于 RT 校验失败，不据此断言具体到期原因。
+        // token_expired 也用于 RT 校验失败，不据此断言具体到期原因
         Some("token_expired") => Some("刷新令牌不可用，请重新授权"),
         Some("invalid_grant") => Some("刷新令牌无效或已失效，请重新授权"),
         _ => None,
@@ -2640,7 +2696,7 @@ fn map_quota_error(error: CodexCredentialQuotaError) -> ProviderAdminError {
             detail,
         } => {
             // 公开文案只解释已知状态和错误码；原始上游材料留在内部诊断，
-            // 额度查询拒绝不作为凭据失效证据，也不写入账号的凭据错误字段。
+            // 额度查询拒绝不作为凭据失效证据，也不写入账号的凭据错误字段
             let (kind, public_message) = match (status, code.as_deref()) {
                 (Some(401), Some("token_revoked")) => (
                     Kind::BadGateway,

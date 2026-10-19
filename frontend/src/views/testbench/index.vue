@@ -3,7 +3,7 @@
 // 状态与收流循环都在 stores/modules/testbench.ts：切走页面再回来，结果与进行中的生成都保留。
 // 输出（常是 HTML/SVG）用 sandbox="" iframe 隔离预览：无脚本/无同源/无表单/无导航 + CSP 断远程资源。
 import type { RunState, RunStatus, Verdict } from '@/stores/modules/testbench'
-import { BaseButton, BaseCard, BaseCheckbox, BaseInput, BaseNumberInput, BasePageHeader, BaseSelect, BaseTextarea } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZCheckbox, ZInput, ZInputNumber, ZPageHeader, ZSelect, ZTextarea } from '@codex-proxy/ui'
 import { storeToRefs } from 'pinia'
 import { onMounted } from 'vue'
 import { useTestBenchStore } from '@/stores/modules/testbench'
@@ -125,41 +125,41 @@ onMounted(() => {
 
 <template>
   <div class="flex w-full flex-col gap-5 px-4 py-6">
-    <BasePageHeader
+    <ZPageHeader
       title="测智台"
       description="按账号对比回答，查看实际票与连接使用情况"
     />
 
-    <BaseCard>
+    <ZCard>
       <div class="flex flex-col gap-4">
         <!-- 参数行 -->
         <div class="flex flex-wrap items-end gap-3">
           <div class="w-40">
             <span class="block text-xs text-neutral-500">测试方式</span>
-            <BaseSelect v-model="mode" :options="modeOptions" aria-label="测试方式" class="mt-1" />
+            <ZSelect v-model="mode" :options="modeOptions" aria-label="测试方式" class="mt-1" />
           </div>
           <div class="w-48">
             <span class="block text-xs text-neutral-500">分组</span>
-            <BaseSelect v-model="groupId" :options="groupOptions()" class="mt-1" @update:model-value="store.loadAccounts()" />
+            <ZSelect v-model="groupId" :options="groupOptions()" class="mt-1" @update:model-value="store.loadAccounts()" />
           </div>
           <div class="w-48">
             <span class="block text-xs text-neutral-500">模型</span>
-            <BaseSelect v-model="model" :options="modelOptions" class="mt-1" />
+            <ZSelect v-model="model" :options="modelOptions" class="mt-1" />
           </div>
           <div class="w-40">
             <span class="block text-xs text-neutral-500">思考强度</span>
-            <BaseSelect v-model="effort" :options="effortOptions" class="mt-1" />
+            <ZSelect v-model="effort" :options="effortOptions" class="mt-1" />
           </div>
           <div class="w-32">
             <span class="block text-xs text-neutral-500">并发上限</span>
-            <BaseNumberInput v-model="concurrency" label="并发上限" :min="1" :max="8" class="mt-1" />
+            <ZInputNumber v-model="concurrency" aria-label="并发上限" :min="1" :max="8" class="mt-1" />
           </div>
-          <BaseButton :loading="running" :disabled="running || selected.length === 0" @click="store.runBatch()">
+          <ZButton :loading="running" :disabled="running || selected.length === 0" @click="store.runBatch()">
             开始测试（{{ selected.length }}）
-          </BaseButton>
-          <BaseButton v-if="runs.length" size="sm" variant="secondary" :disabled="running" @click="store.clearRuns()">
+          </ZButton>
+          <ZButton v-if="runs.length" size="small" :disabled="running" @click="store.clearRuns()">
             清空结果
-          </BaseButton>
+          </ZButton>
         </div>
 
         <p class="m-0 text-xs text-neutral-500">
@@ -169,7 +169,7 @@ onMounted(() => {
         <!-- prompt -->
         <div>
           <span class="block text-xs text-neutral-500">Prompt（所有选中账号共用）</span>
-          <BaseTextarea v-model="prompt" label="测试 Prompt" :rows="3" class="mt-1" placeholder="输入测试 prompt" />
+          <ZTextarea v-model="prompt" aria-label="测试 Prompt" :rows="3" class="mt-1" placeholder="输入测试 prompt" />
         </div>
 
         <!-- 账号选择 -->
@@ -180,9 +180,9 @@ onMounted(() => {
               <span v-if="accountsLoading" class="ml-1 text-amber-500">加载中…</span>
               <span v-else class="ml-1 text-neutral-400">（{{ filteredAccounts.length }} 个，已选 {{ selected.length }}）</span>
             </span>
-            <BaseInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-full text-xs sm:w-56" />
-            <BaseCheckbox
-              :model-value="allVisibleSelected" label="全选可见" show-label
+            <ZInput v-model="search" placeholder="搜索名称/邮箱/ID" class="h-7 w-full text-xs sm:w-56" />
+            <ZCheckbox
+              :model-value="allVisibleSelected" label="全选可见"
               class="shrink-0 text-xs" @update:model-value="store.toggleAllVisible"
             />
             <button class="shrink-0 text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200" @click="store.clearSelection()">
@@ -197,8 +197,8 @@ onMounted(() => {
               v-for="a in filteredAccounts" :key="a.id"
               class="flex items-center gap-2 border-b border-neutral-100 px-3 py-1.5 text-sm last:border-b-0 dark:border-neutral-800/60"
             >
-              <BaseCheckbox
-                :model-value="selectedSet.has(a.id)" :label="a.name || a.id"
+              <ZCheckbox
+                :model-value="selectedSet.has(a.id)" :aria-label="a.name || a.id"
                 @update:model-value="(v: boolean) => store.toggle(a.id, v)"
               />
               <span class="min-w-0 flex-1 truncate">{{ a.name || a.id }}</span>
@@ -222,11 +222,11 @@ onMounted(() => {
           </div>
         </div>
       </div>
-    </BaseCard>
+    </ZCard>
 
     <!-- 结果并排 -->
     <div v-if="runs.length" class="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-      <BaseCard v-for="run in runs" :key="run.accountId + run.startedAt" class="flex flex-col">
+      <ZCard v-for="run in runs" :key="run.accountId + run.startedAt" class="flex flex-col">
         <template #header>
           <div class="flex flex-col gap-2">
             <div class="flex items-center justify-between gap-2">
@@ -274,10 +274,10 @@ onMounted(() => {
               >
                 降智
               </button>
-              <BaseInput v-model="run.note" placeholder="备注" class="h-6 flex-1 text-[11px]" />
-              <BaseButton v-if="run.output" size="sm" variant="secondary" @click="downloadOutput(run)">
+              <ZInput v-model="run.note" placeholder="备注" class="h-6 flex-1 text-[11px]" />
+              <ZButton v-if="run.output" size="small" @click="downloadOutput(run)">
                 下载
-              </BaseButton>
+              </ZButton>
             </div>
           </div>
         </template>
@@ -309,7 +309,7 @@ onMounted(() => {
             上游未返回任何文本（可能被拒绝或空响应）。
           </div>
         </template>
-      </BaseCard>
+      </ZCard>
     </div>
   </div>
 </template>

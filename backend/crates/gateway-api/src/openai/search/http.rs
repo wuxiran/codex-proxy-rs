@@ -1,4 +1,4 @@
-//! Codex standalone search 非流式 HTTP adapter。
+//! Codex standalone search 非流式 HTTP adapter
 
 use std::net::SocketAddr;
 
@@ -24,7 +24,7 @@ use crate::openai::{
 
 const OPENAI_PROTOCOL: &str = "openai";
 
-/// `POST /v1/alpha/search`。
+/// `POST /v1/alpha/search`
 pub(crate) async fn standalone_search(
     State(state): State<ApiState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -54,7 +54,7 @@ pub(crate) async fn standalone_search(
         },
         client_ip,
         user_agent,
-        search_operation,
+        async move |body, headers| search_operation(body, &headers),
     )
     .await
 }

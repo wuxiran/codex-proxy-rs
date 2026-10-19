@@ -1,6 +1,7 @@
-//! 过渡期展示格式化；目标迁移到 Vue presenter。
+//! 观测领域事实到管理页面的展示投影
 
 use super::*;
+use gateway_core::metering::Usage;
 
 pub(crate) fn display_duration(value: Option<u64>) -> String {
     let Some(value) = value.and_then(|value| i64::try_from(value).ok()) else {
@@ -44,16 +45,6 @@ fn basis_points_rate(value: u64) -> f64 {
     value as f64 / 10_000.0
 }
 
-pub(crate) fn china_datetime(value: &DateTime<Utc>) -> String {
-    (*value + Duration::hours(8))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
-pub(crate) fn china_label(value: DateTime<Utc>, format: &str) -> String {
-    (value + Duration::hours(8)).format(format).to_string()
-}
-
 pub(crate) fn outcome_name(outcome: &domain::RequestOutcome) -> &str {
     outcome.as_str()
 }
@@ -68,9 +59,9 @@ pub(crate) fn request_metrics_view(metrics: &domain::RequestMetrics) -> RequestM
         caller_error_count: metrics.caller_error_count,
         input_tokens: metrics.input_tokens,
         output_tokens: metrics.output_tokens,
-        cached_tokens: metrics.cached_tokens,
-        cache_write_tokens: metrics.cache_write_tokens,
-        reasoning_tokens: metrics.reasoning_tokens,
+        cached_input_tokens: metrics.cached_input_tokens,
+        cache_write_input_tokens: metrics.cache_write_input_tokens,
+        reasoning_output_tokens: metrics.reasoning_output_tokens,
         total_tokens: metrics.total_tokens,
     }
 }
@@ -110,74 +101,63 @@ pub(crate) fn attempt_metrics_view(metrics: &domain::AttemptMetrics) -> AttemptM
 }
 
 pub(crate) fn token_details(record: &domain::UsageRecord) -> TokenDetailsView {
-    TokenDetailsView {
+    token_details_view(&Usage {
         input_tokens: record.input_tokens,
         output_tokens: record.output_tokens,
-        cached_tokens: record.cached_tokens,
-        cache_write_tokens: record.cache_write_tokens,
-        reasoning_tokens: record.reasoning_tokens,
+        cached_input_tokens: record.cached_input_tokens,
+        cache_write_input_tokens: record.cache_write_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
         image_input_tokens: record.image_input_tokens,
         image_output_tokens: record.image_output_tokens,
         total_tokens: record.total_tokens,
-        input_tokens_display: record
-            .input_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-        output_tokens_display: record
-            .output_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-        cached_tokens_display: record
-            .cached_tokens
-            .map_or_else(|| "-".to_owned(), format_compact_number),
-        cache_write_tokens_display: record
-            .cache_write_tokens
-            .map_or_else(|| "-".to_owned(), format_compact_number),
-        reasoning_tokens_display: record
-            .reasoning_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-        image_input_tokens_display: record
-            .image_input_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-        image_output_tokens_display: record
-            .image_output_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-        total_tokens_display: record
-            .total_tokens
-            .map_or_else(|| "-".to_owned(), format_number),
-    }
+    })
 }
 
 pub(crate) fn usage_list_token_details(record: &domain::UsageListRecord) -> TokenDetailsView {
-    TokenDetailsView {
+    token_details_view(&Usage {
         input_tokens: record.input_tokens,
         output_tokens: record.output_tokens,
-        cached_tokens: record.cached_tokens,
-        cache_write_tokens: record.cache_write_tokens,
-        reasoning_tokens: record.reasoning_tokens,
+        cached_input_tokens: record.cached_input_tokens,
+        cache_write_input_tokens: record.cache_write_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
         image_input_tokens: record.image_input_tokens,
         image_output_tokens: record.image_output_tokens,
         total_tokens: record.total_tokens,
-        input_tokens_display: record
+    })
+}
+
+fn token_details_view(usage: &Usage) -> TokenDetailsView {
+    TokenDetailsView {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        image_input_tokens: usage.image_input_tokens,
+        image_output_tokens: usage.image_output_tokens,
+        total_tokens: usage.total_tokens,
+        input_tokens_display: usage
             .input_tokens
             .map_or_else(|| "-".to_owned(), format_number),
-        output_tokens_display: record
+        output_tokens_display: usage
             .output_tokens
             .map_or_else(|| "-".to_owned(), format_number),
-        cached_tokens_display: record
-            .cached_tokens
+        cached_input_tokens_display: usage
+            .cached_input_tokens
             .map_or_else(|| "-".to_owned(), format_compact_number),
-        cache_write_tokens_display: record
-            .cache_write_tokens
+        cache_write_input_tokens_display: usage
+            .cache_write_input_tokens
             .map_or_else(|| "-".to_owned(), format_compact_number),
-        reasoning_tokens_display: record
-            .reasoning_tokens
+        reasoning_output_tokens_display: usage
+            .reasoning_output_tokens
             .map_or_else(|| "-".to_owned(), format_number),
-        image_input_tokens_display: record
+        image_input_tokens_display: usage
             .image_input_tokens
             .map_or_else(|| "-".to_owned(), format_number),
-        image_output_tokens_display: record
+        image_output_tokens_display: usage
             .image_output_tokens
             .map_or_else(|| "-".to_owned(), format_number),
-        total_tokens_display: record
+        total_tokens_display: usage
             .total_tokens
             .map_or_else(|| "-".to_owned(), format_number),
     }
@@ -270,15 +250,21 @@ pub(crate) fn billing_view(billing: Option<&domain::UsageBilling>) -> Option<Bil
     }
 }
 
-pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageListRecordView {
+pub(crate) fn usage_list_record_view(
+    record: domain::UsageListRecord,
+    time: crate::time::TimePresenter,
+) -> UsageListRecordView {
     let token_details = usage_list_token_details(&record);
     let billing = billing_view(record.billing.as_ref());
-    let created_at_display = china_datetime(&record.started_at);
+    let created_at_display = time.datetime(&record.started_at);
     let model = record
         .upstream_model_id
         .clone()
         .or_else(|| record.requested_model_id.clone());
     UsageListRecordView {
+        error_code: record.error_code,
+        error_message: record.error_message,
+        logical_outcome: record.outcome.as_str().to_owned(),
         client_api_key_name: record.client_api_key_name,
         id: record.id,
         provider: record.provider_kind,
@@ -314,8 +300,14 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
             first_event_ms: record.first_event_ms,
             first_reasoning_ms: record.first_reasoning_ms,
             first_text_ms: record.first_text_ms,
-            first_token_ms: record.first_token_ms,
             openai_processing_ms: record.provider_processing_ms,
+            upstream_response_ms: record.upstream_response_ms,
+            upstream_api_overhead_ms: record.upstream_api_overhead_ms,
+            upstream_engine_ms: record.upstream_engine_ms,
+            upstream_engine_iapi_ttft_ms: record.upstream_engine_iapi_ttft_ms,
+            upstream_engine_service_ttft_ms: record.upstream_engine_service_ttft_ms,
+            upstream_engine_iapi_tbt_ms: record.upstream_engine_iapi_tbt_ms,
+            upstream_engine_service_tbt_ms: record.upstream_engine_service_tbt_ms,
         },
         first_token_latency_ms: record.first_token_ms,
         latency_ms: record.latency_ms,
@@ -326,7 +318,10 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
     }
 }
 
-pub(crate) fn usage_record_view(record: domain::UsageRecord) -> UsageRecordView {
+pub(crate) fn usage_record_view(
+    record: domain::UsageRecord,
+    time: crate::time::TimePresenter,
+) -> UsageRecordView {
     let tokens = token_details(&record);
     let billing = billing_view(record.billing.as_ref());
     let costs = record
@@ -349,7 +344,6 @@ pub(crate) fn usage_record_view(record: domain::UsageRecord) -> UsageRecordView 
         .error_message
         .clone()
         .unwrap_or_else(|| outcome.clone());
-    let first_token_display = display_duration(record.first_token_ms);
     let latency_display = display_duration(record.latency_ms);
     let cost_coverage = match record.cost_source.as_str() {
         "provider_reported" | "calculated" => CostCoverageView {
@@ -413,26 +407,31 @@ pub(crate) fn usage_record_view(record: domain::UsageRecord) -> UsageRecordView 
             first_event_ms: record.first_event_ms,
             first_reasoning_ms: record.first_reasoning_ms,
             first_text_ms: record.first_text_ms,
-            first_token_ms: record.first_token_ms,
             openai_processing_ms: record.provider_processing_ms,
+            upstream_response_ms: record.upstream_response_ms,
+            upstream_api_overhead_ms: record.upstream_api_overhead_ms,
+            upstream_engine_ms: record.upstream_engine_ms,
+            upstream_engine_iapi_ttft_ms: record.upstream_engine_iapi_ttft_ms,
+            upstream_engine_service_ttft_ms: record.upstream_engine_service_ttft_ms,
+            upstream_engine_iapi_tbt_ms: record.upstream_engine_iapi_tbt_ms,
+            upstream_engine_service_tbt_ms: record.upstream_engine_service_tbt_ms,
         },
         attempt_index: None,
         attempt_count: u64::from(record.attempt_count),
         response_id: record.client_response_id,
         upstream_request_id: record.upstream_request_id,
         latency_ms: record.latency_ms,
-        first_token_ms: record.first_token_ms,
         input_tokens: record.input_tokens,
         output_tokens: record.output_tokens,
-        cached_tokens: record.cached_tokens,
-        cache_write_tokens: record.cache_write_tokens,
-        reasoning_tokens: record.reasoning_tokens,
+        cached_input_tokens: record.cached_input_tokens,
+        cache_write_input_tokens: record.cache_write_input_tokens,
+        reasoning_output_tokens: record.reasoning_output_tokens,
         image_input_tokens: record.image_input_tokens,
         image_output_tokens: record.image_output_tokens,
         message,
         metadata,
         created_at: record.started_at,
-        created_at_display: china_datetime(&record.started_at),
+        created_at_display: time.datetime(&record.started_at),
         client_ip: record.client_ip,
         user_agent: record.user_agent,
         reasoning_effort: record.reasoning_effort,
@@ -445,7 +444,6 @@ pub(crate) fn usage_record_view(record: domain::UsageRecord) -> UsageRecordView 
         costs,
         cost_coverage,
         first_token_latency_ms: record.first_token_ms,
-        first_token_latency_ms_display: first_token_display,
         latency_ms_display: latency_display,
         logical_outcome: outcome,
     }
@@ -521,7 +519,7 @@ pub(crate) fn usage_attempt_view(attempt: domain::UsageAttempt) -> UsageAttemptV
         estimated_cost_currency: attempt.cost_currency,
         input_tokens: attempt.input_tokens,
         output_tokens: attempt.output_tokens,
-        cached_tokens: attempt.cached_tokens,
+        cached_input_tokens: attempt.cached_input_tokens,
         total_tokens: attempt.total_tokens,
         first_token_ms: None,
         latency_ms: attempt.latency_ms,
@@ -535,11 +533,12 @@ pub(crate) fn usage_attempt_view(attempt: domain::UsageAttempt) -> UsageAttemptV
     }
 }
 
-pub(crate) fn usage_detail_view(detail: domain::UsageDetail) -> UsageRecordDetailView {
+pub(crate) fn usage_detail_view(
+    detail: domain::UsageDetail,
+    time: crate::time::TimePresenter,
+) -> UsageRecordDetailView {
     UsageRecordDetailView {
-        trace: detail.trace,
-        related_requests: detail.related_requests,
-        request: usage_record_view(detail.request),
+        request: usage_record_view(detail.request, time),
         attempts: detail
             .attempts
             .into_iter()
@@ -549,16 +548,26 @@ pub(crate) fn usage_detail_view(detail: domain::UsageDetail) -> UsageRecordDetai
     }
 }
 
-pub(crate) fn usage_page_view(page: domain::UsagePage) -> PageData<UsageListRecordView> {
+pub(crate) fn usage_page_view(
+    page: domain::UsagePage,
+    time: crate::time::TimePresenter,
+) -> PageData<UsageListRecordView> {
     PageData {
-        items: page.items.into_iter().map(usage_list_record_view).collect(),
+        items: page
+            .items
+            .into_iter()
+            .map(|value| usage_list_record_view(value, time))
+            .collect(),
         current_page: page.current_page,
         page_size: page.page_size,
         total: page.total,
     }
 }
 
-pub(crate) fn ops_error_view(error: domain::OpsError) -> OpsErrorView {
+pub(crate) fn ops_error_view(
+    error: domain::OpsError,
+    time: crate::time::TimePresenter,
+) -> OpsErrorView {
     let account_label = error
         .provider_account_email
         .as_ref()
@@ -608,7 +617,7 @@ pub(crate) fn ops_error_view(error: domain::OpsError) -> OpsErrorView {
         subagent_kind: error.subagent_kind,
         compact: error.compact,
         message: error.message,
-        raw_upstream_error: error.raw_upstream_error,
+        error_details: error.error_details.map(error_details_view),
         metadata: OpsErrorMetadataView {
             source: error.source,
             component: error.component,
@@ -628,22 +637,46 @@ pub(crate) fn ops_error_view(error: domain::OpsError) -> OpsErrorView {
             recovery_total_latency_ms: error.recovery_total_latency_ms,
         },
         created_at: error.occurred_at,
-        created_at_display: china_datetime(&error.occurred_at),
+        created_at_display: time.datetime(&error.occurred_at),
     }
 }
 
-pub(crate) fn ops_page_view(page: domain::OpsErrorPage) -> PageData<OpsErrorView> {
+// 受控错误正文保持原文语义，嵌套 JSON 只在展示投影中展开缩进
+fn error_details_view(raw: String) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+        return raw;
+    };
+    if let Some(upstream) = value.get_mut("upstream")
+        && let Some(text) = upstream.as_str()
+        && let Ok(parsed) = serde_json::from_str::<Value>(text)
+    {
+        *upstream = parsed;
+    }
+    serde_json::to_string_pretty(&value).unwrap_or(raw)
+}
+
+pub(crate) fn ops_page_view(
+    page: domain::OpsErrorPage,
+    time: crate::time::TimePresenter,
+) -> PageData<OpsErrorView> {
     PageData {
-        items: page.items.into_iter().map(ops_error_view).collect(),
+        items: page
+            .items
+            .into_iter()
+            .map(|value| ops_error_view(value, time))
+            .collect(),
         current_page: page.current_page,
         page_size: page.page_size,
         total: page.total,
     }
 }
 
-pub(crate) fn trend_point_view(point: domain::TrendPoint) -> TrendPointView {
-    let local_time = china_label(point.bucket_start, "%H:%M");
-    let label = china_label(point.bucket_start, "%m-%d %H:%M");
+pub(crate) fn trend_point_view(
+    point: domain::TrendPoint,
+    time: crate::time::TimePresenter,
+) -> TrendPointView {
+    let local_time = time.label(point.bucket_start, "%H:%M");
+    let label = time.label(point.bucket_start, "%m-%d %H:%M");
     let success_rate_value = point.success_rate.map(|value| value * 100.0);
     TrendPointView {
         time: local_time,
@@ -655,8 +688,8 @@ pub(crate) fn trend_point_view(point: domain::TrendPoint) -> TrendPointView {
         input_tokens_value: point.metrics.input_tokens,
         output_tokens: format_compact_number(point.metrics.output_tokens),
         output_tokens_value: point.metrics.output_tokens,
-        cached_tokens: format_compact_number(point.metrics.cached_tokens),
-        cached_tokens_value: point.metrics.cached_tokens,
+        cached_input_tokens: format_compact_number(point.metrics.cached_input_tokens),
+        cached_input_tokens_value: point.metrics.cached_input_tokens,
         cache_hit_rate_value: point.cached_token_rate,
         tokens_value: point.metrics.total_tokens,
         errors: format_compact_number(point.service_failure_count),
@@ -721,7 +754,7 @@ pub(crate) fn trend_summary_view(
             },
             TrendSummaryView {
                 label: "缓存".to_owned(),
-                value: format_compact_number(summary.cached_tokens),
+                value: format_compact_number(summary.cached_input_tokens),
                 ratio: None,
             },
         ],
@@ -737,7 +770,7 @@ pub(crate) fn trend_summary_view(
                 ratio: None,
             },
             TrendSummaryView {
-                label: "吞吐 P50".to_owned(),
+                label: "速率 P50".to_owned(),
                 value: summary
                     .minimum_output_throughput_p50
                     .map_or_else(|| "—".to_owned(), |value| format!("{value} tok/s")),
@@ -766,11 +799,20 @@ pub(crate) fn trend_summary_view(
     }
 }
 
-pub(crate) fn trend_view(trend: domain::Trend, kind: TrendKind) -> TrendData {
+pub(crate) fn trend_view(
+    trend: domain::Trend,
+    kind: TrendKind,
+    time: crate::time::TimePresenter,
+) -> TrendData {
     TrendData {
+        analytics: analytics_view(trend.analytics, time),
         kind,
         summary: trend_summary_view(kind, &trend.summary),
-        points: trend.points.into_iter().map(trend_point_view).collect(),
+        points: trend
+            .points
+            .into_iter()
+            .map(|value| trend_point_view(value, time))
+            .collect(),
     }
 }
 
@@ -789,7 +831,10 @@ pub(crate) fn reliability_display(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| format!("{value:.1}%"))
 }
 
-pub(crate) fn health_timeline_view(timeline: domain::HealthTimeline) -> HealthTimelineView {
+pub(crate) fn health_timeline_view(
+    timeline: domain::HealthTimeline,
+    time: crate::time::TimePresenter,
+) -> HealthTimelineView {
     HealthTimelineView {
         title: "请求健康时间线".to_owned(),
         description: "有效请求可用性".to_owned(),
@@ -803,25 +848,25 @@ pub(crate) fn health_timeline_view(timeline: domain::HealthTimeline) -> HealthTi
         points: timeline
             .points
             .into_iter()
-            .enumerate()
-            .map(|(index, point)| {
-                let elapsed_minutes = i64::try_from(index).unwrap_or(i64::MAX).saturating_mul(15);
-                HealthTimelinePointView {
-                    time: format!("{:02}:{:02}", elapsed_minutes / 60, elapsed_minutes % 60),
-                    status: health_status_name(point.status).to_owned(),
-                    reliability_display: reliability_display(point.reliability_percent),
-                    success_requests: point.success_requests,
-                    failed_requests: point.failed_requests,
-                    cancelled_requests: point.cancelled_requests,
-                    incomplete_requests: point.incomplete_requests,
-                    caller_error_requests: point.caller_error_requests,
-                }
+            .map(|point| HealthTimelinePointView {
+                bucket_start: point.bucket_start,
+                time: time.label(point.bucket_start, "%H:%M"),
+                status: health_status_name(point.status).to_owned(),
+                reliability_display: reliability_display(point.reliability_percent),
+                success_requests: point.success_requests,
+                failed_requests: point.failed_requests,
+                cancelled_requests: point.cancelled_requests,
+                incomplete_requests: point.incomplete_requests,
+                caller_error_requests: point.caller_error_requests,
             })
             .collect(),
     }
 }
 
-pub(crate) fn wire_profile_view(profile: domain::DashboardWireProfile) -> DashboardWireProfileView {
+pub(crate) fn wire_profile_view(
+    profile: domain::DashboardWireProfile,
+    time: crate::time::TimePresenter,
+) -> DashboardWireProfileView {
     DashboardWireProfileView {
         provider: profile.provider,
         product: profile.product,
@@ -842,9 +887,11 @@ pub(crate) fn wire_profile_view(profile: domain::DashboardWireProfile) -> Dashbo
                 value: attribute.value,
             })
             .collect(),
+        verified_at_display: profile.verified_at.map(|value| time.datetime(&value)),
         verified_at: profile.verified_at,
         release: profile.release.map(|release| DashboardDesktopReleaseView {
             status: release.status.into(),
+            checked_at_display: release.checked_at.map(|value| time.datetime(&value)),
             checked_at: release.checked_at,
             latest_version: release.latest_version,
             latest_build: release.latest_build,
@@ -853,29 +900,10 @@ pub(crate) fn wire_profile_view(profile: domain::DashboardWireProfile) -> Dashbo
     }
 }
 
-pub(crate) fn relative_time(value: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
-    let Some(value) = value else {
-        return "从未使用".to_owned();
-    };
-    let elapsed = now.signed_duration_since(value);
-    if elapsed.num_seconds() < 0 {
-        return china_datetime(&value);
-    }
-    if elapsed.num_seconds() < 60 {
-        return "刚刚".to_owned();
-    }
-    if elapsed.num_minutes() < 60 {
-        return format!("{} 分钟前", elapsed.num_minutes());
-    }
-    if elapsed.num_hours() < 24 {
-        return format!("{} 小时前", elapsed.num_hours());
-    }
-    format!("{} 天前", elapsed.num_days())
-}
-
 pub(crate) fn dashboard_view(
     result: domain::DashboardResult,
     kind: TrendKind,
+    time: crate::time::TimePresenter,
 ) -> DashboardDataView {
     let domain::DashboardResult {
         observation,
@@ -891,6 +919,8 @@ pub(crate) fn dashboard_view(
         rotation_strategy,
     } = result;
     let domain::DashboardObservation {
+        analytics,
+        runtime_slots: _,
         range,
         totals,
         provider_accounts,
@@ -939,21 +969,19 @@ pub(crate) fn dashboard_view(
                 .total_tokens
                 .map_or_else(|| "—".to_owned(), format_compact_number),
             request_count: credential.request_count,
-            request_buckets: credential
-                .request_buckets
-                .iter()
-                .map(|bucket| DashboardAccountRequestBucketView {
-                    bucket_start: bucket.bucket_start,
-                    request_count: bucket.request_count,
-                })
-                .collect(),
+            request_buckets: time.request_buckets(
+                credential
+                    .request_buckets
+                    .iter()
+                    .map(|bucket| (bucket.bucket_start, bucket.request_count)),
+            ),
             quota_used_percent: credential.quota_used_percent,
             usage_window: credential
                 .quota_window
-                .map(crate::admin::accounts::quota_window_view),
+                .map(|window| crate::admin::accounts::quota_window_view(window, time)),
             metric_label,
             metric_value,
-            last_used: relative_time(credential.last_used_at, range.end),
+            last_used: time.relative_optional(credential.last_used_at, range.end),
         });
     }
     let unavailable_accounts = provider_accounts
@@ -961,6 +989,9 @@ pub(crate) fn dashboard_view(
         .saturating_sub(provider_accounts.normal);
 
     DashboardDataView {
+        analytics: analytics_view(analytics, time),
+        as_of: range.end,
+        as_of_display: time.datetime(&range.end),
         cards: DashboardCardsView {
             credentials: DashboardCredentialsCardView {
                 total: provider_accounts.total.to_string(),
@@ -990,17 +1021,20 @@ pub(crate) fn dashboard_view(
                 today_hit_rate_value: today.observed_cached_token_rate,
                 yesterday_hit_rate_value: yesterday.observed_cached_token_rate,
                 total_hit_rate: display_rate(total_cached_token_rate),
-                total_cached_tokens: format_compact_number(totals.cached_tokens),
+                total_cached_input_tokens: format_compact_number(totals.cached_input_tokens),
                 average_first_token_latency_ms: display_duration(average_first_token_latency_ms),
             },
         },
-        trend: trend_view(trend, kind),
-        health_timeline: health_timeline_view(health_timeline),
-        wire_profiles: wire_profiles.into_iter().map(wire_profile_view).collect(),
+        trend: trend_view(trend, kind, time),
+        health_timeline: health_timeline_view(health_timeline, time),
+        wire_profiles: wire_profiles
+            .into_iter()
+            .map(|value| wire_profile_view(value, time))
+            .collect(),
         account_usage: account_usage_views,
         usage_records: recent_requests
             .into_iter()
-            .map(usage_list_record_view)
+            .map(|value| usage_list_record_view(value, time))
             .collect(),
         pool_summary: DashboardPoolSummaryView {
             total: provider_accounts.total,
@@ -1020,14 +1054,18 @@ pub(crate) fn dashboard_view(
     }
 }
 
-pub(crate) fn usage_summary_view(summary: domain::UsageSummary) -> UsageSummaryView {
+pub(crate) fn usage_summary_view(
+    summary: domain::UsageSummary,
+    time: crate::time::TimePresenter,
+) -> UsageSummaryView {
     let overview = summary.overview;
     UsageSummaryView {
+        analytics: analytics_view(overview.analytics, time),
         total_requests: format_compact_number(overview.requests.request_count),
         input_tokens: format_compact_number(overview.requests.input_tokens),
         output_tokens: format_compact_number(overview.requests.output_tokens),
-        cached_tokens: format_compact_number(overview.requests.cached_tokens),
-        cache_write_tokens: format_compact_number(overview.requests.cache_write_tokens),
+        cached_input_tokens: format_compact_number(overview.requests.cached_input_tokens),
+        cache_write_input_tokens: format_compact_number(overview.requests.cache_write_input_tokens),
         total_tokens: format_compact_number(overview.requests.total_tokens),
         average_latency_ms: display_duration(summary.average_latency_ms),
         logical_requests: request_metrics_view(&overview.requests),
@@ -1035,14 +1073,17 @@ pub(crate) fn usage_summary_view(summary: domain::UsageSummary) -> UsageSummaryV
     }
 }
 
-pub(crate) fn usage_insights_view(insights: domain::UsageInsights) -> UsageInsightsOverviewView {
+pub(crate) fn usage_insights_view(
+    insights: domain::UsageInsights,
+    time: crate::time::TimePresenter,
+) -> UsageInsightsOverviewView {
     let health_points = insights
         .health
         .points
         .iter()
         .map(|point| OverviewHealthPointView {
             bucket: point.bucket_start,
-            label: china_label(point.bucket_start, "%m-%d %H:%M"),
+            label: time.label(point.bucket_start, "%m-%d %H:%M"),
             total_requests: point.total_requests,
             success_requests: point.success_requests,
             failed_requests: point.failed_requests,
@@ -1058,7 +1099,7 @@ pub(crate) fn usage_insights_view(insights: domain::UsageInsights) -> UsageInsig
         .iter()
         .map(|point| OverviewPerformancePointView {
             bucket: point.bucket_start,
-            label: china_label(point.bucket_start, "%m-%d %H:%M"),
+            label: time.label(point.bucket_start, "%m-%d %H:%M"),
             latency_p50_ms: point.latency_percentiles.p50_ms.map(|value| value.as_f64()),
             latency_p95_ms: point.latency_percentiles.p95_ms.map(|value| value.as_f64()),
             latency_p99_ms: point.latency_percentiles.p99_ms.map(|value| value.as_f64()),
@@ -1107,10 +1148,10 @@ pub(crate) fn usage_insights_view(insights: domain::UsageInsights) -> UsageInsig
         .iter()
         .map(|point| OverviewCostPointView {
             bucket: point.bucket_start,
-            label: china_label(point.bucket_start, "%m-%d %H:%M"),
+            label: time.label(point.bucket_start, "%m-%d %H:%M"),
             input_tokens: point.input_tokens,
             output_tokens: point.output_tokens,
-            cached_tokens: point.cached_tokens,
+            cached_input_tokens: point.cached_input_tokens,
             total_tokens: point.total_tokens,
             estimated_cost: point.estimated_cost.as_ref().map(ToString::to_string),
             standard_cost: point.standard_cost.as_ref().map(ToString::to_string),
@@ -1121,6 +1162,7 @@ pub(crate) fn usage_insights_view(insights: domain::UsageInsights) -> UsageInsig
         })
         .collect();
     UsageInsightsOverviewView {
+        analytics: analytics_view(insights.analytics, time),
         granularity: granularity_name(insights.granularity).to_owned(),
         health: OverviewHealthView {
             total_requests: insights.health.total_requests,
@@ -1241,7 +1283,7 @@ pub(crate) fn usage_insights_view(insights: domain::UsageInsights) -> UsageInsig
             cache_hit_request_rate: insights.cost.cache_hit_request_rate,
             input_tokens: insights.cost.input_tokens,
             output_tokens: insights.cost.output_tokens,
-            cached_tokens: insights.cost.cached_tokens,
+            cached_input_tokens: insights.cost.cached_input_tokens,
             total_tokens: insights.cost.total_tokens,
             points: cost_points,
             costs: cost_views(&insights.cost.costs),
@@ -1273,8 +1315,10 @@ pub(crate) fn granularity_name(granularity: domain::Granularity) -> &'static str
 pub(crate) fn diagnostics_view(
     result: domain::DiagnosticsResult,
     dimension: DiagnosticDimension,
+    time: crate::time::TimePresenter,
 ) -> DiagnosticsView {
     DiagnosticsView {
+        analytics: analytics_view(result.analytics, time),
         dimension: dimension.display_name().to_owned(),
         items: result
             .items
@@ -1326,4 +1370,23 @@ pub(crate) fn map_wire_error(error: WireValidationError) -> AdminError {
 
 pub(crate) fn map_service_error(error: gateway_admin::model::AdminError) -> AdminError {
     map_admin_service_error(error)
+}
+
+pub(crate) fn analytics_view(
+    metadata: domain::AnalyticsMetadata,
+    time: crate::time::TimePresenter,
+) -> AnalyticsView {
+    AnalyticsView {
+        coverage_start: metadata.coverage_start,
+        coverage_start_display: metadata.coverage_start.map(|value| time.datetime(&value)),
+        coverage_end: metadata.coverage_end,
+        coverage_end_display: metadata.coverage_end.map(|value| time.datetime(&value)),
+        generated_at: metadata.generated_at,
+        generated_at_display: time.datetime(&metadata.generated_at),
+        lag_seconds: metadata.lag_seconds,
+        state: metadata.state.as_str().to_owned(),
+        percentiles_approximate: metadata.percentiles_approximate,
+        schema_version: metadata.schema_version,
+        histogram_version: metadata.histogram_version,
+    }
 }

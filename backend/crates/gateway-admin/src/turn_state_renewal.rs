@@ -69,7 +69,14 @@ impl TurnStateRenewalTask {
 
     pub async fn run_cycle_inner(&self, context: &WorkerCycleContext) {
         let now = SystemTime::now();
-        for renewal in self.accounts.turn_state_renewals(now, RENEWAL_MARGIN).await {
+        let renewals = match self.accounts.turn_state_renewals(now, RENEWAL_MARGIN).await {
+            Ok(renewals) => renewals,
+            Err(error) => {
+                tracing::warn!(error = %error, "state 续期名单读取失败，本轮跳过");
+                return;
+            }
+        };
+        for renewal in renewals {
             if context.cancellation().is_cancelled() {
                 return;
             }
@@ -83,6 +90,7 @@ impl TurnStateRenewalTask {
                 .accounts
                 .turn_state_renewals(SystemTime::now(), RENEWAL_MARGIN)
                 .await
+                .unwrap_or_default()
                 .into_iter()
                 .find(|current| current.account_id == renewal.account_id)
             else {

@@ -1,4 +1,4 @@
-//! Account group management use cases.
+//! 账号分组的查询、配置与运行态容量聚合用例
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,9 +19,9 @@ use crate::{
         AdminError, MutationContext,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupListQuery,
-            AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage, AccountGroupRecord,
-            CreateAccountGroup, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
-            UpdateAccountGroup,
+            AccountGroupMemberFact, AccountGroupMutation, AccountGroupOptionsPage,
+            AccountGroupPage, AccountGroupRecord, CreateAccountGroup, DeleteAccountGroup,
+            NewAccountGroup, SetAccountGroupEnabled, UpdateAccountGroup,
         },
     },
     ports::store::{AccountGroupStore, AccountRuntimeStore},
@@ -29,10 +29,14 @@ use crate::{
 
 use super::{map_store_error, publish_committed};
 
-/// API-facing account group management service.
+/// 面向 API 的账号分组管理服务
 #[async_trait]
 pub trait AccountGroupService: Send + Sync {
     async fn list(&self, query: AccountGroupListQuery) -> Result<AccountGroupPage, AdminError>;
+    async fn list_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> Result<AccountGroupOptionsPage, AdminError>;
     async fn create(
         &self,
         context: &MutationContext,
@@ -130,21 +134,37 @@ impl AccountGroupService for DefaultAccountGroupService {
         Ok(page)
     }
 
+    async fn list_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> Result<AccountGroupOptionsPage, AdminError> {
+        self.store
+            .list_account_group_options(query)
+            .await
+            .map_err(|error| map_store_error(error, "account group options"))
+    }
+
     async fn create(
         &self,
         context: &MutationContext,
         command: CreateAccountGroup,
     ) -> Result<AccountGroupMutation, AdminError> {
+        crate::model::account_groups::validate_group_fields(
+            &command.name,
+            command.description.as_deref(),
+        )
+        .map_err(|_| AdminError::invalid("账号组请求不合法"))?;
         let id = AccountGroupId::new(format!("grp_{}", Uuid::now_v7().simple()))
             .map_err(|_| AdminError::internal("创建账号组 ID 失败"))?;
         self.publish(
             self.store
                 .create_account_group(
                     NewAccountGroup {
+                        allow_image_generation: command.allow_image_generation,
                         id,
                         name: command.name,
                         description: command.description,
-                        disable_fast: command.disable_fast,
+                        fast_mode: command.fast_mode,
                         color: command.color,
                     },
                     context,
@@ -159,6 +179,11 @@ impl AccountGroupService for DefaultAccountGroupService {
         context: &MutationContext,
         command: UpdateAccountGroup,
     ) -> Result<AccountGroupMutation, AdminError> {
+        crate::model::account_groups::validate_group_fields(
+            &command.name,
+            command.description.as_deref(),
+        )
+        .map_err(|_| AdminError::invalid("账号组请求不合法"))?;
         self.publish(self.store.update_account_group(command, context).await)
             .await
     }

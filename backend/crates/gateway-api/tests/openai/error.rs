@@ -1,3 +1,5 @@
+//! 验证执行错误到 OpenAI 状态码、错误正文与重试提示的映射
+
 use axum::{body::to_bytes, http::StatusCode};
 use gateway_core::engine::EngineError;
 use gateway_core::error::{
@@ -10,6 +12,40 @@ use gateway_api::openai::error::{
     engine_error_response, gateway_error_contract, gateway_error_from_engine,
     gateway_error_response, openai_error_response,
 };
+
+#[tokio::test]
+async fn ordinary_upstream_rejections_preserve_status_body_and_client_retry_advice() {
+    use bytes::Bytes;
+    use gateway_core::error::ClientVisibleUpstreamResponse;
+    use gateway_core::event::ProviderResponseHeader;
+
+    let body = Bytes::from_static(br#"{ "error":{"code":"Vendor.Future.v2","type":"server_error","message":"original failure","future":9007199254740993} }"#);
+    for status in [400, 409, 500, 503, 504] {
+        let error = EngineError::Provider(
+            ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+                .with_retry_prohibited()
+                .with_client_visible_upstream_response(
+                    ClientVisibleUpstreamResponse::new(
+                        status,
+                        Some(b"application/problem+json".to_vec()),
+                        body.clone(),
+                    )
+                    .with_headers(vec![ProviderResponseHeader::new(
+                        "retry-after",
+                        Bytes::from_static(b"17"),
+                    )]),
+                ),
+        );
+        let response = engine_error_response(&error);
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        assert_eq!(response.headers()["retry-after"], "17");
+        assert_eq!(to_bytes(response.into_body(), 4096).await.unwrap(), body);
+    }
+}
 
 #[tokio::test]
 async fn capacity_errors_offer_client_retry_without_changing_upstream_facts() {
@@ -228,6 +264,18 @@ fn rate_limited_error_should_map_to_openai_retryable_status() {
 }
 
 #[test]
+fn middleware_capacity_is_service_unavailable() {
+    assert_eq!(
+        gateway_error_contract(GatewayErrorKind::MiddlewareCapacityUnavailable),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "middleware_capacity_unavailable"
+        ),
+    );
+}
+
+#[test]
 fn queue_rejections_keep_distinct_retryable_http_codes() {
     for (kind, code) in [
         (
@@ -302,12 +350,14 @@ fn local_provider_capacity_exhaustion_should_map_to_service_unavailable() {
         UpstreamSendState::NotSent,
     ));
 
+    let projected = gateway_error_from_engine(&error);
     assert_eq!(
-        gateway_error_from_engine(&error),
-        GatewayError::new(
-            GatewayErrorKind::AccountCapacityUnavailable,
-            "all eligible upstream accounts are temporarily busy"
-        )
+        projected.kind(),
+        GatewayErrorKind::AccountCapacityUnavailable
+    );
+    assert_eq!(
+        projected.safe_message(),
+        "all eligible upstream accounts are temporarily busy"
     );
 }
 
@@ -350,12 +400,14 @@ fn provider_infrastructure_failure_should_have_a_distinct_client_contract() {
         UpstreamSendState::NotSent,
     ));
 
+    let projected = gateway_error_from_engine(&error);
     assert_eq!(
-        gateway_error_from_engine(&error),
-        GatewayError::new(
-            GatewayErrorKind::ProviderInfrastructureUnavailable,
-            "provider account infrastructure is temporarily unavailable"
-        )
+        projected.kind(),
+        GatewayErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_eq!(
+        projected.safe_message(),
+        "provider account infrastructure is temporarily unavailable"
     );
 }
 
@@ -366,12 +418,11 @@ fn no_eligible_provider_account_should_map_to_service_unavailable() {
         UpstreamSendState::NotSent,
     ));
 
+    let projected = gateway_error_from_engine(&error);
+    assert_eq!(projected.kind(), GatewayErrorKind::NoAvailableProvider);
     assert_eq!(
-        gateway_error_from_engine(&error),
-        GatewayError::new(
-            GatewayErrorKind::NoAvailableProvider,
-            "no upstream provider is currently available for this request"
-        )
+        projected.safe_message(),
+        "no upstream provider is currently available for this request"
     );
 }
 
@@ -497,13 +548,9 @@ fn engine_provider_runtime_failures_should_collapse_to_safe_unavailability() {
     ] {
         let error = EngineError::Provider(ProviderError::new(kind, UpstreamSendState::Ambiguous));
 
-        assert_eq!(
-            gateway_error_from_engine(&error),
-            GatewayError::new(
-                GatewayErrorKind::UpstreamUnavailable,
-                "upstream service is unavailable"
-            )
-        );
+        let projected = gateway_error_from_engine(&error);
+        assert_eq!(projected.kind(), GatewayErrorKind::UpstreamUnavailable);
+        assert_eq!(projected.safe_message(), "upstream service is unavailable");
     }
 }
 
@@ -511,10 +558,9 @@ fn engine_provider_runtime_failures_should_collapse_to_safe_unavailability() {
 fn engine_store_error_should_collapse_to_safe_internal_error() {
     let error = EngineError::Store(StoreError::new(StoreErrorKind::Unavailable));
 
-    assert_eq!(
-        gateway_error_from_engine(&error),
-        GatewayError::new(GatewayErrorKind::Internal, "gateway execution failed")
-    );
+    let projected = gateway_error_from_engine(&error);
+    assert_eq!(projected.kind(), GatewayErrorKind::Internal);
+    assert_eq!(projected.safe_message(), "request execution failed");
 }
 #[test]
 fn openai_error_response_should_preserve_only_safe_contract_fields() {
@@ -602,6 +648,32 @@ async fn upstream_message_too_big_returns_actionable_http_error() {
 }
 
 #[tokio::test]
+async fn session_policy_rejection_returns_bad_request_with_the_policy_code() {
+    let error = EngineError::Provider(
+        ProviderError::new(
+            ProviderErrorKind::SessionPolicyRestricted,
+            UpstreamSendState::NotSent,
+        )
+        .with_retry_prohibited()
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "No account is available for this session after a policy rejection.",
+            Some("cyber_policy".to_owned()),
+            Some("invalid_request_error".to_owned()),
+        )),
+    );
+    let response = engine_error_response(&error);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "cyber_policy");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "No account is available for this session after a policy rejection."
+    );
+}
+
+#[tokio::test]
 async fn continuation_recovery_should_preserve_the_official_retry_signal() {
     let error = GatewayError::from_provider(
         &ProviderError::new(
@@ -667,6 +739,7 @@ mod model_routing {
             Arc::new(UnusedAdmissions),
             Arc::new(UnusedContinuation),
             Arc::new(IgnoredClientApiKeyUsage),
+            Arc::new(crate::support::RecordingDiagnostics::default()),
         );
         let response = crate::openai::api_router(Arc::new(execution))
             .await

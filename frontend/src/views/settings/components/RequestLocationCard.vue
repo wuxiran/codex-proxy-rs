@@ -1,22 +1,25 @@
 <script setup lang="ts">
 import type { RequestLocation } from '@/api'
-import { BaseCard, BaseForm, BaseSwitch } from '@codex-proxy/ui'
+import { ZCard, ZForm, ZSwitch } from '@codex-proxy/ui'
+import RequestLocationDetectButton from '@/components/RequestLocationDetectButton.vue'
 import RequestLocationFields from '@/components/RequestLocationFields.vue'
 
-defineProps<{ disabled: boolean }>()
+defineProps<{ disabled: boolean, detectingLocation: boolean }>()
+const emit = defineEmits<{ detectLocation: [] }>()
 const location = defineModel<RequestLocation>({ required: true })
 const enabled = defineModel<boolean>('enabled', { required: true })
 </script>
 
 <template>
-  <BaseCard title="请求位置覆盖" description="覆盖 Codex 请求中的时区与位置字段，账号出站代理的自定义位置优先">
+  <ZCard title="请求位置覆盖" description="覆盖 Codex 请求中的时区与位置字段，账号出站代理的自定义位置优先">
     <template #body>
-      <div>
-        <BaseSwitch v-model="enabled" label="启用位置覆盖" show-label :disabled="disabled" />
+      <div class="flex max-w-6xl items-center justify-between gap-3">
+        <ZSwitch v-model="enabled" label="启用位置覆盖" :disabled="disabled" />
+        <RequestLocationDetectButton :loading="detectingLocation" :disabled="disabled" @detect="emit('detectLocation')" />
       </div>
-      <BaseForm class="mt-4 max-w-6xl">
+      <ZForm class="mt-4 max-w-6xl">
         <RequestLocationFields v-model="location" :disabled="disabled || !enabled" />
-      </BaseForm>
+      </ZForm>
     </template>
-  </BaseCard>
+  </ZCard>
 </template>

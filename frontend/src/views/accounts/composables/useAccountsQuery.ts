@@ -1,12 +1,12 @@
-import type { BaseTableSort } from '@codex-proxy/ui'
-import { useDocumentVisibility, useIntervalFn, useStorage, watchDebounced } from '@vueuse/core'
+import type { TableSort } from '@codex-proxy/ui'
+import type { Account } from '@/api'
+import { useDocumentVisibility, useIntervalFn, useStorage } from '@vueuse/core' // fork: auto-refresh
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getAccounts } from '@/api'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 
-type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-
+// fork: auto-refresh
 /** 自动刷新可选间隔（秒）；0 表示关闭。状态、并发、报错与用量随线上流量变化。 */
 export const AUTO_REFRESH_SECONDS = [0, 10, 15, 30, 60] as const
 // 列表每次刷新都要对请求表做 24h/额度窗口聚合，默认档放宽到 30 s 降低数据库压力。
@@ -17,7 +17,7 @@ export function useAccountsQuery() {
   const providerQuery = shallowRef('')
   const statusQuery = shallowRef('')
   const groupQuery = shallowRef('')
-  const sort = shallowRef<BaseTableSort>()
+  const sort = shallowRef<TableSort>()
   const accountSummary = shallowRef({
     total: 0,
     normal: 0,
@@ -63,13 +63,13 @@ export function useAccountsQuery() {
     void query.execute()
   }
 
-  function handleSortChange(nextSort: BaseTableSort | undefined) {
+  function handleSortChange(nextSort: TableSort | undefined) {
     sort.value = nextSort
     query.page.value = 1
     void query.execute()
   }
 
-  async function replaceAccount(updated: AccountRow) {
+  async function replaceAccount(updated: Account) {
     // 先取消旧查询并应用接口返回的账号，避免旧响应覆盖最新行数据。
     query.invalidate()
     query.items.value = query.items.value.map(account => account.id === updated.id ? updated : account)
@@ -80,14 +80,13 @@ export function useAccountsQuery() {
     return query.items.value.some(account => account.id === updated.id)
   }
 
-  watchDebounced(
-    searchQuery,
-    () => {
+  watch(searchQuery, (_value, _previous, onCleanup) => {
+    const timer = setTimeout(() => {
       query.page.value = 1
       void query.execute()
-    },
-    { debounce: 250 },
-  )
+    }, 250)
+    onCleanup(() => clearTimeout(timer))
+  })
 
   watch([providerQuery, statusQuery, groupQuery], () => {
     query.page.value = 1
@@ -98,7 +97,7 @@ export function useAccountsQuery() {
     void query.execute()
   })
 
-  // 间隔按浏览器记忆；非法值回退默认，避免被改坏的存储导致高频请求。
+  // fork: auto-refresh — 间隔按浏览器记忆；非法值回退默认，避免被改坏的存储导致高频请求。
   const autoRefreshSeconds = useStorage<number>(
     'codex-proxy:accounts:auto-refresh-seconds',
     DEFAULT_AUTO_REFRESH_SECONDS,

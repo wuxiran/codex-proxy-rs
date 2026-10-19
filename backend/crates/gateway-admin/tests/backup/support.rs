@@ -1,8 +1,8 @@
-//! 备份测试共享 fixture：内存 fake 端口与辅助函数。
+//! 备份测试共享 fixture：内存 fake 端口与辅助函数
 //!
-//! 用内存 fake 端口驱动编排层，不依赖 MinIO/真实 S3。
-//! s3.rs / pg_dump.rs 是 SDK 薄适配器，协议正确性交给 aws-sdk / pg_dump 保证。
-//! 供 backup::task 与 use_case::backup 的测试复用。
+//! 用内存 fake 端口驱动编排层，不依赖 MinIO/真实 S3
+//! s3.rs / pg_dump.rs 是 SDK 薄适配器，协议正确性交给 aws-sdk / pg_dump 保证
+//! 供 backup::task 与 use_case::backup 的测试复用
 
 use std::sync::Mutex;
 
@@ -31,20 +31,20 @@ use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
-/// 假归档内容；dump 与上传校验共用同一字节与校验值。
+/// 假归档内容；dump 与上传校验共用同一字节与校验值
 pub(crate) const DUMP_CONTENT: &[u8] = b"custom-format-archive-bytes-0123456789";
 
-/// 计算一段内容的 SHA-256 十六进制。
+/// 计算一段内容的 SHA-256 十六进制
 pub(crate) fn sha256_hex(content: &[u8]) -> String {
     hex::encode(Sha256::digest(content))
 }
 
-/// 返回 32 位十六进制的合法备份记录 id。
+/// 返回 32 位十六进制的合法备份记录 id
 pub(crate) fn backup_id(suffix: &str) -> String {
     format!("backup_{}", sha256_hex(suffix.as_bytes()))
 }
 
-/// 已配置且已通过连接测试的设置快照。
+/// 已配置且已通过连接测试的设置快照
 pub(crate) fn configured_settings() -> BackupSettings {
     let now = Utc::now();
     BackupSettings {
@@ -67,7 +67,7 @@ pub(crate) fn configured_settings() -> BackupSettings {
     }
 }
 
-/// 从 seed 构造 queued 记录。
+/// 从 seed 构造 queued 记录
 pub(crate) fn queued_record(seed: &BackupRecordSeed) -> BackupRecord {
     let now = Utc::now();
     BackupRecord {
@@ -89,7 +89,7 @@ pub(crate) fn queued_record(seed: &BackupRecordSeed) -> BackupRecord {
     }
 }
 
-/// 内存版备份仓储。
+/// 内存版备份仓储
 pub(crate) struct FakeBackupRepository {
     settings: Mutex<BackupSettings>,
     records: Mutex<Vec<BackupRecord>>,
@@ -103,12 +103,12 @@ impl FakeBackupRepository {
         }
     }
 
-    /// 测试辅助：读取当前全部记录。
+    /// 测试辅助：读取当前全部记录
     pub(crate) fn all_records(&self) -> Vec<BackupRecord> {
         self.records.lock().expect("records").clone()
     }
 
-    /// 测试辅助：强制把一条记录标记为指定时间完成的 completed。
+    /// 测试辅助：强制把一条记录标记为指定时间完成的 completed
     pub(crate) fn set_completed(&self, id: &str, completed_at: DateTime<Utc>) {
         let mut records = self.records.lock().expect("records");
         if let Some(record) = records.iter_mut().find(|record| record.id == id) {
@@ -118,7 +118,7 @@ impl FakeBackupRepository {
         }
     }
 
-    /// 测试辅助：强制把一条记录迁移到指定状态。
+    /// 测试辅助：强制把一条记录迁移到指定状态
     pub(crate) fn force_status(&self, id: &str, status: BackupStatus) {
         let mut records = self.records.lock().expect("records");
         if let Some(record) = records.iter_mut().find(|record| record.id == id) {
@@ -166,11 +166,12 @@ impl BackupRepository for FakeBackupRepository {
         command: UpdateBackupScheduleCommand,
         next_run_at: Option<DateTime<Utc>>,
         _context: &MutationContext,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> AdminStoreResult<BackupSettings> {
         let mut settings = self.settings.lock().expect("settings");
         settings.schedule_enabled = command.schedule_enabled;
         settings.cron_expression = Some(command.cron_expression);
-        settings.schedule_timezone = Some(command.schedule_timezone);
+        settings.schedule_timezone = Some(timezone.name().to_owned());
         settings.retention_days = command.retention_days;
         settings.retention_count = command.retention_count;
         settings.next_run_at = next_run_at;
@@ -205,7 +206,23 @@ impl BackupRepository for FakeBackupRepository {
         Ok(record)
     }
 
-    async fn insert_scheduled_record(&self, seed: BackupRecordSeed) -> AdminStoreResult<bool> {
+    async fn insert_scheduled_record(
+        &self,
+        seed: BackupRecordSeed,
+        next_run_at: Option<DateTime<Utc>>,
+        expected_cron: &str,
+        expected_timezone: &str,
+        expected_next_run_at: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        let mut settings = self.settings.lock().expect("settings");
+        if !settings.schedule_enabled
+            || settings.cron_expression.as_deref() != Some(expected_cron)
+            || settings.schedule_timezone.as_deref() != Some(expected_timezone)
+            || settings.next_run_at != expected_next_run_at
+        {
+            return Ok(false);
+        }
+        settings.next_run_at = next_run_at;
         let mut records = self.records.lock().expect("records");
         if records.iter().any(|record| record.status.is_active())
             || records.iter().any(|record| {
@@ -391,11 +408,21 @@ impl BackupRepository for FakeBackupRepository {
     async fn advance_schedule_cursor(
         &self,
         next_run_at: DateTime<Utc>,
-        _expected_cron: &str,
-        _expected_timezone: &str,
+        expected_cron: &str,
+        expected_timezone: Option<&str>,
+        expected_next_run_at: Option<DateTime<Utc>>,
+        timezone: &str,
     ) -> AdminStoreResult<bool> {
         let mut settings = self.settings.lock().expect("settings");
+        if !settings.schedule_enabled
+            || settings.cron_expression.as_deref() != Some(expected_cron)
+            || settings.schedule_timezone.as_deref() != expected_timezone
+            || settings.next_run_at != expected_next_run_at
+        {
+            return Ok(false);
+        }
         settings.next_run_at = Some(next_run_at);
+        settings.schedule_timezone = Some(timezone.to_owned());
         Ok(true)
     }
 
@@ -423,7 +450,7 @@ impl BackupRepository for FakeBackupRepository {
     }
 }
 
-/// 假 `pg_dump` 端口：把固定内容写入临时文件作为归档；可注入失败。
+/// 假 `pg_dump` 端口：把固定内容写入临时文件作为归档；可注入失败
 pub(crate) struct FakeDumpPort {
     dir: TempDir,
     fail_dump: bool,
@@ -437,7 +464,7 @@ impl FakeDumpPort {
         }
     }
 
-    /// 让下一次 `dump` 返回 `backup.pg_dump_failed`。
+    /// 让下一次 `dump` 返回 `backup.pg_dump_failed`
     pub(crate) fn fail_next_dump(mut self) -> Self {
         self.fail_dump = true;
         self
@@ -492,16 +519,26 @@ impl DatabaseDumpPort for FakeDumpPort {
 
     async fn cleanup_staging(
         &self,
-        _backup_id: &str,
+        backup_id: &str,
     ) -> Result<(), gateway_admin::model::backup::BackupError> {
-        Ok(())
+        match std::fs::remove_file(self.dir.path().join(format!("{backup_id}.dump"))) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(gateway_admin::model::backup::BackupError::new(
+                gateway_admin::model::backup::code::PG_DUMP_FAILED,
+                "cleanup failed".to_owned(),
+            )),
+        }
     }
 }
 
-/// 内存版对象存储：把上传内容按 key 保存并支持 Head/Delete/预签名。
+/// 内存版对象存储：把上传内容按 key 保存并支持 Head/Delete/预签名
 pub(crate) struct FakeObjectStore {
     pub(crate) objects: Mutex<std::collections::HashMap<String, Vec<u8>>>,
     upload_error: Option<BackupError>,
+    head_error: Option<BackupError>,
+    delete_error: Option<BackupError>,
+    connection_error: Option<BackupError>,
 }
 
 impl FakeObjectStore {
@@ -509,12 +546,30 @@ impl FakeObjectStore {
         Self {
             objects: Mutex::new(std::collections::HashMap::new()),
             upload_error: None,
+            head_error: None,
+            delete_error: None,
+            connection_error: None,
         }
     }
 
-    /// 让上传返回指定的脱敏 S3 错误。
+    /// 让上传返回指定的脱敏 S3 错误
     pub(crate) fn fail_upload(mut self, code: &'static str, message: impl Into<String>) -> Self {
         self.upload_error = Some(BackupError::new(code, message.into()));
+        self
+    }
+
+    pub(crate) fn fail_head(mut self, code: &'static str) -> Self {
+        self.head_error = Some(BackupError::new(code, "HEAD failed".into()));
+        self
+    }
+
+    pub(crate) fn fail_delete(mut self, code: &'static str) -> Self {
+        self.delete_error = Some(BackupError::new(code, "DELETE failed".into()));
+        self
+    }
+
+    pub(crate) fn fail_connection(mut self, code: &'static str) -> Self {
+        self.connection_error = Some(BackupError::new(code, "DELETE failed".into()));
         self
     }
 
@@ -529,6 +584,14 @@ impl BackupObjectStorePort for FakeObjectStore {
         &self,
         _config: &BackupStorageConfig,
     ) -> Result<ConnectionTestResult, gateway_admin::model::backup::BackupError> {
+        if let Some(error) = &self.connection_error {
+            return Ok(ConnectionTestResult {
+                ok: false,
+                stage: "deleteObject",
+                code: Some(error.code()),
+                message: error.message().into(),
+            });
+        }
         Ok(ConnectionTestResult {
             ok: true,
             stage: "deleteObject",
@@ -563,6 +626,9 @@ impl BackupObjectStorePort for FakeObjectStore {
         _config: &BackupStorageConfig,
         object_key: &str,
     ) -> Result<Option<BackupObjectMetadata>, gateway_admin::model::backup::BackupError> {
+        if let Some(error) = &self.head_error {
+            return Err(error.clone());
+        }
         let Some(content) = self.object(object_key) else {
             return Ok(None);
         };
@@ -579,6 +645,9 @@ impl BackupObjectStorePort for FakeObjectStore {
         _config: &BackupStorageConfig,
         object_key: &str,
     ) -> Result<(), gateway_admin::model::backup::BackupError> {
+        if let Some(error) = &self.delete_error {
+            return Err(error.clone());
+        }
         self.objects.lock().expect("objects").remove(object_key);
         Ok(())
     }
@@ -594,7 +663,7 @@ impl BackupObjectStorePort for FakeObjectStore {
     }
 }
 
-/// 记录审计事件的假 AuthStore。
+/// 记录审计事件的假 AuthStore
 pub(crate) struct FakeAuthStore {
     audit: Mutex<Vec<AdminAuditEvent>>,
 }
@@ -656,6 +725,15 @@ impl AuthStore for FakeAuthStore {
     ) -> AdminStoreResult<()> {
         Ok(())
     }
+    async fn compare_exchange_session(
+        &self,
+        _: &str,
+        _: &gateway_admin::model::auth::AuthSession,
+        _: Option<&gateway_admin::model::auth::AuthSession>,
+    ) -> AdminStoreResult<Option<gateway_admin::model::auth::AuthSession>> {
+        Ok(None)
+    }
+
     async fn delete_session(
         &self,
         _session_id: &str,
@@ -685,7 +763,7 @@ impl AuthStore for FakeAuthStore {
     }
 }
 
-/// 系统发起者上下文。
+/// 系统发起者上下文
 pub(crate) fn system_context() -> MutationContext {
     MutationContext {
         actor: MutationActor::System,

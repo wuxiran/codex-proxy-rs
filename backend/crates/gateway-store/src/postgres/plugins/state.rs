@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! 插件私有状态的 PostgreSQL 读写、代次隔离、配额与迁移事务
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use gateway_admin::{
@@ -23,11 +28,59 @@ use gateway_admin::{
         store::{AdminStoreError, AdminStoreErrorKind, AdminStoreResult},
     },
 };
-use sqlx::{Postgres, Row as _, Transaction};
+use sqlx::{PgConnection, Postgres, Row as _, Transaction};
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::artifacts::PgPluginStore;
 
 const MIGRATION_BATCH_MAXIMUM: u32 = 100;
+
+struct TransitionGuard {
+    // 独立会话不占连接池名额，也不持有空闲事务；取消或宿主退出后断连释放咨询锁
+    _connection: PgConnection,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl PgPluginStore {
+    /// 启动时只回收没有迁移所有者的暂存代次，不改变实例启用状态或重放迁移
+    pub async fn recover_abandoned_state_transitions(&self) -> crate::StoreResult<u64> {
+        let instances: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "select distinct instance_id from plugin_state_generations where status='staging'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| crate::postgres_unavailable("list abandoned plugin transitions", error))?;
+        let mut removed = 0;
+        for instance in instances {
+            let mut transaction = self.pool.begin().await.map_err(|error| {
+                crate::postgres_unavailable("begin plugin transition recovery", error)
+            })?;
+            let acquired: bool = sqlx::query_scalar(
+                "select pg_try_advisory_xact_lock(hashtextextended($1, 739220))",
+            )
+            .bind(instance.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| {
+                crate::postgres_unavailable("lock abandoned plugin transition", error)
+            })?;
+            if acquired {
+                removed += sqlx::query(
+                    "delete from plugin_state_generations where instance_id=$1 and status='staging'",
+                )
+                .bind(instance)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| crate::postgres_unavailable("discard abandoned plugin transition", error))?
+                .rows_affected();
+            }
+            transaction.commit().await.map_err(|error| {
+                crate::postgres_unavailable("commit plugin transition recovery", error)
+            })?;
+        }
+        Ok(removed)
+    }
+}
 
 struct ActiveGeneration {
     id: uuid::Uuid,
@@ -547,6 +600,30 @@ impl PluginStateStore for PgPluginStore {
     ) -> PluginStateStoreResult<PluginStateTransition> {
         validate_configuration(&target)?;
         let instance_uuid = uuid::Uuid::parse_str(instance_id).map_err(|_| invalid())?;
+        let slot = self
+            .transition_slot
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| conflict())?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| unavailable())?
+            .detach();
+        let acquired: bool =
+            sqlx::query_scalar("select pg_try_advisory_lock(hashtextextended($1, 739220))")
+                .bind(instance_uuid.to_string())
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| unavailable())?;
+        if !acquired {
+            return Err(conflict());
+        }
+        let guard = Arc::new(TransitionGuard {
+            _connection: connection,
+            _slot: slot,
+        });
         let mut transaction = self.pool.begin().await.map_err(|_| unavailable())?;
         let current =
             sqlx::query("select enabled, revision from plugin_instances where id=$1 for update")
@@ -565,17 +642,14 @@ impl PluginStateStore for PgPluginStore {
         {
             return Err(conflict());
         }
-        let staging_exists: bool = sqlx::query_scalar(
-            "select exists(select 1 from plugin_state_generations \
-             where instance_id=$1 and status='staging')",
+        // 咨询锁已排除所有活跃所有者，遗留暂存数据只可能属于中断的迁移
+        sqlx::query(
+            "delete from plugin_state_generations where instance_id=$1 and status='staging'",
         )
         .bind(instance_uuid)
-        .fetch_one(&mut *transaction)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| unavailable())?;
-        if staging_exists {
-            return Err(conflict());
-        }
         let active = active_generations(&mut transaction, instance_uuid, true).await?;
         let targets = target_map(&target);
         let transition_id = uuid::Uuid::new_v4();
@@ -640,6 +714,7 @@ impl PluginStateStore for PgPluginStore {
             instance_id: instance_id.to_owned(),
             artifact_sha256: artifact_sha256.to_owned(),
             namespaces,
+            guard,
         })
     }
 
@@ -926,7 +1001,7 @@ async fn writable_generation(
     })
 }
 
-/// 实例与状态代次在同一事务绑定；只有这里会晋升 staging generation。
+/// 实例与状态代次在同一事务绑定；只有这里会晋升 staging generation
 pub(super) async fn commit_configuration(
     transaction: &mut Transaction<'_, Postgres>,
     instance: &PluginInstance,
@@ -1041,7 +1116,7 @@ pub(super) async fn commit_configuration(
             return Err(admin_conflict());
         }
         let staging_id: uuid::Uuid = staging.try_get("id").map_err(|_| admin_unavailable())?;
-        // 先解除迁移来源，再替换活动代次；任一步失败都会连同配置和旧记录一起回滚。
+        // 先解除迁移来源，再替换活动代次；任一步失败都会连同配置和旧记录一起回滚
         sqlx::query("update plugin_state_generations set source_generation_id=null where id=$1")
             .bind(staging_id)
             .execute(&mut **transaction)
@@ -1115,7 +1190,7 @@ pub(super) async fn commit_configuration(
     Ok(())
 }
 
-/// 紧急停用不依赖损坏包的 schema 解析；只允许原制品续绑并立即轮换 fence。
+/// 紧急停用不依赖损坏包的 schema 解析；只允许原制品续绑并立即轮换 fence
 pub(super) async fn rebind_existing_configuration(
     transaction: &mut Transaction<'_, Postgres>,
     instance_id: &str,

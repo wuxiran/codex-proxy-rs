@@ -1,4 +1,4 @@
-//! `provider_accounts` row 模型、解码与校验。
+//! `provider_accounts` row 模型、解码与校验
 
 use super::*;
 use gateway_core::routing::AccountGroupId;
@@ -8,83 +8,6 @@ pub(crate) const CREDENTIALS_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const QUOTA_MAX_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_ADMIN_IMPORT_BATCH: usize = 200;
 pub(crate) const ADMIN_USAGE_CHUNK_SIZE: usize = 200;
-
-/// 四种窗口投影通过一组 `GROUPING SETS` 从同一批匹配请求派生。`grouping_* = 1`
-/// 表示对应维度未参与该行聚合，调用方据此区分窗口、模型与成本行。
-pub(crate) fn account_usage_by_windows_sql() -> String {
-    let completed_usage = completed_usage_fact_predicate("mr");
-    format!(
-        "with requested_windows as (
-         select *
-         from unnest($1::text[], $2::text[], $3::timestamptz[], $4::timestamptz[])
-           as requested(account_id, window_key, window_start, window_end)
-     ), matched as (
-         select requested.account_id,
-                requested.window_key,
-                mr.id as request_id,
-                coalesce(mr.upstream_model_id, mr.requested_model_id) as model,
-                jsonb_build_array(mr.requested_model_id, mr.upstream_model_id,
-                                 mrb.response_model, mrb.billing_model)::text as model_key,
-                mrb.calculated_cost_amount, mrb.calculated_cost_currency,
-                mr.outcome, mr.input_tokens, mr.output_tokens, mr.cached_tokens,
-                mr.cache_write_tokens, mr.reasoning_tokens,
-                mr.image_input_tokens, mr.image_output_tokens,
-                mr.image_generation_succeeded, mr.total_tokens,
-                mr.cost_source, mr.cost_amount, mr.cost_currency, mr.started_at
-           from requested_windows requested
-           left join model_requests mr
-             on mr.provider_account_ref = requested.account_id
-            and mr.started_at >= requested.window_start
-            and mr.started_at < requested.window_end
-            and {completed_usage}
-           left join model_request_billing mrb on mrb.model_request_id = mr.id
-     )
-     select account_id,
-            window_key,
-            model, model_key,
-            cost_currency,
-            grouping(model)::integer as model_grouping,
-            grouping(cost_currency)::integer as currency_grouping,
-            count(request_id)::bigint as request_count,
-            count(request_id) filter (where outcome = 'succeeded')::bigint as success_count,
-            sum(input_tokens)::bigint as input_tokens,
-            sum(output_tokens)::bigint as output_tokens,
-            sum(cached_tokens)::bigint as cached_tokens,
-            sum(cache_write_tokens)::bigint as cache_write_tokens,
-            sum(reasoning_tokens)::bigint as reasoning_tokens,
-            sum(image_input_tokens)::bigint as image_input_tokens,
-            sum(image_output_tokens)::bigint as image_output_tokens,
-            count(request_id) filter (where image_generation_succeeded is true)::bigint
-              as image_request_count,
-            count(request_id) filter (where image_generation_succeeded is false)::bigint
-              as image_request_failed_count,
-            coalesce(sum(coalesce(
-              total_tokens,
-              coalesce(input_tokens, 0) + coalesce(output_tokens, 0)
-            )), 0)::bigint as total_tokens,
-            count(request_id) filter (where cost_source = 'provider_reported')::bigint
-              as provider_reported_count,
-            count(request_id) filter (where cost_source = 'calculated')::bigint
-              as calculated_count,
-            count(request_id) filter (where cost_source = 'unavailable')::bigint
-              as unavailable_count,
-            max(started_at) as last_used_at,
-            sum(cost_amount)::text as amount,
-            sum(calculated_cost_amount) filter (where calculated_cost_currency = 'USD')::text as model_price_usd,
-            sum(cost_amount) filter (where cost_source = 'provider_reported' and cost_currency = 'USD')::text as upstream_cost_usd,
-            count(request_id) filter (where calculated_cost_currency = 'USD')::bigint as model_price_count,
-            count(request_id) filter (where cost_source = 'provider_reported' and cost_currency = 'USD')::bigint as upstream_cost_count
-       from matched
-      group by grouping sets (
-        (account_id, window_key),
-        (account_id, window_key, cost_currency),
-        (account_id, window_key, model, model_key),
-        (account_id, window_key, model, model_key, cost_currency)
-      )
-      order by account_id, window_key, model_grouping desc, currency_grouping desc,
-               model nulls last, cost_currency nulls last"
-    )
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountAdminScope {
@@ -128,6 +51,7 @@ pub(crate) fn parse_error_reason(value: Option<String>) -> StoreResult<Option<Ac
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountSummary {
+    pub outbound_proxy_enabled: bool,
     pub request_location: Option<gateway_core::account::RequestLocation>,
     pub outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub id: String,
@@ -255,7 +179,7 @@ pub struct ImportProviderAccounts {
 pub struct ProviderAccountAdminImport {
     pub config_revision: Revision,
     pub account_ids: Vec<String>,
-    /// 与导入同一事务返回的最终凭据版本，避免提交后再查到另一轮写入。
+    /// 与导入同一事务返回的最终凭据版本，避免提交后再查到另一轮写入
     pub credential_revisions: std::collections::BTreeMap<String, Revision>,
 }
 
@@ -400,37 +324,37 @@ impl ProviderAccountStateUpdate {
     }
 }
 
-pub(crate) const ACCOUNT_SELECT: &str = "select auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
+pub(crate) const ACCOUNT_SELECT: &str = "select coalesce(proxy_enabled, true) as outbound_proxy_enabled, coalesce(max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
             has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
      from provider_accounts
-     left join (select id as location_proxy_id, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
+     left join (select id as location_proxy_id, enabled as proxy_enabled, max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
        on outbound_proxy_id = location_proxy_id
      where id = $1";
 
-pub(crate) const ACCOUNT_SELECT_BY_IDS: &str = "select auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
+pub(crate) const ACCOUNT_SELECT_BY_IDS: &str = "select coalesce(proxy_enabled, true) as outbound_proxy_enabled, coalesce(max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
             has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
      from provider_accounts
-     left join (select id as location_proxy_id, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
+     left join (select id as location_proxy_id, enabled as proxy_enabled, max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
        on outbound_proxy_id = location_proxy_id
      where id = any($1::text[]) and provider_kind = $2
      order by id";
 
-pub(crate) const REFRESH_CANDIDATES_SELECT: &str = "select auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
+pub(crate) const REFRESH_CANDIDATES_SELECT: &str = "select coalesce(proxy_enabled, true) as outbound_proxy_enabled, coalesce(max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
             has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
      from provider_accounts
-     left join (select id as location_proxy_id, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
+     left join (select id as location_proxy_id, enabled as proxy_enabled, max_websocket_connections, auto_location, detected_location_json, location_country, location_region, location_city, location_timezone from outbound_proxies) proxy_location
        on outbound_proxy_id = location_proxy_id
      where provider_kind = $1
        and has_refresh_token
@@ -453,12 +377,12 @@ pub(crate) fn account_record_from_row(
     let credentials = JsonObject::try_from_value(
         "provider_credentials_json",
         row.try_get("provider_credentials_json")
-            .map_err(|_| invalid("invalid credentials JSON"))?,
+            .map_err(|source| invalid("invalid credentials JSON").with_source(source))?,
         CREDENTIALS_MAX_BYTES,
     )?;
     let quota = row
         .try_get::<Option<serde_json::Value>, _>("provider_quota_json")
-        .map_err(|_| invalid("invalid quota JSON"))?
+        .map_err(|source| invalid("invalid quota JSON").with_source(source))?
         .map(|value| JsonObject::try_from_value("provider_quota_json", value, QUOTA_MAX_BYTES))
         .transpose()?;
     Ok(ProviderAccountRecord {
@@ -472,11 +396,11 @@ pub(crate) fn core_account_from_summary(
     summary: ProviderAccountSummary,
 ) -> Result<CoreProviderAccount, CoreStoreError> {
     let id = CoreProviderAccountId::new(summary.id)
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     let provider = ProviderKind::new(summary.provider_kind)
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     let revision = CoreCredentialRevision::new(summary.credential_revision.get())
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     Ok(CoreProviderAccount::new(
         id,
         provider,
@@ -486,6 +410,7 @@ pub(crate) fn core_account_from_summary(
         revision,
         summary.access_token_expires_at.map(Into::into),
     )
+    .with_notes(summary.notes)
     .with_profile(
         summary.email,
         summary.upstream_account_id,
@@ -500,23 +425,16 @@ pub(crate) fn core_account_from_summary(
     )
     .with_scheduling(summary.concurrency_limit, summary.weight)
     .with_model_access(summary.model_access)
-    .with_outbound_proxy(summary.outbound_proxy)
+    .with_outbound_proxy(
+        summary
+            .outbound_proxy
+            .filter(|_| summary.outbound_proxy_enabled),
+    )
     .with_request_location(summary.request_location)
     .with_refresh_schedule(
         summary.has_refresh_token,
         summary.next_refresh_at.map(Into::into),
     ))
-}
-
-pub(crate) fn core_store_error(error: StoreError) -> CoreStoreError {
-    let kind = match error {
-        StoreError::Unavailable { .. } => CoreStoreErrorKind::Unavailable,
-        StoreError::Conflict { .. } => CoreStoreErrorKind::Conflict,
-        StoreError::NotFound { .. } | StoreError::InvalidData { .. } => {
-            CoreStoreErrorKind::InvalidData
-        }
-    };
-    CoreStoreError::new(kind)
 }
 
 pub(crate) fn require_core_update(updated: bool) -> Result<(), CoreStoreError> {
@@ -532,21 +450,8 @@ pub(crate) fn account_summary_from_row(
 ) -> StoreResult<ProviderAccountSummary> {
     let revision = row
         .try_get::<i64, _>("credential_revision")
-        .map_err(|_| invalid("invalid credential revision"))?;
-    let credential_state = row
-        .try_get::<String, _>("credential_state")
-        .map_err(|_| invalid("invalid credential_state"))?;
-    let quota_access_state = parse_quota_access_state(&get::<String>(&row, "quota_access_state")?)?;
-    let quota_evidence = parse_quota_evidence(get(&row, "quota_evidence")?)?;
-    let quota_access_observed_at = get::<Option<DateTime<Utc>>>(&row, "quota_access_observed_at")?;
-    let quota_reset_at = get::<Option<DateTime<Utc>>>(&row, "quota_reset_at")?;
-    let quota = QuotaState::from_persisted(
-        quota_access_state,
-        quota_evidence,
-        quota_access_observed_at.map(Into::into),
-        quota_reset_at.map(Into::into),
-    )
-    .ok_or_else(|| invalid("invalid persisted quota fact"))?;
+        .map_err(|source| invalid("invalid credential revision").with_source(source))?;
+    let status = account_status_facts_from_row(&row)?;
     let concurrency_limit = get::<Option<i64>>(&row, "concurrency_limit")?
         .map(|value| {
             u32::try_from(value)
@@ -560,11 +465,18 @@ pub(crate) fn account_summary_from_row(
         .and_then(AccountWeight::new)
         .ok_or_else(|| invalid("invalid weight"))?;
     Ok(ProviderAccountSummary {
+        outbound_proxy_enabled: get(&row, "outbound_proxy_enabled")?,
         request_location: super::super::proxies::effective_location_from_row(&row)?,
         outbound_proxy: get::<Option<String>>(&row, "outbound_proxy_url")?
             .map(|url| {
+                let limit = u32::try_from(get::<i64>(
+                    &row,
+                    "outbound_proxy_max_websocket_connections",
+                )?)
+                .map_err(|source| invalid("invalid proxy websocket limit").with_source(source))?;
                 gateway_core::account::OutboundProxy::parse(&url)
-                    .map_err(|_| invalid("invalid outbound proxy"))
+                    .map(|proxy| proxy.with_max_websocket_connections(limit))
+                    .map_err(|source| invalid("invalid outbound proxy").with_source(source))
             })
             .transpose()?,
         id: get(&row, "id")?,
@@ -578,9 +490,9 @@ pub(crate) fn account_summary_from_row(
         authentication_kind: get(&row, "authentication_kind")?,
         credential_revision: Revision::new(to_u64(revision)?)?,
         has_refresh_token: get(&row, "has_refresh_token")?,
-        access_token_expires_at: get(&row, "access_token_expires_at")?,
+        access_token_expires_at: status.access_token_expires_at.map(Into::into),
         next_refresh_at: get(&row, "next_refresh_at")?,
-        enabled: get(&row, "enabled")?,
+        enabled: status.enabled,
         concurrency_limit,
         weight,
         model_access: get::<sqlx::types::Json<gateway_core::account::AccountModelAccess>>(
@@ -588,11 +500,11 @@ pub(crate) fn account_summary_from_row(
             "model_access_json",
         )?
         .0,
-        credential_state: parse_credential_state(&credential_state)?,
+        credential_state: status.credential_state,
         credential_observed_at: get(&row, "credential_observed_at")?,
-        quota,
-        last_error_reason: parse_error_reason(get(&row, "last_error_reason")?)?,
-        last_error_message: get(&row, "last_error_message")?,
+        quota: status.quota,
+        last_error_reason: status.last_error_reason,
+        last_error_message: status.last_error_message,
         created_at: get(&row, "created_at")?,
         updated_at: get(&row, "updated_at")?,
     })
@@ -602,7 +514,8 @@ pub(crate) fn get<'r, T>(row: &'r sqlx::postgres::PgRow, column: &'static str) -
 where
     T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
 {
-    row.try_get(column).map_err(|_| invalid(column))
+    row.try_get(column)
+        .map_err(|source| invalid(column).with_source(source))
 }
 
 pub(crate) fn validate_object_size(
@@ -612,8 +525,9 @@ pub(crate) fn validate_object_size(
 ) -> StoreResult<()> {
     let size = serde_json::to_vec(&object.as_value())
         .map_err(|error| StoreError::InvalidData {
+            source: Some(error.into()),
             entity: ENTITY,
-            message: error.to_string(),
+            message: "JSON encoding failed".to_owned(),
         })?
         .len();
     if size > max {
@@ -624,16 +538,46 @@ pub(crate) fn validate_object_size(
 }
 
 pub(crate) fn to_i64(value: u64) -> StoreResult<i64> {
-    i64::try_from(value).map_err(|_| invalid("revision is too large"))
+    i64::try_from(value).map_err(|source| invalid("revision is too large").with_source(source))
 }
 
 pub(crate) fn to_u64(value: i64) -> StoreResult<u64> {
-    u64::try_from(value).map_err(|_| invalid("revision must be positive"))
+    u64::try_from(value).map_err(|source| invalid("revision must be positive").with_source(source))
 }
 
 pub(crate) fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: ENTITY,
         message: message.to_owned(),
     }
+}
+
+pub(crate) fn account_status_facts_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<gateway_core::account::AccountStatusFacts> {
+    let credential_state = row
+        .try_get::<String, _>("credential_state")
+        .map_err(|source| invalid("invalid credential_state").with_source(source))?;
+    let quota_access_state = parse_quota_access_state(&get::<String>(row, "quota_access_state")?)?;
+    let quota_evidence = parse_quota_evidence(get(row, "quota_evidence")?)?;
+    let quota_access_observed_at = get::<Option<DateTime<Utc>>>(row, "quota_access_observed_at")?;
+    let quota_reset_at = get::<Option<DateTime<Utc>>>(row, "quota_reset_at")?;
+    let quota = QuotaState::from_persisted(
+        quota_access_state,
+        quota_evidence,
+        quota_access_observed_at.map(Into::into),
+        quota_reset_at.map(Into::into),
+    )
+    .ok_or_else(|| invalid("invalid persisted quota fact"))?;
+    Ok(gateway_core::account::AccountStatusFacts {
+        enabled: get(row, "enabled")?,
+        credential_state: parse_credential_state(&credential_state)?,
+        access_token_expires_at: get::<Option<DateTime<Utc>>>(row, "access_token_expires_at")?
+            .map(Into::into),
+        quota,
+        cooldown: None,
+        last_error_reason: parse_error_reason(get(row, "last_error_reason")?)?,
+        last_error_message: get(row, "last_error_message")?,
+    })
 }

@@ -1,3 +1,5 @@
+//! 插件自有分组、Key 与成员关系的写入及配置发布编排
+
 use crate::{
     model::{
         AdminError, MutationContext,
@@ -50,11 +52,12 @@ impl PluginResourceAccess for DefaultPluginResourceAccess {
                     owner,
                     resource_key,
                     NewAccountGroup {
+                        allow_image_generation: command.allow_image_generation,
                         id,
                         name: command.name,
                         description: command.description,
                         color: command.color,
-                        disable_fast: command.disable_fast,
+                        fast_mode: command.fast_mode,
                     },
                     context,
                 )

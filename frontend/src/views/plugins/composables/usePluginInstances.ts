@@ -1,37 +1,37 @@
 import type { Ref } from 'vue'
-import type { PluginActionContext } from './usePluginActions'
+import type { PluginRefreshContext } from '../utils/actions'
 import type { ConfigurePluginInstanceRequest, PluginArtifact, PluginInstance, PluginVersionPlan } from '@/api'
-import { toast } from '@codex-proxy/ui'
-import { computed, shallowRef, watch } from 'vue'
+import { ZNotification } from '@codex-proxy/ui'
+import { shallowRef } from 'vue'
 import { deletePluginInstance, disablePluginInstance, getPluginArtifacts, getPluginInstances, updatePluginInstance } from '@/api'
+import { useAsyncAction } from '@/composables/useAsyncAction'
+import { notifyPluginError } from '../utils/actions'
 import { configurationStatus } from '../utils/catalog'
 
-interface InstanceContext extends PluginActionContext {
+interface InstanceContext extends PluginRefreshContext {
   artifacts: Ref<PluginArtifact[]>
   onEdit: (pluginId: string) => void
   onSaved: () => void
 }
 
-export function usePluginInstances({ artifacts, refresh, notifyError, runAction, onEdit, onSaved }: InstanceContext) {
+export function usePluginInstances({ artifacts, refresh, onEdit, onSaved }: InstanceContext) {
   const configurationArtifact = shallowRef<PluginArtifact | null>(null)
   const showInstance = shallowRef(false)
   const configurationDraft = shallowRef<PluginVersionPlan | null>(null)
   const configurationError = shallowRef('')
   const editingInstance = shallowRef<PluginInstance | null>(null)
-  const savingInstance = shallowRef(false)
+  const action = useAsyncAction({
+    errorText: false,
+    onError: error => notifyPluginError('插件配置保存失败', error),
+  })
+  const savingInstance = action.loading
   const pendingEnable = shallowRef<{
     request: ConfigurePluginInstanceRequest
     instanceId?: string
     artifact: PluginArtifact
     replacements: (Pick<PluginInstance, 'id' | 'name' | 'revision'> & { version?: string })[]
   } | null>(null)
-  const showEnableConfirmation = computed({
-    get: () => pendingEnable.value !== null,
-    set: (open: boolean) => {
-      if (!open && !savingInstance.value)
-        pendingEnable.value = null
-    },
-  })
+  const showEnableConfirmation = shallowRef(false)
   const showInstanceDelete = shallowRef(false)
   const pendingDeleteInstance = shallowRef<PluginInstance | null>(null)
   const busyInstanceId = shallowRef('')
@@ -46,21 +46,22 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
   }
 
   async function saveInstance(request: ConfigurePluginInstanceRequest) {
-    if (savingInstance.value || pendingEnable.value)
+    if (savingInstance.value || showEnableConfirmation.value)
       return
     const instance = editingInstance.value
     if (!instance)
       return
     const input = { ...request, expectedRevision: configurationDraft.value?.instanceRevision ?? instance.revision }
-    const result = await runAction(savingInstance, '插件配置保存失败', async () => {
+    const result = await action.run(async () => {
       if (request.enabled) {
-        const pending = await prepareInstanceEnable(input, instance?.id)
+        const pending = await prepareInstanceEnable(input, instance.id)
         if (pending.replacements.length) {
           pendingEnable.value = pending
+          showEnableConfirmation.value = true
           return true
         }
       }
-      await persistInstance(input, instance?.id)
+      await persistInstance(input, instance.id)
       return true
     })
     if (!result)
@@ -84,17 +85,17 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
   }
 
   async function requestInstanceEnable(instance: PluginInstance) {
-    if (instance.compatibilityWarning) {
-      toast.error(instance.compatibilityWarning)
+    if (instance.loadError) {
+      ZNotification.error({ message: instance.loadError })
       return
     }
-    if ((instance.enabled && configurationStatus(instance) !== 'failed') || savingInstance.value || pendingEnable.value)
+    if ((instance.enabled && configurationStatus(instance) !== 'failed') || savingInstance.value || showEnableConfirmation.value)
       return
     if (instance.configurationRequired) {
       openEditInstance(instance)
       return
     }
-    const result = await runAction(savingInstance, '启用配置加载失败', async () => {
+    const result = await action.run(async () => {
       // 不传 secrets，沿用已保存密钥，不读取或回填明文。
       const pending = await prepareInstanceEnable({
         expectedRevision: instance.revision,
@@ -104,28 +105,32 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
         configuration: instance.configuration,
         bindings: instance.bindings,
       }, instance.id)
-      if (pending.replacements.length)
+      if (pending.replacements.length) {
         pendingEnable.value = pending
-      else await persistInstance(pending.request, instance.id)
+        showEnableConfirmation.value = true
+      }
+      else {
+        await persistInstance(pending.request, instance.id)
+      }
       return true
-    })
+    }, { onError: error => notifyPluginError('启用配置加载失败', error) })
     if (!result)
       await refresh(true, true)
   }
 
   async function confirmInstanceEnable() {
     const pending = pendingEnable.value
-    if (!pending || savingInstance.value)
+    if (!showEnableConfirmation.value || !pending || savingInstance.value)
       return
-    const result = await runAction(savingInstance, '配置启用失败', async () => {
+    const result = await action.run(async () => {
       await persistInstance({
         ...pending.request,
         replaceInstances: pending.replacements.map(instance => ({ id: instance.id, expectedRevision: instance.revision })),
       }, pending.instanceId)
       return true
-    })
+    }, { onError: error => notifyPluginError('配置启用失败', error) })
     // 失败后保留编辑草稿或已保存配置，再次提交需重新读取并确认停用范围。
-    pendingEnable.value = null
+    showEnableConfirmation.value = false
     if (!result)
       await refresh(true, true)
   }
@@ -134,10 +139,9 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
     if (!instanceId)
       return
     await updatePluginInstance({ id: instanceId, instance: request }, { silent: true })
-    pendingEnable.value = null
+    showEnableConfirmation.value = false
     showInstance.value = false
-    editingInstance.value = null
-    toast.success(request.replaceInstances?.length ? '已切换当前配置' : request.enabled ? '插件设置已应用' : '设置已保存，插件保持停用')
+    ZNotification.success({ message: request.replaceInstances?.length ? '已切换当前配置' : request.enabled ? '插件设置已应用' : '设置已保存，插件保持停用' })
     await refresh(true)
     onSaved()
   }
@@ -148,11 +152,11 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
     busyInstanceId.value = instance.id
     try {
       await disablePluginInstance({ id: instance.id }, { silent: true })
-      toast.success('插件已停用')
+      ZNotification.success({ message: '插件已停用' })
       await refresh(true)
     }
     catch (error) {
-      notifyError('插件停用失败', error)
+      notifyPluginError('插件停用失败', error)
     }
     finally {
       busyInstanceId.value = ''
@@ -172,24 +176,16 @@ export function usePluginInstances({ artifacts, refresh, notifyError, runAction,
     try {
       await deletePluginInstance({ id: instance.id }, { silent: true })
       showInstanceDelete.value = false
-      pendingDeleteInstance.value = null
-      toast.success('配置、密钥与私有数据已删除，无法恢复')
+      ZNotification.success({ message: '配置、密钥与私有数据已删除，无法恢复' })
       await refresh(true)
     }
     catch (error) {
-      notifyError('插件实例删除失败', error)
+      notifyPluginError('插件实例删除失败', error)
     }
     finally {
       busyInstanceId.value = ''
     }
   }
-
-  watch(showInstance, (open) => {
-    if (!open && !savingInstance.value) {
-      editingInstance.value = null
-      pendingEnable.value = null
-    }
-  })
 
   function editVersionPlan(instance: PluginInstance, artifact: PluginArtifact, plan: PluginVersionPlan, error: string) {
     configurationArtifact.value = artifact

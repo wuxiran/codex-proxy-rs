@@ -1,4 +1,4 @@
-//! `gateway-admin` 账号端口的 PostgreSQL adapter。
+//! `gateway-admin` 账号端口的 PostgreSQL adapter
 
 use gateway_admin::model::audit::MutationAuditOperation;
 use std::collections::BTreeMap;
@@ -23,9 +23,9 @@ fn account_capacity(
     }
 }
 
-/// Admin 账号用例所需的公共账号、留存观测与 revision 事务能力。
+/// Admin 账号用例所需的公共账号、留存观测与 revision 事务能力
 ///
-/// 三个 PostgreSQL adapter 都保持私有，调用方只能取得 [`AccountStore`] 暴露的领域能力。
+/// 三个 PostgreSQL adapter 都保持私有，调用方只能取得 [`AccountStore`] 暴露的领域能力
 #[derive(Clone)]
 pub struct PgAdminAccountStore {
     pub(super) pool: PgPool,
@@ -46,7 +46,12 @@ impl PgAdminAccountStore {
         Self {
             pool: pool.clone(),
             accounts: PgProviderAccountRepository::new(pool.clone()),
-            observability: PgObservabilityRepository::new(pool.clone(), None, query_budget.clone()),
+            observability: PgObservabilityRepository::new(
+                pool.clone(),
+                None,
+                query_budget.clone(),
+                None,
+            ),
             control_plane: PgControlPlaneRepository::new(pool),
             cooldowns,
             query_budget,
@@ -64,14 +69,8 @@ impl PgAdminAccountStore {
         let mut observations = Vec::with_capacity(account_ids.len());
         for account_ids in account_ids.chunks(ADMIN_USAGE_CHUNK_SIZE) {
             let query = ProviderAccountUsageQuery::for_accounts(range, account_ids.to_vec())
-                .map(ProviderAccountUsageQuery::with_model_identity)
-                .and_then(|query| {
-                    if range.end.signed_duration_since(range.start) <= TimeDelta::hours(24) {
-                        query.with_hourly_request_buckets()
-                    } else {
-                        Ok(query)
-                    }
-                })
+                .map(ProviderAccountUsageQuery::with_model_identity) // fork: billing
+                .and_then(ProviderAccountUsageQuery::with_hourly_request_buckets)
                 .map_err(|error| admin_store_error(ENTITY, error))?;
             observations.extend(
                 self.observability
@@ -104,103 +103,17 @@ impl PgAdminAccountStore {
             ObservabilityRange::new(window.range.start, window.range.end)
                 .map_err(|error| admin_store_error(ENTITY, error))?;
         }
-        let keys = windows
-            .iter()
-            .map(|window| window.key.clone())
-            .collect::<Vec<_>>();
-        let starts = windows
-            .iter()
-            .map(|window| window.range.start)
-            .collect::<Vec<_>>();
-        let ends = windows
-            .iter()
-            .map(|window| window.range.end)
-            .collect::<Vec<_>>();
-        let account_ids = windows
-            .iter()
-            .map(|window| window.account_id.clone())
-            .collect::<Vec<_>>();
-        let rows = self
-            .query_budget
-            .run("load account usage windows", async {
-                sqlx::query(sqlx::AssertSqlSafe(account_usage_by_windows_sql()))
-                    .bind(account_ids)
-                    .bind(keys)
-                    .bind(starts)
-                    .bind(ends)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|_| postgres_unavailable("load provider account quota window usage"))
-            })
+        self.query_budget
+            .run(
+                &self.pool,
+                "load account usage windows",
+                |mut connection| async move {
+                    crate::postgres::observability::account_usage_windows(&mut connection, windows)
+                        .await
+                },
+            )
             .await
-            .map_err(|error| admin_store_error(ENTITY, error))?;
-        let mut usage_rows = Vec::with_capacity(windows.len());
-        let mut costs_by_window = BTreeMap::<(String, String), Vec<AccountCost>>::new();
-        let mut model_costs = BTreeMap::<(String, String, String), Vec<AccountCost>>::new();
-        let mut models_by_window = BTreeMap::<(String, String), Vec<AccountModelUsage>>::new();
-        for row in &rows {
-            let model_grouping = window_usage_value::<i32>(row, "model_grouping")?;
-            let currency_grouping = window_usage_value::<i32>(row, "currency_grouping")?;
-            match (model_grouping, currency_grouping) {
-                (1, 1) => usage_rows.push(row),
-                (1, 0) if window_usage_value::<Option<String>>(row, "cost_currency")?.is_some() => {
-                    let (key, cost) = admin_account_usage_window_cost(row)?;
-                    costs_by_window.entry(key).or_default().push(cost);
-                }
-                (0, 1) if window_usage_value::<Option<String>>(row, "model")?.is_some() => {
-                    let ((account_id, window_key, _), usage) =
-                        admin_account_usage_window_model(row)?;
-                    models_by_window
-                        .entry((account_id, window_key))
-                        .or_default()
-                        .push(usage);
-                }
-                (0, 0)
-                    if window_usage_value::<Option<String>>(row, "model")?.is_some()
-                        && window_usage_value::<Option<String>>(row, "cost_currency")?
-                            .is_some() =>
-                {
-                    let (key, cost) = admin_account_usage_window_model_cost(row)?;
-                    model_costs.entry(key).or_default().push(cost);
-                }
-                (0 | 1, 0 | 1) => {}
-                _ => {
-                    return Err(AdminStoreError::new(
-                        AdminStoreErrorKind::Unavailable,
-                        ENTITY,
-                        "account usage window query returned an invalid grouping marker",
-                    ));
-                }
-            }
-        }
-        let mut results = usage_rows
-            .into_iter()
-            .map(admin_account_usage_window)
-            .collect::<AdminStoreResult<Vec<_>>>()?;
-        for result in &mut results {
-            result.usage.costs = costs_by_window
-                .remove(&(result.account_id.clone(), result.key.clone()))
-                .unwrap_or_default();
-            result.usage.models = models_by_window
-                .remove(&(result.account_id.clone(), result.key.clone()))
-                .unwrap_or_default();
-            for model in &mut result.usage.models {
-                model.costs = model_costs
-                    .remove(&(
-                        result.account_id.clone(),
-                        result.key.clone(),
-                        model.identity.key.clone(),
-                    ))
-                    .unwrap_or_default();
-            }
-            result.usage.models.sort_by(|left, right| {
-                right
-                    .request_count
-                    .cmp(&left.request_count)
-                    .then_with(|| left.model.cmp(&right.model))
-            });
-        }
-        Ok(results)
+            .map_err(|error| admin_store_error(ENTITY, error))
     }
 
     async fn required_scope(
@@ -216,6 +129,7 @@ impl PgAdminAccountStore {
                 admin_store_error(
                     ENTITY,
                     StoreError::NotFound {
+                        source: None,
                         entity: ENTITY,
                         id: account_id.to_owned(),
                     },
@@ -282,10 +196,10 @@ impl PgAdminAccountStore {
             .bind(credential.upstream_account_id.as_deref())
             .fetch_one(&self.pool)
             .await
-            .map_err(|_| {
+            .map_err(|source| {
                 admin_store_error(
                     ENTITY,
-                    postgres_unavailable("check existing account identity"),
+                    postgres_unavailable("check existing account identity", source),
                 )
             })?;
             if exists {
@@ -316,10 +230,10 @@ impl PgAdminAccountStore {
         .bind(account_ids)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| {
+        .map_err(|source| {
             admin_store_error(
                 ENTITY,
-                postgres_unavailable("load account group references"),
+                postgres_unavailable("load account group references", source),
             )
         })?;
         let mut groups = BTreeMap::<String, Vec<AccountGroupRef>>::new();
@@ -351,6 +265,19 @@ impl PgAdminAccountStore {
 
 #[async_trait]
 impl AccountStore for PgAdminAccountStore {
+    async fn account_exists(&self, account_id: &str) -> AdminStoreResult<bool> {
+        sqlx::query_scalar("select exists(select 1 from provider_accounts where id = $1)")
+            .bind(account_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| {
+                admin_store_error(
+                    ENTITY,
+                    postgres_unavailable("check account existence", source),
+                )
+            })
+    }
+
     async fn list_plugin_accounts(
         &self,
         query: PluginAccountListQuery,
@@ -410,8 +337,14 @@ impl AccountStore for PgAdminAccountStore {
             .filter(|(_, cooldown)| cooldown.is_active(now_system_time))
             .map(|(account_id, _)| account_id.clone())
             .collect::<Vec<_>>();
-        let page =
-            load_admin_account_page(&self.pool, &query, now, active_rate_limited_ids).await?;
+        let page = load_admin_account_page(
+            &self.pool,
+            &self.query_budget,
+            &query,
+            now,
+            active_rate_limited_ids,
+        )
+        .await?;
         let item_ids = page
             .accounts
             .iter()
@@ -476,7 +409,12 @@ impl AccountStore for PgAdminAccountStore {
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account concurrency")))?;
+        .map_err(|source| {
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("load account concurrency", source),
+            )
+        })?;
         let default_concurrency = u64::try_from(default_concurrency).map_err(|_| {
             AdminStoreError::new(
                 AdminStoreErrorKind::Invalid,
@@ -498,11 +436,12 @@ impl AccountStore for PgAdminAccountStore {
     ) -> AdminStoreResult<Vec<AccountUsage>> {
         let range = ObservabilityRange::new(range.start, range.end)
             .map_err(|error| admin_store_error(ENTITY, error))?;
-        self.usage_observations(range, account_ids)
+        Ok(self
+            .usage_observations(range, account_ids)
             .await?
             .into_iter()
             .map(admin_account_usage)
-            .collect()
+            .collect())
     }
 
     async fn load_account_usage_by_windows(
@@ -540,17 +479,17 @@ impl AccountStore for PgAdminAccountStore {
         >(
             // 已花费一次分组算完：原相关子查询会对每个账号各扫一遍 model_request_billing 全表。
             "with spent as (
-               select mr.provider_account_id, sum(mrb.calculated_cost_amount) as usd
+               select mr.provider_account_ref as provider_account_id, sum(mrb.calculated_cost_amount) as usd
                  from account_tickets t
                  join provider_accounts pa on pa.id = t.provider_account_id
                  join model_requests mr
-                   on mr.provider_account_id = t.provider_account_id
+                   on mr.provider_account_ref = t.provider_account_id
                   and mr.started_at >= coalesce(t.purchased_at, pa.created_at)
                  join model_request_billing mrb
                    on mrb.model_request_id = mr.id
                   and mrb.calculated_cost_currency = 'USD'
                 where t.provider_account_id = any($1::text[])
-                group by mr.provider_account_id
+                group by mr.provider_account_ref
              )
              select t.provider_account_id, t.purchase_amount::text, t.purchase_currency,
                     t.purchased_at, t.expires_at, t.ticket_hint, t.ticket_updated_at,
@@ -563,7 +502,9 @@ impl AccountStore for PgAdminAccountStore {
         .bind(account_ids)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account tickets")))?;
+        .map_err(|source| {
+            admin_store_error(ENTITY, postgres_unavailable("load account tickets", source))
+        })?;
         rows.into_iter()
             .map(
                 |(
@@ -615,8 +556,9 @@ impl AccountStore for PgAdminAccountStore {
         write: gateway_admin::model::account_tickets::AccountTicketWrite,
     ) -> AdminStoreResult<()> {
         use gateway_admin::model::account_tickets::TicketChange;
-        let unavailable =
-            |_| admin_store_error(ENTITY, postgres_unavailable("save account ticket"));
+        let unavailable = |source: sqlx::Error| {
+            admin_store_error(ENTITY, postgres_unavailable("save account ticket", source))
+        };
         let mut transaction = self.pool.begin().await.map_err(unavailable)?;
         let (amount, currency) = write
             .purchase
@@ -693,10 +635,10 @@ impl AccountStore for PgAdminAccountStore {
         retry_before: DateTime<Utc>,
         limit: i64,
     ) -> AdminStoreResult<Vec<String>> {
-        let unavailable = |_| {
+        let unavailable = |source: sqlx::Error| {
             admin_store_error(
                 ENTITY,
-                postgres_unavailable("load ticket revive candidates"),
+                postgres_unavailable("load ticket revive candidates", source),
             )
         };
         // 已恢复正常（含手动重新授权）的账号清零，下次失效时重新获得完整的自动复活次数。
@@ -754,7 +696,9 @@ impl AccountStore for PgAdminAccountStore {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("record ticket revive")))
+            .map_err(|source| {
+                admin_store_error(ENTITY, postgres_unavailable("record ticket revive", source))
+            })
     }
 
     async fn load_account_ticket_ciphertext(
@@ -768,7 +712,9 @@ impl AccountStore for PgAdminAccountStore {
         .fetch_optional(&self.pool)
         .await
         .map(Option::flatten)
-        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load account ticket")))
+        .map_err(|source| {
+            admin_store_error(ENTITY, postgres_unavailable("load account ticket", source))
+        })
     }
 
     async fn load_account_request_outcomes(
@@ -782,23 +728,23 @@ impl AccountStore for PgAdminAccountStore {
             return Ok(BTreeMap::new());
         }
         let rows = sqlx::query_as::<_, (String, i64, i64)>(
-            "select provider_account_id,
+            "select provider_account_ref,
                     count(*) filter (where outcome <> 'running'),
                     count(*) filter (where outcome in ('failed', 'incomplete'))
                from model_requests
-              where provider_account_id = any($1::text[])
+              where provider_account_ref = any($1::text[])
                 and started_at >= $2 and started_at < $3
-              group by provider_account_id",
+              group by provider_account_ref",
         )
         .bind(account_ids)
         .bind(range.start)
         .bind(range.end)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| {
+        .map_err(|source| {
             admin_store_error(
                 ENTITY,
-                postgres_unavailable("load account request outcomes"),
+                postgres_unavailable("load account request outcomes", source),
             )
         })?;
         Ok(rows
@@ -1054,16 +1000,19 @@ impl AccountStore for PgAdminAccountStore {
         limit: AccountConcurrencyLimit,
         context: &MutationContext,
     ) -> AdminStoreResult<Option<AccountUpdateResult>> {
-        let mut transaction = self.pool.begin().await.map_err(|_| {
-            admin_store_error(ENTITY, postgres_unavailable("begin concurrency reduction"))
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("begin concurrency reduction", source),
+            )
         })?;
         let result =
             async {
-                // 与管理写入采用相同锁顺序；锁住默认值后再检查账号最新设置，避免把旧快照写回。
+                // 与管理写入采用相同锁顺序；锁住默认值后再检查账号最新设置，避免把旧快照写回
                 let default_limit: i64 = sqlx::query_scalar(
                 "select max_concurrent_per_account from runtime_settings where id = 1 for update"
             ).fetch_one(&mut *transaction).await
-                .map_err(|_| postgres_unavailable("lock default concurrency"))?;
+                .map_err(|source| postgres_unavailable("lock default concurrency", source))?;
                 let changed = sqlx::query_scalar::<_, String>(
                     "update provider_accounts set concurrency_limit = $2, updated_at = greatest(now(), updated_at)
                  where id = $1 and enabled = true
@@ -1075,7 +1024,7 @@ impl AccountStore for PgAdminAccountStore {
                 .bind(default_limit)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|_| postgres_unavailable("lower account concurrency"))?;
+                .map_err(|source| postgres_unavailable("lower account concurrency", source))?;
                 if changed.is_none() {
                     return Ok(None);
                 }
@@ -1272,10 +1221,10 @@ impl AccountStore for PgAdminAccountStore {
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
         let revision = control_plane.settings.config_revision;
-        let mut transaction = self.accounts.pool.begin().await.map_err(|_| {
+        let mut transaction = self.accounts.pool.begin().await.map_err(|source| {
             admin_store_error(
                 ENTITY,
-                postgres_unavailable("begin credential export audit"),
+                postgres_unavailable("begin credential export audit", source),
             )
         })?;
         let result = async {

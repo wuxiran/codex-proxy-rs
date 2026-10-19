@@ -1,3 +1,5 @@
+//! 管理控制面 HTTP 接口的测试入口
+
 mod plugins;
 use std::{
     collections::BTreeMap,
@@ -16,9 +18,10 @@ use gateway_admin::{
         MutationContext, Revision,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         accounts::{
             AccountListQuery, AccountPage, AccountPageItem, AccountRuntimeSnapshot,
@@ -35,9 +38,10 @@ use gateway_admin::{
             NewClientKey, SetClientKeyEnabled, UpdateClientKey,
         },
         observability::{
-            DashboardObservation, DecimalAmount, DiagnosticDimension, DiagnosticsObservation,
-            OpsError, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageDetail,
-            UsageFilter, UsageListRecord, UsageOverview, UsagePage, UsageQuery,
+            DashboardObservation, DashboardQuery, DecimalAmount, DiagnosticDimension,
+            DiagnosticsObservation, Granularity, OpsError, OpsErrorPage, OpsErrorQuery,
+            RequestMetricPoint, TimeRange, UsageDetail, UsageFilter, UsageListRecord,
+            UsageOverview, UsagePage, UsageQuery,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -69,6 +73,7 @@ use gateway_admin::{
 };
 use gateway_api::auth::SessionState;
 use gateway_core::{
+    account::FastMode,
     account::{AccountStatusFacts, CredentialState, ProviderAccountId, QuotaState},
     engine::{
         execution::{ClientAuthenticationError, ClientKeyVerifier},
@@ -83,6 +88,8 @@ mod account_groups;
 mod accounts;
 mod auth;
 mod client_keys;
+mod compression;
+mod error_diagnostics;
 mod errors;
 mod fork_proxy_quality; // fork: proxy-quality
 mod observability;
@@ -109,6 +116,7 @@ pub(super) struct AdminTestFixture {
     pub dashboard_summary_range: Arc<Mutex<Option<TimeRange>>>,
     pub provider_error: Arc<Mutex<Option<ProviderAdminError>>>,
     pub account: Arc<Mutex<Option<AccountPageItem>>>,
+    pub account_usage: Arc<Mutex<Vec<AccountUsage>>>,
 }
 
 impl AdminTestFixture {
@@ -117,19 +125,24 @@ impl AdminTestFixture {
     }
 
     pub async fn with_system(system: Arc<dyn SystemOperations>) -> Self {
-        Self::with_dependencies(system, None).await
+        Self::with_dependencies(system, None, Default::default()).await
     }
 
     pub async fn with_key_verifier(
         verifier: Arc<dyn ClientKeyVerifier>,
         system: Arc<dyn SystemOperations>,
     ) -> Self {
-        Self::with_dependencies(system, Some(verifier)).await
+        Self::with_dependencies(system, Some(verifier), Default::default()).await
+    }
+
+    pub async fn with_timezone(timezone: gateway_core::time::DeploymentTimeZone) -> Self {
+        Self::with_dependencies(Arc::new(UnusedSystem), None, timezone).await
     }
 
     async fn with_dependencies(
         system: Arc<dyn SystemOperations>,
         verifier: Option<Arc<dyn ClientKeyVerifier>>,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         let api_key = Arc::new(Mutex::new(None));
         let auth = Arc::new(MemoryAuthStore::new(api_key.clone()));
@@ -146,6 +159,7 @@ impl AdminTestFixture {
         let dashboard_summary_range = Arc::new(Mutex::new(None));
         let provider_error = Arc::new(Mutex::new(None));
         let account = Arc::new(Mutex::new(None));
+        let account_usage = Arc::new(Mutex::new(Vec::new()));
         let unused = Arc::new(UnusedStore {
             observations: observations.clone(),
             usage_records: Arc::clone(&usage_records),
@@ -155,6 +169,7 @@ impl AdminTestFixture {
             dashboard_observation: Arc::clone(&dashboard_observation),
             dashboard_summary_range: Arc::clone(&dashboard_summary_range),
             account: Arc::clone(&account),
+            account_usage: Arc::clone(&account_usage),
         });
         let plugin_ports = Arc::new(plugins::TestPluginPorts::default());
         let published_snapshot = gateway_core::runtime::RuntimeSnapshotHandle::default();
@@ -173,6 +188,7 @@ impl AdminTestFixture {
             plugin_ports.clone(),
             plugin_ports.clone(),
             plugin_ports.clone(),
+            plugin_ports.clone(),
         );
         let providers: Vec<Arc<dyn ProviderAdmin>> = vec![
             Arc::new(UnusedProvider::new("openai", Arc::clone(&provider_error))),
@@ -180,6 +196,7 @@ impl AdminTestFixture {
         ];
         let bundle = gateway_admin::initialize(
             AdminConfig {
+                session_absolute_ttl_minutes: 30 * 24 * 60,
                 session_ttl_minutes: 60,
                 default_username: "admin_1".to_owned(),
                 default_password: InitialAdminPassword::new("strong-admin-password"),
@@ -187,6 +204,7 @@ impl AdminTestFixture {
             ClientConfig::default(),
             stores,
             gateway_admin::AdminRuntimePorts {
+                timezone,
                 service_middleware: std::sync::Arc::new(|| None),
                 plugin_preparation: plugin_ports.clone(),
                 plugin_management: plugin_ports.clone(),
@@ -226,6 +244,7 @@ impl AdminTestFixture {
             dashboard_summary_range,
             provider_error,
             account,
+            account_usage,
         }
     }
 
@@ -311,6 +330,8 @@ impl MemoryAuthStore {
                     },
                     admin_user_id: "admin_1".to_owned(),
                 },
+                renewal: None,
+                absolute_expires_at: None,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         );
@@ -322,6 +343,15 @@ impl MemoryAuthStore {
 
     pub fn fail_audit(&self, fail: bool) {
         self.fail_audit.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_session_expiry(&self, session_id: &str, expires_at: chrono::DateTime<Utc>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get_mut(session_id.split('.').nth(1).unwrap_or(session_id))
+            .unwrap()
+            .expires_at = expires_at;
     }
 
     pub fn session_count(&self) -> usize {
@@ -393,6 +423,30 @@ impl AuthStore for MemoryAuthStore {
             .expect("sessions")
             .insert(session_id.to_owned(), session.clone());
         Ok(())
+    }
+
+    async fn compare_exchange_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        replacement: Option<&AuthSession>,
+    ) -> AdminStoreResult<Option<AuthSession>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session.retained_until() <= chrono::Utc::now() {
+                return Ok(None);
+            }
+            if session == expected {
+                if let Some(replacement) = replacement {
+                    *session = replacement.clone();
+                } else {
+                    sessions.remove(session_id);
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(session.clone()));
+        }
+        Ok(None)
     }
 
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>> {
@@ -560,38 +614,51 @@ impl SettingsStore for MemorySettingsStore {
         }
         let updated = RuntimeSettings {
             request_profiles,
-            request_location_enabled: command.request_location_enabled,
-            request_location: command.request_location,
             config_revision: next_revision(settings.config_revision),
             model_mappings: command.model_mappings,
-            refresh_margin_seconds: command.refresh_margin_seconds,
-            refresh_concurrency: command.refresh_concurrency,
-            max_concurrent_per_account: command.max_concurrent_per_account,
-            request_interval_ms: command.request_interval_ms,
-            max_waiting_per_key: command.max_waiting_per_key,
-            max_waiting_per_account: command.max_waiting_per_account,
-            concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
-            responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
-            smart_scheduling: command.smart_scheduling,
             rotation_strategy: command.rotation_strategy,
-            min_codex_desktop_version: command.min_codex_desktop_version,
-            min_codex_cli_version: command.min_codex_cli_version,
-            usage_retention_days: command.usage_retention_days,
-            ops_event_retention_days: command.ops_event_retention_days,
-            audit_retention_days: command.audit_retention_days,
-            account_auto_freeze_enabled: true,
-            account_auto_freeze_threshold: 12,
-            account_auto_freeze_window_seconds: 600,
-            account_auto_freeze_duration_seconds: 7_200,
-            account_auto_freeze_probe_enabled: true,
-            account_auto_freeze_probe_model: None,
-            account_auto_freeze_adaptive_concurrency: true,
-            request_log_enabled: true,
-            request_log_test_key_id: None,
-            account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
-            account_warmup_model: None,
             updated_at: Utc::now(),
+            values: gateway_admin::model::settings::RuntimeSettingsValues {
+                codex_privacy_policy: command.values.codex_privacy_policy,
+                request_location_enabled: command.values.request_location_enabled,
+                request_location: command.values.request_location,
+                refresh_margin_seconds: command.values.refresh_margin_seconds,
+                refresh_concurrency: command.values.refresh_concurrency,
+                max_concurrent_per_account: command.values.max_concurrent_per_account,
+                max_waiting_per_key: command.values.max_waiting_per_key,
+                max_waiting_per_account: command.values.max_waiting_per_account,
+                concurrency_wait_timeout_seconds: command.values.concurrency_wait_timeout_seconds,
+                openai_guardian_reserved_concurrency: command
+                    .values
+                    .openai_guardian_reserved_concurrency,
+                openai_account_affinity: command.values.openai_account_affinity,
+                max_account_rotations: command.values.max_account_rotations,
+                openai_session_affinity_ttl_hours: command.values.openai_session_affinity_ttl_hours,
+                responses_max_decompressed_body_bytes: command
+                    .values
+                    .responses_max_decompressed_body_bytes,
+                smart_scheduling: command.values.smart_scheduling,
+                min_codex_desktop_version: command.values.min_codex_desktop_version,
+                min_codex_cli_version: command.values.min_codex_cli_version,
+                usage_retention_days: command.values.usage_retention_days,
+                ops_event_retention_days: command.values.ops_event_retention_days,
+                audit_retention_days: command.values.audit_retention_days,
+                // fork: request-log
+                request_log_enabled: command.values.request_log_enabled,
+                request_log_test_key_id: command.values.request_log_test_key_id,
+                account_auto_freeze_enabled: true,
+                account_auto_freeze_threshold: 12,
+                account_auto_freeze_window_seconds: 600,
+                account_auto_freeze_duration_seconds: 7_200,
+                account_auto_freeze_probe_enabled: true,
+                account_auto_freeze_probe_model: None,
+                account_auto_freeze_adaptive_concurrency: true,
+                account_warmup_enabled: false,
+                account_warmup_schedule_time: "08:00".to_owned(),
+                account_warmup_model: None,
+                reset_credit_lead_minutes: 10,
+                reset_credit_max_weekly_remaining_percent: None,
+            },
         };
         *settings = updated.clone();
         Ok(updated)
@@ -656,7 +723,8 @@ impl MemoryAccountGroupStore {
             (
                 primary_id.clone(),
                 AccountGroupRecord {
-                    disable_fast: false,
+                    allow_image_generation: true,
+                    fast_mode: FastMode::Default,
                     id: primary_id,
                     name: "Alpha routing".to_owned(),
                     description: Some("Primary traffic".to_owned()),
@@ -678,7 +746,8 @@ impl MemoryAccountGroupStore {
             (
                 secondary_id.clone(),
                 AccountGroupRecord {
-                    disable_fast: false,
+                    allow_image_generation: true,
+                    fast_mode: FastMode::Default,
                     id: secondary_id,
                     name: "Beta routing".to_owned(),
                     description: None,
@@ -747,6 +816,48 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         })
     }
 
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        let state = self.state.lock().expect("account groups");
+        let search = query.search.as_ref().map(|value| value.to_lowercase());
+        let mut matching = state
+            .groups
+            .values()
+            .filter(|record| {
+                query
+                    .enabled
+                    .is_none_or(|enabled| record.enabled == enabled)
+            })
+            .filter(|record| {
+                search
+                    .as_ref()
+                    .is_none_or(|search| record.name.to_lowercase().contains(search))
+            })
+            .map(|record| AccountGroupRef {
+                id: record.id.clone(),
+                name: record.name.clone(),
+                color: record.color.clone(),
+                enabled: record.enabled,
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+        let total = matching.len() as u64;
+        let page_size = usize::from(query.page_size.get());
+        let offset = usize::try_from(query.page.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(page_size);
+        let items = matching.into_iter().skip(offset).take(page_size).collect();
+        Ok(AccountGroupOptionsPage {
+            config_revision: state.revision,
+            items,
+            total,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
     async fn load_account_group_members(
         &self,
         group_ids: &[gateway_core::routing::AccountGroupId],
@@ -794,7 +905,8 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut state = self.state.lock().expect("account groups");
         let now = Utc::now();
         let record = AccountGroupRecord {
-            disable_fast: command.disable_fast,
+            allow_image_generation: command.allow_image_generation,
+            fast_mode: command.fast_mode,
             id: command.id.clone(),
             name: command.name,
             description: command.description,
@@ -826,8 +938,11 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         record.name = command.name;
         record.description = command.description;
         record.color = command.color;
-        if let Some(disable_fast) = command.disable_fast {
-            record.disable_fast = disable_fast;
+        if let Some(fast_mode) = command.fast_mode {
+            record.fast_mode = fast_mode;
+        }
+        if let Some(allowed) = command.allow_image_generation {
+            record.allow_image_generation = allowed;
         }
         record.updated_at = Utc::now();
         mutation(&mut state, command.id, true)
@@ -1014,6 +1129,7 @@ struct UnusedStore {
     dashboard_observation: Arc<Mutex<Option<DashboardObservation>>>,
     dashboard_summary_range: Arc<Mutex<Option<TimeRange>>>,
     account: Arc<Mutex<Option<AccountPageItem>>>,
+    account_usage: Arc<Mutex<Vec<AccountUsage>>>,
 }
 
 struct UnusedClientKeyVerifier;
@@ -1026,6 +1142,15 @@ impl ClientKeyVerifier for UnusedClientKeyVerifier {
 
 #[async_trait]
 impl AccountStore for UnusedStore {
+    async fn account_exists(&self, id: &str) -> AdminStoreResult<bool> {
+        Ok(self
+            .account
+            .lock()
+            .expect("account")
+            .as_ref()
+            .is_some_and(|account| account.account.id == id))
+    }
+
     async fn list_plugin_accounts(
         &self,
         _: gateway_admin::model::provider_credentials::PluginAccountListQuery,
@@ -1038,6 +1163,27 @@ impl AccountStore for UnusedStore {
         _: AccountListQuery,
         _: AccountRuntimeSnapshot,
     ) -> AdminStoreResult<AccountPage> {
+        if let Some(account) = self.account.lock().expect("account").as_ref() {
+            let status = account.projection.status;
+            return Ok(AccountPage {
+                config_revision: Revision::new(1).unwrap(),
+                items: vec![account.clone()],
+                total: 1,
+                summary: gateway_admin::model::accounts::AccountSummary {
+                    total: 1,
+                    normal: u64::from(status == gateway_core::account::AccountStatus::Normal),
+                    quota_exhausted: u64::from(
+                        status == gateway_core::account::AccountStatus::QuotaExhausted,
+                    ),
+                    rate_limited: u64::from(
+                        status == gateway_core::account::AccountStatus::RateLimited,
+                    ),
+                    disabled: u64::from(status == gateway_core::account::AccountStatus::Disabled),
+                    error: u64::from(status == gateway_core::account::AccountStatus::Error),
+                    expired: 0, // fork: account-expired
+                },
+            });
+        }
         Err(unavailable("account list"))
     }
 
@@ -1055,20 +1201,40 @@ impl AccountStore for UnusedStore {
     async fn load_account_usage(
         &self,
         _: TimeRange,
-        _: &[String],
+        account_ids: &[String],
     ) -> AdminStoreResult<Vec<AccountUsage>> {
         if self.account.lock().expect("account").is_some() {
-            return Ok(Vec::new());
+            return Ok(self
+                .account_usage
+                .lock()
+                .expect("account usage")
+                .iter()
+                .filter(|usage| account_ids.contains(&usage.account_id))
+                .cloned()
+                .collect());
         }
         Err(unavailable("account usage"))
     }
 
     async fn load_account_usage_by_windows(
         &self,
-        _: &[AccountUsageWindowQuery],
+        windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>> {
         if self.account.lock().expect("account").is_some() {
-            return Ok(Vec::new());
+            let usage = self.account_usage.lock().expect("account usage");
+            return Ok(windows
+                .iter()
+                .filter_map(|window| {
+                    usage
+                        .iter()
+                        .find(|usage| usage.account_id == window.account_id)
+                        .map(|usage| AccountUsageWindowResult {
+                            account_id: window.account_id.clone(),
+                            key: window.key.clone(),
+                            usage: usage.clone(),
+                        })
+                })
+                .collect());
         }
         Err(unavailable("account quota window usage"))
     }
@@ -1204,6 +1370,32 @@ impl AccountStore for UnusedStore {
 
 #[async_trait]
 impl AccountRuntimeStore for UnusedStore {
+    async fn account_concurrency(
+        &self,
+        account_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> AdminStoreResult<gateway_admin::model::accounts::AccountConcurrencyPage> {
+        use gateway_admin::model::accounts::{AccountConcurrencyEntry, AccountConcurrencyPage};
+        assert_eq!(account_id, "acct_cooldown");
+        assert_eq!((offset, limit), (20, 20));
+        let now = "2026-10-17T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        Ok(AccountConcurrencyPage {
+            total: 21,
+            observed_at: now,
+            entries: vec![AccountConcurrencyEntry {
+                lease_id: "lease_current".into(),
+                request_id: Some("req_current".into()),
+                client_key_id: Some("key_fixture".into()),
+                client_key_name: Some("测试 Key".into()),
+                model: Some("gpt-5.4".into()),
+                client_ip: Some("2001:db8::376".into()),
+                started_at: Some(now - chrono::Duration::seconds(15)),
+                acquired_at: Some(now - chrono::Duration::seconds(5)),
+            }],
+        })
+    }
+
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
         Ok(AccountRuntimeSnapshot {
             cooldown: BTreeMap::new(),
@@ -1243,15 +1435,40 @@ impl AccountRuntimeStore for UnusedStore {
 
 #[async_trait]
 impl ObservabilityStore for UnusedStore {
+    async fn diagnostic_errors(
+        &self,
+        target: &gateway_admin::model::diagnostics::DiagnosticTarget,
+        limit: u16,
+    ) -> AdminStoreResult<Vec<gateway_admin::model::observability::OpsError>> {
+        let errors = self.ops_errors.lock().expect("ops errors");
+        Ok(errors
+            .iter()
+            .filter(|error| match target {
+                gateway_admin::model::diagnostics::DiagnosticTarget::Request(id) => {
+                    error.request_id.as_ref() == Some(id)
+                }
+                gateway_admin::model::diagnostics::DiagnosticTarget::Operation(id) => {
+                    &error.event_id == id && error.source == "ops_event"
+                }
+            })
+            .take(usize::from(limit))
+            .cloned()
+            .collect())
+    }
+
+    fn query_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(10)
+    }
+
     async fn dashboard_summary(
         &self,
-        range: TimeRange,
+        query: DashboardQuery,
         _: DateTime<Utc>,
     ) -> AdminStoreResult<DashboardObservation> {
         *self
             .dashboard_summary_range
             .lock()
-            .expect("dashboard summary range") = Some(range);
+            .expect("dashboard summary range") = Some(query.range);
         self.dashboard_observation
             .lock()
             .expect("dashboard observation")
@@ -1259,7 +1476,11 @@ impl ObservabilityStore for UnusedStore {
             .ok_or_else(|| unavailable("dashboard"))
     }
 
-    async fn dashboard_trend(&self, _: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>> {
+    async fn dashboard_trend(
+        &self,
+        _: TimeRange,
+        _: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         Err(unavailable("dashboard trend"))
     }
 
@@ -1267,20 +1488,46 @@ impl ObservabilityStore for UnusedStore {
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        _: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         let mut data = self.observations.lock().expect("observations");
         data.trends.push((range, filter));
         data.trend.clone().ok_or_else(|| unavailable("usage trend"))
     }
 
-    fn usage_calculated_billing_facts(
+    async fn analytics_cache_generation(&self) -> AdminStoreResult<u64> {
+        Ok(self
+            .observations
+            .lock()
+            .expect("observations")
+            .summary
+            .as_ref()
+            .map_or(0, |summary| summary.analytics.generation))
+    }
+
+    async fn usage_insights_observation(
         &self,
-        _: TimeRange,
-        _: UsageFilter,
-    ) -> gateway_admin::ports::store::UsageCalculatedBillingStream<'_> {
-        Box::pin(futures::stream::once(async {
-            Err(unavailable("usage billing facts"))
-        }))
+        range: TimeRange,
+        filter: UsageFilter,
+        _: Granularity,
+    ) -> AdminStoreResult<gateway_admin::model::observability::UsageInsightsObservation> {
+        let mut data = self.observations.lock().expect("observations");
+        data.summaries.push((range, filter.clone()));
+        data.trends.push((range, filter));
+        Ok(
+            gateway_admin::model::observability::UsageInsightsObservation {
+                overview: data
+                    .summary
+                    .clone()
+                    .map(|summary| UsageOverview { range, ..summary })
+                    .ok_or_else(|| unavailable("usage summary"))?,
+                trend: data
+                    .trend
+                    .clone()
+                    .ok_or_else(|| unavailable("usage trend"))?,
+                costs: Vec::new(),
+            },
+        )
     }
 
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage> {
@@ -1298,11 +1545,12 @@ impl ObservabilityStore for UnusedStore {
         })
     }
 
-    async fn usage_record_detail(&self, _: &str) -> AdminStoreResult<UsageDetail> {
+    async fn usage_record_detail(&self, request_id: &str) -> AdminStoreResult<UsageDetail> {
         self.usage_detail
             .lock()
             .expect("usage detail")
             .clone()
+            .filter(|detail| detail.request.id == request_id)
             .ok_or_else(|| unavailable("usage detail"))
     }
 
@@ -1324,6 +1572,7 @@ impl ObservabilityStore for UnusedStore {
         _: TimeRange,
         _: UsageFilter,
         _: DiagnosticDimension,
+        _: u16,
     ) -> AdminStoreResult<DiagnosticsObservation> {
         Ok(self.diagnostics.lock().expect("diagnostics").clone())
     }
@@ -1553,38 +1802,46 @@ fn test_runtime_settings() -> RuntimeSettings {
     ]);
     RuntimeSettings {
         request_profiles: Default::default(),
-        request_location_enabled: false,
-        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: mappings,
-        refresh_margin_seconds: 3_600,
-        refresh_concurrency: 2,
-        max_concurrent_per_account: 3,
-        request_interval_ms: 50,
-        max_waiting_per_key: 0,
-        max_waiting_per_account: 0,
-        concurrency_wait_timeout_seconds: 30,
-        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: RotationStrategy::Smart,
-        min_codex_desktop_version: None,
-        min_codex_cli_version: None,
-        usage_retention_days: 31,
-        ops_event_retention_days: 30,
-        audit_retention_days: 90,
-        account_auto_freeze_enabled: true,
-        account_auto_freeze_threshold: 12,
-        account_auto_freeze_window_seconds: 600,
-        account_auto_freeze_duration_seconds: 7_200,
-        account_auto_freeze_probe_enabled: true,
-        account_auto_freeze_probe_model: None,
-        account_auto_freeze_adaptive_concurrency: true,
-        request_log_enabled: true,
-        request_log_test_key_id: None,
-        account_warmup_enabled: false,
-        account_warmup_schedule_time: "08:00".to_owned(),
-        account_warmup_model: None,
         updated_at: Utc::now(),
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_privacy_policy: Default::default(),
+            request_location_enabled: false,
+            request_location: Default::default(),
+            refresh_margin_seconds: 3_600,
+            refresh_concurrency: 2,
+            max_concurrent_per_account: 3,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            min_codex_desktop_version: None,
+            min_codex_cli_version: None,
+            usage_retention_days: 31,
+            ops_event_retention_days: 30,
+            audit_retention_days: 90,
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            request_log_enabled: true, // fork: request-log
+            request_log_test_key_id: None,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
+            reset_credit_lead_minutes: 10,
+            reset_credit_max_weekly_remaining_percent: None,
+        },
     }
 }
 
@@ -1626,6 +1883,7 @@ fn unavailable(resource: &'static str) -> AdminStoreError {
         resource,
         "unused test port",
     )
+    .with_source(std::io::Error::other("PRIVATE_ADMIN_NATIVE_CAUSE"))
 }
 
 fn not_found(resource: &'static str) -> AdminStoreError {
@@ -1638,4 +1896,30 @@ fn unsupported_provider() -> ProviderAdminError {
 
 fn unavailable_system() -> SystemOperationError {
     SystemOperationError::new(SystemOperationErrorKind::Internal, "unused test operation")
+}
+
+#[async_trait]
+impl gateway_admin::ports::reset_credit_automation::ResetCreditAutomationStore for UnusedStore {
+    async fn reset_credit_automation(
+        &self,
+        _: &str,
+    ) -> AdminStoreResult<
+        Option<gateway_admin::model::reset_credit_automation::ResetCreditAutomation>,
+    > {
+        Ok(None)
+    }
+    async fn due_reset_credit_automations(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: u32,
+    ) -> AdminStoreResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn save_reset_credit_automation(
+        &self,
+        _: &gateway_admin::model::reset_credit_automation::ResetCreditAutomation,
+        _: Option<&gateway_admin::model::MutationContext>,
+    ) -> AdminStoreResult<u64> {
+        Err(unavailable("reset-credit automation"))
+    }
 }

@@ -1,41 +1,43 @@
 <script setup lang="ts">
-import type { AccountRow } from '../constants'
+import type { Account } from '@/api'
 
-import { BaseTable, defineTableColumns } from '@codex-proxy/ui'
+import { defineTableColumns, ZTable } from '@codex-proxy/ui'
 import { Sigma } from '@lucide/vue'
 import { computed } from 'vue'
 import { modelSuccessRateTextClass } from '../constants'
 
 const props = defineProps<{
-  account: AccountRow
+  account: Account
 }>()
 
-type AccountModelUsage = AccountRow['usage']['models'][number]
+type AccountModelUsage = Account['usage']['models'][number]
 
+// fork: billing — 总计费取「按模型价格计费」，与真实上游费用分开展示。
 const totalBillingDisplay = computed(() => props.account.usage.billing?.modelPriceAmountUsdDisplay ?? '未提供')
 const hasUsageSummary = computed(() => (props.account.usage.requestCount ?? 0) > 0)
 
+// fork: billing — 按请求模型 / 路由模型 / 计费模型拆行，并列出两种费用口径与差额。
 const modelUsageColumns = defineTableColumns<AccountModelUsage>([
   { key: 'requestedModelId', label: '请求模型', kind: 'text', size: 'md' },
   { key: 'upstreamModelId', label: '路由 / 响应模型', kind: 'text', size: 'lg' },
   { key: 'billingModel', label: '计费模型', kind: 'text', size: 'md' },
-  { key: 'billing.modelPriceAmountUsdDisplay', format: (_value, row) => row.billing?.modelPriceAmountUsdDisplay ?? '未提供', label: '按模型价格计费', kind: 'numeric', size: 'md' },
-  { key: 'billing.upstreamCostAmountUsdDisplay', format: (_value, row) => row.billing?.upstreamCostAmountUsdDisplay ?? '未提供', label: '真实上游费用', kind: 'numeric', size: 'lg' },
-  { key: 'billing.differenceAmountUsdDisplay', format: (_value, row) => row.billing?.differenceAmountUsdDisplay ?? '不可计算', label: '差额', kind: 'numeric', size: 'sm' },
+  { key: 'billing.modelPriceAmountUsdDisplay', formatter: (_value, row) => row.billing?.modelPriceAmountUsdDisplay ?? '未提供', label: '按模型价格计费', kind: 'numeric', size: 'md' },
+  { key: 'billing.upstreamCostAmountUsdDisplay', formatter: (_value, row) => row.billing?.upstreamCostAmountUsdDisplay ?? '未提供', label: '真实上游费用', kind: 'numeric', size: 'lg' },
+  { key: 'billing.differenceAmountUsdDisplay', formatter: (_value, row) => row.billing?.differenceAmountUsdDisplay ?? '不可计算', label: '差额', kind: 'numeric', size: 'sm' },
   { key: 'requestCountDisplay', label: '调用 / 成功率', kind: 'numeric', size: 'sm' },
 ])
 </script>
 
 <template>
-  <section class="grid min-w-0 gap-4 rounded-lg bg-cp-bg-container p-4 shadow-cp-tertiary xl:min-h-0 xl:grid-cols-[0.52fr_1.48fr]">
-    <div class="min-w-0 xl:flex xl:min-h-0 xl:flex-col">
+  <section class="grid gap-4 rounded-lg bg-cp-bg-container p-4 shadow-cp-tertiary xl:min-h-0 xl:grid-cols-[0.52fr_1.48fr]">
+    <div class="xl:flex xl:min-h-0 xl:flex-col">
       <div class="mb-3 flex shrink-0 items-center justify-between gap-3">
         <h3 class="m-0 text-cp-lg font-heavy text-cp-text">
           Tokens 结构
         </h3>
         <span class="text-cp-xs font-emphasis text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
       </div>
-      <div class="grid grid-cols-2 gap-2 sm:grid-cols-5">
+      <div class="grid gap-2 xl:min-h-0 xl:flex-1 xl:grid-rows-5">
         <div class="flex items-center justify-between rounded-lg bg-cp-green-container px-3 py-2">
           <span class="text-cp-sm font-bold text-cp-green-on-container">输入</span>
           <strong class="font-mono text-cp text-cp-text">
@@ -49,33 +51,33 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
           </strong>
         </div>
         <div class="flex items-center justify-between rounded-lg bg-cp-cyan-container px-3 py-2">
-          <span class="text-cp-sm font-bold text-cp-cyan-on-container">缓存</span>
+          <span class="text-cp-sm font-bold text-cp-cyan-on-container">缓存读取</span>
           <strong class="font-mono text-cp text-cp-text">
-            {{ account.usage.cachedTokensDisplay }}
+            {{ account.usage.cachedInputTokensDisplay }}
           </strong>
         </div>
         <div class="flex items-center justify-between rounded-lg bg-cp-blue-container px-3 py-2">
           <span class="text-cp-sm font-bold text-cp-blue-on-container">推理</span>
           <strong class="font-mono text-cp text-cp-text">
-            {{ account.usage.reasoningTokensDisplay }}
+            {{ account.usage.reasoningOutputTokensDisplay }}
           </strong>
         </div>
         <div class="flex items-center justify-between rounded-lg bg-cp-blue-container px-3 py-2">
-          <span class="text-cp-sm font-bold text-cp-blue-on-container">读取</span>
+          <span class="text-cp-sm font-bold text-cp-blue-on-container">缓存写入</span>
           <strong class="font-mono text-cp text-cp-text">
-            {{ account.usage.readTokensDisplay }}
+            {{ account.usage.cacheWriteInputTokensDisplay }}
           </strong>
         </div>
       </div>
     </div>
 
-    <div class="min-w-0">
+    <div class="min-w-0 pt-4 xl:flex xl:min-h-0 xl:flex-col xl:pt-0 xl:pl-4">
       <div class="mb-3 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2">
         <h3 class="m-0 shrink-0 text-cp-lg font-heavy text-cp-text">
           模型使用排行
         </h3>
 
-        <div class="ml-auto flex flex-wrap items-baseline gap-2">
+        <div class="ml-auto flex items-baseline gap-4">
           <div v-if="hasUsageSummary" class="flex items-baseline gap-1.5 whitespace-nowrap">
             <Sigma class="size-3.5 self-center text-cp-text-tertiary" :stroke-width="1.75" />
             <span title="总 Token">
@@ -96,21 +98,22 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
         </div>
       </div>
 
+      <!-- fork: billing -->
       <p class="mb-2 whitespace-normal text-cp-xs text-cp-text-tertiary">
         差额 = 按模型价格计费 − 真实上游费用；仅同一行全部请求的两项 USD 金额均已提供时计算。历史未记录的模型显示“未记录”。
       </p>
-      <div class="h-64 min-w-0">
-        <BaseTable
+      <div class="h-56 min-w-0 xl:h-auto xl:min-h-0 xl:flex-1 xl:basis-0">
+        <ZTable
           :columns="modelUsageColumns"
-          :rows="account.usage.models"
+          :data="account.usage.models"
           row-key="key"
-          density="compact"
+          size="small"
           empty-text="暂无模型用量"
         >
           <template #requestedModelId="{ row }">
             <div class="grid gap-1">
               <span>{{ row.requestedModelId ?? '未记录' }}</span>
-              <span class="text-[10px] text-cp-text-tertiary" :title="`输入 ${row.inputTokensDisplay} · 输出 ${row.outputTokensDisplay} · 缓存 ${row.cachedTokensDisplay}`">Tokens {{ row.totalTokensDisplay }}</span>
+              <span class="text-[10px] text-cp-text-tertiary" :title="`输入 ${row.inputTokensDisplay} · 输出 ${row.outputTokensDisplay} · 缓存 ${row.cachedInputTokensDisplay}`">Tokens {{ row.totalTokensDisplay }}</span>
               <span v-if="row.mismatch" class="w-fit rounded-cp bg-cp-warning-container px-1.5 text-cp-xs font-bold text-cp-warning-on-container">mismatch</span>
             </div>
           </template>
@@ -123,7 +126,7 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
           <template #billingModel="{ row }">
             <div class="grid gap-1">
               <span>{{ row.billingModel ?? '未记录' }}</span>
-              <span class="text-[10px] text-cp-text-tertiary" :title="row.lastUsedAt">{{ row.lastUsedAtDisplay }}</span>
+              <span class="text-[10px] text-cp-text-tertiary" :title="row.lastUsedAtFullDisplay ?? row.lastUsedAt">{{ row.lastUsedAtDisplay }}</span>
             </div>
           </template>
           <template #requestCountDisplay="{ row }">
@@ -132,7 +135,7 @@ const modelUsageColumns = defineTableColumns<AccountModelUsage>([
               <span :class="modelSuccessRateTextClass(row.successRate)">{{ row.successRateDisplay }}</span>
             </div>
           </template>
-        </BaseTable>
+        </ZTable>
       </div>
     </div>
   </section>

@@ -1,3 +1,5 @@
+//! 验证设置服务调用、Provider 参数校验与价格管理行为
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -26,7 +28,7 @@ struct PricingSettingsStore {
 
 #[tokio::test]
 async fn explicit_service_calls_freeze_empty_plan_and_cancel_before_entering_terminal() {
-    use gateway_admin::service::{Origin, Plan, scope};
+    use gateway_admin::public_service::{Origin, Plan, scope};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let resolutions = Arc::new(AtomicUsize::new(0));
@@ -58,7 +60,7 @@ async fn explicit_service_calls_freeze_empty_plan_and_cancel_before_entering_ter
             )
             .await
             .unwrap();
-        // 内部 pricing 不再单独进入插件链；显式调用只解析一次发布集合。
+        // 内部 pricing 不再单独进入插件链；显式调用只解析一次发布集合
         assert_eq!(resolutions.load(Ordering::SeqCst), expected);
     }
     store.updated.lock().unwrap().take();
@@ -96,6 +98,51 @@ async fn client_profile_preview_rejects_unknown_provider_before_loading_settings
         .await
         .expect_err("unknown provider cannot use global settings");
     assert_eq!(error.kind(), AdminErrorKind::Invalid);
+}
+
+#[tokio::test]
+async fn pricing_accepts_ultrafast_for_openai_but_rejects_it_for_xai() {
+    for provider in ["openai", "xai"] {
+        let store = Arc::new(PricingSettingsStore::default());
+        let services = super::AdminHarness::new()
+            .settings(store.clone())
+            .provider(super::test_provider(provider))
+            .build()
+            .await;
+        let context = MutationContext {
+            actor: gateway_admin::model::MutationActor::System,
+            request_id: "request-ultrafast-pricing".to_owned(),
+        };
+        for band in ["ultrafast", "long_ultrafast"] {
+            let pricing = serde_json::from_value(serde_json::json!({
+                "multiplierBps": 10000,
+                "bands": {
+                    "standard": {"input":"2", "output":"10", "cacheRead":"0.1", "cacheWrite":"2.5"},
+                    (band): {"input":"12", "output":"60", "cacheRead":"0.6", "cacheWrite":"15"}
+                }
+            }))
+            .expect("Ultrafast override");
+            let update = UpdatePricing {
+                provider: provider.to_owned(),
+                models: vec!["example-model".to_owned()],
+                change: PricingChange::Replace(pricing),
+            };
+            let result = services
+                .settings()
+                .update_pricing(&context, update.clone())
+                .await;
+            if provider == "openai" {
+                result.expect("OpenAI accepts Ultrafast overrides");
+                assert_eq!(store.updated.lock().unwrap().as_ref(), Some(&update));
+            } else {
+                assert_eq!(
+                    result.expect_err("xAI rejects Ultrafast").kind(),
+                    AdminErrorKind::Invalid
+                );
+                assert!(store.updated.lock().unwrap().is_none());
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -275,36 +322,44 @@ async fn settings_should_reject_zero_refresh_margin_before_store_call() {
             ReplaceRuntimeSettings {
                 expected_revision: gateway_admin::model::Revision::new(1).unwrap(),
                 request_profile_updates: Default::default(),
-                request_location_enabled: false,
-                request_location: Default::default(),
                 model_mappings: Default::default(),
-                refresh_margin_seconds: 0,
-                refresh_concurrency: 1,
-                max_concurrent_per_account: 1,
-                request_interval_ms: 0,
-                max_waiting_per_key: 0,
-                max_waiting_per_account: 0,
-                concurrency_wait_timeout_seconds: 30,
-                responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-                smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
                 rotation_strategy: RotationStrategy::Smart,
-                min_codex_desktop_version: None,
-                min_codex_cli_version: None,
-                usage_retention_days: 31,
-                ops_event_retention_days: 30,
-                audit_retention_days: 30,
-                account_auto_freeze_enabled: true,
-                account_auto_freeze_threshold: 12,
-                account_auto_freeze_window_seconds: 600,
-                account_auto_freeze_duration_seconds: 7_200,
-                account_auto_freeze_probe_enabled: true,
-                account_auto_freeze_probe_model: None,
-                account_auto_freeze_adaptive_concurrency: true,
-                request_log_enabled: true,
-                request_log_test_key_id: None,
-                account_warmup_enabled: false,
-                account_warmup_schedule_time: "08:00".to_owned(),
-                account_warmup_model: None,
+                values: gateway_admin::model::settings::RuntimeSettingsValues {
+                    codex_privacy_policy: Default::default(),
+                    request_location_enabled: false,
+                    request_location: Default::default(),
+                    refresh_margin_seconds: 0,
+                    refresh_concurrency: 1,
+                    max_concurrent_per_account: 1,
+                    max_waiting_per_key: 0,
+                    max_waiting_per_account: 0,
+                    concurrency_wait_timeout_seconds: 30,
+                    openai_guardian_reserved_concurrency: 0,
+                    openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+                    max_account_rotations: 3,
+                    openai_session_affinity_ttl_hours: 24,
+                    responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+                    smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+                    request_log_enabled: true, // fork: request log
+                    request_log_test_key_id: None,
+                    min_codex_desktop_version: None,
+                    min_codex_cli_version: None,
+                    usage_retention_days: 31,
+                    ops_event_retention_days: 30,
+                    audit_retention_days: 30,
+                    account_auto_freeze_enabled: true,
+                    account_auto_freeze_threshold: 12,
+                    account_auto_freeze_window_seconds: 600,
+                    account_auto_freeze_duration_seconds: 7_200,
+                    account_auto_freeze_probe_enabled: true,
+                    account_auto_freeze_probe_model: None,
+                    account_auto_freeze_adaptive_concurrency: true,
+                    account_warmup_enabled: false,
+                    account_warmup_schedule_time: "08:00".to_owned(),
+                    account_warmup_model: None,
+                    reset_credit_lead_minutes: 10,
+                    reset_credit_max_weekly_remaining_percent: None,
+                },
             },
         )
         .await

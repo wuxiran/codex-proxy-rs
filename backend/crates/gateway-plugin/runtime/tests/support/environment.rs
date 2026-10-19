@@ -1,3 +1,5 @@
+//! 插件集成测试的专用存储环境、账号与 Client Key 数据准备
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
@@ -30,6 +32,7 @@ use gateway_admin::{
         system::{SystemOperationError, SystemOperations, SystemUpdateEventStream},
     },
 };
+use gateway_core::account::FastMode;
 use gateway_plugin_runtime::{
     PackageInspector, PackageLimits, PluginRuntime, PluginRuntimeConfig, RpcLimits,
 };
@@ -62,7 +65,7 @@ impl Environment {
         .await
         .unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "insert into {}.client_key_budget_windows
+            "insert into {}.client_api_key_budget_windows
              (client_api_key_id, daily_start, daily_end, daily_used_usd, weekly_start, weekly_end, weekly_used_usd)
              values ($1, now(), now()+interval '1 day', 3, now(), now()+interval '7 days', 4)",
             self.schema
@@ -124,7 +127,8 @@ impl Environment {
             .account_groups()
             .create_account_group(
                 NewAccountGroup {
-                    disable_fast: false,
+                    allow_image_generation: true,
+                    fast_mode: FastMode::Default,
                     id: id.clone(),
                     name: format!("fixture {}", id.as_str()),
                     description: None,
@@ -297,6 +301,16 @@ impl Environment {
                 vec![],
             )]);
         }
+        let has_retry = configuration.get("retry_decision").is_some();
+        if has_retry {
+            contributes.extend([super::contribution_for_id(
+                &plugin_id,
+                Capability::RetryPolicy,
+                vec![Stage::Retry],
+                vec![],
+                vec![],
+            )]);
+        }
         let service_worker = (has_service || has_http)
             .then(|| std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap());
         let worker = service_worker.as_deref().unwrap_or_else(|| super::worker());
@@ -334,6 +348,18 @@ impl Environment {
             secrets: BTreeMap::new(),
 
             bindings: [
+                has_retry.then(|| PluginCapabilityBinding {
+                    contribution: format!("{plugin_id}.retryPolicy"),
+                    stage: "retry".into(),
+                    order: 0,
+                    failure_policy: PluginFailurePolicy::Delegate,
+                    client_key_ids: vec![],
+                    account_group_ids: vec![],
+                    provider_ids: vec![],
+                    models: vec![],
+                    event: None,
+                    identity_bindings: vec![],
+                }),
                 has_upstream_adapter.then(|| PluginCapabilityBinding {
                     contribution: format!("{plugin_id}.upstreamAdapter"),
                     stage: "upstream".into(),
@@ -429,14 +455,23 @@ impl Environment {
         &self,
         limits: RpcLimits,
     ) -> (Arc<PluginRuntime>, gateway_core::CoreBundle) {
+        self.runtime_with_providers(limits, super::native::provider_registry())
+            .await
+    }
+
+    pub async fn runtime_with_providers(
+        &self,
+        limits: RpcLimits,
+        providers: gateway_core::engine::provider::ProviderRegistry,
+    ) -> (Arc<PluginRuntime>, gateway_core::CoreBundle) {
         let runtime = self.plugin_runtime_with_limits(limits);
         let core = gateway_core::prepare(
             self.store.core_ports(),
-            super::native::provider_registry(),
+            providers,
             Some(runtime.clone()),
             Some(runtime.observer_registry()),
             Some(runtime.policy_registry()),
-            Some(runtime.middleware_registry()),
+            Some(runtime.execution_registry()),
             Some(runtime.frontend_authentication_registry()),
         );
         let access = gateway_admin::initialize_plugin_accounts(
@@ -469,7 +504,7 @@ impl Environment {
             Some(runtime.clone()),
             Some(runtime.observer_registry()),
             Some(runtime.policy_registry()),
-            Some(runtime.middleware_registry()),
+            Some(runtime.execution_registry()),
         )
         .activate()
         .await
@@ -522,6 +557,7 @@ impl Environment {
             .expect("runtime account access");
         gateway_admin::initialize_with_plugin_accounts(
             AdminConfig {
+                session_absolute_ttl_minutes: 30 * 24 * 60,
                 session_ttl_minutes: 60,
                 default_username: "plugin-test-admin".to_owned(),
                 default_password: InitialAdminPassword::new("plugin-test-password"),
@@ -529,12 +565,13 @@ impl Environment {
             ClientConfig::default(),
             self.store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                timezone: Default::default(),
                 service_middleware: {
                     let snapshots = core.snapshots();
-                    let middleware = runtime.middleware_registry();
+                    let middleware = runtime.execution_registry();
                     std::sync::Arc::new(move || {
                         let snapshot = snapshots.snapshot_for_diagnostics()?;
-                        middleware.resolve(snapshot.extensions()?)
+                        middleware.middleware(snapshot.extensions()?)
                     })
                 },
                 plugin_preparation: runtime.clone(),
@@ -648,7 +685,7 @@ impl Environment {
     }
 
     async fn create_with_store_mode(command_line: bool) -> Option<Self> {
-        // 插件专用服务优先；CI 的标准测试服务同样通过随机 schema 隔离数据库。
+        // 插件专用服务优先；CI 的标准测试服务同样通过随机 schema 隔离数据库
         let (database, redis) = if let Ok(database) = std::env::var("CPR_PLUGIN_TEST_DATABASE_URL")
         {
             (
@@ -698,9 +735,6 @@ impl Environment {
         } else {
             gateway_store::initialize(config).await.unwrap()
         };
-        // 迁移可能已创建默认行；该场景只测租约释放，明确关闭相邻请求的间隔限制。
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("insert into {schema}.runtime_settings(id, config_revision, request_interval_ms, updated_at) values (1,1,0,now()) on conflict (id) do update set request_interval_ms=0")))
-            .execute(&admin).await.unwrap();
         Some(Self {
             store,
             directory,
@@ -720,6 +754,17 @@ impl Environment {
         .await
         .unwrap();
         self.admin.close().await;
+    }
+
+    pub async fn audit_actor_refs(&self, action: &str) -> Vec<String> {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "select actor_ref from {}.admin_audit_events where action=$1 order by created_at",
+            self.schema
+        )))
+        .bind(action)
+        .fetch_all(&self.admin)
+        .await
+        .unwrap()
     }
 
     pub async fn audit_requests(&self, action: &str) -> Vec<String> {
@@ -745,7 +790,7 @@ impl Environment {
 
     pub async fn bound_model_requests(&self, client_key_id: &str) -> Vec<(String, String)> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "select request_kind, subagent_kind from {}.model_requests
+            "select request_kind, subagent_kind from {}.model_request_observations
              where client_api_key_ref = $1 order by started_at, id",
             self.schema
         )))
@@ -814,7 +859,11 @@ impl PricingSource for UnusedAdminRuntime {
 
 #[async_trait]
 impl ProxyProbe for UnusedAdminRuntime {
-    async fn test(&self, _: &gateway_core::account::OutboundProxy, _: bool) -> ProxyTestResult {
+    async fn test(
+        &self,
+        _: Option<&gateway_core::account::OutboundProxy>,
+        _: bool,
+    ) -> ProxyTestResult {
         panic!("unexpected proxy probe")
     }
 }
