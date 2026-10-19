@@ -1,10 +1,10 @@
-//! 流式 WebSocket exchange 与连接回收。
+//! 流式 WebSocket exchange 与连接回收
 
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use gateway_core::diagnostics::{TraceContext, diagnostic_json};
-use gateway_core::engine::response_control::{ActiveResponseInterrupt, ResponseControl};
+use gateway_core::engine::response_control::ResponseControl;
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -68,7 +68,7 @@ impl StreamWebSocketDiscardReason {
     reason = "转发启动分别接管连接、池租约、响应控制和请求模型策略"
 )]
 pub(in crate::transport::websocket) fn stream_websocket_response(
-    websocket: PumpedWebSocket,
+    mut websocket: PumpedWebSocket,
     metadata: CodexWebSocketConnectionMetadata,
     pool_return: Option<WebSocketStreamPoolReturn>,
     reused_connection: bool,
@@ -78,6 +78,7 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
     requested_model: String,
     discard_mismatched_connection: bool,
 ) -> CodexWebSocketStreamingExchange {
+    websocket.bind_control(response_control.as_ref());
     let websocket_connection_id = websocket.connection_id();
     let response_metadata = metadata.clone();
     let rate_limit_updates = Arc::new(Mutex::new(Vec::new()));
@@ -109,7 +110,6 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
         );
     let forward = async move {
         forward_websocket_response_stream(WebSocketStreamForwardState {
-            response_control,
             websocket,
             metadata,
             pool_return,
@@ -151,7 +151,6 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
 }
 
 struct WebSocketStreamForwardState {
-    response_control: Option<ResponseControl>,
     trace: TraceContext,
     websocket: PumpedWebSocket,
     metadata: CodexWebSocketConnectionMetadata,
@@ -168,7 +167,6 @@ struct WebSocketStreamForwardState {
 
 async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
     let WebSocketStreamForwardState {
-        response_control,
         trace,
         mut websocket,
         mut metadata,
@@ -188,20 +186,15 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         .map(|pool_return| std::mem::take(&mut pool_return.continuation))
         .unwrap_or_default();
     let mut last_event_type = None;
-    let mut active_interrupt: Option<ActiveResponseInterrupt> = None;
-    let mut interrupt_requested: futures::future::BoxFuture<'static, ()> =
-        Box::pin(std::future::pending());
-    let mut interrupt_sent = false;
-    // 官方 run_websocket_response_stream 按响应消费 metadata 事件；它们不属于握手头。
-    // 复用连接时恢复握手快照，避免上一轮模型信息及普通响应头随每次请求累积。
+    // 官方 run_websocket_response_stream 按响应消费 metadata 事件；它们不属于握手头
+    // 复用连接时恢复握手快照，避免上一轮模型信息及普通响应头随每次请求累积
     let opening_response_metadata = metadata.response_metadata.clone();
     loop {
         let message = tokio::select! {
             biased;
             // 客户端断开下游 SSE 流：立即丢弃连接并释放池 slot，
-            // 不再傻等上游 idle 超时（否则同会话后续请求会一直 bypass/busy）。
+            // 不再傻等上游 idle 超时（否则同会话后续请求会一直 bypass/busy）
             () = tx.closed() => {
-                drop(active_interrupt.take());
                 trace.record("upstream.cancelled", json!({"reason": "receiver_dropped"}));
                 discard_stream_websocket(
                     websocket,
@@ -211,7 +204,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                 return;
             }
             () = shutdown.cancelled() => {
-                drop(active_interrupt.take());
                 trace.record("upstream.cancelled", json!({"reason": "pool_shutdown"}));
                 discard_stream_websocket(
                     websocket,
@@ -219,24 +211,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                     StreamWebSocketDiscardReason::PoolShutdown,
                 ).await;
                 return;
-            }
-            () = &mut interrupt_requested, if !interrupt_sent => {
-                let Some(active) = active_interrupt.as_ref() else { continue };
-                let payload = json!({
-                    "type": "response.interrupt",
-                    "response_id": active.response_id(),
-                    "mode": "discard_partial_items",
-                }).to_string();
-                // 复用正在消费此响应的原 socket；信号不经过选号或新请求恢复。
-                if let Err(error) = super::super::handshake::send_websocket_request(&websocket, &payload).await {
-                    drop(active_interrupt.take());
-                    discard_stream_websocket(websocket, pool_return, StreamWebSocketDiscardReason::UpstreamReceiveFailed).await;
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-                interrupt_sent = true;
-                trace.record("upstream.interrupt.sent", json!({"mode": "discard_partial_items"}));
-                continue;
             }
             message = next_websocket_message(
                 &mut websocket,
@@ -246,8 +220,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                // 先撤销 owner 再发布失败；下一次 attempt 不等待旧 socket 异步清理。
-                drop(active_interrupt.take());
                 let observation = connection_observation(&websocket, &error);
                 trace.record(
                     "upstream.read.failed",
@@ -283,7 +255,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         let raw = match message {
             tungstenite::Message::Text(text) => text.to_string(),
             tungstenite::Message::Binary(bytes) => {
-                drop(active_interrupt.take());
                 trace.capture("upstream.binary", &bytes);
                 let error = CodexWebSocketExchangeError::UnexpectedBinaryEvent;
                 let observation = connection_observation(&websocket, &error);
@@ -299,7 +270,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
                 return;
             }
             tungstenite::Message::Close(frame) => {
-                drop(active_interrupt.take());
                 if let Some(frame) = &frame {
                     trace.dump("upstream.close.reason", frame.reason.as_bytes());
                 }
@@ -343,7 +313,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         ) {
             Ok(reduced) => reduced,
             Err(error) => {
-                drop(active_interrupt.take());
                 let observation =
                     (!matches!(error.classified(), CodexWebSocketExchangeError::Upstream(_)))
                         .then(|| connection_observation(&websocket, &error));
@@ -363,31 +332,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
         };
         if let Some(event_type) = reduced.diagnostic_event_type {
             last_event_type = Some(event_type);
-        }
-        if active_interrupt.is_none()
-            && let (Some(control), Some(response_id)) =
-                (&response_control, reduced.created_response_id)
-        {
-            active_interrupt = control.activate(response_id);
-            if let Some(active) = &active_interrupt {
-                // 跨消息复用同一个等待 future，避免每帧留下新的取消等待者。
-                interrupt_requested = Box::pin(active.requested());
-            }
-            if active_interrupt.is_none() {
-                discard_stream_websocket(
-                    websocket,
-                    pool_return,
-                    StreamWebSocketDiscardReason::FailedResponse,
-                )
-                .await;
-                let _ = tx
-                    .send(Err(CodexWebSocketExchangeError::PostSendAmbiguous {
-                        message: "response control already has an active owner".to_owned(),
-                        source: None,
-                    }))
-                    .await;
-                return;
-            }
         }
         if let Some(turn_state) = reduced.turn_state_update {
             let mut pending = response_metadata_updates.lock().await;
@@ -410,20 +354,15 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
             );
             updates.discard_connection |= discard_mismatched_connection && updates.served_mismatch;
         }
-        let (frame, terminal) = match reduced.action {
+        let terminal = match reduced.action {
             ExchangeAction::RateLimits(rate_limits) => {
                 rate_limit_updates.lock().await.push(rate_limits);
                 continue;
             }
-            ExchangeAction::Forward { frame, terminal } => (frame, terminal),
+            ExchangeAction::Forward { terminal } => terminal,
             ExchangeAction::Ignore => continue,
         };
-        if terminal.is_some() {
-            // 先撤销控制权，再交付终态和归还连接，避免迟到的中断影响下一轮。
-            drop(active_interrupt.take());
-        }
-        if tx.send(Ok(Bytes::from(frame))).await.is_err() {
-            drop(active_interrupt.take());
+        if tx.send(Ok(Bytes::from(raw))).await.is_err() {
             trace.record(
                 "upstream.forward.failed",
                 json!({"reason": "receiver_dropped"}),
@@ -511,7 +450,6 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
             last_event_type,
         },
     };
-    drop(active_interrupt.take());
     let observation = connection_observation(&websocket, &error);
     discard_stream_websocket(
         websocket,
@@ -529,7 +467,8 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
 }
 
 /// 请求模型与上游声明不一致时，终态连接不回池。只置位，不把已经记下的不一致清掉。
-fn note_served_model(
+#[doc(hidden)]
+pub fn note_served_model(
     requested_model: &str,
     header_model: Option<&str>,
     body_model: Option<&str>,
@@ -545,7 +484,8 @@ fn note_served_model(
     }
 }
 
-enum TerminalRelease {
+#[doc(hidden)]
+pub enum TerminalRelease {
     DiscardMismatch,
     ReturnToPool,
     DiscardIncomplete,
@@ -553,7 +493,8 @@ enum TerminalRelease {
 }
 
 /// 终态怎么处理连接。`discard_connection` 在本帧归约时已经写好，不依赖消费方。
-fn terminal_release(kind: WebSocketTerminalKind, discard_connection: bool) -> TerminalRelease {
+#[doc(hidden)]
+pub fn terminal_release(kind: WebSocketTerminalKind, discard_connection: bool) -> TerminalRelease {
     match kind {
         WebSocketTerminalKind::Completed | WebSocketTerminalKind::Interrupted
             if discard_connection =>
@@ -656,72 +597,5 @@ fn exchange_exit_reason(error: &CodexWebSocketExchangeError) -> &'static str {
         CodexWebSocketExchangeError::ReceiveIdleTimeout { .. } => "receive_idle_timeout",
         CodexWebSocketExchangeError::UnexpectedBinaryEvent => "unexpected_binary_event",
         _ => "exchange_failure",
-    }
-}
-
-#[cfg(test)]
-mod served_model_release {
-    use super::super::reducer::WebSocketTerminalKind;
-    use super::{TerminalRelease, note_served_model, terminal_release};
-
-    #[test]
-    fn a_mismatch_on_the_terminal_frame_discards_without_a_consumer_write() {
-        let mut discard = false;
-        note_served_model(
-            "gpt-6-astra",
-            Some("gpt-6-astra"),
-            Some("gpt-5.6-luna"),
-            &mut discard,
-        );
-        assert!(discard);
-        assert!(matches!(
-            terminal_release(WebSocketTerminalKind::Completed, discard),
-            TerminalRelease::DiscardMismatch
-        ));
-    }
-
-    #[test]
-    fn a_header_mismatch_discards_even_when_the_body_matches() {
-        let mut discard = false;
-        note_served_model(
-            "gpt-6-astra",
-            Some("gpt-5.6-luna"),
-            Some("gpt-6-astra"),
-            &mut discard,
-        );
-        assert!(matches!(
-            terminal_release(WebSocketTerminalKind::Interrupted, discard),
-            TerminalRelease::DiscardMismatch
-        ));
-    }
-
-    #[test]
-    fn a_matching_declaration_returns_the_connection() {
-        let mut discard = false;
-        note_served_model(
-            "gpt-6-astra",
-            Some("GPT-6-ASTRA"),
-            Some("gpt-6-astra"),
-            &mut discard,
-        );
-        assert!(!discard);
-        assert!(matches!(
-            terminal_release(WebSocketTerminalKind::Completed, discard),
-            TerminalRelease::ReturnToPool
-        ));
-    }
-
-    #[test]
-    fn a_missing_declaration_does_not_discard() {
-        let mut discard = false;
-        note_served_model("gpt-6-astra", None, None, &mut discard);
-        assert!(matches!(
-            terminal_release(WebSocketTerminalKind::Completed, discard),
-            TerminalRelease::ReturnToPool
-        ));
-        assert!(matches!(
-            terminal_release(WebSocketTerminalKind::Failed, true),
-            TerminalRelease::DiscardFailed
-        ));
     }
 }

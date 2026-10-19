@@ -1,4 +1,4 @@
-//! 官方 Grok Responses SSE 到网关 canonical 事件的转换。
+//! 官方 Grok Responses SSE 到网关 canonical 事件的转换
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,7 +40,7 @@ struct ProjectedWireEvent {
     wire: ProtocolWireEvent,
 }
 
-/// 单次 xAI stream 独占的原生响应交付转换状态。
+/// 单次 xAI stream 独占的原生响应交付转换状态
 pub(crate) struct GrokNativeResponseTranslator {
     response_transform: GrokResponseTransform,
 }
@@ -58,7 +58,7 @@ struct ModelPricing {
     long: TokenRates,
 }
 
-// 价格来源：https://docs.x.ai/developers/pricing，核验日期 2026-09-09。
+// 价格来源：https://docs.x.ai/developers/pricing，核验日期 2026-09-09
 const GROK_46_PRICING: ModelPricing = ModelPricing {
     short: TokenRates {
         input_ticks: 20_000,
@@ -111,31 +111,37 @@ const GROK_43_PRICING: ModelPricing = ModelPricing {
     },
 };
 
-/// 按 xAI Provider 当前受控价格规则计算费用明细。
+/// 按 xAI Provider 当前受控价格规则计算费用明细
 #[must_use]
 pub fn grok_billing_breakdown(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
+    cached_input_tokens: u64,
 ) -> Option<CalculatedCostBreakdown> {
-    grok_billing_breakdown_with_tier(model, input_tokens, output_tokens, cached_tokens, None)
+    grok_billing_breakdown_with_tier(
+        model,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        None,
+    )
 }
 
-/// 按响应确认的实际档位计算 xAI Token 费用；未知档位不估算。
+/// 按响应确认的实际档位计算 xAI Token 费用；未知档位不估算
 #[must_use]
 pub fn grok_billing_breakdown_with_tier(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
+    cached_input_tokens: u64,
     service_tier: Option<&str>,
 ) -> Option<CalculatedCostBreakdown> {
     grok_billing_breakdown_with_override(
         model,
         input_tokens,
         output_tokens,
-        cached_tokens,
+        cached_input_tokens,
         0,
         service_tier,
         None,
@@ -147,8 +153,8 @@ pub fn grok_billing_breakdown_with_override(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
-    cached_tokens: u64,
-    cache_write_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
     service_tier: Option<&str>,
     custom: Option<&gateway_core::metering::ModelPriceOverride>,
 ) -> Option<CalculatedCostBreakdown> {
@@ -174,7 +180,7 @@ pub fn grok_billing_breakdown_with_override(
             .and_then(|p| p.bands.get(fast_band))
             .map(convert)
             .or_else(|| {
-                // 未覆盖档位继承内置价，不把人工标准价再次解释成 Priority 价。
+                // 未覆盖档位继承内置价，不把人工标准价再次解释成 Priority 价
                 let builtin = model_pricing(model).map(|p| if long { p.long } else { p.short })?;
                 Some(TokenRates {
                     input_ticks: builtin.input_ticks.checked_mul(2)?,
@@ -185,7 +191,7 @@ pub fn grok_billing_breakdown_with_override(
     } else {
         standard
     };
-    if cached_tokens.checked_add(cache_write_tokens)? > input_tokens {
+    if cached_input_tokens.checked_add(cache_write_input_tokens)? > input_tokens {
         return None;
     }
     let standard_write = custom
@@ -199,27 +205,25 @@ pub fn grok_billing_breakdown_with_override(
     let selected_write = custom
         .and_then(|p| p.bands.get(selected_band))
         .map(|p| p.cache_write.ticks_per_token());
-    let uncached_tokens =
-        input_tokens
-            .checked_sub(cached_tokens)?
-            .checked_sub(if selected_write.is_some() {
-                cache_write_tokens
-            } else {
-                0
-            })?;
-    let standard_input_tokens =
-        input_tokens
-            .checked_sub(cached_tokens)?
-            .checked_sub(if standard_write.is_some() {
-                cache_write_tokens
-            } else {
-                0
-            })?;
+    let uncached_tokens = input_tokens.checked_sub(cached_input_tokens)?.checked_sub(
+        if selected_write.is_some() {
+            cache_write_input_tokens
+        } else {
+            0
+        },
+    )?;
+    let standard_input_tokens = input_tokens.checked_sub(cached_input_tokens)?.checked_sub(
+        if standard_write.is_some() {
+            cache_write_input_tokens
+        } else {
+            0
+        },
+    )?;
     let cache_write_amount_ticks =
-        u128::from(cache_write_tokens).checked_mul(selected_write.unwrap_or_default())?;
+        u128::from(cache_write_input_tokens).checked_mul(selected_write.unwrap_or_default())?;
     let input_amount_ticks = u128::from(uncached_tokens).checked_mul(rates.input_ticks)?;
     let cache_read_amount_ticks =
-        u128::from(cached_tokens).checked_mul(rates.cached_input_ticks)?;
+        u128::from(cached_input_tokens).checked_mul(rates.cached_input_ticks)?;
     let output_amount_ticks = u128::from(output_tokens).checked_mul(rates.output_ticks)?;
     let selected_amount_ticks = input_amount_ticks
         .checked_add(cache_read_amount_ticks)?
@@ -227,9 +231,9 @@ pub fn grok_billing_breakdown_with_override(
         .checked_add(output_amount_ticks)?;
     let standard_amount_ticks = u128::from(standard_input_tokens)
         .checked_mul(standard.input_ticks)?
-        .checked_add(u128::from(cached_tokens).checked_mul(standard.cached_input_ticks)?)?
+        .checked_add(u128::from(cached_input_tokens).checked_mul(standard.cached_input_ticks)?)?
         .checked_add(
-            u128::from(cache_write_tokens).checked_mul(standard_write.unwrap_or_default())?,
+            u128::from(cache_write_input_tokens).checked_mul(standard_write.unwrap_or_default())?,
         )?
         .checked_add(u128::from(output_tokens).checked_mul(standard.output_ticks)?)?;
     let multiplier_percent = if standard_amount_ticks == 0 {
@@ -276,9 +280,9 @@ fn usd_price_per_million(per_token_ticks: u128) -> Option<Money> {
     usd_money(per_token_ticks.checked_mul(1_000_000)?)
 }
 
-/// 单次官方 Grok Responses 尝试的增量解码器。
+/// 单次官方 Grok Responses 尝试的增量解码器
 ///
-/// 每个上游 event 同时保留 OpenAI wire，并在可识别时附加 canonical facts。
+/// 每个上游 event 同时保留 OpenAI wire，并在可识别时附加 canonical facts
 pub struct GrokCanonicalDecoder {
     pricing: Option<gateway_core::metering::ModelPriceOverride>,
     decoder: SseEventDecoder,
@@ -290,7 +294,6 @@ pub struct GrokCanonicalDecoder {
     content: BTreeMap<u32, ContentKind>,
     tool_arguments_seen: BTreeSet<u32>,
     usage_emitted: bool,
-    output_start_seen: bool,
     response_service_tier: Option<String>,
     response_model: ResponseModelObservation,
     requires_provider_cost: bool,
@@ -355,7 +358,7 @@ impl NativeResponseTranslator for GrokNativeResponseTranslator {
 }
 
 impl GrokCanonicalDecoder {
-    /// 使用路由后最终发往上游的请求模型计价，并在响应缺少模型时用于 canonical 兜底。
+    /// 使用路由后最终发往上游的请求模型计价，并在响应缺少模型时用于 canonical 兜底
     pub fn new(upstream_model: impl Into<String>) -> Self {
         Self {
             decoder: SseEventDecoder::default(),
@@ -368,7 +371,6 @@ impl GrokCanonicalDecoder {
             content: BTreeMap::new(),
             tool_arguments_seen: BTreeSet::new(),
             usage_emitted: false,
-            output_start_seen: false,
             response_service_tier: None,
             response_model: ResponseModelObservation::default(),
             requires_provider_cost: false,
@@ -385,7 +387,7 @@ impl GrokCanonicalDecoder {
     }
 
     /// 创建在 canonical 与 wire 投影处理每个上游 event 前先还原请求级 tool 别名的
-    /// 解码器。
+    /// 解码器
     #[must_use]
     pub fn for_request(upstream_model: impl Into<String>, request: &GrokResponsesRequest) -> Self {
         Self {
@@ -408,13 +410,13 @@ impl GrokCanonicalDecoder {
         }
     }
 
-    /// 上游报告的实际服务档位，供费用与持久观测共用。
+    /// 上游报告的实际服务档位，供费用与持久观测共用
     #[must_use]
     pub fn response_service_tier(&self) -> Option<&str> {
         self.response_service_tier.as_deref()
     }
 
-    /// 返回原始上游响应声明的模型，缺失时不使用请求模型补齐。
+    /// 返回原始上游响应声明的模型，缺失时不使用请求模型补齐
     #[must_use]
     pub fn response_model(&self) -> Option<&str> {
         self.response_model.model()
@@ -425,7 +427,7 @@ impl GrokCanonicalDecoder {
         self.decode(events).map(|batch| batch.projected_events)
     }
 
-    /// 解码同一批上游事件，同时返回转换前 xAI wire 与独立生成的 OpenAI 投影。
+    /// 解码同一批上游事件，同时返回转换前 xAI wire 与独立生成的 OpenAI 投影
     pub(crate) fn push_before_translation(
         &mut self,
         chunk: &[u8],
@@ -457,11 +459,6 @@ impl GrokCanonicalDecoder {
     pub(crate) fn finish_without_terminal(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
         let events = self.decoder.finish().map_err(protocol_error)?;
         self.decode(events).map(|batch| batch.projected_events)
-    }
-
-    /// 取走本批解码帧里是否已出现首个非前导输出事件（结构帧也算），用于首字计时。
-    pub fn take_output_start(&mut self) -> bool {
-        std::mem::take(&mut self.output_start_seen)
     }
 
     fn decode(&mut self, events: Vec<SseEvent>) -> Result<GrokDecodedResponseBatch, ProviderError> {
@@ -528,7 +525,7 @@ impl GrokCanonicalDecoder {
             if !event_type.is_empty() {
                 self.response_model.observe(Some(&event_type), &value);
             }
-            // 工具转换可能隐藏注入的调用，计费事实必须从转换前的上游事件读取。
+            // 工具转换可能隐藏注入的调用，计费事实必须从转换前的上游事件读取
             if let Some(response) = value.get("response") {
                 if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
                     self.response_service_tier = Some(tier.trim().to_owned());
@@ -538,7 +535,7 @@ impl GrokCanonicalDecoder {
             if let Some(item) = value.get("item") {
                 self.requires_provider_cost |= !token_only_output(item);
             }
-            // 转换失败必须终止，不能丢弃工具参数后仍向客户端报告成功。
+            // 转换失败必须终止，不能丢弃工具参数后仍向客户端报告成功
             let projected = project_response_event(
                 &mut self.response_transform,
                 &event_type,
@@ -550,17 +547,12 @@ impl GrokCanonicalDecoder {
             let mut source_canonical = Vec::new();
             for projected in projected {
                 let transformed_type = projected.event_type;
-                // 首个非前导、非失败事件（结构帧也算）开启首字计时。
-                self.output_start_seen |= !matches!(
-                    transformed_type.as_str(),
-                    "response.created" | "response.in_progress" | "response.failed" | "error"
-                );
                 let value = projected.wire.data();
                 let mut canonical = Vec::new();
-                // 终态事件（completed/incomplete）fail-closed：用量/计费校验失败即断流。
+                // 终态事件（completed/incomplete）fail-closed：用量/计费校验失败即断流
                 // 其余内容事件容忍字段校验失败——正常上游变体（空 delta、重复 index、
-                // 缺字段等）不打断已开始的客户端流：跳过 canonical 提取、wire 原样转发。
-                // 真·上游错误（response.failed/error）为非 Protocol 类别，按终态传播。
+                // 缺字段等）不打断已开始的客户端流：跳过 canonical 提取、wire 原样转发
+                // 真·上游错误（response.failed/error）为非 Protocol 类别，按终态传播
                 let terminal_event = matches!(
                     transformed_type.as_str(),
                     "response.completed" | "response.incomplete"
@@ -871,7 +863,7 @@ impl GrokCanonicalDecoder {
         }
         if !self.requires_provider_cost
             && let Some(cost) = usage.and_then(|usage| {
-                // 已报告金额仍优先；本地估价只使用实际发送模型，响应模型仅作观测。
+                // 已报告金额仍优先；本地估价只使用实际发送模型，响应模型仅作观测
                 calculated_cost(
                     response,
                     &self.upstream_model,
@@ -1049,9 +1041,9 @@ fn core_usage(usage: TokenUsage) -> Usage {
     let mut normalized = Usage::new();
     normalized.input_tokens = Some(usage.input_tokens);
     normalized.output_tokens = Some(usage.output_tokens);
-    normalized.cached_tokens = Some(usage.cached_tokens);
-    normalized.cache_write_tokens = Some(usage.cache_write_tokens);
-    normalized.reasoning_tokens = Some(usage.reasoning_tokens);
+    normalized.cached_input_tokens = Some(usage.cached_input_tokens);
+    normalized.cache_write_input_tokens = Some(usage.cache_write_input_tokens);
+    normalized.reasoning_output_tokens = Some(usage.reasoning_output_tokens);
     normalized.image_input_tokens = Some(usage.image_input_tokens);
     normalized.image_output_tokens = Some(usage.image_output_tokens);
     normalized.total_tokens = Some(usage.total_tokens);
@@ -1063,14 +1055,17 @@ fn provider_reported_cost(response: &Value) -> Result<Option<ProviderReportedCos
         return Ok(None);
     };
     let ticks = value.as_u64().ok_or_else(protocol_error_marker)?;
-    // 明确返回的零费用也是上游账单事实，不能当作缺失而改用本地估算。
+    // 官方 Grok REST 层会把未报告费用回填为 0，只有正数才是已报告账单
+    if ticks == 0 {
+        return Ok(None);
+    }
     ProviderReportedCost::from_usd_ticks(u128::from(ticks))
         .map(Some)
         .map_err(protocol_error)
 }
 
 // cost_in_usd_ticks 已包含服务端工具费；缺少该字段时，只有全部按 token
-// 计费的响应才能确定总价。
+// 计费的响应才能确定总价
 fn token_only_output(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
@@ -1120,8 +1115,8 @@ fn calculated_cost(
         model,
         usage.input_tokens,
         usage.output_tokens,
-        usage.cached_tokens,
-        usage.cache_write_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
         service_tier,
         pricing,
     )?;
@@ -1129,21 +1124,12 @@ fn calculated_cost(
 }
 
 const PRICING_RULES: &[(&[&str], ModelPricing)] = &[
-    (&["grok-4.6", "grok-4.6-latest"], GROK_46_PRICING),
-    (
-        &[
-            "grok-4.5",
-            "grok-4.5-latest",
-            "grok-4.5-build-free",
-            "grok-build-latest",
-        ],
-        GROK_45_PRICING,
-    ),
+    (&["grok-4.6"], GROK_46_PRICING),
+    (&["grok-4.5", "grok-4.5-build-free"], GROK_45_PRICING),
     (
         &[
             "grok-build-0.1",
             "grok-code-fast-1",
-            "grok-code-fast",
             "grok-code-fast-1-0825",
         ],
         GROK_BUILD_PRICING,
@@ -1151,40 +1137,22 @@ const PRICING_RULES: &[(&[&str], ModelPricing)] = &[
     (
         &[
             "grok-4.3",
-            "grok-4.3-latest",
-            "grok-latest",
             "grok-4.20-multi-agent-0309",
             "grok-4.20-multi-agent",
-            "grok-4.20-multi-agent-latest",
-            "grok-4.20-multi-agent-beta-latest",
             "grok-4.20-multi-agent-experimental-beta-0304",
-            "grok-4.20-multi-agent-experimental-beta-latest",
             "grok-4.20-multi-agent-beta-0309",
             "grok-4.20-0309-reasoning",
-            "grok-4.20-reasoning-latest",
             "grok-4.20",
             "grok-4.20-reasoning",
             "grok-4.20-0309",
             "grok-4.20-beta-0309-reasoning",
-            "grok-4.20-beta",
             "grok-4.20-beta-0309",
-            "grok-4.20-beta-latest",
-            "grok-4.20-beta-latest-reasoning",
-            "grok-4.20-beta-reasoning",
             "grok-4.20-experimental-beta-0304-reasoning",
             "grok-4.20-experimental-beta-0304",
-            "grok-4.20-experimental-beta-reasoning-latest",
-            "grok-4.20-experimental-beta-latest",
-            "grok-4.20-reasoning-gv2",
             "grok-4.20-0309-non-reasoning",
             "grok-4.20-non-reasoning",
-            "grok-4.20-non-reasoning-latest",
-            "grok-4.20-beta-non-reasoning",
-            "grok-4.20-beta-latest-non-reasoning",
             "grok-4.20-experimental-beta-0304-non-reasoning",
-            "grok-4.20-experimental-beta-non-reasoning-latest",
             "grok-4.20-beta-0309-non-reasoning",
-            "grok-4.20-non-reasoning-gv2",
         ],
         GROK_43_PRICING,
     ),
@@ -1246,7 +1214,9 @@ fn incomplete_finish_reason(response: &Value) -> FinishReason {
         .pointer("/incomplete_details/reason")
         .and_then(Value::as_str)
     {
-        Some("max_output_tokens" | "max_tokens") => FinishReason::Length,
+        Some("max_output_tokens" | "max_tokens" | "max_prompt_tokens" | "max_time_limit") => {
+            FinishReason::Length
+        }
         Some("content_filter") => FinishReason::ContentFilter,
         _ => FinishReason::Other,
     }
@@ -1268,13 +1238,14 @@ fn upstream_event_error(value: &Value) -> ProviderError {
             _ => ProviderErrorKind::Unavailable,
         }
     };
-    let mut error = ProviderError::new(kind, UpstreamSendState::Sent)
-        .redact_sensitive_context("upstream event");
+    let mut error = ProviderError::new(kind, UpstreamSendState::Sent).with_raw_upstream_error(
+        gateway_core::error::RawUpstreamError::new(value.to_string()),
+    );
     if let Some(code) = code {
         error = error.with_upstream_code(OpaqueUpstreamValue::new(code.to_owned()));
     }
     // 结构化 message/code/type 供原客户端展示与重试分类；message 先脱去
-    // 账号指纹（上游限流文案内嵌 team UUID），非结构化正文不透出。
+    // 账号指纹（上游限流文案内嵌 team UUID），非结构化正文不透出
     if let Some(message) = message {
         error = error.with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
             scrub_account_fingerprints(message),
@@ -1293,8 +1264,8 @@ fn upstream_error_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-fn protocol_error(_error: impl std::fmt::Debug) -> ProviderError {
-    protocol_error_marker()
+fn protocol_error(error: impl std::error::Error + Send + Sync + 'static) -> ProviderError {
+    protocol_error_marker().with_source(error)
 }
 
 fn protocol_error_marker() -> ProviderError {

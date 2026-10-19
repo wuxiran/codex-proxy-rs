@@ -1,3 +1,5 @@
+//! 验证 WebSocket 请求编码、事件处理与载荷审计脱敏
+
 use provider_openai::transport::protocol::responses::CodexResponsesRequest;
 use provider_openai::transport::protocol::websocket::{
     OpeningAuditSnapshot, websocket_audit_artifact_from_attempt, websocket_event_to_sse_frame,
@@ -92,7 +94,7 @@ fn websocket_response_create_payload_should_keep_explicit_empty_instructions() {
 
 #[test]
 fn websocket_response_create_payload_text_should_match_merged_map_serialization() {
-    // body 自带 type 键与未知字段：文本帧必须与「合并 Map 再序列化」逐字节一致。
+    // body 自带 type 键与未知字段：文本帧必须与「合并 Map 再序列化」逐字节一致
     let request = CodexResponsesRequest::from_body(
         json!({
             "model": "gpt-test",
@@ -154,10 +156,16 @@ fn websocket_event_to_sse_should_forward_public_events_and_strip_internal_events
         format!("event: response.completed\ndata: {event}\n\n")
     );
     assert!(websocket_event_to_sse_frame(r#"{"type":"codex.rate_limits"}"#).is_none());
-    assert!(websocket_event_to_sse_frame(r#"{"type":"response.metadata"}"#).is_none());
+    assert!(websocket_event_to_sse_frame(r#"{"type":"response.metadata"}"#).is_some());
     assert!(websocket_event_to_sse_frame(r#"{"type":"codex.response.metadata"}"#).is_some());
-    assert!(websocket_event_to_sse_frame(r#"{"response":{}}"#).is_none());
-    assert!(websocket_event_to_sse_frame("not-json").is_none());
+    assert_eq!(
+        websocket_event_to_sse_frame(r#"{"response":{}}"#).unwrap(),
+        "data: {\"response\":{}}\n\n"
+    );
+    assert_eq!(
+        websocket_event_to_sse_frame("not-json").unwrap(),
+        "data: not-json\n\n"
+    );
 }
 
 #[test]

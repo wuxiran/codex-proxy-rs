@@ -1,4 +1,4 @@
-import type { UsageListRecord, UsageRecordDetail } from '@/api'
+import type { RequestTrace, UsageListRecord, UsageRecordDetail } from '@/api'
 
 // diagnostics/capture.rs 对非白名单头名使用 SHA-256 字段名，只读取长度摘要。
 const stateHeaderKey = 'field_32d2463cbff63dc265904a36bcfdafdfc999f6914640e0af9bcc15d663361d71'
@@ -40,8 +40,8 @@ function headerLengths(value: unknown): number[] {
       : [])
 }
 
-function observedLengths(detail: UsageRecordDetail, accountId: string): number[] {
-  const events = detail.trace?.events ?? []
+function observedLengths(trace: RequestTrace | null, accountId: string): number[] {
+  const events = trace?.events ?? []
   const owners = new Map<number, string>()
   for (const event of events) {
     if (event.stage === 'account.selected' && typeof event.data.accountId === 'string')
@@ -68,7 +68,7 @@ const outcomes: Record<string, string> = {
   running: '进行中',
 }
 
-export function turnStateHistoryRow(record: UsageListRecord, detail: UsageRecordDetail | null, accountId: string): TurnStateHistoryRow {
+export function turnStateHistoryRow(record: UsageListRecord, detail: UsageRecordDetail | null, trace: RequestTrace | null, accountId: string): TurnStateHistoryRow {
   const base = {
     id: record.id,
     time: record.createdAtDisplay,
@@ -77,7 +77,7 @@ export function turnStateHistoryRow(record: UsageListRecord, detail: UsageRecord
   if (!detail || detail.accountId !== accountId) {
     return { ...base, lengths: [], result: '待核对', reason: '诊断读取失败，请刷新重试', partial: true }
   }
-  const lengths = observedLengths(detail, accountId)
+  const lengths = observedLengths(trace, accountId)
   // 长度仅作为响应观测，不能据此判断票是否入库或模型能力。
   const reason = detail.logicalOutcome === 'running'
     ? '请求进行中，完成后刷新查看'
@@ -89,6 +89,6 @@ export function turnStateHistoryRow(record: UsageListRecord, detail: UsageRecord
     lengths,
     result: outcomes[detail.logicalOutcome] ?? '未知结果',
     reason,
-    partial: !detail.trace || detail.trace.droppedEvents > 0,
+    partial: !trace || trace.droppedEvents > 0,
   }
 }

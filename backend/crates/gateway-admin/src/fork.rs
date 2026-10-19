@@ -24,10 +24,7 @@ use crate::{
         },
     },
     ops_report,
-    ports::{
-        proxy::ProxyStore,
-        store::{AdminStorePorts, SettingsStore},
-    },
+    ports::{proxy::ProxyStore, store::AdminStorePorts},
     ticket_revive, turn_state_renewal, use_case,
 };
 
@@ -54,17 +51,18 @@ impl ForkRuntimePorts {
     }
 }
 
-/// 账号用例的 fork 依赖：运行设置、代理目录与票据密钥目录。
-pub(crate) struct AccountsDeps {
-    pub(crate) settings: Arc<dyn SettingsStore>,
+/// 账号用例的 fork 依赖：代理目录与票据密钥目录（运行设置由上游构造函数直接传入）。
+///
+/// 服务端与 CLI 组合根都要构造它（`initialize_accounts`），所以对外公开。
+pub struct AccountsDeps {
     pub(crate) proxies: Arc<dyn ProxyStore>,
     pub(crate) ticket_dir: PathBuf,
 }
 
 impl AccountsDeps {
-    pub(crate) fn new(store: &AdminStorePorts, ports: &ForkRuntimePorts) -> Self {
+    #[must_use]
+    pub fn new(store: &AdminStorePorts, ports: &ForkRuntimePorts) -> Self {
         Self {
-            settings: store.settings(),
             proxies: store.proxies(),
             ticket_dir: ports.account_ticket_dir.clone(),
         }

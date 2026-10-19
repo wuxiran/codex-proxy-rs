@@ -1,4 +1,4 @@
-//! 配置文件发现、反序列化与 Host-owned 配置校验。
+//! 配置文件发现、反序列化与 Host-owned 配置校验
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -14,18 +14,18 @@ const CONFIG_RELATIVE_PATH: &str = "deploy/config.yaml";
 const SERVER_HOST_ENV: &str = "CPR_SERVER_HOST";
 const SERVER_PORT_ENV: &str = "CPR_SERVER_PORT";
 
-/// 由组装根实现的顶层配置契约。
+/// 由组装根实现的顶层配置契约
 ///
 /// Host 只负责找到和解析文件；每个包的字段解释与相对路径解析
-/// 由顶层配置委托给对应的包完成。
+/// 由顶层配置委托给对应的包完成
 pub trait LoadableConfig: DeserializeOwned {
-    /// 同一配置文件中由其他工具消费的顶层配置段。
+    /// 同一配置文件中由其他工具消费的顶层配置段
     const EXTERNAL_SECTIONS: &'static [&'static str] = &[];
 
     fn resolve_and_validate(&mut self, source_dir: &Path) -> Result<(), ConfigError>;
 }
 
-/// 从当前目录或父目录中的 `deploy/config.yaml` 加载顶层配置。
+/// 从当前目录或父目录中的 `deploy/config.yaml` 加载顶层配置
 pub fn load_config<T: LoadableConfig>() -> Result<T, ConfigError> {
     let current = env::current_dir().map_err(|_| ConfigError::CurrentDirectory)?;
     let path = discover_config_path(&current)?;
@@ -35,17 +35,22 @@ pub fn load_config<T: LoadableConfig>() -> Result<T, ConfigError> {
         .build()
         .map_err(|_| ConfigError::InvalidDocument { path: path.clone() })?;
     let mut unused = std::collections::BTreeSet::new();
-    let mut value: T = serde_ignored::deserialize(document, |field| {
+    let mut ignored = |field: serde_ignored::Path<'_>| {
         unused.insert(field.to_string());
-    })
-    .map_err(|error| match missing_config_field(&error) {
-        Some(field) => ConfigError::MissingField {
-            path: path.clone(),
-            field,
-        },
-        None => ConfigError::InvalidDocument { path: path.clone() },
-    })?;
-    // 此时日志尚未初始化；只报告字段路径，不回显可能包含凭据的配置值。
+    };
+    let mut value: T =
+        serde_path_to_error::deserialize(serde_ignored::Deserializer::new(document, &mut ignored))
+            .map_err(|error| match missing_config_field(error.inner()) {
+                Some(field) => ConfigError::MissingField {
+                    path: path.clone(),
+                    field,
+                },
+                None => ConfigError::InvalidValue {
+                    path: path.clone(),
+                    field: error.path().to_string(),
+                },
+            })?;
+    // 此时日志尚未初始化；只报告字段路径，不回显可能包含凭据的配置值
     for field in unused {
         if !T::EXTERNAL_SECTIONS.contains(&field.as_str()) {
             eprintln!("[警告] 配置字段 {field:?} 未使用，已忽略");
@@ -66,22 +71,22 @@ fn missing_config_field(error: &config::ConfigError) -> Option<String> {
     }
 }
 
-/// Host 唯一拥有的进程配置。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Host 唯一拥有的进程配置
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HostConfig {
+    #[serde(default)]
+    pub timezone: gateway_core::time::DeploymentTimeZone,
     pub listen: ListenConfig,
     pub runtime_data_dir: PathBuf,
     pub logging: LoggingConfig,
     #[serde(default)]
     pub system_update: SystemUpdateConfig,
-    #[serde(default = "default_drain_timeout_seconds")]
-    pub drain_timeout_seconds: u64,
     #[serde(default = "default_worker_shutdown_timeout_seconds")]
     pub worker_shutdown_timeout_seconds: u64,
 }
 
 impl HostConfig {
-    /// 解析 Host 配置；在线更新默认沿用已解析的 API 静态资源目录。
+    /// 解析 Host 配置；在线更新默认沿用已解析的 API 静态资源目录
     pub fn resolve_and_validate(
         &mut self,
         source_dir: &Path,
@@ -102,9 +107,6 @@ impl HostConfig {
         }
         if self.listen.port == 0 {
             return Err(ConfigError::InvalidField("host.listen.port"));
-        }
-        if self.drain_timeout_seconds == 0 {
-            return Err(ConfigError::InvalidField("host.drain_timeout_seconds"));
         }
         if self.worker_shutdown_timeout_seconds == 0 {
             return Err(ConfigError::InvalidField(
@@ -130,47 +132,42 @@ impl HostConfig {
     }
 
     #[must_use]
-    pub const fn drain_timeout(&self) -> Duration {
-        Duration::from_secs(self.drain_timeout_seconds)
-    }
-
-    #[must_use]
     pub const fn worker_shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.worker_shutdown_timeout_seconds)
     }
 }
 
-/// HTTP 监听地址。
+/// HTTP 监听地址
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ListenConfig {
     pub host: String,
     pub port: u16,
 }
 
-/// Host 结构化日志配置。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Host 结构化日志配置
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct LoggingConfig {
     pub level: String,
     pub stdout: bool,
     pub file: FileLoggingConfig,
-    /// 将 OAuth 原始 AT/RT 写入独立恢复日志；默认关闭，沿用 file 的目录与保留期。
+    /// 将 OAuth 原始 AT/RT 写入独立恢复日志；默认关闭，沿用 file 的目录与保留期
     #[serde(default)]
     pub oauth_recovery: bool,
-    /// 将完整请求原文写入独立诊断日志；默认关闭，因为内容包含凭据。
-    /// 请求报文的留存窗口由 request_dump_retention_days 独立控制。
+    /// 将完整请求原文写入独立诊断日志；默认关闭，因为内容包含凭据
+    /// 请求报文的留存窗口由 request_dump_retention_days 独立控制
     #[serde(default)]
     pub request_dump: bool,
-    /// 完整报文的最少保留天数；按 UTC 日期整组清理，默认 1 天。
+    /// 完整报文的最少保留天数；支持小数，每天按 24 小时换算，默认 1 天
     #[serde(default = "default_request_dump_retention_days")]
-    pub request_dump_retention_days: usize,
+    pub request_dump_retention_days: f64,
 }
 
 fn default_file_retention_days() -> usize {
     7
 }
 
-fn default_request_dump_retention_days() -> usize {
-    1
+fn default_request_dump_retention_days() -> f64 {
+    1.0
 }
 
 impl LoggingConfig {
@@ -193,22 +190,27 @@ impl LoggingConfig {
                 "host.logging.file.max_file_size_mb",
             ));
         }
-        if self.request_dump_retention_days == 0 {
-            return Err(ConfigError::InvalidField(
-                "host.logging.request_dump_retention_days",
-            ));
-        }
+        self.request_dump_retention()?;
         resolve_relative_path(source_dir, &mut self.file.directory);
         Ok(())
     }
+
+    pub(crate) fn request_dump_retention(&self) -> Result<Duration, ConfigError> {
+        Duration::try_from_secs_f64(self.request_dump_retention_days * 86_400.0)
+            .ok()
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ConfigError::InvalidField(
+                "host.logging.request_dump_retention_days",
+            ))
+    }
 }
 
-/// Host 文件日志配置。
+/// Host 文件日志配置
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct FileLoggingConfig {
     pub enabled: bool,
     pub directory: PathBuf,
-    /// 至少保留的完整天数，默认 7 天；文件数量不参与清理。
+    /// 至少保留的完整天数，默认 7 天；文件数量不参与清理
     #[serde(default = "default_file_retention_days")]
     pub retention_days: usize,
     pub max_file_size_mb: u64,
@@ -216,6 +218,8 @@ pub struct FileLoggingConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("配置文件 {path} 的字段 {field:?} 不合法")]
+    InvalidValue { path: PathBuf, field: String },
     #[error("current directory is unavailable")]
     CurrentDirectory,
     #[error("deploy/config.yaml was not found")]
@@ -253,10 +257,6 @@ fn resolve_relative_path(base: &Path, path: &mut PathBuf) {
     if path.is_relative() {
         *path = base.join(&*path);
     }
-}
-
-const fn default_drain_timeout_seconds() -> u64 {
-    30
 }
 
 const fn default_worker_shutdown_timeout_seconds() -> u64 {

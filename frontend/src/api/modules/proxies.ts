@@ -1,38 +1,14 @@
 import type { RequestOptions } from '../request'
-import type { RequestLocation } from '../types/request-location'
-import type { AccountGroupRef } from './account-groups'
+import type { AccountGroupRef } from './groups'
+import type { RequestLocation } from './settings'
 import request from '../request'
 
+// fork: proxy-quality — 出口地理与质量检测的类型
 export interface OutboundProxyExitGeo {
   country: string
   countryCode: string
   region: string | null
   city: string | null
-}
-
-export type ProxyLocationDetection
-  = | { status: 'notRequested' }
-    | { status: 'detected', location: RequestLocation }
-    | { status: 'failed', message: string }
-    | { status: 'conflict' }
-
-export interface DetectedProxyLocation {
-  location: RequestLocation
-  exitIpv4: string | null
-  exitIpv6: string | null
-  detectedAt: string
-}
-
-export interface OutboundProxyTest {
-  location: ProxyLocationDetection
-  success: boolean
-  latencyMs: number
-  exitIp: string | null
-  // 滚动发布期间旧后端不返回地区/双栈字段，按缺失处理。
-  exitGeo?: OutboundProxyExitGeo | null
-  exitIpv4?: string | null
-  exitIpv6?: string | null
-  message: string
 }
 
 export type ProxyQualityStatus = 'healthy' | 'warn' | 'challenge' | 'failed'
@@ -71,7 +47,33 @@ export interface ProxyBatchSkip {
   reason: string
 }
 
+export type ProxyLocationDetection
+  = | { status: 'notRequested' }
+    | { status: 'detected', location: RequestLocation }
+    | { status: 'failed', message: string }
+    | { status: 'conflict' }
+
+export interface DetectedProxyLocation {
+  location: RequestLocation
+  exitIpv4: string | null
+  exitIpv6: string | null
+  detectedAt: string
+}
+
+export interface OutboundProxyTest {
+  location: ProxyLocationDetection
+  success: boolean
+  latencyMs: number
+  exitIp: string | null
+  exitIpv4: string | null
+  exitIpv6: string | null
+  exitGeo?: OutboundProxyExitGeo | null // fork: proxy-quality
+  message: string
+}
+
 export interface OutboundProxyRecord {
+  maxWebsocketConnections: number
+  enabled: boolean
   autoLocation: boolean
   detectedLocation: DetectedProxyLocation | null
   location: RequestLocation | null
@@ -82,10 +84,13 @@ export interface OutboundProxyRecord {
   revision: number
   accountCount: number
   lastTestAt: string | null
+  lastTestAtDisplay: string | null
   lastTest: OutboundProxyTest | null
-  quality?: ProxyQualitySnapshot | null
+  quality?: ProxyQualitySnapshot | null // fork: proxy-quality
   createdAt: string
+  createdAtDisplay: string
   updatedAt: string
+  updatedAtDisplay: string
 }
 
 interface ProxyPage {
@@ -127,6 +132,11 @@ export function removeProxyAccount(data: { proxyId: string, accountId: string })
   })
 }
 
+export type ProxyBatchResult<T>
+  = | { status: 'succeeded', data: T }
+    | { status: 'failed', httpStatus: number, code: number, message: string }
+    | { status: 'skipped' }
+
 interface ProxyMutation {
   record: OutboundProxyRecord
   configRevision: number
@@ -141,16 +151,17 @@ export function getProxies(data: { page: number, pageSize: number, search?: stri
   })
 }
 
-export function createProxy(data: { name: string, proxyUrl: string, autoLocation?: boolean, location?: RequestLocation | null }) {
-  return request<ProxyMutation>({
+export function createProxy(data: { name: string, proxyUrl: string, maxWebsocketConnections?: number, autoLocation?: boolean, location?: RequestLocation | null }[], options: RequestOptions = {}) {
+  return request<ProxyBatchResult<ProxyMutation>[]>({
     url: '/api/admin/proxies/create',
-    timeout: 25000,
+    timeout: 25000 * Math.max(1, data.length),
     method: 'POST',
     data,
+    ...options,
   })
 }
 
-export function updateProxy(data: { id: string, revision: number, name: string, proxyUrl?: string, autoLocation?: boolean, location?: RequestLocation | null }) {
+export function updateProxy(data: { id: string, revision: number, name: string, enabled?: boolean, maxWebsocketConnections?: number, proxyUrl?: string, autoLocation?: boolean, location?: RequestLocation | null }) {
   return request<ProxyMutation>({
     url: '/api/admin/proxies/update',
     timeout: 25000,
@@ -167,17 +178,17 @@ export function deleteProxy(data: { id: string, revision: number }) {
   })
 }
 
-// 槽位排队最多 20 秒，其后才是探测本身；超时需要覆盖两段。
-export function testProxy(data: { id: string, revision: number, detectLocation?: boolean }, options: RequestOptions = {}) {
-  return request<OutboundProxyRecord>({
+export function testProxy(data: { id: string, revision: number, detectLocation?: boolean }[], options: RequestOptions = {}) {
+  return request<ProxyBatchResult<OutboundProxyRecord>[]>({
     url: '/api/admin/proxies/test',
     method: 'POST',
     data,
-    timeout: 45000,
+    timeout: 25000 * Math.max(1, Math.ceil(data.length / 2)),
     ...options,
   })
 }
 
+// fork: proxy-quality — 质量检测与报告读取
 export function checkProxyQuality(data: { id: string, revision: number }, options: RequestOptions = {}) {
   return request<{ record: OutboundProxyRecord, report: ProxyQualityReport }>({
     url: '/api/admin/proxies/quality-check',
@@ -197,15 +208,7 @@ export function getProxyQualityReport(data: { id: string }, options: RequestOpti
   })
 }
 
-export function batchCreateProxies(data: { items: Array<{ name?: string, proxyUrl: string }> }) {
-  return request<{ created: OutboundProxyRecord[], skipped: ProxyBatchSkip[], configRevision: number | null }>({
-    url: '/api/admin/proxies/batch-create',
-    method: 'POST',
-    data,
-    timeout: 60000,
-  })
-}
-
+// fork: proxy-batch-delete — 上游只有单条删除；批量删除沿用 fork 后端接口
 export function batchDeleteProxies(data: { items: Array<{ id: string, revision: number }> }) {
   return request<{ deletedIds: string[], skipped: ProxyBatchSkip[], configRevision: number | null }>({
     url: '/api/admin/proxies/batch-delete',

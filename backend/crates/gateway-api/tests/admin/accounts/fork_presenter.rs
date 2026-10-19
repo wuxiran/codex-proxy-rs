@@ -7,7 +7,7 @@ use gateway_admin::model::{
     },
     quota_forecast_sampling::QuotaForecastCurvePoint,
 };
-use gateway_api::admin::accounts::AccountQuotaForecastData;
+use gateway_api::{TimePresenter, admin::accounts::AccountQuotaForecastData};
 
 #[test]
 fn fork_quota_forecast_projection_exposes_curve_burn_and_exhaustion() {
@@ -44,11 +44,15 @@ fn fork_quota_forecast_projection_exposes_curve_burn_and_exhaustion() {
     monthly.period = AccountUsagePeriod::Monthly;
     monthly.extrapolated = true;
     monthly.target_seconds = 30 * 86_400;
-    let view = AccountQuotaForecastData::from(AccountQuotaForecastReport {
-        account_id: "acct_forecast".to_owned(),
-        generated_at: now,
-        forecasts: [forecast, monthly],
-    });
+    // 时间展示跟随部署时区；默认 Asia/Shanghai 与原断言一致
+    let view = AccountQuotaForecastData::from((
+        AccountQuotaForecastReport {
+            account_id: "acct_forecast".to_owned(),
+            generated_at: now,
+            forecasts: [forecast, monthly],
+        },
+        TimePresenter::new(Default::default()),
+    ));
     let value = serde_json::to_value(view).unwrap();
     let week = &value["forecasts"][0];
     assert_eq!(week["windowStartAt"], "2026-09-12T08:00:00+08:00");
@@ -153,9 +157,9 @@ fn account_model_view_exposes_full_identity_and_mismatch_without_mixing_cost_sou
             success_count: 1,
             input_tokens: Some(100),
             output_tokens: Some(10),
-            cached_tokens: Some(0),
-            cache_write_tokens: None,
-            reasoning_tokens: None,
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
             image_input_tokens: None,
             image_output_tokens: None,
             image_request_count: 0,
@@ -168,7 +172,12 @@ fn account_model_view_exposes_full_identity_and_mismatch_without_mixing_cost_sou
             }],
             last_used_at: now,
         };
-        let view = serde_json::to_value(ModelUsageView::from((usage, now))).unwrap();
+        let view = serde_json::to_value(ModelUsageView::from((
+            usage,
+            now,
+            TimePresenter::new(Default::default()),
+        )))
+        .unwrap();
         assert_eq!(view["mismatch"], mismatch);
         assert_eq!(view["requestedModelId"], "gpt-6-astra");
         assert_eq!(view["upstreamModelId"], route);

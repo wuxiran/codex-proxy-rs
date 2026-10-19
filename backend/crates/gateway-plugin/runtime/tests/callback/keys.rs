@@ -1,3 +1,5 @@
+//! 验证插件 Key 预算回调复用宿主服务、权限与提交审计
+
 use std::{sync::Arc, time::Duration};
 
 use gateway_admin::{
@@ -71,6 +73,7 @@ async fn plugin_process_manages_native_budget_through_client_key_service() {
             .handle(
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "POST".into(),
                     path: "reset".into(),
@@ -165,7 +168,7 @@ async fn seed_budget(environment: &Environment) -> ClientApiKeyId {
 }
 
 fn reset_queries() -> Value {
-    // 重置无需先查询目录；两个基础接口由测试插件自行选择调用顺序。
+    // 重置无需先查询目录；两个基础接口由测试插件自行选择调用顺序
     json!([
         {"method":"host.keys.reset_budget","query":{"client_key_id":"key_budget","period":"weekly"}},
         {"method":"host.keys.list","query":{"limit":10}},
@@ -344,7 +347,7 @@ impl PluginClientKeyAccess for HoldCommittedReply {
         context: &MutationContext,
     ) -> Result<ClientApiKeyId, AdminError> {
         self.inner.reset_budget(owner, command, context).await?;
-        // 在真实事务提交后挡住宿主回包，稳定复现插件未收到提交结果的窗口。
+        // 在真实事务提交后挡住宿主回包，稳定复现插件未收到提交结果的窗口
         self.committed.notify_one();
         std::future::pending().await
     }
@@ -400,6 +403,7 @@ async fn losing_callback_reply_after_commit_keeps_budget_and_audit_without_repla
             .handle(
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "POST".into(),
                     path: "reset".into(),
@@ -415,7 +419,7 @@ async fn losing_callback_reply_after_commit_keeps_budget_and_audit_without_repla
         .await
         .expect("native budget transaction committed");
     assert!(!request.is_finished());
-    // 只断开插件，宿主保持运行，确保连接丢失不会触发透明重放。
+    // 只断开插件，宿主保持运行，确保连接丢失不会触发透明重放
     std::fs::write(&disconnect, b"").unwrap();
     assert!(
         timeout(Duration::from_secs(5), request)

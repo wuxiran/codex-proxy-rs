@@ -1,3 +1,5 @@
+//! 执行引擎各阶段与端口合同的测试入口
+
 mod admission;
 mod connection;
 mod continuation;
@@ -8,7 +10,7 @@ mod fork_coordinator; // fork: attribution
 mod fork_provider; // fork: attribution
 mod middleware;
 mod policy;
-mod probe;
+mod probe; // fork: warm verification trace
 mod provider;
 mod response_control;
 

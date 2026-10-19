@@ -1,3 +1,5 @@
+//! 验证额度预测的窗口选择、容量估算与无效样本边界
+
 use chrono::{DateTime, Duration, Utc};
 use gateway_admin::model::{
     accounts::{AccountCost, AccountUsage},
@@ -31,9 +33,9 @@ pub(super) fn window(key: &str, days: u64) -> ProviderQuotaWindow {
             success_count: 10,
             input_tokens: Some(900),
             output_tokens: Some(100),
-            cached_tokens: Some(800),
-            cache_write_tokens: None,
-            reasoning_tokens: None,
+            cached_input_tokens: Some(800),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
             image_input_tokens: None,
             image_output_tokens: None,
             image_request_count: 0,
@@ -57,6 +59,7 @@ pub(super) fn window(key: &str, days: u64) -> ProviderQuotaWindow {
 
 pub(super) fn quota(windows: Vec<ProviderQuotaWindow>) -> ProviderQuota {
     ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: Some(now()),
         refresh_token_expires_at: None,
@@ -82,7 +85,7 @@ pub(super) fn samples(quota: &ProviderQuota) -> Vec<QuotaForecastSample> {
                 tokens: usage.total_tokens.unwrap_or(0),
                 input_tokens: usage.input_tokens.unwrap_or(0),
                 output_tokens: usage.output_tokens.unwrap_or(0),
-                cached_tokens: usage.cached_tokens.unwrap_or(0),
+                cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
                 missing_token_count: u64::from(usage.total_tokens.is_none()),
                 known_cost_count: if usd.is_some() {
                     usage.cost_coverage.known_count()
@@ -312,7 +315,7 @@ fn partial_costs_keep_estimates_from_known_amounts() {
 fn missing_tokens_and_costs_do_not_block_recorded_capacity_estimates() {
     let source = quota(vec![window("week", 7)]);
     let mut sample = samples(&source).remove(0);
-    // 完整请求之外混有缺少计量的成功请求，不把已有用量和费用一并作废。
+    // 完整请求之外混有缺少计量的成功请求，不把已有用量和费用一并作废
     sample.usage.request_count += 2;
     sample.usage.missing_token_count = 2;
     sample.usage.unavailable_cost_count = 2;

@@ -1,3 +1,5 @@
+//! Responses WebSocket 连接生命周期与多轮请求边界测试
+
 mod middleware;
 
 use std::{
@@ -232,6 +234,7 @@ struct TestSocket {
     incoming: UnboundedReceiver<Result<Message, TestSocketError>>,
     written: UnboundedSender<Message>,
     stall_writes: bool,
+    flush_started: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -240,7 +243,7 @@ impl Stream for TestSocket {
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let event = self.incoming.poll_recv(context);
-        // 模拟 Axum transport 的自动 Pong；pump 不再重复实现协议层应答。
+        // 模拟 Axum transport 的自动 Pong；pump 不再重复实现协议层应答
         if let Poll::Ready(Some(Ok(Message::Ping(payload)))) = &event {
             self.written
                 .send(Message::Pong(payload.clone()))
@@ -266,7 +269,12 @@ impl Sink<Message> for TestSocket {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+        self.flush_started.store(true, Ordering::Release);
+        if self.stall_writes {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -284,6 +292,7 @@ struct PumpHarness {
     connection: ResponsesWebSocketConnection,
     incoming: UnboundedSender<Result<Message, TestSocketError>>,
     written: UnboundedReceiver<Message>,
+    flush_started: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
     cancellation: CancellationToken,
 }
@@ -292,11 +301,13 @@ fn test_connection(stall_writes: bool) -> PumpHarness {
     let (incoming_tx, incoming_rx) = unbounded_channel();
     let (written_tx, written_rx) = unbounded_channel();
     let dropped = Arc::new(AtomicBool::new(false));
+    let flush_started = Arc::new(AtomicBool::new(false));
     let cancellation = CancellationToken::new();
     let socket = TestSocket {
         incoming: incoming_rx,
         written: written_tx,
         stall_writes,
+        flush_started: Arc::clone(&flush_started),
         dropped: Arc::clone(&dropped),
     };
     let connection = spawn_connection(
@@ -304,11 +315,14 @@ fn test_connection(stall_writes: bool) -> PumpHarness {
         Arc::from("ws_test"),
         cancellation.clone(),
         ConnectionConfig::PRODUCTION,
+        None,
+        Arc::from([]),
     );
     PumpHarness {
         connection,
         incoming: incoming_tx,
         written: written_rx,
+        flush_started,
         dropped,
         cancellation,
     }
@@ -398,6 +412,62 @@ async fn client_close_should_take_priority_over_queued_business_frames() {
         connection.next_event().await,
         Some(ConnectionEvent::Exited(PumpExitReason::ClientClose))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_close_flush_has_a_short_deadline_without_sending_another_frame() {
+    let PumpHarness {
+        mut connection,
+        incoming,
+        mut written,
+        flush_started,
+        dropped,
+        ..
+    } = test_connection(true);
+    incoming.send(Ok(Message::Close(None))).expect("close peer");
+    let started = tokio::time::Instant::now();
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), connection.wait_for_exit())
+        .await
+        .expect("peer close cannot consume the ordinary write timeout");
+    assert_eq!(reason, PumpExitReason::ClientClose);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert!(flush_started.load(Ordering::Acquire));
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(
+        written.recv().await.is_none(),
+        "do not send a duplicate Close"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_shutdown_interrupts_a_pending_client_close_flush() {
+    let PumpHarness {
+        mut connection,
+        incoming,
+        flush_started,
+        cancellation,
+        dropped,
+        ..
+    } = test_connection(true);
+    incoming.send(Ok(Message::Close(None))).expect("close peer");
+    for _ in 0..100 {
+        if flush_started.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        flush_started.load(Ordering::Acquire),
+        "close flush must start"
+    );
+    cancellation.cancel();
+
+    let reason = tokio::time::timeout(Duration::from_millis(50), connection.wait_for_exit())
+        .await
+        .expect("host cancellation must not wait for the close timeout");
+    assert_eq!(reason, PumpExitReason::ClientClose);
+    assert!(dropped.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -604,7 +674,7 @@ async fn idle_connection_reaches_the_official_limit_without_starting_an_executio
     );
     assert_eq!(trace.starts.load(Ordering::Acquire), 0);
 
-    // 服务端已因生命周期到期关闭；不再向关闭中的连接写入。
+    // 服务端已因生命周期到期关闭；不再向关闭中的连接写入
     drop(socket);
     server.abort();
 }
@@ -760,6 +830,7 @@ async fn start_active_response_with_middleware(
             Vec::new(),
             Arc::new(crate::openai::EmptyWorkerHealth),
             Arc::new(crate::openai::TestLifecycle::default()),
+            Arc::new(crate::support::RecordingDiagnostics::default()),
         )
         .unwrap()
         .with_middleware(move |_| Some(plan.clone()))
@@ -985,6 +1056,40 @@ async fn requests_deferred_during_active_response_share_the_inbound_queue_limit(
 }
 
 #[tokio::test]
+async fn client_normal_close_after_completed_response_receives_normal_close_reply() {
+    let (trace, mut socket, server) = start_active_response().await;
+    trace.release_terminal.notify_one();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("terminal response timeout")
+            .expect("response remains open")
+            .expect("valid response frame");
+        if let ClientMessage::Text(text) = message {
+            let event: Value = serde_json::from_str(&text).expect("response JSON");
+            if event["type"] == "response.completed" {
+                break;
+            }
+        }
+    }
+    socket
+        .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: CloseCode::Normal,
+            reason: "client finished".into(),
+        }))
+        .await
+        .expect("send normal close");
+    // close() 只发送本端关闭帧；必须读取对端应答，才能证明握手正常完成
+    let reply = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+    server.abort();
+    assert!(
+        matches!(&reply, Ok(Some(Ok(ClientMessage::Close(Some(frame)))))
+            if frame.code == CloseCode::Normal && frame.reason == "client finished"),
+        "client must receive the close acknowledgement, got {reply:?}"
+    );
+}
+
+#[tokio::test]
 async fn client_close_should_cancel_active_execution_without_starting_queued_requests() {
     let (trace, mut socket, server) = start_active_response().await;
     socket
@@ -1005,6 +1110,12 @@ async fn client_close_should_cancel_active_execution_without_starting_queued_req
     .expect("cancel active execution promptly");
     assert_eq!(trace.starts.load(Ordering::Acquire), 1);
     assert!(trace.cancelled.load(Ordering::Acquire));
+    let reply = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("close reply timeout")
+        .expect("close reply")
+        .expect("clean close handshake");
+    assert!(matches!(reply, ClientMessage::Close(None)));
     server.abort();
 }
 
@@ -1069,6 +1180,7 @@ async fn stalled_heartbeat_can_be_cancelled_without_waiting_for_write_timeout() 
         written: _written,
         dropped,
         cancellation,
+        ..
     } = test_connection(true);
     tokio::time::advance(Duration::from_secs(25)).await;
     tokio::task::yield_now().await;
@@ -1114,7 +1226,7 @@ async fn active_response_receives_heartbeats_during_two_hundred_seconds_of_silen
         let ClientMessage::Ping(payload) = message else {
             panic!("expected heartbeat while business stream is silent: {message:?}");
         };
-        // 与官方 WsStream 一样，在业务响应未完成时回复同 payload 的 Pong。
+        // 与官方 WsStream 一样，在业务响应未完成时回复同 payload 的 Pong
         socket
             .send(ClientMessage::Pong(payload))
             .await

@@ -1,4 +1,4 @@
-//! 复用选号时的输入，保留有界的候选评分与阻断原因。
+//! 复用选号时的输入，保留有界的候选评分与阻断原因
 
 use serde_json::json;
 
@@ -8,11 +8,11 @@ use crate::account::{
     smart_score,
 };
 
-// 单个 trace 事件最多 4 KiB；优先保留实际选中的账号。
+// 单个 trace 事件最多 4 KiB；优先保留实际选中的账号
 const MAX_CANDIDATES: usize = 6;
 
 impl TraceContext {
-    /// 记录实际选号输入与结果；只复用评分规则，不参与调度决策。
+    /// 记录实际选号输入与结果；只复用评分规则，不参与调度决策
     pub fn account_selection(
         &self,
         candidates: &[AccountCandidate],
@@ -41,17 +41,14 @@ impl TraceContext {
                     "blocker": AccountSelector.scheduling_blocker(candidate, context)
                         .map(|blocker| format!("{blocker:?}")),
                     "inFlight": signals.in_flight,
-                    "concurrencyLimit": candidate.account
-                        .effective_concurrency(context.policy.max_concurrent_per_account()).get(),
+                    "concurrencyLimit": context.concurrency_limit(&candidate.account).get(),
                     "quotaRemainingBasisPoints": signals.quota_remaining_rank,
                     "quotaResetAtUnixMs": signals.quota_reset_at.and_then(|reset|
                         reset.duration_since(std::time::UNIX_EPOCH).ok()
                     ).map(|duration| duration.as_millis()),
                     "failureRateBasisPoints": signals.failure_rate_basis_points,
                     "firstOutputLatencyMs": signals.first_output_latency_ms,
-                    "smartScore": smart.then(|| smart_score(
-                        candidate, context.policy.max_concurrent_per_account(), context.policy.smart_scheduling(), context.now
-                    )),
+                    "smartScore": smart.then(|| smart_score(candidate, context)),
                 })
             })
             .collect::<Vec<_>>();
@@ -63,6 +60,7 @@ impl TraceContext {
                 "preferredAccountId": context.preferred_account.as_ref().map(|id| id.as_str()),
                 "preferredResult": selection.as_ref().map(|s| format!("{:?}", s.preferred())),
                 "roundRobinCursor": context.round_robin_cursor,
+                "reservedConcurrency": context.reserved_concurrency,
                 "smartScoreTolerance": smart.then(|| context.policy.smart_scheduling().score_tolerance()),
                 "candidateCount": candidates.len(),
                 "omittedCandidates": candidates.len().saturating_sub(observations.len()),

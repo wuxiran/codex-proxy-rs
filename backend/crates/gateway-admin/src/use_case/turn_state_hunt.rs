@@ -416,7 +416,8 @@ impl DefaultAccountsService {
 
 /// 把轮换代理模板地址改造成一次性出口：用户名里的 `_area-`/`_session-`/`_life-` 段全部换成
 /// 目标国家与一次性 session。仅支持 smartproxy 式下划线用户名（`base_key-value_key-value`）。
-fn ephemeral_proxy_url(template: &str, country: &str, session: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn ephemeral_proxy_url(template: &str, country: &str, session: &str) -> Option<String> {
     let (scheme, after) = template.split_once("://")?;
     let (authority, path) = after
         .split_once('/')
@@ -998,7 +999,8 @@ fn not_sent_because_busy(error: &AccountProbeError) -> bool {
 /// 必须看 Provider 的原始分类：面向客户端的 [`GatewayErrorKind`] 把凭据失效、无权限
 /// 都折叠成「上游不可用」，按它分类会把已经没救的账号拿去把所有代理打一遍。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureClass {
+#[doc(hidden)]
+pub enum FailureClass {
     /// 换出口也不会好：凭据失效、被封、额度耗尽、限流、模型不支持、请求本身不合法。
     Account,
     /// 上游明确拒绝的是这个模型的容量，与出口无关。它多为瞬时过载，所以不立刻中止：
@@ -1013,7 +1015,8 @@ enum FailureClass {
 }
 
 impl FailureClass {
-    fn of(error: &AccountProbeError) -> Self {
+    #[doc(hidden)]
+    pub fn of(error: &AccountProbeError) -> Self {
         // 上游 404（如 model_not_found）随出口/后端分片时有时无：同一账号换个出口或下一次
         // 就可能成功。流式失败时没有 HTTP 响应，只剩 Provider 转述的错误码。
         if error
@@ -1067,7 +1070,8 @@ impl FailureClass {
     }
 
     /// 需要中止整轮遍历时返回事件码与说明；出口类失败返回 `None`，换下一个出口。
-    const fn abort(self) -> Option<(&'static str, &'static str)> {
+    #[doc(hidden)]
+    pub const fn abort(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Account => Some(("account_rejected", "上游拒绝了该账号的请求，遍历已中止")),
             // 是否中止由连续次数决定，见 `try_egress`。
@@ -1075,76 +1079,5 @@ impl FailureClass {
             Self::System => Some(("system_error", "网关本地错误，遍历已中止")),
             Self::Egress | Self::ModelUnavailable => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod failure_class_tests {
-    use gateway_core::{
-        engine::probe::{AccountProbeError, AccountProbeErrorSource},
-        error::{GatewayError, GatewayErrorKind, ProviderErrorKind},
-    };
-
-    use super::FailureClass;
-
-    fn provider_error(kind: ProviderErrorKind, code: Option<&'static str>) -> AccountProbeError {
-        let mut gateway = GatewayError::new(GatewayErrorKind::InvalidRequest, "upstream rejected");
-        if let Some(code) = code {
-            gateway = gateway.with_client_code(code);
-        }
-        AccountProbeError::new(gateway, AccountProbeErrorSource::Upstream, None, None)
-            .with_provider_kind(Some(kind))
-    }
-
-    #[test]
-    fn model_not_found_moves_on_instead_of_aborting_the_hunt() {
-        let class = FailureClass::of(&provider_error(
-            ProviderErrorKind::InvalidRequest,
-            Some("model_not_found"),
-        ));
-        assert_eq!(class, FailureClass::ModelUnavailable);
-        assert!(class.abort().is_none());
-    }
-
-    #[test]
-    fn other_invalid_requests_still_abort_the_hunt() {
-        let class = FailureClass::of(&provider_error(ProviderErrorKind::InvalidRequest, None));
-        assert_eq!(class, FailureClass::Account);
-        assert!(class.abort().is_some());
-    }
-}
-
-#[cfg(test)]
-mod ephemeral_url_tests {
-    use super::ephemeral_proxy_url;
-
-    #[test]
-    fn injects_country_and_session_replacing_existing_tokens() {
-        let url = ephemeral_proxy_url(
-            "http://user_area-US_life-30_session-old:pass@host.example:3120/",
-            "JP",
-            "abc123",
-        )
-        .expect("valid template");
-        // 旧的 area/session/life 段被剥掉，换成目标国家与一次性 session；base 段与其余部分保留。
-        assert_eq!(
-            url,
-            "http://user_area-JP_session-abc123:pass@host.example:3120/"
-        );
-    }
-
-    #[test]
-    fn appends_tokens_when_username_has_none() {
-        let url = ephemeral_proxy_url("http://base:pass@host.example:3120/", "DE", "s1")
-            .expect("valid template");
-        assert_eq!(
-            url,
-            "http://base_area-DE_session-s1:pass@host.example:3120/"
-        );
-    }
-
-    #[test]
-    fn rejects_a_template_without_credentials() {
-        assert!(ephemeral_proxy_url("http://host.example:3120/", "US", "s1").is_none());
     }
 }

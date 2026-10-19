@@ -1,9 +1,8 @@
-//! Runtime settings 与管理员 API Key 用例。
+//! Runtime settings 与管理员 API Key 用例
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gateway_core::policy::CodexClientVersion;
 use gateway_core::runtime::SnapshotControl;
 use rand_core::{OsRng, RngCore as _};
 
@@ -20,9 +19,16 @@ use crate::{
 
 use super::{map_store_error, publish_committed};
 
-/// API 消费的 Runtime settings 管理服务。
+/// API 消费的 Runtime settings 管理服务
 #[async_trait]
 pub trait SettingsService: Send + Sync {
+    async fn preview_privacy_policy(
+        &self,
+        _request: gateway_core::settings::privacy::PrivacyPreviewRequest,
+    ) -> Result<gateway_core::settings::privacy::PrivacyPreviewResult, AdminError> {
+        Err(AdminError::invalid("隐私预览不可用"))
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError>;
@@ -103,54 +109,36 @@ impl DefaultSettingsService {
 }
 
 fn validate_settings(command: &ReplaceRuntimeSettings) -> Result<(), AdminError> {
-    let valid = command.request_location.validate().is_ok()
-        && command.responses_max_decompressed_body_bytes > 0
-        && isize::try_from(command.responses_max_decompressed_body_bytes).is_ok()
-        && command.refresh_margin_seconds > 0
-        && command.refresh_concurrency > 0
-        && command.max_waiting_per_key <= 1_000
-        && command.max_waiting_per_account <= 1_000
-        && (1..=120).contains(&command.concurrency_wait_timeout_seconds)
-        && crate::model::retention::RetentionPolicy::try_new(
-            command.usage_retention_days,
-            command.ops_event_retention_days,
-            command.audit_retention_days,
-        )
-        .is_ok()
-        && valid_client_version(command.min_codex_desktop_version.as_deref())
-        && valid_client_version(command.min_codex_cli_version.as_deref())
-        && valid_probe_model(command.account_auto_freeze_probe_model.as_deref())
-        && gateway_core::provider_ports::valid_warmup_schedule_time(
-            &command.account_warmup_schedule_time,
-        )
-        && valid_probe_model(command.account_warmup_model.as_deref())
-        && (!command.account_warmup_enabled || command.account_warmup_model.is_some())
-        && i64::try_from(command.request_interval_ms).is_ok()
-        && (2..=1_000).contains(&command.account_auto_freeze_threshold)
-        && (60..=3_600).contains(&command.account_auto_freeze_window_seconds)
-        && (300..=604_800).contains(&command.account_auto_freeze_duration_seconds);
-    if valid {
-        Ok(())
-    } else {
-        Err(AdminError::invalid("运行时设置不满足约束"))
-    }
-}
-
-fn valid_client_version(value: Option<&str>) -> bool {
-    value.is_none_or(|value| CodexClientVersion::parse(value).is_ok())
-}
-
-fn valid_probe_model(value: Option<&str>) -> bool {
-    value.is_none_or(|value| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value == value.trim()
-            && !value.bytes().any(|byte| byte.is_ascii_control())
-    })
+    crate::model::settings::validate_model_mappings(
+        command
+            .model_mappings
+            .iter()
+            .map(|(requested, upstream)| (requested.as_str(), upstream.as_str())),
+    )
+    .map_err(|_| AdminError::invalid("运行时设置不满足约束"))?;
+    command
+        .values
+        .validate()
+        .map_err(|_| AdminError::invalid("运行时设置不满足约束"))
 }
 
 #[async_trait]
 impl SettingsService for DefaultSettingsService {
+    async fn preview_privacy_policy(
+        &self,
+        request: gateway_core::settings::privacy::PrivacyPreviewRequest,
+    ) -> Result<gateway_core::settings::privacy::PrivacyPreviewResult, AdminError> {
+        self.profile_provider("openai")?
+            .preview_privacy_policy(request)
+            .map_err(|error| {
+                AdminError::invalid(format!(
+                    "第 {} 条规则：{}",
+                    error.rule_index + 1,
+                    error.reason
+                ))
+            })
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError> {
@@ -272,10 +260,12 @@ impl SettingsService for DefaultSettingsService {
             PricingChange::Replace(pricing) => {
                 pricing.validate().map_err(AdminError::invalid)?;
                 if command.provider == "xai"
-                    && pricing
-                        .bands
-                        .keys()
-                        .any(|band| matches!(band.as_str(), "image" | "flex" | "long_flex"))
+                    && pricing.bands.keys().any(|band| {
+                        matches!(
+                            band.as_str(),
+                            "image" | "flex" | "long_flex" | "ultrafast" | "long_ultrafast"
+                        )
+                    })
                 {
                     return Err(AdminError::invalid("xAI 不支持此价格档位"));
                 }
@@ -376,6 +366,17 @@ impl SettingsService for DefaultSettingsService {
         mut command: ReplaceRuntimeSettings,
     ) -> Result<RuntimeSettings, AdminError> {
         validate_settings(&command)?;
+        if command.values.codex_privacy_policy != Default::default() {
+            self.profile_provider("openai")?
+                .compile_privacy_policy(&command.values.codex_privacy_policy)
+                .map_err(|error| {
+                    AdminError::invalid(format!(
+                        "第 {} 条规则：{}",
+                        error.rule_index + 1,
+                        error.reason
+                    ))
+                })?;
+        }
         if command
             .request_profile_updates
             .values()

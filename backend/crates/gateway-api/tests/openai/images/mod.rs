@@ -1,3 +1,7 @@
+//! 图像生成与编辑 HTTP 接口的请求传递和响应交付测试
+
+mod request;
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -8,6 +12,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use gateway_core::engine::execution::{
@@ -257,7 +262,7 @@ impl ExecutionSession for ImageSession {
 }
 
 #[tokio::test]
-async fn image_routes_should_not_decode_bodies_and_should_preserve_both_directions() {
+async fn image_json_routes_should_preserve_both_directions_without_decoding() {
     let mut execution = ImageExecution::new();
     let middleware = Arc::new(crate::openai::middleware::RequestMiddleware {
         expected_operation: Some(OperationKind::GenerateImage),
@@ -279,12 +284,6 @@ async fn image_routes_should_not_decode_bodies_and_should_preserve_both_directio
             "application/json",
             br#"{"model":"gpt-image-2","images":[{"image_url":"data:image/png;base64,AAEC"}],"prompt":"add fog","prompt":"duplicate stays raw"}"#.as_slice(),
         ),
-        (
-            "/v1/images/edits",
-            ImageRequestKind::Edit,
-            "multipart/form-data; boundary=image-boundary",
-            b"--image-boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\x00\xff\r\n--image-boundary--\r\n".as_slice(),
-        ),
     ];
 
     for (path, _, content_type, body) in &cases {
@@ -298,6 +297,11 @@ async fn image_routes_should_not_decode_bodies_and_should_preserve_both_directio
                     .header("x-codex-image-turn-id", "turn_image_route")
                     .header("session-id", "root-image-session")
                     .header("thread-id", "child-image-thread")
+                    .header("x-future-business", "first")
+                    .header("x-future-business", "second")
+                    .header("cookie", "client-secret")
+                    .header("connection", "x-private-hop")
+                    .header("x-private-hop", "client-hop")
                     .body(Body::from(body.to_vec()))
                     .expect("image request"),
             )
@@ -324,11 +328,7 @@ async fn image_routes_should_not_decode_bodies_and_should_preserve_both_directio
     assert_eq!(captured.len(), cases.len());
     assert_eq!(
         *middleware.endpoints.lock().unwrap(),
-        vec![
-            "/v1/images/generations",
-            "/v1/images/edits",
-            "/v1/images/edits"
-        ]
+        vec!["/v1/images/generations", "/v1/images/edits"]
     );
     for (captured, (endpoint, kind, _, body)) in captured.iter().zip(cases.iter()) {
         assert_eq!(captured.provider, "openai");
@@ -336,8 +336,37 @@ async fn image_routes_should_not_decode_bodies_and_should_preserve_both_directio
         assert_eq!(captured.transport, ClientTransport::HttpJson);
         assert_eq!(captured.kind, *kind);
         assert_eq!(captured.body.as_ref(), *body);
+        let mut context = captured.context.clone();
+        let headers = context
+            .as_object_mut()
+            .unwrap()
+            .remove("opaque_request_headers")
+            .unwrap();
+        let headers: Vec<_> = headers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry[0].as_str().unwrap(),
+                    STANDARD.decode(entry[1].as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect();
         assert_eq!(
-            captured.context,
+            headers
+                .iter()
+                .filter(|(name, _)| *name == "x-future-business")
+                .map(|(_, value)| value.as_slice())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second".as_slice()]
+        );
+        assert!(!headers.iter().any(|(name, _)| matches!(
+            *name,
+            "authorization" | "cookie" | "connection" | "x-private-hop"
+        )));
+        assert_eq!(
+            context,
             json!({"image_turn_id": "turn_image_route", "session_id": "root-image-session", "thread_id": "child-image-thread"})
         );
     }

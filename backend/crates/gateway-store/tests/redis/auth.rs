@@ -1,3 +1,5 @@
+//! 验证 Redis 认证会话的续期、撤销、固定有效期与原子限流
+
 use std::time::Duration;
 
 use chrono::Utc;
@@ -18,6 +20,8 @@ async fn client_session_should_use_fixed_ttl_without_storing_session_or_api_key_
         subject: SessionSubjectRecord::Key {
             client_key_id: "key-42".to_owned(),
         },
+        renewal: None,
+        absolute_expires_at: None,
         expires_at: Utc::now() + chrono::Duration::seconds(60),
     };
 
@@ -113,6 +117,8 @@ async fn client_session_should_reject_invalid_intervals_and_rate_limit_policies(
         subject: SessionSubjectRecord::Key {
             client_key_id: "key-42".to_owned(),
         },
+        renewal: None,
+        absolute_expires_at: None,
         expires_at: now,
     };
 
@@ -152,6 +158,8 @@ fn admin_auth_state_rejects_invalid_ttl_boundaries() {
             credential_fingerprint: String::new(),
             admin_user_id: "admin".to_owned(),
         },
+        renewal: None,
+        absolute_expires_at: None,
         expires_at: Utc::now() - chrono::Duration::seconds(1),
     };
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
@@ -178,6 +186,8 @@ async fn admin_auth_state_keeps_fixed_ttl_and_opaque_keys() {
             credential_fingerprint: "test-password-fingerprint".to_owned(),
             admin_user_id: "default-admin".to_owned(),
         },
+        renewal: None,
+        absolute_expires_at: None,
         expires_at: Utc::now() + chrono::Duration::seconds(60),
     };
 
@@ -246,6 +256,8 @@ async fn unified_session_rejects_invalid_identities_and_loads_legacy_admin_paylo
                 subject: SessionSubjectRecord::Key {
                     client_key_id: "key-42".to_owned(),
                 },
+                renewal: None,
+                absolute_expires_at: None,
                 expires_at: Utc::now() + chrono::Duration::seconds(60),
             },
         )
@@ -275,7 +287,7 @@ async fn unified_session_rejects_invalid_identities_and_loads_legacy_admin_paylo
         assert!(repository.load_session(token).await.is_err());
     }
 
-    // 旧版会话仍能解码，空指纹交由认证服务判定失效，避免升级后返回存储故障。
+    // 旧版会话仍能解码，空指纹交由认证服务判定失效，避免升级后返回存储故障
     let legacy = serde_json::json!({
         "subject": {"type": "admin", "admin_user_id": "admin"},
         "expires_at": (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
@@ -299,5 +311,135 @@ async fn unified_session_rejects_invalid_identities_and_loads_legacy_admin_paylo
             admin_user_id: "admin".to_owned(),
             credential_fingerprint: String::new(),
         }
+    );
+}
+
+fn renewable_record() -> AuthSessionRecord {
+    AuthSessionRecord {
+        subject: SessionSubjectRecord::Admin {
+            admin_user_id: "admin".into(),
+            credential_fingerprint: "fingerprint".into(),
+        },
+        expires_at: Utc::now() - chrono::Duration::minutes(1),
+        absolute_expires_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+        renewal: Some(gateway_admin::model::auth::SessionRenewal {
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            access_digest: [1; 32],
+            refresh_digest: [2; 32],
+            previous: None,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn rotation_is_atomic_and_logout_cannot_be_undone_by_inflight_refresh() {
+    let Some((repository, _, _)) = auth_repository().await else {
+        return;
+    };
+    let original = renewable_record();
+    repository
+        .store_session("rotation", &original)
+        .await
+        .unwrap();
+    let mut replacement = original.clone();
+    replacement.expires_at = Utc::now() + chrono::Duration::minutes(1);
+    replacement.renewal.as_mut().unwrap().refresh_digest = [3; 32];
+    let mut competing = replacement.clone();
+    competing.renewal.as_mut().unwrap().refresh_digest = [4; 32];
+    let (first, second) = tokio::join!(
+        repository.compare_exchange_session("rotation", &original, Some(&replacement)),
+        repository.compare_exchange_session("rotation", &original, Some(&competing)),
+    );
+    let first = first.unwrap().unwrap();
+    assert_eq!(second.unwrap(), Some(first.clone()));
+    assert_eq!(
+        repository.load_session("rotation").await.unwrap(),
+        Some(first.clone())
+    );
+    // 过时快照不能撤销已轮换的状态；领域层重新核对后才决定是否撤销
+    assert_eq!(
+        repository
+            .compare_exchange_session("rotation", &original, None)
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+    assert!(
+        repository
+            .compare_exchange_session("rotation", &first, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .compare_exchange_session("rotation", &first, Some(&replacement))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(repository.load_session("rotation").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn redis_retains_refresh_after_access_expiry_but_never_resurrects_expired_sessions() {
+    let Some((repository, mut connection, namespace)) = auth_repository().await else {
+        return;
+    };
+    let original = renewable_record();
+    repository
+        .store_session("expiry-race", &original)
+        .await
+        .unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:session:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(&keys[0])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((240_000..=300_000).contains(&ttl));
+    assert_eq!(
+        repository.load_session("expiry-race").await.unwrap(),
+        Some(original.clone())
+    );
+    let mut replacement = original.clone();
+    replacement.renewal.as_mut().unwrap().expires_at = Utc::now() + chrono::Duration::minutes(6);
+    assert_eq!(
+        repository
+            .compare_exchange_session("expiry-race", &original, Some(&replacement))
+            .await
+            .unwrap(),
+        Some(replacement.clone())
+    );
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(&keys[0])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((300_000..=360_000).contains(&ttl));
+    redis::cmd("PEXPIRE")
+        .arg(&keys[0])
+        .arg(1)
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        repository
+            .compare_exchange_session("expiry-race", &replacement, Some(&replacement))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .load_session("expiry-race")
+            .await
+            .unwrap()
+            .is_none()
     );
 }

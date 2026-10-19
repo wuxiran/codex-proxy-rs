@@ -1,3 +1,5 @@
+//! 验证 OpenAI 上游失败分类与账号评分反馈规则
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +9,7 @@ use gateway_core::account::{AccountFeedbackStats, ProviderAccountId};
 use gateway_core::engine::provider::{EventStream, ProviderCallMetadata, ProviderStream};
 use gateway_core::error::{
     ClientVisibleUpstreamError, OpaqueUpstreamValue, ProviderError, ProviderErrorKind,
+    TransientRetryPolicy,
 };
 use gateway_core::routing::{ProviderKind, UpstreamModelId};
 use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
@@ -206,6 +209,8 @@ fn openai_feedback_should_penalize_capacity_rejections_even_with_transient_retry
                 NonZeroU32::new(3).expect("retry count"),
                 Duration::from_millis(500),
                 Duration::from_secs(8),
+                Duration::ZERO,
+                TransientRetryPolicy::RetryThenRotateAccount,
             );
 
         deliver_error_with_openai_feedback(&feedback, &provider, &account, error);

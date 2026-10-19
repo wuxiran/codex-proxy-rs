@@ -1,3 +1,5 @@
+//! 账号领域测试入口，以及候选账号与调度输入构造辅助
+
 mod location;
 mod model_access;
 mod proxy;
@@ -97,18 +99,16 @@ fn account_scheduling_should_default_and_resolve_concurrency_override() {
 
 fn context(strategy: RotationStrategy) -> AccountSelectionContext {
     AccountSelectionContext {
-        policy: AccountSelectionPolicy::new(
-            strategy,
-            NonZeroU32::new(3).expect("positive"),
-            Duration::ZERO,
-        ),
+        policy: AccountSelectionPolicy::new(strategy, NonZeroU32::new(3).expect("positive")),
         now: SystemTime::now(),
         excluded_accounts: BTreeSet::new(),
+        busy_accounts: Default::default(),
         preferred_account: None,
         preferred_account_overrides_weight: false,
         round_robin_cursor: 0,
         eligibility: AccountEligibilityPolicy::Enforce,
         account_scope: None,
+        reserved_concurrency: 0,
     }
 }
 
@@ -468,7 +468,6 @@ fn highest_priority_affinity_should_still_obey_existing_scheduling_constraints()
     for blocker in [
         AccountSchedulingBlocker::Excluded,
         AccountSchedulingBlocker::ConcurrencyLimit,
-        AccountSchedulingBlocker::RequestInterval,
         AccountSchedulingBlocker::LocalAvailability,
     ] {
         let mut candidates = [
@@ -485,14 +484,6 @@ fn highest_priority_affinity_should_still_obey_existing_scheduling_constraints()
                     .insert(candidates[0].account.id().clone());
             }
             AccountSchedulingBlocker::ConcurrencyLimit => candidates[0].signals.in_flight = 3,
-            AccountSchedulingBlocker::RequestInterval => {
-                candidates[0].signals.last_started_at = Some(selection.now);
-                selection.policy = AccountSelectionPolicy::new(
-                    RotationStrategy::Smart,
-                    NonZeroU32::new(3).expect("limit"),
-                    Duration::from_secs(1),
-                );
-            }
             AccountSchedulingBlocker::LocalAvailability => {
                 candidates[0].signals.cooldown =
                     Some((selection.now + Duration::from_secs(60)).into())
@@ -785,25 +776,25 @@ fn selector_should_reject_account_at_concurrency_limit() {
 }
 
 #[test]
-fn selector_should_enforce_request_interval_until_boundary() {
+fn selector_should_allow_immediate_reuse_regardless_of_last_started_time() {
     let now = SystemTime::now();
-    let mut cooling = candidate("acct_cooling", 0, Some(100));
-    cooling.signals.last_started_at = Some(now - Duration::from_millis(9));
-    let mut ready = candidate("acct_ready", 0, Some(1));
-    ready.signals.last_started_at = Some(now - Duration::from_millis(10));
-    let candidates = vec![cooling, ready];
-    let mut context = context(RotationStrategy::Smart);
-    context.now = now;
-    context.policy = AccountSelectionPolicy::new(
-        RotationStrategy::Smart,
-        NonZeroU32::new(3).expect("positive"),
-        Duration::from_millis(10),
-    );
-    let selected = AccountSelector
-        .select(&candidates, &context)
-        .expect("candidate available");
-
-    assert_eq!(selected.candidate().account.id().as_str(), "acct_ready");
+    for last_started in [
+        now - Duration::from_millis(1),
+        now,
+        now + Duration::from_secs(30),
+    ] {
+        let mut candidate = candidate("acct_recent", 1, None);
+        candidate.signals.last_started_at = Some(last_started);
+        let candidates = [candidate];
+        let mut context = context(RotationStrategy::Sticky);
+        context.now = now;
+        context.preferred_account = Some(candidates[0].account.id().clone());
+        let selected = AccountSelector
+            .select(&candidates, &context)
+            .expect("available slot");
+        assert_eq!(selected.candidate().account.id().as_str(), "acct_recent");
+        assert_eq!(selected.preferred(), PreferredAccountSelection::Hit);
+    }
 }
 
 #[test]
@@ -1092,4 +1083,59 @@ fn due_probe_freeze_blocks_scheduling_and_remains_visible_as_rate_limited() {
         .select(&candidates, &selection)
         .expect("available account");
     assert_eq!(selected.candidate().account.id().as_str(), "acct_ready");
+}
+
+#[test]
+fn reserved_concurrency_uses_its_own_limit_without_reducing_normal_capacity() {
+    let normal = context(RotationStrategy::Smart);
+    let candidates = [candidate_with_concurrency("acct_reserved", 4, 5)];
+    assert!(AccountSelector.select(&candidates, &normal).is_some());
+    let capacity = AccountSelector
+        .capacity_snapshot(&candidates, &normal)
+        .unwrap();
+    assert_eq!((capacity.used_slots(), capacity.total_slots()), (4, 5));
+
+    let mut reserved = normal.clone();
+    reserved.reserved_concurrency = 3;
+    let candidates = [candidate_with_concurrency("acct_reserved", 2, 5)];
+    assert!(AccountSelector.select(&candidates, &reserved).is_some());
+    let capacity = AccountSelector
+        .capacity_snapshot(&candidates, &reserved)
+        .unwrap();
+    assert_eq!((capacity.used_slots(), capacity.total_slots()), (2, 3));
+    let full = [candidate_with_concurrency("acct_reserved", 3, 5)];
+    assert!(AccountSelector.select(&full, &reserved).is_none());
+    assert_eq!(AccountSelector.wait_candidates(&full, &reserved).len(), 1);
+    assert!(AccountSelector.select(&full, &normal).is_some());
+
+    // 独立额度可以大于账号普通上限，极值不能回绕成无限并发
+    reserved.reserved_concurrency = u32::MAX;
+    assert_eq!(
+        reserved.concurrency_limit(&candidates[0].account).get(),
+        u32::MAX
+    );
+    assert_eq!(normal.concurrency_limit(&candidates[0].account).get(), 5);
+}
+
+#[test]
+fn reserved_capacity_stays_bounded_when_normal_concurrency_is_unlimited() {
+    let candidates = [candidate("acct_unlimited", 3, None)];
+    let mut normal = context(RotationStrategy::Smart);
+    normal.policy = AccountSelectionPolicy::new(
+        RotationStrategy::Smart,
+        gateway_core::account::AccountConcurrency::Unlimited,
+    );
+    assert!(AccountSelector.select(&candidates, &normal).is_some());
+    assert!(
+        AccountSelector
+            .capacity_snapshot(&candidates, &normal)
+            .is_none()
+    );
+    let mut reserved = normal;
+    reserved.reserved_concurrency = 3;
+    assert!(AccountSelector.select(&candidates, &reserved).is_none());
+    let capacity = AccountSelector
+        .capacity_snapshot(&candidates, &reserved)
+        .unwrap();
+    assert_eq!((capacity.used_slots(), capacity.total_slots()), (3, 3));
 }

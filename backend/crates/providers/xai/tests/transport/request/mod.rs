@@ -1,8 +1,16 @@
+//! Grok 请求转换测试入口，以及工具、历史与未知字段处理测试
+
 use gateway_core::operation::{GenerateRequest, ProtocolPayload};
 use gateway_core::policy::ClientApiKeyId;
 use serde_json::{Map, Value, json};
 
 use provider_xai::{GrokRequestEncodeError, GrokResponsesRequest};
+
+mod hosted_names;
+mod incremental_tools;
+mod model_identity;
+mod parameters;
+mod web_search;
 
 fn raw_request(body: Value) -> GenerateRequest {
     let Value::Object(body) = body else {
@@ -15,6 +23,71 @@ fn raw_request(body: Value) -> GenerateRequest {
 
 fn client_key() -> ClientApiKeyId {
     ClientApiKeyId::new("key_xai_request_test").expect("client key id")
+}
+
+#[test]
+fn namespaced_custom_tools_should_preserve_grammar_choice_and_history() {
+    let grammar = "start: /.+/";
+    let request = raw_request(json!({
+        "model":"client",
+        "tools":[{"type":"namespace","name":"functions","tools":[
+            {"type":"function","name":"lookup","parameters":{"type":"object"}},
+            {"type":"custom","name":"exec","format":{"type":"grammar","syntax":"lark","definition":grammar}}
+        ]}],
+        "tool_choice":{"type":"custom","namespace":"functions","name":"exec"},
+        "input":[
+            {"type":"custom_tool_call","namespace":"functions","name":"exec","id":"ctc_exec","call_id":"call_exec","input":"echo hello"},
+            {"type":"custom_tool_call_output","call_id":"call_exec","output":"hello"}
+        ]
+    }));
+    let encoded = GrokResponsesRequest::encode(&request, "grok-4.5", &client_key()).unwrap();
+    let body = Value::Object(encoded.body().clone());
+    assert_eq!(body["tools"][0]["name"], "functions__lookup");
+    assert_eq!(body["tools"][1]["name"], "functions__exec");
+    assert!(
+        body["tools"][1]["description"]
+            .as_str()
+            .unwrap()
+            .contains(grammar)
+    );
+    assert_eq!(body["tools"][1]["parameters"]["required"], json!(["input"]));
+    assert_eq!(
+        body["tool_choice"],
+        json!({"type":"function","name":"functions__exec"})
+    );
+    assert_eq!(body["input"][0]["name"], "functions__exec");
+    assert_eq!(body["input"][0]["id"], "fc_exec");
+    assert_eq!(body["input"][0]["call_id"], "call_exec");
+    assert_eq!(
+        body["input"][0]["arguments"],
+        json!("{\"input\":\"echo hello\"}")
+    );
+    assert_eq!(body["input"][1]["call_id"], "call_exec");
+}
+
+#[test]
+fn additional_tools_should_accept_namespaced_custom_tools() {
+    let request = raw_request(json!({
+        "model":"client", "input":[{"type":"additional_tools","tools":[
+            {"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}
+        ]}]
+    }));
+    let encoded = GrokResponsesRequest::encode(&request, "grok-4.5", &client_key()).unwrap();
+    assert_eq!(encoded.body()["tools"][0]["name"], "functions__exec");
+    assert_eq!(encoded.body()["input"], json!([]));
+}
+
+#[test]
+fn namespace_should_still_reject_non_function_or_custom_children() {
+    for kind in ["namespace", "web_search", "tool_search", "future_tool"] {
+        let request = raw_request(
+            json!({"tools":[{"type":"namespace","name":"functions","tools":[{"type":kind,"name":"invalid"}]}]}),
+        );
+        assert!(matches!(
+            GrokResponsesRequest::encode(&request, "grok-4.5", &client_key()),
+            Err(GrokRequestEncodeError::InvalidRequestField { field: "tools" })
+        ));
+    }
 }
 
 #[test]
@@ -124,7 +197,7 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
             "reasoning.encrypted_content"
         ]))
     );
-    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("xhigh")));
     assert_eq!(body.pointer("/reasoning/summary"), Some(&json!("auto")));
 
     let request = raw_request(json!({
@@ -133,9 +206,9 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
         "reasoning": {"effort": "xhigh"}
     }));
     let encoded = GrokResponsesRequest::encode(&request, "xai/grok-4.6-latest", &client_key())
-        .expect("aliased request");
+        .expect("routed model request");
     let body = Value::Object(encoded.body().clone());
-    assert_eq!(body.pointer("/model"), Some(&json!("grok-4.6")));
+    assert_eq!(body.pointer("/model"), Some(&json!("xai/grok-4.6-latest")));
     assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("xhigh")));
     assert_eq!(body.pointer("/reasoning_effort"), None);
     assert_eq!(body.pointer("/reasoningEffort"), None);
@@ -148,7 +221,10 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
     let encoded = GrokResponsesRequest::encode(&request, "grok-composer-2.5-fast", &client_key())
         .expect("Composer request");
     let body = Value::Object(encoded.body().clone());
-    assert_eq!(body.pointer("/reasoning"), None);
+    assert_eq!(
+        body.pointer("/reasoning"),
+        Some(&json!({"effort":"high", "summary":"auto"}))
+    );
 
     let request = raw_request(json!({
         "model": "client-model",
@@ -165,7 +241,7 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
         body.pointer("/include"),
         Some(&json!(["reasoning.encrypted_content"]))
     );
-    assert_eq!(body.pointer("/reasoning"), None);
+    assert_eq!(body.pointer("/reasoning"), Some(&json!({"effort":"max"})));
 
     let request = raw_request(json!({
         "model": "client-model",
@@ -176,7 +252,7 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
         .expect("Composer reasoning without effort");
     assert_eq!(
         Value::Object(encoded.body().clone()).pointer("/reasoning"),
-        None
+        Some(&json!({}))
     );
 
     let request = raw_request(json!({
@@ -188,12 +264,12 @@ fn encoder_should_apply_build_defaults_and_normalize_reasoning_effort() {
         .expect("unknown provider prefix");
     assert_eq!(
         Value::Object(encoded.body().clone()).pointer("/reasoning/effort"),
-        None
+        Some(&json!("max"))
     );
 }
 
 #[test]
-fn encoder_should_strip_grok_unsupported_fields() {
+fn encoder_should_strip_codex_only_fields_without_model_guesses() {
     let request = raw_request(json!({
         "model": "client-model",
         "input": "hello",
@@ -218,16 +294,11 @@ fn encoder_should_strip_grok_unsupported_fields() {
     }));
 
     let encoded = GrokResponsesRequest::encode(&request, "grok-latest", &client_key())
-        .expect("sanitized 4.5 request");
+        .expect("sanitized request");
     let body = Value::Object(encoded.body().clone());
     for pointer in [
         "/prompt_cache_retention",
         "/safety_identifier",
-        "/presence_penalty",
-        "/presencePenalty",
-        "/frequency_penalty",
-        "/frequencyPenalty",
-        "/stop",
         "/external_web_access",
         "/metadata/external_web_access",
         "/tools/0/external_web_access",
@@ -244,12 +315,9 @@ fn encoder_should_strip_grok_unsupported_fields() {
     let encoded = GrokResponsesRequest::encode(&request, "grok-4.20-reasoning", &client_key())
         .expect("sanitized 4.20 request");
     let body = Value::Object(encoded.body().clone());
-    assert_eq!(
-        body.pointer("/model"),
-        Some(&json!("grok-4.20-0309-reasoning"))
-    );
-    assert_eq!(body.pointer("/logprobs"), None);
-    assert_eq!(body.pointer("/top_logprobs"), None);
+    assert_eq!(body.pointer("/model"), Some(&json!("grok-4.20-reasoning")));
+    assert_eq!(body.pointer("/logprobs"), Some(&json!(true)));
+    assert_eq!(body.pointer("/top_logprobs"), Some(&json!(5)));
 }
 
 #[test]
@@ -646,14 +714,14 @@ fn explicit_session_should_add_x_search_after_codex_additional_tools_normalizati
 }
 
 #[test]
-fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types() {
+fn additional_tools_should_replace_earlier_definition_and_drop_unsupported_types() {
     let request = raw_request(json!({
         "model": "client",
         "tools": [
             {
                 "type": "function",
                 "name": "existing",
-                "description": "top-level wins",
+                "description": "initial definition",
                 "parameters": {"type": "object"}
             },
             {"type": "image_generation", "model": "gpt-image-2"}
@@ -666,7 +734,7 @@ fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types(
                     {
                         "type": "function",
                         "name": "existing",
-                        "description": "carrier duplicate",
+                        "description": "updated definition",
                         "parameters": {"type": "object"}
                     },
                     {"type": "function", "name": "wait"},
@@ -686,7 +754,7 @@ fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types(
     assert_eq!(body.pointer("/tools/0/name"), Some(&json!("existing")));
     assert_eq!(
         body.pointer("/tools/0/description"),
-        Some(&json!("top-level wins"))
+        Some(&json!("updated definition"))
     );
     assert_eq!(body.pointer("/tools/1/name"), Some(&json!("wait")));
     assert_eq!(body.pointer("/tools/2"), None);
@@ -937,7 +1005,7 @@ fn hosted_tool_choice_should_preserve_normalized_web_search_choice() {
         "model": "client",
         "input": "search",
         "tools": [
-            {"type": "web_search_preview", "allowed_domains": ["example.com"]},
+            {"type": "web_search_preview", "filters": {"allowed_domains": ["example.com"]}},
             {"type": "x_search"}
         ],
         "tool_choice": {"type": "web_search_preview"}
@@ -1130,14 +1198,14 @@ fn history_sanitizer_should_only_strip_known_grok_injection_sites() {
         .expect("history normalization");
     let body = Value::Object(encoded.body().clone());
 
-    // 工具 schema 里恰好叫 phase 的属性与语义 null 不再被误删。
+    // 工具 schema 里恰好叫 phase 的属性与语义 null 不再被误删
     assert_eq!(
         body.pointer("/input/0/tools/0/input_schema/properties/phase"),
         Some(&json!({"type": "string"}))
     );
     assert_eq!(body.pointer("/input/1/output/result"), Some(&Value::Null));
     assert_eq!(body.pointer("/input/1/output/phase"), Some(&json!("keep")));
-    // shell_call action 是已知注入点：内部键与 null 占位字段仍被剥离。
+    // shell_call action 是已知注入点：内部键与 null 占位字段仍被剥离
     assert_eq!(
         body.pointer("/input/2/action/commands/0"),
         Some(&json!("pwd"))

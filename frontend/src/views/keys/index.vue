@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ApiKey } from '@/api'
-import { BaseCard, BaseCheckbox, BaseConfirmModal, BasePageHeader, BaseTable, BaseTablePagination } from '@codex-proxy/ui'
+import { ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable } from '@codex-proxy/ui'
 
 import { ref, shallowRef, watch } from 'vue'
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
@@ -10,12 +10,14 @@ import { usePageSelection } from '@/composables/usePageSelection'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyBudgetResetModal from './components/ApiKeyBudgetResetModal.vue'
-import ApiKeyCreateModal from './components/ApiKeyCreateModal.vue'
+import ApiKeyCreatedModal from './components/ApiKeyCreatedModal.vue'
 import ApiKeyFilters from './components/ApiKeyFilters.vue'
+import ApiKeyFormModal from './components/ApiKeyFormModal.vue'
 import ApiKeyIdentityCell from './components/ApiKeyIdentityCell.vue'
 import ApiKeyPrefixCell from './components/ApiKeyPrefixCell.vue'
 import ApiKeyScopeCell from './components/ApiKeyScopeCell.vue'
 import ApiKeyStatusBadge from './components/ApiKeyStatusBadge.vue'
+import { useApiKeyEditor } from './composables/useApiKeyEditor'
 import { useApiKeyMutations } from './composables/useApiKeyMutations'
 import { useApiKeysQuery } from './composables/useApiKeysQuery'
 import { useApiKeyUse } from './composables/useApiKeyUse'
@@ -48,51 +50,52 @@ const {
 } = useAccountGroupCatalog({ immediate: false })
 
 const {
-  showFormModal,
-  showDeleteModal,
-  showSingleDeleteModal,
-  showKeyModal,
-  showAllAccountsConfirm,
+  showUseKeyModal,
+  selectedUseKey,
+  showCreatedKeyModal,
   createdKey,
-  createdKeyName,
-  editingKey,
-  pendingDeleteKey,
-  savingKey,
-  deletingKey,
-  batchDeleting,
-  updatingStatusKeyIds,
   revealingKeyIds,
+  openAiBaseUrl,
+  showCreatedKey,
+  clearCreatedKey,
+  copyToClipboard,
+  copyApiKey,
+  importCreatedKeyToCcs,
+  openUseKeyModal,
+  importToCcs,
+} = useApiKeyUse()
+
+const {
+  showFormModal,
+  showAllAccountsConfirm,
+  editingKey,
+  savingKey,
   form,
   openCreate,
   openEdit,
+  clearCustomKey,
   requestSave,
   confirmAllAccountsScope,
+} = useApiKeyEditor({ reload: loadApiKeys, onCreated: showCreatedKey })
+
+const {
+  showDeleteModal,
+  showSingleDeleteModal,
+  pendingDeleteKey,
+  deleteCount,
+  deletingKey,
+  batchDeleting,
+  updatingStatusKeyIds,
   requestDeleteKey,
   handleDelete,
   handleBatchDelete,
   handleToggleStatus,
-  copyToClipboard,
-  revealPlaintextKey,
-  copyApiKey,
 } = useApiKeyMutations({ selectedIds, reload: loadApiKeys })
 
 const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll } = usePageSelection(
   apiKeys,
   selectedIds,
 )
-
-const {
-  showUseKeyModal,
-  selectedUseKey,
-  openAiBaseUrl,
-  importCreatedKeyToCcs,
-  openUseKeyModal,
-  importToCcs,
-} = useApiKeyUse({
-  createdKey,
-  createdKeyName,
-  revealPlaintextKey,
-})
 
 watch(
   showFormModal,
@@ -102,13 +105,13 @@ watch(
 
 <template>
   <div class="flex h-full min-h-0 w-full flex-col overflow-hidden">
-    <BasePageHeader
+    <ZPageHeader
       class="h-17"
       title="API 密钥"
       description="创建和管理 API 密钥，并设置每个密钥可以使用的账号"
     />
 
-    <BaseCard
+    <ZCard
       class="mt-5 flex h-[calc(100dvh-136px)] min-h-125 flex-col"
     >
       <template #header>
@@ -123,10 +126,10 @@ watch(
 
       <template #body>
         <div class="flex h-full min-h-0 flex-col">
-          <BaseTable
+          <ZTable
             class="min-h-0 flex-1"
             :columns="apiKeyColumns"
-            :rows="apiKeys"
+            :data="apiKeys"
             :loading="loading"
             :selected-row-keys="selectedRowKeys"
             :sort="sort"
@@ -134,17 +137,17 @@ watch(
             @sort-change="handleSortChange"
           >
             <template #header-selection>
-              <BaseCheckbox
+              <ZCheckbox
                 :model-value="allSelected"
                 :indeterminate="indeterminate"
-                label="选择当前页密钥"
+                aria-label="选择当前页密钥"
                 @update:model-value="toggleAll"
               />
             </template>
             <template #selection="{ row }">
-              <BaseCheckbox
+              <ZCheckbox
                 :model-value="selectedIds.has(row.id)"
-                label="选择密钥"
+                aria-label="选择密钥"
                 @update:model-value="toggleSelection(row.id)"
               />
             </template>
@@ -184,7 +187,7 @@ watch(
               <ApiKeyStatusBadge :api-key="row" />
             </template>
             <template #lastUsedAt="{ row }">
-              <LastUsedAtCell :value="row.lastUsedAt" />
+              <LastUsedAtCell :value="row.lastUsedAt" :display="row.lastUsedAtDisplay" :full-display="row.lastUsedAtFullDisplay" />
             </template>
             <template #actions="{ row }">
               <ApiKeyActions
@@ -200,29 +203,34 @@ watch(
                 @use="openUseKeyModal"
               />
             </template>
-          </BaseTable>
-          <BaseTablePagination
-            :pagination="apiKeyPagination"
-            :loading="loading"
-            @page-change="handlePageChange"
-            @page-size-change="handlePageSizeChange"
+          </ZTable>
+          <ZPagination
+            v-bind="apiKeyPagination"
+            :disabled="loading"
+            @current-change="handlePageChange"
+            @size-change="handlePageSizeChange"
           />
         </div>
       </template>
-    </BaseCard>
+    </ZCard>
 
-    <ApiKeyCreateModal
+    <ApiKeyFormModal
       v-model="showFormModal"
-      v-model:created-open="showKeyModal"
       v-model:form="form"
       :groups="groups"
       :group-loading="loadingGroups"
       :editing="Boolean(editingKey)"
-      :created-key="createdKey"
       :saving="savingKey"
-      @copy="copyToClipboard"
       @save="requestSave"
+      @after-leave="clearCustomKey"
+    />
+
+    <ApiKeyCreatedModal
+      v-model="showCreatedKeyModal"
+      :created-key="createdKey"
+      @copy="copyToClipboard"
       @import-ccs="importCreatedKeyToCcs"
+      @after-leave="clearCreatedKey"
     />
 
     <ApiKeyBudgetResetModal
@@ -236,9 +244,10 @@ watch(
       :api-key="selectedUseKey"
       :api-base-url="openAiBaseUrl"
       @copy="copyToClipboard"
+      @after-leave="selectedUseKey = null"
     />
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showAllAccountsConfirm"
       title="授予全部账号权限"
       description="保存后，该密钥可以使用所有账号"
@@ -249,9 +258,9 @@ watch(
       <p class="m-0">
         该密钥可以使用所有账号，包括以后新增和未分组的账号
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showDeleteModal"
       title="确认删除"
       description="删除后这些 API Key 将立即失效，此操作不可撤销"
@@ -261,11 +270,11 @@ watch(
       @confirm="handleBatchDelete"
     >
       <p class="m-0">
-        确定删除选中的 {{ selectedIds.size }} 个 API Key 吗？
+        确定删除选中的 {{ deleteCount }} 个 API Key 吗？
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
 
-    <BaseConfirmModal
+    <ZConfirmDialog
       v-model="showSingleDeleteModal"
       title="删除 API Key"
       description="删除后该 API Key 将立即失效，此操作不可撤销"
@@ -277,6 +286,6 @@ watch(
       <p class="m-0">
         确定删除 {{ pendingDeleteKey?.name || pendingDeleteKey?.prefix || '该 API Key' }} 吗？
       </p>
-    </BaseConfirmModal>
+    </ZConfirmDialog>
   </div>
 </template>

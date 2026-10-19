@@ -1,3 +1,5 @@
+//! 验证价格精度、人工覆盖与费用倍率的计算和快照保留
+
 use gateway_core::metering::{ModelPriceOverride, PricingOverrides, TokenPrice, merge_pricing};
 use serde_json::json;
 
@@ -33,6 +35,19 @@ fn override_validation_rejects_unsupported_bands_and_excessive_multiplier() {
         .unwrap(),
     );
     assert!(price.validate().is_err());
+}
+
+#[test]
+fn override_validation_accepts_ultrafast_bands() {
+    let pricing: ModelPriceOverride = serde_json::from_value(json!({
+        "multiplierBps": 10000,
+        "bands": {
+            "ultrafast": {"input":"12", "output":"60", "cacheRead":"0.6", "cacheWrite":"15"},
+            "long_ultrafast": {"input":"24", "output":"90", "cacheRead":"1.2", "cacheWrite":"30"}
+        }
+    }))
+    .unwrap();
+    assert!(pricing.validate().is_ok());
 }
 
 #[test]

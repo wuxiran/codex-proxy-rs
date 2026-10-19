@@ -1,4 +1,4 @@
-//! 官方 Grok CLI proxy 模型目录 wire、transport port 与安全快照。
+//! 官方 Grok CLI proxy 模型目录 wire、transport port 与安全快照
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -15,16 +15,16 @@ use zeroize::Zeroizing;
 
 use crate::{GrokHeader, SecretValue, XaiWireProfileState};
 
-/// 官方 Grok CLI proxy 模型目录 URL。
+/// 官方 Grok CLI proxy 模型目录 URL
 pub const GROK_MODEL_CATALOG_URL: &str = "https://cli-chat-proxy.grok.com/v1/models";
-/// 官方 Grok Build credits/billing URL。
+/// 官方 Grok Build credits/billing URL
 pub const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// 官方实时订阅查询 URL；额度响应本身不提供套餐事实。
+/// 官方实时订阅查询 URL；额度响应本身不提供套餐事实
 pub const GROK_SUBSCRIPTION_URL: &str =
     "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
-/// 单次 Grok 模型目录响应允许的最大字节数。
+/// 单次 Grok 模型目录响应允许的最大字节数
 pub const MAX_GROK_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
-/// 单次 Grok billing 响应允许的最大字节数。
+/// 单次 Grok billing 响应允许的最大字节数
 pub const MAX_GROK_BILLING_BYTES: usize = 512 * 1024;
 
 pub(crate) const MAX_CATALOG_MODELS: usize = 2_048;
@@ -33,15 +33,15 @@ const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_ETAG_BYTES: usize = 256;
 const SUBSCRIPTION_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 构造模型目录 OAuth session 失败。
+/// 构造模型目录 OAuth session 失败
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GrokModelCatalogSessionError {
-    /// OAuth、身份或兼容版本无法安全写入 HTTP header。
+    /// OAuth、身份或兼容版本无法安全写入 HTTP header
     #[error("Grok model catalog OAuth session contains invalid header data")]
     InvalidHeaderData,
 }
 
-/// 一次模型目录请求使用的 OAuth session，不支持 API Key。
+/// 一次模型目录请求使用的 OAuth session，不支持 API Key
 #[derive(Clone)]
 pub struct GrokModelCatalogSession {
     access_token: SecretValue,
@@ -52,11 +52,11 @@ pub struct GrokModelCatalogSession {
 }
 
 impl GrokModelCatalogSession {
-    /// 创建仅用于官方 CLI proxy 的 OAuth session。
+    /// 创建仅用于官方 CLI proxy 的 OAuth session
     ///
     /// # Errors
     ///
-    /// 任一 header 值为空、过长或含非可见 ASCII 时返回错误。
+    /// 任一 header 值为空、过长或含非可见 ASCII 时返回错误
     pub fn new(
         access_token: SecretValue,
         user_id: SecretValue,
@@ -102,7 +102,7 @@ impl fmt::Debug for GrokModelCatalogSession {
     }
 }
 
-/// 交给单次 GET transport 的完整模型目录请求。
+/// 交给单次 GET transport 的完整模型目录请求
 #[derive(Debug)]
 pub struct GrokModelCatalogRequest {
     endpoint: Url,
@@ -138,27 +138,27 @@ impl GrokModelCatalogRequest {
         })
     }
 
-    /// 返回固定官方 `/v1/models` URL。
+    /// 返回固定官方 `/v1/models` URL
     #[must_use]
     pub const fn endpoint(&self) -> &Url {
         &self.endpoint
     }
 
-    /// 返回完整官方 OAuth/session header；敏感值保留类型标记。
+    /// 返回完整官方 OAuth/session header；敏感值保留类型标记
     #[must_use]
     pub fn headers(&self) -> &[GrokHeader] {
         &self.headers
     }
 }
 
-/// 单次成功 GET 的有界原始响应。
+/// 单次成功 GET 的有界原始响应
 pub struct GrokModelCatalogTransportResponse {
     body: Zeroizing<Vec<u8>>,
     etag: Option<String>,
 }
 
 impl GrokModelCatalogTransportResponse {
-    /// 创建 transport 响应；上层仍会重复执行字节和 ETag 校验。
+    /// 创建 transport 响应；上层仍会重复执行字节和 ETag 校验
     #[must_use]
     pub fn new(body: impl Into<Vec<u8>>, etag: Option<String>) -> Self {
         Self {
@@ -187,26 +187,26 @@ impl fmt::Debug for GrokModelCatalogTransportResponse {
     }
 }
 
-/// 模型目录 GET transport 失败类型。
+/// 模型目录 GET transport 失败类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokModelCatalogTransportErrorKind {
-    /// URL、header 或响应协议不合法。
+    /// URL、header 或响应协议不合法
     Protocol,
-    /// OAuth access token 被拒绝。
+    /// OAuth access token 被拒绝
     Unauthorized,
-    /// OAuth session 没有目录权限。
+    /// OAuth session 没有目录权限
     PermissionDenied,
-    /// 官方 proxy 限流。
+    /// 官方 proxy 限流
     RateLimited,
-    /// 请求超时。
+    /// 请求超时
     Timeout,
-    /// 网络或 TLS 失败。
+    /// 网络或 TLS 失败
     Transport,
-    /// 官方 proxy 暂不可用。
+    /// 官方 proxy 暂不可用
     Unavailable,
 }
 
-/// 不携带上游正文的模型目录 transport 错误。
+/// 不携带上游正文的模型目录 transport 错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("Grok model catalog transport failed: {kind:?}")]
 pub struct GrokModelCatalogTransportError {
@@ -215,13 +215,13 @@ pub struct GrokModelCatalogTransportError {
 }
 
 impl GrokModelCatalogTransportError {
-    /// 创建未附带 HTTP 状态的失败。
+    /// 创建未附带 HTTP 状态的失败
     #[must_use]
     pub const fn new(kind: GrokModelCatalogTransportErrorKind) -> Self {
         Self { kind, status: None }
     }
 
-    /// 附加合法 HTTP 状态码。
+    /// 附加合法 HTTP 状态码
     #[must_use]
     pub fn with_status(mut self, status: u16) -> Self {
         if (100..=599).contains(&status) {
@@ -230,20 +230,20 @@ impl GrokModelCatalogTransportError {
         self
     }
 
-    /// 返回稳定失败分类。
+    /// 返回稳定失败分类
     #[must_use]
     pub const fn kind(&self) -> GrokModelCatalogTransportErrorKind {
         self.kind
     }
 
-    /// 返回可公开 HTTP 状态。
+    /// 返回可公开 HTTP 状态
     #[must_use]
     pub const fn status(&self) -> Option<u16> {
         self.status
     }
 }
 
-/// 模型目录 transport future。
+/// 模型目录 transport future
 pub type GrokModelCatalogTransportFuture<'a> = Pin<
     Box<
         dyn Future<
@@ -253,13 +253,13 @@ pub type GrokModelCatalogTransportFuture<'a> = Pin<
     >,
 >;
 
-/// 只执行一次固定官方 GET 的模型目录 transport port。
+/// 只执行一次固定官方 GET 的模型目录 transport port
 pub trait GrokModelCatalogTransport: Send + Sync {
-    /// 发送一次请求；实现不得重试、改用 API Key 或跟随 redirect。
+    /// 发送一次请求；实现不得重试、改用 API Key 或跟随 redirect
     fn execute(&self, request: GrokModelCatalogRequest) -> GrokModelCatalogTransportFuture<'_>;
 }
 
-/// 交给单次官方计费或订阅 GET transport 的完整请求。
+/// 交给单次官方计费或订阅 GET transport 的完整请求
 #[derive(Debug)]
 pub struct GrokBillingRequest {
     endpoint: Url,
@@ -301,20 +301,20 @@ impl GrokBillingRequest {
         })
     }
 
-    /// 返回固定官方计费或订阅 URL。
+    /// 返回固定官方计费或订阅 URL
     #[must_use]
     pub const fn endpoint(&self) -> &Url {
         &self.endpoint
     }
 
-    /// 返回官方 OAuth/session headers；敏感值保留类型标记。
+    /// 返回官方 OAuth/session headers；敏感值保留类型标记
     #[must_use]
     pub fn headers(&self) -> &[GrokHeader] {
         &self.headers
     }
 }
 
-/// 单次成功 billing GET 的有界原始响应。
+/// 单次成功 billing GET 的有界原始响应
 pub struct GrokBillingTransportResponse {
     body: Zeroizing<Vec<u8>>,
 }
@@ -342,7 +342,7 @@ impl fmt::Debug for GrokBillingTransportResponse {
     }
 }
 
-/// Billing transport 的稳定失败分类。
+/// Billing transport 的稳定失败分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokBillingTransportErrorKind {
     Protocol,
@@ -354,7 +354,7 @@ pub enum GrokBillingTransportErrorKind {
     Unavailable,
 }
 
-/// 不携带上游正文的 billing transport 错误。
+/// 不携带上游正文的 billing transport 错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("Grok billing transport failed: {kind:?}")]
 pub struct GrokBillingTransportError {
@@ -387,7 +387,7 @@ impl GrokBillingTransportError {
     }
 }
 
-/// 计费 transport 的 future。
+/// 计费 transport 的 future
 pub type GrokBillingTransportFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<GrokBillingTransportResponse, GrokBillingTransportError>>
@@ -396,13 +396,13 @@ pub type GrokBillingTransportFuture<'a> = Pin<
     >,
 >;
 
-/// 只执行一次固定官方 billing GET 的 transport port。
+/// 只执行一次固定官方 billing GET 的 transport port
 pub trait GrokBillingTransport: Send + Sync {
-    /// 实现不得重试、改用 API Key 或跟随 redirect。
+    /// 实现不得重试、改用 API Key 或跟随 redirect
     fn execute(&self, request: GrokBillingRequest) -> GrokBillingTransportFuture<'_>;
 }
 
-/// 已验证但仍由 xAI Provider 独占解释的动态 billing JSON。
+/// 已验证但仍由 xAI Provider 独占解释的动态 billing JSON
 #[derive(Clone, PartialEq)]
 pub struct GrokBillingSnapshot {
     document: Map<String, Value>,
@@ -442,7 +442,7 @@ pub enum GrokBillingError {
     InvalidWire,
 }
 
-/// 有界官方 billing client。
+/// 有界官方 billing client
 #[derive(Clone)]
 pub struct GrokBillingClient {
     transport: Arc<dyn GrokBillingTransport>,
@@ -467,7 +467,7 @@ impl GrokBillingClient {
         parse_grok_billing(response.body())
     }
 
-    /// 查询实时订阅，只返回套餐事实，不保存用户资料。
+    /// 查询实时订阅，只返回套餐事实，不保存用户资料
     pub async fn fetch_subscription(
         &self,
         session: &GrokModelCatalogSession,
@@ -503,7 +503,7 @@ fn parse_subscription_tier(body: &[u8]) -> Result<Option<String>, GrokBillingErr
             let tier = tier.trim();
             Ok((!tier.is_empty()).then(|| tier.to_owned()))
         }
-        // 官方仅在存在有效付费订阅时返回套餐名；缺字段或团队身份不能推断为 Free。
+        // 官方仅在存在有效付费订阅时返回套餐名；缺字段或团队身份不能推断为 Free
         Some(Value::Null)
             if document.get("principalType").and_then(Value::as_str) == Some("User")
                 && document.get("teamId") == Some(&Value::Null)
@@ -525,7 +525,7 @@ impl fmt::Debug for GrokBillingClient {
     }
 }
 
-/// 验证已限长的动态 billing document，同时保留 Provider 后续新增字段。
+/// 验证已限长的动态 billing document，同时保留 Provider 后续新增字段
 pub fn parse_grok_billing(body: &[u8]) -> Result<GrokBillingSnapshot, GrokBillingError> {
     if body.len() > MAX_GROK_BILLING_BYTES {
         return Err(GrokBillingError::ResponseTooLarge);
@@ -570,17 +570,12 @@ fn validate_billing_config(config: &Map<String, Value>) -> Result<(), GrokBillin
             return Err(GrokBillingError::InvalidWire);
         }
     }
-    for field in [
-        "monthlyLimit",
-        "used",
-        "onDemandCap",
-        "onDemandUsed",
-        "prepaidBalance",
-    ] {
+    for field in ["onDemandCap", "onDemandUsed", "prepaidBalance"] {
         if let Some(value) = config.get(field)
             && !value.is_null()
         {
-            validate_cent(value)?;
+            // 预付余额使用带符号的账本金额，限额和已使用量仍须非负
+            validate_cent(value, field == "prepaidBalance")?;
         }
     }
     if let Some(period) = config.get("currentPeriod")
@@ -610,12 +605,14 @@ fn validate_billing_config(config: &Map<String, Value>) -> Result<(), GrokBillin
     Ok(())
 }
 
-fn validate_cent(value: &Value) -> Result<(), GrokBillingError> {
+fn validate_cent(value: &Value, allow_negative: bool) -> Result<(), GrokBillingError> {
     let Value::Object(cent) = value else {
         return Err(GrokBillingError::InvalidWire);
     };
     if let Some(value) = cent.get("val")
-        && value.as_i64().is_none_or(|value| value < 0)
+        && value
+            .as_i64()
+            .is_none_or(|value| !allow_negative && value < 0)
     {
         return Err(GrokBillingError::InvalidWire);
     }
@@ -632,14 +629,14 @@ fn validate_dynamic_text(value: &Value, max_bytes: usize) -> Result<(), GrokBill
     Ok(())
 }
 
-/// 上游目录对一项能力给出的明确证据。
+/// 上游目录对一项能力给出的明确证据
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokCatalogCapabilityEvidence {
-    /// 上游明确声明原生支持。
+    /// 上游明确声明原生支持
     DeclaredNative,
-    /// 上游明确声明不支持。
+    /// 上游明确声明不支持
     DeclaredUnsupported,
-    /// 上游没有提供可依赖的声明。
+    /// 上游没有提供可依赖的声明
     Unknown,
 }
 
@@ -653,22 +650,22 @@ impl GrokCatalogCapabilityEvidence {
     }
 }
 
-/// Grok 官方目录声明的 API backend。
+/// Grok 官方目录声明的 API backend
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrokCatalogApiBackend {
-    /// OpenAI Responses wire。
+    /// OpenAI Responses wire
     Responses,
-    /// OpenAI Chat Completions wire。
+    /// OpenAI Chat Completions wire
     ChatCompletions,
-    /// Anthropic Messages wire。
+    /// Anthropic Messages wire
     Messages,
-    /// 上游新增、当前 adapter 尚未识别的 backend。
+    /// 上游新增、当前 adapter 尚未识别的 backend
     #[serde(other)]
     Unknown,
 }
 
-/// Grok 官方目录允许声明的 reasoning effort。
+/// Grok 官方目录允许声明的 reasoning effort
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GrokCatalogReasoningEffort {
@@ -679,13 +676,13 @@ pub enum GrokCatalogReasoningEffort {
     High,
     Xhigh,
     Max,
-    /// 上游新增、当前 adapter 尚未识别的 effort；不进入能力投影。
+    /// 上游新增、当前 adapter 尚未识别的 effort；不进入能力投影
     #[serde(other)]
     Unknown,
 }
 
 impl GrokCatalogReasoningEffort {
-    /// 返回 Responses API 使用的规范值。
+    /// 返回 Responses API 使用的规范值
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -701,7 +698,7 @@ impl GrokCatalogReasoningEffort {
     }
 }
 
-/// Grok 目录中允许进入控制面的能力证据。
+/// Grok 目录中允许进入控制面的能力证据
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCatalogCapabilities {
     responses_api: GrokCatalogCapabilityEvidence,
@@ -714,71 +711,78 @@ pub struct GrokCatalogCapabilities {
 }
 
 impl GrokCatalogCapabilities {
-    /// 返回 Responses API 支持证据。
+    /// 返回 Responses API 支持证据
     #[must_use]
     pub const fn responses_api(&self) -> GrokCatalogCapabilityEvidence {
         self.responses_api
     }
 
-    /// 返回 reasoning effort 支持证据。
+    /// 返回 reasoning effort 支持证据
     #[must_use]
     pub const fn reasoning_effort(&self) -> GrokCatalogCapabilityEvidence {
         self.reasoning_effort
     }
 
-    /// 返回上游声明的可选 reasoning effort，顺序与目录一致。
+    /// 返回上游声明的可选 reasoning effort，顺序与目录一致
     #[must_use]
     pub fn reasoning_efforts(&self) -> &[GrokCatalogReasoningEffort] {
         &self.reasoning_efforts
     }
 
-    /// 返回上游声明或菜单推导出的默认 reasoning effort。
+    /// 返回上游声明或菜单推导出的默认 reasoning effort
     #[must_use]
     pub const fn default_reasoning_effort(&self) -> Option<GrokCatalogReasoningEffort> {
         self.default_reasoning_effort
     }
 
-    /// 返回后端 search 支持证据。
+    /// 返回后端 search 支持证据
     #[must_use]
     pub const fn backend_search(&self) -> GrokCatalogCapabilityEvidence {
         self.backend_search
     }
 
-    /// 返回流式工具调用支持证据。
+    /// 返回流式工具调用支持证据
     #[must_use]
     pub const fn streaming_tool_calls(&self) -> GrokCatalogCapabilityEvidence {
         self.streaming_tool_calls
     }
 
-    /// 返回上游明确声明的 API backend。
+    /// 返回上游明确声明的 API backend
     #[must_use]
     pub const fn api_backend(&self) -> Option<GrokCatalogApiBackend> {
         self.api_backend
     }
 }
 
-/// Grok 目录中明确声明的模型限制。
+/// Grok 目录中明确声明的模型限制
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCatalogLimits {
     context_window_tokens: Option<NonZeroU64>,
+    max_context_window_tokens: Option<NonZeroU64>,
     max_output_tokens: Option<NonZeroU64>,
 }
 
 impl GrokCatalogLimits {
-    /// 返回明确上下文窗口；缺失表示未知。
+    /// 返回明确上下文窗口；缺失表示未知
     #[must_use]
     pub const fn context_window_tokens(&self) -> Option<NonZeroU64> {
         self.context_window_tokens
     }
 
-    /// 返回明确最大输出 token；缺失表示未知。
+    /// 返回目录默认窗口与可选窗口中的最大值；缺失表示未知
+    #[must_use]
+    pub const fn max_context_window_tokens(&self) -> Option<NonZeroU64> {
+        self.max_context_window_tokens
+    }
+
+    /// 返回明确最大输出 token；缺失表示未知
     #[must_use]
     pub const fn max_output_tokens(&self) -> Option<NonZeroU64> {
         self.max_output_tokens
     }
 }
 
-/// Grok 目录中允许持久化的原始元数据白名单。
+/// Grok 目录中允许持久化的原始元数据白名单
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCatalogMetadata {
     catalog_entry_id: Option<String>,
@@ -787,26 +791,26 @@ pub struct GrokCatalogMetadata {
 }
 
 impl GrokCatalogMetadata {
-    /// 返回目录自身的稳定 entry ID；它不替代实际请求模型。
+    /// 返回目录自身的稳定 entry ID；它不替代实际请求模型
     #[must_use]
     pub fn catalog_entry_id(&self) -> Option<&str> {
         self.catalog_entry_id.as_deref()
     }
 
-    /// 返回安全说明文本。
+    /// 返回安全说明文本
     #[must_use]
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
 
-    /// 返回上游明确隐藏标记。
+    /// 返回上游明确隐藏标记
     #[must_use]
     pub const fn hidden(&self) -> Option<bool> {
         self.hidden
     }
 }
 
-/// 一个已完整校验的 Grok 真实模型。
+/// 一个已完整校验的 Grok 真实模型
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCatalogModel {
     request_model: UpstreamModelId,
@@ -817,38 +821,38 @@ pub struct GrokCatalogModel {
 }
 
 impl GrokCatalogModel {
-    /// 返回实际写入上游请求的模型 slug。
+    /// 返回实际写入上游请求的模型 slug
     #[must_use]
     pub const fn request_model(&self) -> &UpstreamModelId {
         &self.request_model
     }
 
-    /// 返回上游明确提供的展示名；不从 slug 猜测。
+    /// 返回上游明确提供的展示名；不从 slug 猜测
     #[must_use]
     pub fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
     }
 
-    /// 返回能力证据。
+    /// 返回能力证据
     #[must_use]
     pub const fn capabilities(&self) -> &GrokCatalogCapabilities {
         &self.capabilities
     }
 
-    /// 返回明确限制。
+    /// 返回明确限制
     #[must_use]
     pub const fn limits(&self) -> &GrokCatalogLimits {
         &self.limits
     }
 
-    /// 返回白名单元数据。
+    /// 返回白名单元数据
     #[must_use]
     pub const fn metadata(&self) -> &GrokCatalogMetadata {
         &self.metadata
     }
 }
 
-/// 一次完整成功的 Grok 远端模型快照。
+/// 一次完整成功的 Grok 远端模型快照
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokModelCatalogSnapshot {
     models: Vec<GrokCatalogModel>,
@@ -856,74 +860,74 @@ pub struct GrokModelCatalogSnapshot {
 }
 
 impl GrokModelCatalogSnapshot {
-    /// 返回本轮全部模型。
+    /// 返回本轮全部模型
     #[must_use]
     pub fn models(&self) -> &[GrokCatalogModel] {
         &self.models
     }
 
-    /// 返回经过语法和长度白名单校验的 HTTP ETag。
+    /// 返回经过语法和长度白名单校验的 HTTP ETag
     #[must_use]
     pub fn etag(&self) -> Option<&str> {
         self.etag.as_deref()
     }
 }
 
-/// 模型目录请求或完整快照失败。
+/// 模型目录请求或完整快照失败
 #[derive(Debug, thiserror::Error)]
 pub enum GrokModelCatalogError {
-    /// 固定官方请求无法构造。
+    /// 固定官方请求无法构造
     #[error("Grok model catalog request is invalid")]
     InvalidRequest,
-    /// 单次 transport 失败。
+    /// 单次 transport 失败
     #[error(transparent)]
     Transport(#[from] GrokModelCatalogTransportError),
-    /// 响应超过硬上限。
+    /// 响应超过硬上限
     #[error("Grok model catalog response exceeds the byte limit")]
     ResponseTooLarge,
-    /// 顶层不是唯一受支持的 `{data:[...]}` wire。
+    /// 顶层不是唯一受支持的 `{data:[...]}` wire
     #[error("Grok model catalog response violates the official wire contract")]
     InvalidWire,
-    /// 目录没有任何模型。
+    /// 目录没有任何模型
     #[error("Grok model catalog snapshot is empty")]
     EmptySnapshot,
-    /// 目录模型数量超过安全上限。
+    /// 目录模型数量超过安全上限
     #[error("Grok model catalog contains too many models")]
     TooManyModels,
-    /// 实际请求模型 slug 不合法。
+    /// 实际请求模型 slug 不合法
     #[error("Grok model catalog contains an invalid request model slug")]
     InvalidModelSlug,
-    /// 同一实际请求模型重复出现。
+    /// 同一实际请求模型重复出现
     #[error("Grok model catalog contains a duplicate request model slug")]
     DuplicateModelSlug,
-    /// 展示或白名单元数据不合法。
+    /// 展示或白名单元数据不合法
     #[error("Grok model catalog contains invalid public metadata")]
     InvalidMetadata,
-    /// 模型限制不是明确的正整数。
+    /// 模型限制不是明确的正整数
     #[error("Grok model catalog contains invalid model limits")]
     InvalidLimits,
-    /// ETag 不属于允许持久化的安全格式。
+    /// ETag 不属于允许持久化的安全格式
     #[error("Grok model catalog ETag is invalid")]
     InvalidEtag,
 }
 
-/// 仅负责编排一次严格 transport 与快照解析的目录 client。
+/// 仅负责编排一次严格 transport 与快照解析的目录 client
 pub struct GrokModelCatalogClient {
     transport: Arc<dyn GrokModelCatalogTransport>,
 }
 
 impl GrokModelCatalogClient {
-    /// 注入一个严格的单次 GET transport。
+    /// 注入一个严格的单次 GET transport
     #[must_use]
     pub fn new(transport: Arc<dyn GrokModelCatalogTransport>) -> Self {
         Self { transport }
     }
 
-    /// 获取并验证一次完整快照。
+    /// 获取并验证一次完整快照
     ///
     /// # Errors
     ///
-    /// transport、字节上限、wire、任一模型或 ETag 不合法时整轮失败。
+    /// transport、字节上限、wire、任一模型或 ETag 不合法时整轮失败
     pub async fn fetch(
         &self,
         session: &GrokModelCatalogSession,
@@ -958,76 +962,34 @@ enum GrokModelsObject {
 #[derive(Debug, Deserialize)]
 struct GrokModelWire {
     id: Option<String>,
-    model: Option<String>,
-    #[serde(rename = "modelId")]
-    model_id: Option<String>,
+    model: String,
     name: Option<String>,
     description: Option<String>,
-    #[serde(rename = "contextWindow", alias = "context_window")]
     context_window: Option<u64>,
-    #[serde(rename = "maxCompletionTokens", alias = "max_completion_tokens")]
+    #[serde(default)]
+    context_windows: Vec<NonZeroU64>,
     max_completion_tokens: Option<u64>,
-    #[serde(rename = "apiBackend", alias = "api_backend")]
     api_backend: Option<GrokCatalogApiBackend>,
-    #[serde(rename = "supportedInApi", alias = "supported_in_api")]
     supported_in_api: Option<bool>,
-    #[serde(
-        rename = "supportsReasoningEffort",
-        alias = "supports_reasoning_effort"
-    )]
-    supports_reasoning_effort: Option<bool>,
-    #[serde(rename = "reasoningEffort", alias = "reasoning_effort")]
-    reasoning_effort: Option<GrokCatalogReasoningEffort>,
-    #[serde(default, rename = "reasoningEfforts", alias = "reasoning_efforts")]
+    #[serde(default)]
     reasoning_efforts: Vec<GrokReasoningEffortOptionWire>,
-    features: Option<GrokModelFeaturesWire>,
-    #[serde(rename = "supportsBackendSearch", alias = "supports_backend_search")]
     supports_backend_search: Option<bool>,
-    #[serde(rename = "streamToolCalls", alias = "stream_tool_calls")]
     stream_tool_calls: Option<bool>,
     hidden: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GrokModelFeaturesWire {
-    reasoning: Option<bool>,
-    #[serde(rename = "reasoningEffortOptions", alias = "reasoning_effort_options")]
-    reasoning_effort_options: Option<GrokReasoningEffortOptionsWire>,
+struct GrokReasoningEffortOptionWire {
+    value: GrokCatalogReasoningEffort,
+    #[serde(default)]
+    default: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct GrokReasoningEffortOptionsWire {
-    #[serde(default, rename = "supportedEfforts", alias = "supported_efforts")]
-    supported_efforts: Vec<GrokCatalogReasoningEffort>,
-    #[serde(rename = "defaultEffort", alias = "default_effort")]
-    default_effort: Option<GrokCatalogReasoningEffort>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum GrokReasoningEffortOptionWire {
-    Bare(GrokCatalogReasoningEffort),
-    Detailed {
-        value: GrokCatalogReasoningEffort,
-        #[serde(default)]
-        default: bool,
-    },
-}
-
-impl GrokReasoningEffortOptionWire {
-    fn into_parts(self) -> (GrokCatalogReasoningEffort, bool) {
-        match self {
-            Self::Bare(value) => (value, false),
-            Self::Detailed { value, default } => (value, default),
-        }
-    }
-}
-
-/// 解析唯一受支持的 Grok 官方完整快照。
+/// 解析唯一受支持的 Grok 官方完整快照
 ///
 /// # Errors
 ///
-/// 任一条目、重复 slug 或 ETag 不合法时整轮失败；上游新增的未知字段会忽略。
+/// 任一条目、重复 slug 或 ETag 不合法时整轮失败；上游新增的未知字段会忽略
 pub fn parse_grok_model_catalog(
     body: &[u8],
     etag: Option<&str>,
@@ -1062,8 +1024,8 @@ pub fn parse_grok_model_catalog(
 }
 
 fn normalize_model(wire: GrokModelWire) -> Result<GrokCatalogModel, GrokModelCatalogError> {
-    let actual_model = wire.model.or(wire.model_id).or_else(|| wire.id.clone());
-    let actual_model = actual_model.ok_or(GrokModelCatalogError::InvalidModelSlug)?;
+    let (context_window_tokens, max_context_window_tokens) = context_window_limits(&wire)?;
+    let actual_model = wire.model;
     if !valid_model_slug(&actual_model) {
         return Err(GrokModelCatalogError::InvalidModelSlug);
     }
@@ -1082,55 +1044,28 @@ fn normalize_model(wire: GrokModelWire) -> Result<GrokCatalogModel, GrokModelCat
         validate_public_text(description, MAX_DESCRIPTION_BYTES, true)?;
     }
 
-    let context_window_tokens = optional_positive(wire.context_window)?;
     let max_output_tokens = optional_positive(wire.max_completion_tokens)?;
     let api_backend = wire
         .api_backend
         .filter(|backend| *backend != GrokCatalogApiBackend::Unknown);
     let responses_api = responses_evidence(wire.supported_in_api, api_backend);
-    let features = wire.features;
-    let feature_reasoning = features.as_ref().and_then(|features| features.reasoning);
-    let feature_reasoning_options = features.and_then(|features| features.reasoning_effort_options);
-
-    let mut top_level_menu_default = None;
-    // 未识别的 effort 值不进入能力投影，也不作为默认值候选。
-    let top_level_reasoning_efforts =
-        reasoning_effort_menu(wire.reasoning_efforts, &mut top_level_menu_default);
-    let (feature_reasoning_efforts, feature_default_reasoning_effort) = feature_reasoning_options
-        .map_or_else(
-            || (Vec::new(), None),
-            |options| {
-                (
-                    options
-                        .supported_efforts
-                        .into_iter()
-                        .filter(|effort| *effort != GrokCatalogReasoningEffort::Unknown)
-                        .collect::<Vec<_>>(),
-                    options
-                        .default_effort
-                        .filter(|effort| *effort != GrokCatalogReasoningEffort::Unknown),
-                )
-            },
-        );
-    let reasoning_efforts = if feature_reasoning_efforts.is_empty() {
-        top_level_reasoning_efforts
-    } else {
-        feature_reasoning_efforts
-    };
-    let default_reasoning_effort = feature_default_reasoning_effort
-        .or_else(|| {
-            wire.reasoning_effort
-                .filter(|effort| *effort != GrokCatalogReasoningEffort::Unknown)
+    // 固定 CLI proxy 的对象菜单拥有档位与默认值，缺失声明时不替用户选择首项
+    let mut default_reasoning_effort = None;
+    let reasoning_efforts = wire
+        .reasoning_efforts
+        .into_iter()
+        .filter_map(|option| {
+            if option.value == GrokCatalogReasoningEffort::Unknown {
+                return None;
+            }
+            if option.default && default_reasoning_effort.is_none() {
+                default_reasoning_effort = Some(option.value);
+            }
+            Some(option.value)
         })
-        .or(top_level_menu_default)
-        .or_else(|| reasoning_efforts.first().copied());
-    let default_reasoning_effort = default_reasoning_effort
-        .filter(|default| reasoning_efforts.iter().any(|effort| effort == default))
-        .or_else(|| reasoning_efforts.first().copied());
+        .collect::<Vec<_>>();
     let reasoning_effort = if reasoning_efforts.is_empty() {
-        GrokCatalogCapabilityEvidence::from_wire(
-            wire.supports_reasoning_effort.or(feature_reasoning),
-        )
+        GrokCatalogCapabilityEvidence::Unknown
     } else {
         GrokCatalogCapabilityEvidence::DeclaredNative
     };
@@ -1149,6 +1084,7 @@ fn normalize_model(wire: GrokModelWire) -> Result<GrokCatalogModel, GrokModelCat
         },
         limits: GrokCatalogLimits {
             context_window_tokens,
+            max_context_window_tokens,
             max_output_tokens,
         },
         metadata: GrokCatalogMetadata {
@@ -1159,23 +1095,16 @@ fn normalize_model(wire: GrokModelWire) -> Result<GrokCatalogModel, GrokModelCat
     })
 }
 
-fn reasoning_effort_menu(
-    values: Vec<GrokReasoningEffortOptionWire>,
-    menu_default: &mut Option<GrokCatalogReasoningEffort>,
-) -> Vec<GrokCatalogReasoningEffort> {
-    values
+fn context_window_limits(
+    wire: &GrokModelWire,
+) -> Result<(Option<NonZeroU64>, Option<NonZeroU64>), GrokModelCatalogError> {
+    let default =
+        optional_positive(wire.context_window)?.or_else(|| wire.context_windows.first().copied());
+    let maximum = default
         .into_iter()
-        .filter_map(|option| {
-            let (effort, is_default) = option.into_parts();
-            if effort == GrokCatalogReasoningEffort::Unknown {
-                return None;
-            }
-            if is_default && menu_default.is_none() {
-                *menu_default = Some(effort);
-            }
-            Some(effort)
-        })
-        .collect()
+        .chain(wire.context_windows.iter().copied())
+        .max();
+    Ok((default, maximum))
 }
 
 fn responses_evidence(

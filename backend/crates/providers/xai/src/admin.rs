@@ -1,4 +1,4 @@
-//! xAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
+//! xAI 管理边界：Provider preparation 与 Redis OAuth pending 适配
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -396,7 +396,7 @@ impl ProviderAdmin for XaiAdminProvider {
     }
 
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
-        // 删除/禁用账号：清除该账号全部 account/model scoped cooldown key。
+        // 删除/禁用账号：清除该账号全部 account/model scoped cooldown key
         let _ = self.cooldowns.clear_all(account_id).await;
     }
 
@@ -458,7 +458,7 @@ impl ProviderAdmin for XaiAdminProvider {
             &input.upstream_model_id,
             input_tokens,
             output_tokens,
-            input.cached_tokens.unwrap_or_default(),
+            input.cached_input_tokens.unwrap_or_default(),
             input.service_tier.as_deref(),
         ) else {
             return Ok(None);
@@ -468,7 +468,7 @@ impl ProviderAdmin for XaiAdminProvider {
             return Ok(None);
         }
         Ok(Some(CalculatedBillingBreakdown {
-            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记。
+            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记
             long_context_billing_applied: false,
             image: None,
             custom_multiplier_bps: breakdown.custom_multiplier_bps(),
@@ -489,6 +489,35 @@ impl ProviderAdmin for XaiAdminProvider {
         }))
     }
 
+    fn evaluate_usage_pricing(
+        &self,
+        input: &gateway_admin::ports::provider::ProviderUsagePricingInput,
+        pricing: Option<&gateway_core::metering::ModelPriceOverride>,
+    ) -> Result<Option<gateway_core::metering::CalculatedCostBreakdown>, ProviderAdminError> {
+        let (Some(input_tokens), Some(output_tokens), Some(cached), Some(written)) = (
+            input.usage.input_tokens,
+            input.usage.output_tokens,
+            input.usage.cached_input_tokens,
+            input.usage.cache_write_input_tokens,
+        ) else {
+            return Ok(None);
+        };
+        if input.usage.image_input_tokens != Some(0) || input.usage.image_output_tokens != Some(0) {
+            return Ok(None);
+        }
+        Ok(
+            crate::transport::canonical::grok_billing_breakdown_with_override(
+                &input.upstream_model_id,
+                input_tokens,
+                output_tokens,
+                cached,
+                written,
+                input.service_tier.as_deref(),
+                pricing,
+            ),
+        )
+    }
+
     async fn prepare_import(
         &self,
         command: PrepareCredentialImport,
@@ -505,11 +534,12 @@ impl ProviderAdmin for XaiAdminProvider {
         let mut subjects = BTreeSet::new();
         let mut credentials = Vec::new();
         // 逐条目独立成败：verify 会真实轮换 RT，后续条目的任何失败都不得
-        // 丢弃已轮换成功的凭据（旧 RT 已被上游作废，丢弃即不可逆报废）。
-        // 失败条目跳过；仅当没有任何条目成功时返回首个失败。响应只携带
+        // 丢弃已轮换成功的凭据（旧 RT 已被上游作废，丢弃即不可逆报废）
+        // 失败条目跳过；仅当没有任何条目成功时返回首个失败
+        // 响应只携带
         // 成功计数，每个被跳过的条目在此逐条留日志——尤其 verify 成功后
         // 才失败/被去重的条目，其源文件里的 RT 已被轮换作废，运维只能从
-        // 日志得知需要重新授权。
+        // 日志得知需要重新授权
         let mut first_failure: Option<ProviderAdminError> = None;
         for entry in document.into_entries() {
             let model_access = entry.model_access().cloned();
@@ -538,7 +568,7 @@ impl ProviderAdmin for XaiAdminProvider {
                 }
             };
             // 同一账号的另一份 grant：账号已由更早条目入册，本条目跳过；
-            // 本条目若经历了 refresh，其源文件 RT 已作废。
+            // 本条目若经历了 refresh，其源文件 RT 已作废
             if !subjects.insert(tokens.evidence().subject().to_owned()) {
                 tracing::warn!(
                     target: "xai_admin",
@@ -1118,6 +1148,7 @@ fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, Provi
         account.access_token_expires_at.map(SystemTime::from),
     )
     .with_outbound_proxy(account.outbound_proxy.clone())
+    .with_notes(account.notes.clone())
     .with_profile(
         account.email.clone(),
         account.upstream_account_id.clone(),
@@ -1153,6 +1184,7 @@ fn project_quota(
 ) -> ProviderQuota {
     let Some(snapshot) = snapshot else {
         return ProviderQuota {
+            credits: None,
             plan_type: None,
             observed_at: None,
             refresh_token_expires_at,
@@ -1179,8 +1211,6 @@ fn project_quota(
                 .map_or(Value::Null, |value| Value::String(value.to_owned())),
         );
         for (key, value) in [
-            ("monthlyLimitCents", billing.monthly_limit_cents()),
-            ("includedUsedCents", billing.included_used_cents()),
             ("onDemandCapCents", billing.on_demand_cap_cents()),
             ("onDemandUsedCents", billing.on_demand_used_cents()),
             ("prepaidBalanceCents", billing.prepaid_balance_cents()),
@@ -1225,6 +1255,7 @@ fn project_quota(
         }
     };
     ProviderQuota {
+        credits: None,
         plan_type: billing.plan_type().map(str::to_owned),
         observed_at: Some(snapshot.observed_at()),
         refresh_token_expires_at,
@@ -1488,21 +1519,23 @@ fn map_store_error(error: gateway_core::error::StoreError) -> ProviderAdminError
         StoreErrorKind::Unavailable => ProviderAdminErrorKind::Unavailable,
         _ => ProviderAdminErrorKind::Internal,
     })
+    .with_source(error)
 }
 
 fn map_repository_error(error: GrokCredentialRepositoryError) -> ProviderAdminError {
     use GrokCredentialRepositoryError as Error;
-    provider_error(match error {
+    provider_error(match &error {
         Error::InvalidInput(_)
         | Error::WrongProviderKind
         | Error::IdentityRebind
-        | Error::InvalidCredentialData => ProviderAdminErrorKind::Invalid,
+        | Error::InvalidCredentialData(_) => ProviderAdminErrorKind::Invalid,
         Error::CredentialNotFound => ProviderAdminErrorKind::NotFound,
-        Error::StaleCredentialRevision | Error::Conflict | Error::RevisionOverflow => {
+        Error::StaleCredentialRevision(_) | Error::Conflict(_) | Error::RevisionOverflow => {
             ProviderAdminErrorKind::Conflict
         }
-        Error::Store => ProviderAdminErrorKind::Unavailable,
+        Error::Store(_) => ProviderAdminErrorKind::Unavailable,
     })
+    .with_source(error)
 }
 
 fn map_refresh_error(error: GrokCredentialRefreshError) -> ProviderAdminError {

@@ -1,7 +1,7 @@
-//! 主动 HTTP 子调用只进入 API 分派端口，正文复用当前 RPC 的资源池。
+//! 主动 HTTP 子调用只进入 API 分派端口，正文复用当前 RPC 的资源池
 use super::{CallResources, http_middleware, invalid, services::ServicePorts};
 use crate::RpcReply;
-use gateway_core::middleware::http as core;
+use gateway_core::engine::middleware::http as core;
 use gateway_plugin_sdk::{CallContext, PluginFault, call::middleware::http as wire};
 
 pub(super) async fn call(
@@ -49,7 +49,7 @@ pub(super) async fn call(
             |parent| parent.call_id.clone(),
         )),
         extensions: call.scope.child_extensions(&context.instance_id)?,
-        // 句柄可以在父 RPC End 后交给 HTTP 发送端；生命周期属于父调用和响应正文，不能在 RPC End 提前取消。
+        // 句柄可以在父 RPC End 后交给 HTTP 发送端；生命周期属于父调用和响应正文，不能在 RPC End 提前取消
         cancellation: parent.map_or_else(
             || call.cancellation.child_token(),
             |parent| parent.cancellation.child_token(),
@@ -63,7 +63,7 @@ pub(super) async fn call(
     *http.headers_mut() = headers;
     *http.version_mut() = http_middleware::version(request.version);
     http.extensions_mut().insert(settings);
-    call.scope.observe_http_dispatch();
+    call.observe_dispatch()?;
     let response = dispatcher
         .dispatch(child, http)
         .await

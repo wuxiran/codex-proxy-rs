@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { PoolGateway, PoolSnapshot } from '@/api'
-import { BaseButton, BaseCard, BaseInput, BaseModal } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZDialog, ZInput } from '@codex-proxy/ui'
 import { computed, ref } from 'vue'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime } from '@/utils/format.fork'
 import { remaining, verificationText } from '../utils/poolOverview'
 import AccountPoolSummary from './AccountPoolSummary.vue'
 
@@ -56,13 +56,13 @@ function tone(gateway: PoolGateway) {
 </script>
 
 <template>
-  <BaseCard title="网关总览" description="本实例已观察到的网关与空闲预热连接" data-testid="pool-overview" :data-snapshot-stale="stale" :data-snapshot-paused="paused" :data-snapshot-now="now" :data-snapshot-until="snapshot?.validUntilMs">
+  <ZCard title="网关总览" description="本实例已观察到的网关与空闲预热连接" data-testid="pool-overview" :data-snapshot-stale="stale" :data-snapshot-paused="paused" :data-snapshot-now="now" :data-snapshot-until="snapshot?.validUntilMs">
     <div class="grid min-w-0 gap-4">
       <div class="flex flex-wrap items-center justify-between gap-2 text-cp-xs text-cp-text-secondary">
         <span role="status" data-testid="pool-snapshot-status">{{ snapshotState }}<template v-if="snapshot"> · {{ formatDateTime(new Date(snapshot.observedAtMs).toISOString()) }}</template></span>
-        <BaseButton size="sm" variant="soft" :loading="loading" @click="emit('refresh')">
+        <ZButton size="small" type="primary" variant="plain" :loading="loading" @click="emit('refresh')">
           刷新票池
-        </BaseButton>
+        </ZButton>
       </div>
       <div class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6" aria-label="票池指标">
         <div v-for="metric in metrics" :key="metric.label" class="rounded-cp bg-cp-fill-quaternary px-3 py-3">
@@ -88,7 +88,7 @@ function tone(gateway: PoolGateway) {
             {{ group.label }}
           </button>
         </div>
-        <BaseInput v-model="search" class="w-full sm:ml-auto sm:w-64" placeholder="搜索网关、账号或模型" aria-label="搜索网关、账号或模型" />
+        <ZInput v-model="search" class="w-full sm:ml-auto sm:w-64" placeholder="搜索网关、账号或模型" aria-label="搜索网关、账号或模型" />
       </div>
       <div v-if="!snapshot && loading" class="py-7 text-center text-cp-sm text-cp-text-secondary">
         正在读取票据与连接状态
@@ -121,8 +121,8 @@ function tone(gateway: PoolGateway) {
         <span>验证结果按账号和模型区分</span><span v-if="snapshot">显示 {{ rows.length }} / {{ snapshot.gateways.length }} 个网关</span>
       </div>
     </div>
-  </BaseCard>
-  <BaseModal v-model="detailOpen" :title="selectedGateway" size="md-wide">
+  </ZCard>
+  <ZDialog v-model="detailOpen" :title="selectedGateway" width="42rem">
     <div v-if="selected" class="grid gap-4" data-testid="pool-gateway-detail">
       <p v-if="stale || paused" class="m-0 text-cp-sm text-cp-warning">
         {{ snapshotState }}，以下为最近一次快照
@@ -147,5 +147,5 @@ function tone(gateway: PoolGateway) {
     <p v-else class="m-0 text-cp-sm text-cp-text-secondary">
       该网关已不在当前快照中
     </p>
-  </BaseModal>
+  </ZDialog>
 </template>

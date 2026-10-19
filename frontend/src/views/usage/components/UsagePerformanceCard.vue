@@ -2,16 +2,16 @@
 import type { EChartsOption } from 'echarts'
 import type { getUsageRecordInsightsOverview } from '@/api'
 
-import { BaseCard, BaseEmpty, BaseSegmented } from '@codex-proxy/ui'
+import { ZCard, ZEmpty, ZSegmented } from '@codex-proxy/ui'
 import { computed, shallowRef } from 'vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { requestActivityByBucket, zeroInactiveValues } from '@/components/charts/timeSeriesGap'
+import { tooltipIndex, tooltipRows } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
+import { formatLocalizedCompactNumber as formatCompactNumber, formatDuration, formatPercent } from '@/utils/format'
 
 import {
-  tooltipIndex,
-  tooltipRows,
+  formatDurationAxis,
   usageCategoryAxis,
   usageGapAwareLineSeries,
   usageLegend,
@@ -20,7 +20,6 @@ import {
   usageTooltipItem,
   usageValueAxis,
 } from '../utils/chart'
-import { formatDuration, formatDurationAxis, formatPercent } from '../utils/format'
 
 type Performance = Awaited<ReturnType<typeof getUsageRecordInsightsOverview>>['performance']
 type PerformancePoint = Performance['points'][number]
@@ -48,7 +47,7 @@ const requestActivity = computed(() => requestActivityByBucket(
 const viewOptions = [
   { label: '总耗时', value: 'total' },
   { label: '首字', value: 'firstToken' },
-  { label: '吞吐', value: 'throughput' },
+  { label: '速率', value: 'throughput' },
   { label: '调度', value: 'scheduling' },
 ]
 
@@ -236,14 +235,14 @@ function formatThroughput(value: number | null) {
 </script>
 
 <template>
-  <BaseCard
+  <ZCard
     as="article"
     title="响应速度"
-    description="延迟、吞吐与调度分位"
+    description="延迟、速率与调度分位"
     class="min-h-90 xl:h-full"
   >
     <template #actions>
-      <BaseSegmented v-model="activeView" label="性能指标" :options="viewOptions" :disabled="loading" class="w-68" />
+      <ZSegmented v-model="activeView" aria-label="性能指标" :options="viewOptions" :disabled="loading" class="w-68" />
     </template>
 
     <template #body>
@@ -257,16 +256,16 @@ function formatThroughput(value: number | null) {
           </div>
         </div>
         <BaseChart v-if="hasData" :option="chartOption" :height="210" />
-        <BaseEmpty
+        <ZEmpty
           v-else
-          size="sm"
+          size="small"
           surface="none"
           :title="loading ? '正在加载性能数据' : '暂无性能数据'"
           :description="
             activeView === 'firstToken'
               ? '当前范围没有首字耗时样本'
               : activeView === 'throughput'
-                ? '当前范围没有吞吐样本'
+                ? '当前范围没有速率样本'
                 : activeView === 'scheduling'
                   ? '当前范围没有调度或容量样本'
                   : '当前范围没有总耗时样本'
@@ -275,5 +274,5 @@ function formatThroughput(value: number | null) {
         />
       </div>
     </template>
-  </BaseCard>
+  </ZCard>
 </template>

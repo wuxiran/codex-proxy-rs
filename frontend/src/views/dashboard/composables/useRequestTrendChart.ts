@@ -1,6 +1,6 @@
 import type { BarSeriesOption, EChartsOption, LineSeriesOption } from 'echarts'
 import type { Ref } from 'vue'
-import type { dashboardTrendView, normalizeDashboardTrendKind } from './useDashboard'
+import type { dashboardTrendView, normalizeDashboardTrendKind } from '../presenter'
 import { usePreferredReducedMotion } from '@vueuse/core'
 import { computed, shallowRef, watch } from 'vue'
 
@@ -66,7 +66,7 @@ export function useRequestTrendChart(options: {
         || (point.latencyP95Ms ?? 0) > 0
         || (point.outputThroughputP50 ?? 0) > 0
         || point.tokensValue > 0
-        || point.cachedTokensValue > 0,
+        || point.cachedInputTokensValue > 0,
     ),
   )
 
@@ -78,9 +78,9 @@ export function useRequestTrendChart(options: {
   )
 
   const chartOption = computed<EChartsOption>(() => {
-    const times = points.value.map(point => point.time)
+    const buckets = points.value.map(point => point.bucket)
     return {
-      ...getCoordinateSystem(times),
+      ...getCoordinateSystem(buckets),
       series: getSeries(),
       animationDuration: preferredMotion.value === 'reduce' ? 0 : 420,
       animationDurationUpdate: preferredMotion.value === 'reduce' ? 0 : 220,
@@ -99,7 +99,7 @@ export function useRequestTrendChart(options: {
     }
   })
 
-  function getCoordinateSystem(times: string[]) {
+  function getCoordinateSystem(buckets: string[]) {
     const muted = palette.value.textMuted
     const gridLine = palette.value.divider
     const axisLine = palette.value.border
@@ -114,7 +114,7 @@ export function useRequestTrendChart(options: {
       },
       xAxis: {
         type: 'category' as const,
-        data: times,
+        data: buckets,
         boundaryGap: activeKind.value === 'errors',
         axisLine: { show: true, lineStyle: { color: axisLine } },
         axisTick: { show: false },
@@ -123,7 +123,7 @@ export function useRequestTrendChart(options: {
           fontSize: 10,
           fontFamily: 'JetBrains Mono Variable, JetBrains Mono',
           hideOverlap: true,
-          interval: showTwoHourLabel,
+          formatter: (_value: string, index: number) => points.value[index]?.time ?? '',
         },
       },
       yAxis: [
@@ -183,8 +183,8 @@ export function useRequestTrendChart(options: {
 
   function formatTooltip(params: unknown) {
     const rows = Array.isArray(params) ? params : [params]
-    const title = tooltipValue(rows[0], 'axisValueLabel')
     const point = points.value[tooltipIndex(rows[0])]
+    const title = point?.label ?? ''
 
     if (activeKind.value === 'usage') {
       return [
@@ -193,7 +193,7 @@ export function useRequestTrendChart(options: {
         tooltipItem('输出', point?.outputTokens, trendColor('输出', '--cp-color-green-solid', '#12B981')),
         tooltipItem(
           '缓存',
-          point?.cachedTokens,
+          point?.cachedInputTokens,
           trendColor('缓存', '--cp-color-text-tertiary', '#94A3B8'),
         ),
         tooltipItem(
@@ -223,14 +223,14 @@ export function useRequestTrendChart(options: {
       if (name === '输出')
         return point?.outputTokens ?? value
       if (name === '缓存')
-        return point?.cachedTokens ?? value
+        return point?.cachedInputTokens ?? value
     }
     if (activeKind.value === 'latency') {
       if (name === '首字 P95')
         return formatLatency(point?.firstTokenP95Ms, value)
       if (name === '总耗时 P95')
         return formatLatency(point?.latencyP95Ms, value)
-      if (name === '吞吐 P50')
+      if (name === '速率 P50')
         return point?.outputThroughputP50 == null ? value : `${point.outputThroughputP50} tok/s`
     }
     if (name === '错误数')
@@ -248,7 +248,7 @@ export function useRequestTrendChart(options: {
       const inputColor = trendColor('输入', '--cp-color-blue-solid', '#5983F4')
       const outputColor = trendColor('输出', '--cp-color-green-solid', '#12B981')
       return [
-        lineSeries('缓存', seriesValues('cachedTokensValue'), cacheColor, {
+        lineSeries('缓存', seriesValues('cachedInputTokensValue'), cacheColor, {
           area: true,
           areaStartAlpha: '30',
           areaEndAlpha: '08',
@@ -291,9 +291,9 @@ export function useRequestTrendChart(options: {
           { area: true, smooth: 0.24, width: 2.5, z: 4 },
         ),
         ...gapLineSeries(
-          '吞吐 P50',
+          '速率 P50',
           activeSeriesValues('outputThroughputP50'),
-          trendColor('吞吐', '--cp-color-green-solid', '#12B981'),
+          trendColor('速率', '--cp-color-green-solid', '#12B981'),
           { smooth: 0.2, width: 2, yAxisIndex: 1, z: 3 },
         ),
       ]
@@ -487,11 +487,6 @@ function formatLatency(value: number | null | undefined, fallback: string) {
   if (value < 60_000)
     return `${formatAxisNumber(value / 1_000)} s`
   return `${formatAxisNumber(value / 60_000)} min`
-}
-
-function showTwoHourLabel(_index: number, value: string) {
-  const [hour, minute] = value.split(':').map(Number)
-  return minute === 0 && hour % 2 === 0
 }
 
 function tooltipItem(label: string, value: string | undefined, color: string) {

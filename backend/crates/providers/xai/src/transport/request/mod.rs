@@ -1,4 +1,4 @@
-//! OpenAI Responses 请求到官方 Grok Build wire 的转换边界。
+//! OpenAI Responses 请求到官方 Grok Build wire 的转换边界
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,7 +12,7 @@ use super::{GrokSessionAffinityKey, XAI_PROVIDER_NAME};
 
 mod history;
 mod identity;
-mod model;
+mod parameters;
 mod response;
 mod schema;
 mod tools;
@@ -22,16 +22,16 @@ pub(crate) use response::GrokResponseTransform;
 
 use history::*;
 use identity::*;
-use model::*;
+use parameters::*;
 use schema::*;
 use tools::*;
 
 /// Grok CLI 在历史条目上注入、Grok Build 无法反序列化的内部键；只在已知
-/// 注入位置剥离，避免误伤工具 schema 或输出中恰好同名的键。
+/// 注入位置剥离，避免误伤工具 schema 或输出中恰好同名的键
 const GROK_INTERNAL_HISTORY_KEYS: &[&str] =
     &["phase", "internal_chat_message_metadata_passthrough"];
 
-/// 保留客户端 OpenAI Responses object 的 xAI 上游请求。
+/// 保留客户端 OpenAI Responses object 的 xAI 上游请求
 pub struct GrokResponsesRequest {
     body: Map<String, Value>,
     session_id: Option<String>,
@@ -40,25 +40,33 @@ pub struct GrokResponsesRequest {
     response_transform: GrokResponseTransform,
 }
 
+/// 重放条目在进入 wire 编码前的来源，避免将已编码别名再次当作客户端名称解释
+pub(crate) enum GrokReplayItem {
+    /// 已由请求转换器编码的输入，保留上游别名
+    UpstreamInput(Value),
+    /// 已向客户端回译的输出，需要按本轮工具声明重新编码
+    ClientOutput(Value),
+}
+
 impl GrokResponsesRequest {
-    /// 返回发送到 `/v1/responses` 的 JSON object。
+    /// 返回发送到 `/v1/responses` 的 JSON object
     #[must_use]
     pub const fn body(&self) -> &Map<String, Value> {
         &self.body
     }
 
-    /// 返回按下游租户隔离后的稳定 Grok 会话 UUID。
+    /// 返回按下游租户隔离后的稳定 Grok 会话 UUID
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
-    /// 返回只有显式会话身份才启用的 reasoning replay scope。
+    /// 返回只有显式会话身份才启用的 reasoning replay scope
     pub(crate) fn reasoning_replay_session_id(&self) -> Option<&str> {
         self.reasoning_replay_session_id.as_deref()
     }
 
-    /// 返回归一化后的 xAI wire 模型。
+    /// 返回归一化后的 xAI wire 模型
     pub(crate) fn upstream_model(&self) -> Option<&str> {
         self.body.get("model").and_then(Value::as_str)
     }
@@ -75,7 +83,7 @@ impl GrokResponsesRequest {
         self.body.get("input").and_then(Value::as_array).cloned()
     }
 
-    /// 返回与会话一致、额外绑定模型的账号亲和键。
+    /// 返回与会话一致、额外绑定模型的账号亲和键
     #[must_use]
     pub const fn affinity(&self) -> Option<&GrokSessionAffinityKey> {
         self.affinity.as_ref()
@@ -99,18 +107,29 @@ impl GrokResponsesRequest {
 
     pub(crate) fn set_replay_input(
         &mut self,
-        input: Vec<Value>,
+        input: Vec<GrokReplayItem>,
     ) -> Result<(), GrokRequestEncodeError> {
         let mut normalizer = ToolNormalizer::for_replay(self.response_transform.clone());
         let mut normalized = Vec::with_capacity(input.len());
         for item in input {
             match item {
-                Value::Object(item) if string_field(&item, "type") == "custom_tool_call" => {
+                GrokReplayItem::ClientOutput(Value::Object(item))
+                    if string_field(&item, "type") == "custom_tool_call" =>
+                {
                     normalized.push(Value::Object(
                         normalizer.normalize_custom_tool_call_input(&item)?,
                     ));
                 }
-                item => normalized.push(item),
+                GrokReplayItem::ClientOutput(Value::Object(item))
+                    if string_field(&item, "type") == "function_call" =>
+                {
+                    normalized.push(Value::Object(
+                        normalizer.normalize_function_call_input(&item)?,
+                    ));
+                }
+                GrokReplayItem::UpstreamInput(item) | GrokReplayItem::ClientOutput(item) => {
+                    normalized.push(item);
+                }
             }
         }
         self.response_transform = normalizer.response;
@@ -119,10 +138,10 @@ impl GrokResponsesRequest {
         Ok(())
     }
 
-    /// 为同账号的一次 xAI `invalid_encrypted_content` 恢复请求移除被拒绝的密文。
+    /// 为同账号的一次 xAI `invalid_encrypted_content` 恢复请求移除被拒绝的密文
     ///
     /// 只在至少一个 reasoning item 含非空密文时改写；可读 summary/content、ID 与
-    /// 其他历史保持不变，剥离后只剩 `type` 的空壳一并删除。
+    /// 其他历史保持不变，剥离后只剩 `type` 的空壳一并删除
     pub(crate) fn strip_invalid_encrypted_reasoning(&mut self) -> bool {
         strip_invalid_encrypted_reasoning_from_body(&mut self.body)
     }
@@ -201,13 +220,18 @@ impl GrokResponsesRequest {
         if payload.protocol() != "openai" {
             return Err(GrokRequestEncodeError::InvalidProtocolPayload);
         }
+        // Grok Build 会把 Codex 的预热请求当作真实生成；必须在发送前拒绝，
+        // 不能删掉控制字段后继续调用，或在已经计费后隐藏响应与费用
+        if payload.body().get("generate").and_then(Value::as_bool) == Some(false) {
+            return Err(GrokRequestEncodeError::UnsupportedPrewarm);
+        }
         let mut body = payload.body().clone();
         if should_consume_terminal_compaction_trigger {
             consume_terminal_compaction_trigger(&mut body)?;
         }
-        let upstream_model = resolve_grok_text_responses_model_id(upstream_model);
-        // 这些字段属于 Codex/OpenAI 侧请求控制，不是 xAI 上游协议字段。
-        // OpenAI 透明路径会保留未知字段；这里只在 xAI adapter 内做最小剥离。
+        let upstream_model = upstream_model.to_owned();
+        // 这些字段属于 Codex/OpenAI 侧请求控制，不是 xAI 上游协议字段
+        // OpenAI 透明路径会保留未知字段；这里只在 xAI adapter 内做最小剥离
         body.remove("provider_options");
         body.remove("service_tier");
         let session_seed = explicit_session_seed(request, &body);
@@ -220,7 +244,7 @@ impl GrokResponsesRequest {
         );
         sanitize_account_identity(&mut body);
         sanitize_client_metadata(&mut body);
-        normalize_build_request(&mut body, &upstream_model)?;
+        normalize_build_request(&mut body)?;
         let mut response_transform = normalize_responses_request(&mut body)?;
         response_transform.observe_client_cache_tools();
         if enable_cache_route {
@@ -258,33 +282,6 @@ impl GrokResponsesRequest {
     }
 }
 
-fn resolve_grok_text_responses_model_id(model: &str) -> String {
-    let stripped = strip_grok_provider_prefix(model);
-    let normalized = stripped.to_ascii_lowercase();
-    match normalized.as_str() {
-        "grok" | "grok-latest" | "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => {
-            "grok-4.5".to_owned()
-        }
-        "grok-4.6" | "grok-4.6-latest" => "grok-4.6".to_owned(),
-        "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_owned(),
-        "grok-3-mini"
-        | "grok-3-mini-fast"
-        | "grok-build-0.1"
-        | "grok-composer-2.5-fast"
-        | "grok-4.20-0309-reasoning"
-        | "grok-4.20-0309-non-reasoning"
-        | "grok-4.20-multi-agent-0309" => normalized,
-        "grok-build" => "grok-build-0.1".to_owned(),
-        "grok-composer" | "composer-2.5" => "grok-composer-2.5-fast".to_owned(),
-        "grok-4.20-reasoning" => "grok-4.20-0309-reasoning".to_owned(),
-        "grok-4.20-non-reasoning" => "grok-4.20-0309-non-reasoning".to_owned(),
-        "grok-4.20-multi-agent" | "grok-4.20-multi-agent-latest" => {
-            "grok-4.20-multi-agent-0309".to_owned()
-        }
-        _ => stripped.to_owned(),
-    }
-}
-
 fn consume_terminal_compaction_trigger(
     body: &mut Map<String, Value>,
 ) -> Result<(), GrokRequestEncodeError> {
@@ -316,19 +313,22 @@ impl fmt::Debug for GrokResponsesRequest {
     }
 }
 
-/// Generate 到 Responses 的编码错误，不保留 option 与 prompt 值。
+/// Generate 到 Responses 的编码错误，不保留 option 与 prompt 值
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum GrokRequestEncodeError {
-    /// 数据面只接受 OpenAI adapter 保留的原始 Responses object。
+    /// 数据面只接受 OpenAI adapter 保留的原始 Responses object
     #[error("Grok Build request is missing its OpenAI protocol payload")]
     InvalidProtocolPayload,
-    /// JSON 序列化意外失败。
+    /// Grok Build 不支持 Codex 的非生成预热语义
+    #[error("Grok Build does not support non-generating prewarm requests (generate=false)")]
+    UnsupportedPrewarm,
+    /// JSON 序列化意外失败
     #[error("Grok Build request serialization failed")]
     Serialization,
-    /// Responses 兼容字段无法安全归一化。
+    /// Responses 兼容字段无法安全归一化
     #[error("Grok Build request normalization failed")]
     InvalidRequestNormalization,
-    /// 请求中的具体字段无法安全转换为 Grok Build 接受的形态。
+    /// 请求中的具体字段无法安全转换为 Grok Build 接受的形态
     #[error("Grok Build request field `{field}` could not be normalized safely")]
     InvalidRequestField { field: &'static str },
 }

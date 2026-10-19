@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { BasePageHeader } from '@codex-proxy/ui'
+import { ZPageHeader } from '@codex-proxy/ui'
 import PublicImportCard from '@/views/settings/components/PublicImportCard.vue'
 </script>
 
 <template>
   <div class="w-full">
-    <BasePageHeader
+    <ZPageHeader
       title="免登录导入"
       description="生成免登录导入链接，上游无需账号密码即可导入 sub2api 格式账号"
     />

@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import type { OpsError } from '@/api/modules/usage'
-import { BasePopover } from '@codex-proxy/ui'
+import type { UsageListRecord } from '@/api'
+import { ZPopover } from '@codex-proxy/ui'
 
 import { computed, shallowRef, useId } from 'vue'
-import { getOpsErrors } from '@/api'
+import { getUsageRecords } from '@/api'
 import { errorMessage } from '@/utils/operation'
 import { errorRateDisplay } from '../constants'
 
@@ -21,7 +21,7 @@ const detailId = `account-recent-errors-${useId()}`
 const open = shallowRef(false)
 const loading = shallowRef(false)
 const loadError = shallowRef('')
-const items = shallowRef<OpsError[]>([])
+const items = shallowRef<UsageListRecord[]>([])
 const total = shallowRef(0)
 let loadedAt = 0
 let requestSeq = 0
@@ -37,8 +37,10 @@ async function load() {
   const end = new Date()
   const start = new Date(end.getTime() - 24 * 3600 * 1000)
   try {
-    const result = await getOpsErrors({
+    // 上游已把运维错误并入请求记录（status=error 过滤），这里按账号取最近几条失败请求。
+    const result = await getUsageRecords({
       accountId: props.accountId,
+      status: 'error',
       startTime: start.toISOString(),
       endTime: end.toISOString(),
       currentPage: 1,
@@ -67,15 +69,17 @@ function updateOpen(nextOpen: boolean) {
     void load()
 }
 
-function errorCode(item: OpsError) {
-  return item.providerErrorCode
-    ?? (item.upstreamStatusCode === null ? null : String(item.upstreamStatusCode))
-    ?? item.failureClass
+function errorCode(item: UsageListRecord) {
+  return item.errorCode ?? item.logicalOutcome
+}
+
+function errorText(item: UsageListRecord) {
+  return item.errorMessage ?? '未记录错误信息'
 }
 </script>
 
 <template>
-  <BasePopover
+  <ZPopover
     :model-value="open"
     trigger="hover-click"
     placement="right"
@@ -83,7 +87,7 @@ function errorCode(item: OpsError) {
     :hover-delay="240"
     @update:model-value="updateOpen"
   >
-    <template #trigger>
+    <template #reference>
       <button
         type="button"
         class="whitespace-nowrap rounded-cp-sm border-0 bg-transparent p-0 text-left text-cp-xs font-emphasis tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline"
@@ -125,11 +129,11 @@ function errorCode(item: OpsError) {
             <span v-if="item.model" class="text-cp-text-secondary">{{ item.model }}</span>
             <span class="ml-auto font-mono text-cp-error-text">{{ errorCode(item) }}</span>
           </div>
-          <p class="m-0 line-clamp-2 text-cp-xs leading-4 text-cp-text wrap-anywhere select-text" :title="item.message">
-            {{ item.message }}
+          <p class="m-0 line-clamp-2 text-cp-xs leading-4 text-cp-text wrap-anywhere select-text" :title="errorText(item)">
+            {{ errorText(item) }}
           </p>
         </li>
       </ol>
     </section>
-  </BasePopover>
+  </ZPopover>
 </template>

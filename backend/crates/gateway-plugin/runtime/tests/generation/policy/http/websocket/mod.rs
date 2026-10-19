@@ -1,6 +1,8 @@
+//! 验证真实插件 WebSocket 升级、双向大帧与会话资源生命周期
+
 use super::*;
 use futures::FutureExt as _;
-use gateway_core::middleware::{http::upgrade, websocket as ws};
+use gateway_core::engine::middleware::{http::upgrade, websocket as ws};
 use std::sync::atomic::AtomicBool;
 
 struct Transport {
@@ -73,8 +75,8 @@ async fn session_model_and_network_callbacks_outlive_handshake_and_each_executio
     environment.store.start_command_line_writes().unwrap();
     let snapshot = bundle.snapshots().snapshot_for_diagnostics().unwrap();
     let plan = runtime
-        .middleware_registry()
-        .resolve(snapshot.extensions().unwrap())
+        .execution_registry()
+        .middleware(snapshot.extensions().unwrap())
         .unwrap();
     let (send, incoming) = tokio::sync::mpsc::channel(1);
     let (outgoing, mut receive) = tokio::sync::mpsc::channel(1);
@@ -139,7 +141,7 @@ async fn session_model_and_network_callbacks_outlive_handshake_and_each_executio
     let reply: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
     assert_eq!(reply["result"]["status"], 200);
     assert_eq!(reply["payload_bytes"], 13);
-    // 超过单个子调用图的 16 次预算，连接仍可承载新的独立执行。
+    // 超过单个子调用图的 16 次预算，连接仍可承载新的独立执行
     let mut requests = BTreeSet::new();
     for _ in 0..18 {
         send.send(call(serde_json::json!({"method":"host.model.execute","params":{
@@ -340,6 +342,68 @@ async fn dropping_an_uncommitted_upgrade_or_cancelling_a_session_reclaims_its_so
         })
         .await
         .unwrap();
+        drop(plan);
+        drop(generation);
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn upgraded_plugin_business_failure_reaches_terminal_owner_with_safe_classification() {
+    for mode in ["session-error", "session-cancelled"] {
+        let (_cache, runtime, generation, plan) = http_plugin(mode).await;
+        let (_send, incoming) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _receive) = tokio::sync::mpsc::channel(1);
+        let transport = Arc::new(Transport {
+            incoming: tokio::sync::Mutex::new(incoming),
+            outgoing,
+            dropped: Arc::default(),
+        });
+        let mut request = ::http::Request::builder()
+            .uri("/custom/session")
+            .body(core::empty_body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(Arc::new(Upgrade(transport)) as Arc<dyn upgrade::WebSocketUpgrade>);
+        let mut response = plan
+            .handle_http(
+                core::Context {
+                    plugin_instance_id: None,
+                    request_id: "session-failure".into(),
+                    call_id: "http-call".into(),
+                    parent_call_id: None,
+                    extensions: Default::default(),
+                    plan: Some(plan.clone()),
+                    cancellation: CancellationToken::new(),
+                },
+                request,
+                compose(Vec::new(), |_| {
+                    Box::pin(async { panic!("session owns its response") })
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 101);
+        let task = response
+            .extensions_mut()
+            .remove::<upgrade::Upgraded>()
+            .unwrap()
+            .take_task()
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        if mode == "session-error" {
+            assert!(
+                matches!(error, upgrade::SessionError::Failed { kind: "permission_denied", plugin_instance_id: Some(ref id) } if id == "http-plugin")
+            );
+        } else {
+            assert!(matches!(error, upgrade::SessionError::Cancelled));
+        }
+        assert!(!format!("{error:?}").contains("private-plugin-error"));
+        drop(response);
         drop(plan);
         drop(generation);
         runtime.shutdown().await;

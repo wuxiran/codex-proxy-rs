@@ -1,3 +1,5 @@
+//! OpenAI 上游 HTTP、SSE、WebSocket 与客户端画像的测试入口
+
 use std::{
     process::Command,
     sync::{
@@ -56,10 +58,12 @@ mod endpoints;
 mod headers;
 mod http_client;
 mod latency;
+pub(crate) mod privacy;
 mod profile;
 mod profile_avatar;
 mod profile_contract;
 mod protocol;
+mod proxy_capacity;
 mod request;
 mod reset_credits;
 mod subscription;
@@ -71,6 +75,7 @@ mod websocket_pool;
 // fork: fork 专属传输测试
 mod fork_billing_identity;
 mod fork_ws_warm_pool;
+mod warm_connection;
 
 fn websocket_accept_config() -> WebSocketConfig {
     let mut extensions = ExtensionsConfig::default();
@@ -110,11 +115,12 @@ pub(crate) async fn accept_codex_test_websocket(
     .await
 }
 
-pub(crate) async fn accept_codex_test_websocket_with<F>(
-    stream: TcpStream,
+pub(crate) async fn accept_codex_test_websocket_with<S, F>(
+    stream: S,
     callback: F,
-) -> tokio_tungstenite::WebSocketStream<TcpStream>
+) -> tokio_tungstenite::WebSocketStream<S>
 where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnOnce(&WebSocketRequest, &mut WebSocketResponse) + Unpin,
 {
     accept_hdr_async_with_config(
@@ -269,7 +275,16 @@ async fn collect_backend_response(
                 .unwrap_or(i64::MAX)
                 .max(1)
         });
-        body_bytes.extend_from_slice(&chunk);
+        if transport == CodexBackendTransport::WebSocket {
+            let raw = std::str::from_utf8(&chunk).unwrap();
+            body_bytes.extend_from_slice(
+                provider_openai::transport::protocol::websocket::websocket_event_to_sse_frame(raw)
+                    .unwrap()
+                    .as_bytes(),
+            );
+        } else {
+            body_bytes.extend_from_slice(&chunk);
+        }
     }
     if let Some(updates) = rate_limit_updates {
         for update in updates.lock().await.iter() {

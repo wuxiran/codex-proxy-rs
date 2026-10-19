@@ -1,3 +1,5 @@
+//! 验证插件命令参数的类型、默认值、数值边界与非法声明拒绝
+
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -74,7 +76,7 @@ async fn command_parser_preserves_all_types_defaults_and_signed_nanosecond_bound
 }
 
 #[tokio::test]
-async fn command_registration_rejects_reserved_duplicate_and_mistyped_parameters() {
+async fn command_registration_preserves_plugin_owned_parameter_definitions() {
     let (_directory, store, runtime) = super::setup(super::configuration(json!([]))).await;
     for parameters in [
         json!([{"name":"help","description":"保留名","value_type":"bool"}]),
@@ -87,14 +89,14 @@ async fn command_registration_rejects_reserved_duplicate_and_mistyped_parameters
         let commands = runtime
             .prepare_command_line()
             .await
-            .expect("invalid plugin is isolated from the host");
-        assert!(commands.help(Some("commands"), None).is_err());
+            .expect("plugin definitions are not host business rules");
+        assert!(commands.help(Some("commands"), None).is_ok());
         let snapshot = store.snapshot.lock().unwrap().clone();
         assert!(
             gateway_admin::ports::plugins::PluginPreparation::prepare(&runtime, snapshot)
                 .await
-                .is_err(),
-            "invalid registration still rejects an explicit candidate"
+                .is_ok(),
+            "host preparation accepts plugin-owned command semantics"
         );
     }
     for name in ["help", "serve", "plugin", "version"] {
@@ -104,14 +106,14 @@ async fn command_registration_rejects_reserved_duplicate_and_mistyped_parameters
         let commands = runtime
             .prepare_command_line()
             .await
-            .expect("invalid plugin is isolated from the host");
-        assert!(commands.help(Some("commands"), None).is_err());
+            .expect("plugin definitions are not host business rules");
+        assert!(commands.help(Some("commands"), None).is_ok());
         let snapshot = store.snapshot.lock().unwrap().clone();
         assert!(
             gateway_admin::ports::plugins::PluginPreparation::prepare(&runtime, snapshot)
                 .await
-                .is_err(),
-            "invalid registration still rejects an explicit candidate"
+                .is_ok(),
+            "host preparation accepts plugin-owned command semantics"
         );
     }
 }

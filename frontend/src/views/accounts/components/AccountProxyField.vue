@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BaseFormItem, BaseSelect } from '@codex-proxy/ui'
+import { ZFormItem, ZSelect } from '@codex-proxy/ui'
 import { computed } from 'vue'
 import { useProxyCatalog } from '@/composables/useProxyCatalog'
 
@@ -18,15 +18,15 @@ const options = computed(() => [
     : []),
   { label: '直连', value: 'direct', description: '不使用代理' },
   ...proxies.value.map(proxy => ({
-    label: `${proxy.name}${proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
+    label: `${proxy.name}${!proxy.enabled ? '（已禁用）' : proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
     value: proxy.id,
-    // 出口地区与质量等级只帮助挑选，不改变「未通过测试不可选」的规则。
+    // fork: proxy-quality — 出口地区与质量等级只帮助挑选；可选与否沿用上游「已禁用不可选」规则。
     description: [
       proxy.endpoint,
       proxy.lastTest?.exitGeo?.country,
       proxy.quality ? `质量 ${proxy.quality.grade}` : null,
     ].filter(Boolean).join(' · '),
-    disabled: proxy.lastTest?.success !== true,
+    disabled: !proxy.enabled,
   })),
 ])
 const selection = computed({
@@ -40,7 +40,7 @@ const selection = computed({
 </script>
 
 <template>
-  <BaseFormItem label="出站隧道" :error="error">
-    <BaseSelect v-model="selection" class="w-full" :options="options" :disabled="disabled || loading" aria-label="出站隧道" />
-  </BaseFormItem>
+  <ZFormItem label="出站隧道" :error="error">
+    <ZSelect v-model="selection" class="w-full" :options="options" :disabled="disabled || loading" aria-label="出站隧道" />
+  </ZFormItem>
 </template>

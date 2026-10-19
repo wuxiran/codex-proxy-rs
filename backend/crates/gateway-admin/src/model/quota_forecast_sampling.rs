@@ -1,10 +1,10 @@
-//! 预测专用的配对采样；不改变完整交付用量或费用账本的统计口径。
+//! 预测专用的配对采样；不改变完整交付用量或费用账本的统计口径
 
 use chrono::{DateTime, Utc};
 
 use super::provider_credentials::ProviderDocument;
 
-/// 限制带 Provider 文档的历史点数量；累计用量仍覆盖整个查询区间。
+/// 限制带 Provider 文档的历史点数量；累计用量仍覆盖整个查询区间
 pub const MAX_FORECAST_HISTORY_POINTS: usize = 128;
 const MIN_BLOCK_PERCENT: f64 = 5.0;
 const RECENT_BLOCKS: usize = 3;
@@ -15,7 +15,7 @@ pub struct QuotaForecastUsage {
     pub tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cached_tokens: u64,
+    pub cached_input_tokens: u64,
     pub missing_token_count: u64,
     pub known_cost_count: u64,
     pub unavailable_cost_count: u64,
@@ -24,7 +24,7 @@ pub struct QuotaForecastUsage {
 }
 
 impl QuotaForecastUsage {
-    /// 累计计数倒退表示不能配对，不用饱和减法掩盖数据断点。
+    /// 累计计数倒退表示不能配对，不用饱和减法掩盖数据断点
     fn difference(&self, baseline: &Self) -> Option<Self> {
         let usd = self.usd - baseline.usd;
         if !usd.is_finite() || usd < -1e-9 {
@@ -35,7 +35,9 @@ impl QuotaForecastUsage {
             tokens: self.tokens.checked_sub(baseline.tokens)?,
             input_tokens: self.input_tokens.checked_sub(baseline.input_tokens)?,
             output_tokens: self.output_tokens.checked_sub(baseline.output_tokens)?,
-            cached_tokens: self.cached_tokens.checked_sub(baseline.cached_tokens)?,
+            cached_input_tokens: self
+                .cached_input_tokens
+                .checked_sub(baseline.cached_input_tokens)?,
             missing_token_count: self
                 .missing_token_count
                 .checked_sub(baseline.missing_token_count)?,
@@ -68,7 +70,7 @@ pub struct QuotaForecastHistory {
     pub pending_request_count: u64,
 }
 
-/// 具体 Provider 从自己的历史文档解释出的额度事实。
+/// 具体 Provider 从自己的历史文档解释出的额度事实
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaForecastObservation {
     pub used_percent: f64,
@@ -101,7 +103,7 @@ pub struct QuotaForecastSample {
     pub observation_count: usize,
     pub pending_request_count: u64,
     pub discontinuous: bool,
-    /// 本周期已记录用量；近期采样仅用于预测剩余量，不能覆盖这份累计值。
+    /// 本周期已记录用量；近期采样仅用于预测剩余量，不能覆盖这份累计值
     pub cycle_usage: QuotaForecastUsage,
     pub usage: QuotaForecastUsage,
     /// 当前连续段的已用比例观测（含当前点），仅用于展示消耗曲线，不参与估算。
@@ -114,8 +116,8 @@ pub struct QuotaForecastCurvePoint {
     pub used_percent: f64,
 }
 
-/// 对同一额度段的累计点形成至少 5 个百分点的连续块，使用最近三个完整块及尾部。
-/// 不平均逐请求比值；重复百分比不增加块数，5/10 个百分点仅是量化噪声门槛。
+/// 对同一额度段的累计点形成至少 5 个百分点的连续块，使用最近三个完整块及尾部
+/// 不平均逐请求比值；重复百分比不增加块数，5/10 个百分点仅是量化噪声门槛
 #[must_use]
 pub fn select_forecast_sample(
     key: String,
@@ -148,8 +150,8 @@ pub fn select_forecast_sample(
         curve: Vec::new(),
     };
     history.push(current);
-    // 重置边界不在查询起点时，从首个新观测重新计数，避免把旧周期累计带入总量。
-    let mut cycle_baseline = interrupted.then(|| &history[0]);
+    // 重置边界不在查询起点时，从首个新观测重新计数，避免把旧周期累计带入总量
+    let cycle_baseline = interrupted.then(|| &history[0]);
     let mut anchors: Vec<&QuotaForecastPoint> = Vec::new();
     let mut high_water: Option<&QuotaForecastPoint> = None;
     for point in &history {
@@ -158,16 +160,15 @@ pub fn select_forecast_sample(
                 continue;
             }
             if point.used_percent < previous.used_percent {
-                // 一个百分点内的回落可能是量化/并发乱序；更大的回落不能跨越。
+                // 一个百分点内的回落可能是量化/并发乱序；更大的回落不能跨越
                 if previous.used_percent - point.used_percent <= 1.0 {
                     continue;
                 }
+                // 同窗口回落不能证明周期重置，只重建采样并保留已记录累计
                 sample.discontinuous = true;
                 anchors.clear();
-                // 曲线与锚点同口径：回落之前的旧段不与新段连成一条线。
+                // fork: 曲线与锚点同口径，回落之前的旧段不与新段连成一条线。
                 sample.curve.clear();
-                // 周期基线也重置到回落点，之后的总量从新段起算（上游 in-cycle 口径）。
-                cycle_baseline = Some(point);
             }
         }
         high_water = Some(point);
@@ -214,7 +215,7 @@ pub fn select_forecast_sample(
     sample.sampled_percent = progress;
     sample.block_count = anchors.len() - baseline_index - 1;
     sample.usage = usage;
-    // 断点后的新基线已有足够进度时，只消费新段；旧段从不参与本次估算。
+    // 断点后的新基线已有足够进度时，只消费新段；旧段从不参与本次估算
     sample.discontinuous = false;
     sample
 }

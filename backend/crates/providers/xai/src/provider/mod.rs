@@ -1,4 +1,4 @@
-//! 官方 Grok Build 会话的 `gateway-core` Provider adapter。
+//! 官方 Grok Build 会话的 `gateway-core` Provider adapter
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -81,17 +81,18 @@ use stream::*;
 pub(crate) use workers::worker_contributions;
 
 const HTTP_SSE_TRANSPORT: &str = "http_sse";
-const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 const XAI_SESSION_STATE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const XAI_SESSION_OUTPUT_LIMIT: usize = 4_096;
 const REASONING_DECODE_FAILED_CODE: &str = "reasoning_decode_failed";
 const RESPONSE_NOT_FOUND_CODE: &str = "not_found";
 
-/// 官方 Grok Build Provider；会话选择与 HTTP SSE transport 均由外部注入。
+/// 官方 Grok Build Provider；会话选择与 HTTP SSE transport 均由外部注入
 ///
-/// 每次调用只选择一个 OAuth 会话。仅当 xAI 明确拒绝历史 reasoning 密文时，
-/// 允许在同账号、同凭据、同会话绑定上剥离密文后有界重试一次。凭据轮换、
-/// endpoint fallback 以及公开 xAI API key 推理都不在该 adapter 内。
+/// 每次调用只选择一个 OAuth 会话
+/// 仅当 xAI 明确拒绝历史 reasoning 密文时，
+/// 允许在同账号、同凭据、同会话绑定上剥离密文后有界重试一次
+/// 凭据轮换、
+/// endpoint fallback 以及公开 xAI API key 推理都不在该 adapter 内
 #[derive(Clone)]
 pub struct GrokBuildProvider {
     selector: Arc<dyn GrokSessionSelector>,
@@ -124,7 +125,7 @@ struct SelectedGrokAttempt {
 }
 
 impl GrokBuildProvider {
-    /// 在显式的会话与 transport 边界上创建 Provider。
+    /// 在显式的会话与 transport 边界上创建 Provider
     pub fn new(
         selector: Arc<dyn GrokSessionSelector>,
         transport: Arc<dyn GrokInferenceTransport>,
@@ -203,12 +204,9 @@ impl Provider for GrokBuildProvider {
     async fn query_model_capabilities(
         &self,
     ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
-        let Ok(models) = self.catalog.query_models().await else {
-            return Ok(vec![default_grok_model_capabilities()?]);
-        };
-        if models.is_empty() {
-            return Ok(vec![default_grok_model_capabilities()?]);
-        }
+        let models = self.catalog.query_models().await.map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
         Ok(models
             .into_iter()
             .map(compile_grok_model_capabilities)
@@ -363,7 +361,7 @@ impl GrokBuildProvider {
             )
         } else {
             // 源协议由转换插件拥有；这里只使用冻结的候选模型与 Core 账号 owner，
-            // 不把未知 JSON 中的同名字段解释为 xAI 会话或亲和事实。
+            // 不把未知 JSON 中的同名字段解释为 xAI 会话或亲和事实
             let operation_account = continuation_account(&context, previous_session.as_ref())?;
             (
                 upstream_model.as_str().to_owned(),
@@ -475,8 +473,6 @@ impl GrokBuildProvider {
         if let Some(previous) = previous_session.as_ref() {
             upstream_request.inherit_session(previous.session_id.as_deref());
         }
-        // 首字计时的起点：账号选择完成之后、上游建立之前。
-        let output_started_at = Instant::now();
         apply_continuation(
             &mut upstream_request,
             previous_session.as_ref(),
@@ -552,7 +548,6 @@ impl GrokBuildProvider {
                 upstream_model: wire_upstream_model,
                 context,
                 session: Arc::clone(&selected),
-                output_started_at,
                 native_response_boundary: true,
                 session_capture,
                 reasoning_replay_capture,
@@ -645,7 +640,7 @@ impl GrokBuildProvider {
 }
 
 fn native_request_requirements(request: &GenerateRequest) -> CapabilityRequirements {
-    // 这里只读取本 Provider 已知的 Responses 字段；工具别名等原生保护字段另行校验。
+    // 这里只读取本 Provider 已知的 Responses 字段；工具别名等原生保护字段另行校验
     Operation::Generate(GenerateRequest::from_protocol_payload(
         request.protocol_payload().clone(),
     ))
@@ -670,6 +665,8 @@ async fn select_grok_session(
         Arc::clone(candidate.account_scope()),
         context.client_api_key_ref().clone(),
     )
+    .with_lease_metadata(context.lease_metadata())
+    .with_cancellation(context.cancellation().clone())
     .with_concurrency_wait_budget(context.concurrency_wait_budget().clone())
     .with_request_policy(
         context.request_policy_context().cloned(),
@@ -681,8 +678,12 @@ async fn select_grok_session(
         AccountEligibilityPolicy::Enforce
     })
     .with_affinity(affinity);
-    let selection_deadline = remaining(context.deadline())
-        .ok_or_else(|| provider_error(ProviderErrorKind::Timeout, UpstreamSendState::NotSent))?;
+    if context.deadline().is_elapsed() {
+        return Err(provider_error(
+            ProviderErrorKind::Timeout,
+            UpstreamSendState::NotSent,
+        ));
+    }
     let cancellation = context.cancellation().clone();
     let selected = tokio::select! {
         biased;
@@ -690,7 +691,7 @@ async fn select_grok_session(
             ProviderErrorKind::Cancelled,
             UpstreamSendState::NotSent,
         )),
-        _ = tokio::time::sleep(selection_deadline) => Err(provider_error(
+        _ = context.deadline().wait() => Err(provider_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::NotSent,
         )),
@@ -720,7 +721,8 @@ fn provider_call_metadata(
         selected.account_id().clone(),
         UpstreamTransport::new(HTTP_SSE_TRANSPORT).map_err(|_| protocol_not_sent())?,
     )
-    .with_outbound_proxy(selected.binding().outbound_proxy())
+    .with_account_snapshot(selected.account_snapshot().cloned())
+    .with_outbound_proxy(selected.binding().outbound_proxy()) // fork: diagnostic-egress 出口归因
     .with_selection_observation(ProviderSelectionObservation::new(
         account_selection_wait_ms,
         selected.capacity_snapshot(),
@@ -806,7 +808,7 @@ fn tool_support(evidence: GrokCatalogCapabilityEvidence) -> SupportLevel {
         GrokCatalogCapabilityEvidence::DeclaredNative => SupportLevel::Native,
         GrokCatalogCapabilityEvidence::DeclaredUnsupported => SupportLevel::Unsupported,
         // catalog 省略该可选字段时，Grok Build 的 Responses 工具协议仍可用；
-        // 请求 adapter 会在发送前规范化仅客户端侧的工具结构。
+        // 请求 adapter 会在发送前规范化仅客户端侧的工具结构
         GrokCatalogCapabilityEvidence::Unknown => SupportLevel::Emulated,
     }
 }
@@ -839,97 +841,41 @@ fn compile_grok_model_capabilities(model: GrokCatalogModel) -> ProviderModelCapa
         .with_presentation(grok_model_presentation(&model))
 }
 
-fn default_grok_model_capabilities() -> Result<ProviderModelCapabilities, ProviderError> {
-    let model = UpstreamModelId::new(DEFAULT_GROK_MODEL.to_owned())
-        .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
-    let capabilities = ModelCapabilities::new(BTreeSet::from([OperationKind::Generate]), None)
-        .with_upstream_feature_validation();
-    Ok(ProviderModelCapabilities::new(model, capabilities)
-        .with_presentation(default_grok_model_presentation()))
-}
-
-fn default_grok_model_presentation() -> ModelPresentation {
-    ModelPresentation::new(
-        Some("Grok 4.5".to_owned()),
-        Some("xAI Grok 4.5 frontier model with reasoning and vision.".to_owned()),
-    )
-    .with_context_window_tokens(Some(500_000))
-    .with_max_context_window_tokens(Some(500_000))
-    .with_image_input(true)
-    .with_agent_tools(true, true)
-}
-
 fn grok_model_presentation(model: &GrokCatalogModel) -> ModelPresentation {
-    let slug = model.request_model().as_str();
-    let known_grok_4_5 = is_known_grok_4_5_model(slug);
-    let reasoning_evidence = model.capabilities().reasoning_effort();
-    let catalog_reasoning_efforts = model
+    let reasoning_efforts = model
         .capabilities()
         .reasoning_efforts()
         .iter()
         .map(|effort| effort.as_str().to_owned())
         .collect::<Vec<_>>();
-    let catalog_default_reasoning = model
+    let default_reasoning = model
         .capabilities()
         .default_reasoning_effort()
         .map(|effort| effort.as_str().to_owned());
-    let (default_reasoning, reasoning_efforts) = match reasoning_evidence {
-        GrokCatalogCapabilityEvidence::DeclaredNative if !catalog_reasoning_efforts.is_empty() => {
-            let default_reasoning = catalog_default_reasoning
-                .filter(|default| {
-                    catalog_reasoning_efforts
-                        .iter()
-                        .any(|effort| effort == default)
-                })
-                .or_else(|| catalog_reasoning_efforts.first().cloned());
-            (default_reasoning, catalog_reasoning_efforts)
-        }
-        GrokCatalogCapabilityEvidence::DeclaredNative => (None, Vec::new()),
-        GrokCatalogCapabilityEvidence::DeclaredUnsupported => {
-            (Some("none".to_owned()), vec!["none".to_owned()])
-        }
-        GrokCatalogCapabilityEvidence::Unknown => (None, Vec::new()),
-    };
     let context_window_tokens = model
         .limits()
         .context_window_tokens()
-        .map(std::num::NonZeroU64::get)
-        .or(known_grok_4_5.then_some(500_000));
+        .map(std::num::NonZeroU64::get);
     let tool_evidence = model.capabilities().streaming_tool_calls();
 
     ModelPresentation::new(
-        model
-            .display_name()
-            .map(str::to_owned)
-            .or_else(|| known_grok_4_5.then(|| "Grok 4.5".to_owned())),
-        model
-            .metadata()
-            .description()
-            .map(str::to_owned)
-            .or_else(|| {
-                known_grok_4_5
-                    .then(|| "xAI Grok 4.5 frontier model with reasoning and vision.".to_owned())
-            }),
+        model.display_name().map(str::to_owned),
+        model.metadata().description().map(str::to_owned),
     )
     .with_reasoning(default_reasoning, reasoning_efforts)
     .with_context_window_tokens(context_window_tokens)
-    // Grok 目录只声明一个窗口，继续将它作为客户端可覆盖上限。
-    .with_max_context_window_tokens(context_window_tokens)
-    .with_image_input(known_grok_4_5)
+    .with_max_context_window_tokens(
+        model
+            .limits()
+            .max_context_window_tokens()
+            .map(std::num::NonZeroU64::get),
+    )
     .with_agent_tools(
         tool_evidence != GrokCatalogCapabilityEvidence::DeclaredUnsupported,
-        tool_evidence == GrokCatalogCapabilityEvidence::DeclaredNative
-            || (known_grok_4_5 && tool_evidence == GrokCatalogCapabilityEvidence::Unknown),
+        tool_evidence == GrokCatalogCapabilityEvidence::DeclaredNative,
     )
     .with_search_tool(
         model.capabilities().backend_search() == GrokCatalogCapabilityEvidence::DeclaredNative,
     )
     .with_hidden(model.metadata().hidden().unwrap_or(false))
-}
-
-fn is_known_grok_4_5_model(slug: &str) -> bool {
-    matches!(
-        slug,
-        DEFAULT_GROK_MODEL | "grok-4.5-latest" | "grok-4.5-build-free" | "grok-build-latest"
-    )
 }

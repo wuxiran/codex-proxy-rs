@@ -21,7 +21,8 @@ futures = "0.3.32"
 gateway-core = { path = "../gateway-core" }
 heck = "0.5.0"
 hex = "0.4.3"
-ring = "0.17"
+hkdf = "0.13.0"
+ring = "0.17" # fork: ticket cipher
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision", "preserve_order"] }
@@ -31,15 +32,15 @@ sha2 = "0.11"
 subtle = "2.6.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-uuid = { version = "1.23.3", features = ["v7"] }
+uuid = { version = "1.23.3", features = ["v4", "v7"] }
 cron = "0.17"
 chrono-tz = "0.10"
 tokio = { version = "1.52", features = ["rt", "time", "macros", "sync"] }
 
 [dev-dependencies]
-prettyplease = "0.2"
+prettyplease = "0.3"
 quote = "1"
-syn = { version = "2", features = ["full", "visit-mut"] }
+syn = { version = "3", features = ["full", "visit-mut"] }
 tempfile = "3"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "test-util"] }
 

@@ -6,7 +6,7 @@ import DashboardContent from '@/views/dashboard/components/DashboardContent.vue'
 import {
   dashboardSnapshotView,
   dashboardTrendView,
-} from '@/views/dashboard/composables/useDashboard'
+} from '@/views/dashboard/presenter'
 
 import { themeDashboardSummary } from '../fixtures/dashboard'
 
@@ -20,6 +20,7 @@ const trendKind = shallowRef<DashboardTrendKind>('usage')
     v-model:trend-kind="trendKind"
     last-refreshed-at="刚刚更新"
     :metrics="snapshot.metrics"
+    :analytics="snapshot.analytics"
     :trend-points="trend.points"
     :trend-summary="trend.summary"
     :health-timeline="snapshot.healthTimeline"

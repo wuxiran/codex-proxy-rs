@@ -1,3 +1,5 @@
+//! 验证插件上游适配的认证、续接、事件交付与计费边界
+
 use std::{
     num::NonZeroU32,
     sync::{
@@ -25,8 +27,8 @@ use gateway_core::{
     metering::{CalculatedCost, Usage},
     operation::{GenerateRequest, Operation, ProtocolPayload, ProviderSessionState},
     policy::ClientApiKeyId,
+    routing::extensions::{ExtensionPreparationPort, ExtensionSetReference},
     routing::{ConfigRevision, UpstreamModelId},
-    runtime::extensions::{ExtensionPreparationPort, ExtensionSetReference},
     upstream::{UpstreamSendState, UpstreamTransport},
 };
 use gateway_plugin_sdk::{Capability, Contributions, Stage};
@@ -128,19 +130,37 @@ async fn setup(
     (cache, store, runtime)
 }
 
-fn context(generation: &ExtensionSetReference, key: &str) -> AttemptContext {
+fn context(
+    runtime: &gateway_plugin_runtime::PluginRuntime,
+    generation: &ExtensionSetReference,
+    key: &str,
+) -> AttemptContext {
+    context_with_fast_mode(
+        runtime,
+        generation,
+        key,
+        gateway_core::account::FastMode::Default,
+    )
+}
+
+fn context_with_fast_mode(
+    runtime: &gateway_plugin_runtime::PluginRuntime,
+    generation: &ExtensionSetReference,
+    key: &str,
+    mode: gateway_core::account::FastMode,
+) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new("req_one").unwrap(),
             ClientApiKeyId::new(key).unwrap(),
         )
-        .with_upstream_adapters(generation.upstream_adapters()),
+        .with_upstream_adapters(runtime.execution_registry().upstream_adapters(generation))
+        .with_fast_mode(mode),
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(5),
         AccountSelectionPolicy::new(
             gateway_core::account::RotationStrategy::RoundRobin,
             std::num::NonZeroU32::new(1).unwrap(),
-            Duration::ZERO,
         ),
         AccountAttemptContext::new(Default::default(), None, None),
         None,
@@ -149,12 +169,21 @@ fn context(generation: &ExtensionSetReference, key: &str) -> AttemptContext {
 }
 
 fn execute(
+    runtime: &gateway_plugin_runtime::PluginRuntime,
     generation: &ExtensionSetReference,
     account: Arc<Account>,
     key: &str,
     previous: Option<ProviderSessionState>,
 ) -> EventStream {
-    let context = context(generation, key);
+    let context = context(runtime, generation, key);
+    execute_with_context(account, context, previous)
+}
+
+fn execute_with_context(
+    account: Arc<Account>,
+    context: AttemptContext,
+    previous: Option<ProviderSessionState>,
+) -> EventStream {
     let provider = ProviderKind::new("openai").unwrap();
     let model = UpstreamModelId::new("native-model").unwrap();
     let adapter = context
@@ -190,6 +219,46 @@ fn execute(
 }
 
 #[tokio::test]
+async fn adapter_preserves_three_state_fast_in_request_metadata() {
+    use gateway_core::account::FastMode;
+    for mode in [FastMode::Default, FastMode::Enabled, FastMode::Disabled] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/adapter/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = configuration(&server.uri(), false);
+        config["expected_fast_mode"] = json!(mode.as_str());
+        let (cache, _, runtime) = setup(config).await;
+        let generation =
+            ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
+                .await
+                .unwrap();
+        let mut stream = execute_with_context(
+            Account::new(),
+            context_with_fast_mode(&runtime, &generation, "key-one", mode),
+            None,
+        );
+        let mut completed = 0;
+        while let Some(event) = stream.next().await {
+            completed += event
+                .unwrap()
+                .canonical_facts()
+                .iter()
+                .filter(|fact| matches!(fact, GatewayEvent::Completed(_)))
+                .count();
+        }
+        assert_eq!(completed, 1);
+        drop(stream);
+        drop(generation);
+        runtime.shutdown().await;
+        super::wait_until_empty(cache.path()).await;
+    }
+}
+
+#[tokio::test]
 async fn adapter_http_and_sse_are_cold_authenticated_and_settled_once() {
     for streaming in [false, true] {
         let server = MockServer::start().await;
@@ -211,7 +280,7 @@ async fn adapter_http_and_sse_are_cold_authenticated_and_settled_once() {
                 .await
                 .unwrap();
         let account = Account::new();
-        let mut stream = execute(&generation, Arc::clone(&account), "key-one", None);
+        let mut stream = execute(&runtime, &generation, Arc::clone(&account), "key-one", None);
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "构造冷流不能先发送业务请求"
@@ -255,7 +324,7 @@ async fn adapter_accepts_service_tier_resolved_by_the_terminal_response() {
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     let mut tiers = Vec::new();
     let mut completed = false;
     while let Some(event) = stream.next().await {
@@ -302,7 +371,7 @@ async fn adapter_failure_preserves_upstream_diagnostics_and_native_feedback() {
         .await
         .unwrap();
     let account = Account::new();
-    let mut stream = execute(&generation, Arc::clone(&account), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Arc::clone(&account), "key-one", None);
     let error = stream.next().await.unwrap().unwrap_err();
     assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
     assert_eq!(error.send_state(), UpstreamSendState::Sent);
@@ -312,6 +381,17 @@ async fn adapter_failure_preserves_upstream_diagnostics_and_native_feedback() {
         "rate_limit_exceeded"
     );
     assert_eq!(error.retry_after(), Some(Duration::from_millis(1500)));
+    let snapshot = error.stable_snapshot();
+    let raw: Value = serde_json::from_str(snapshot.raw_upstream_error().unwrap().as_str()).unwrap();
+    assert_eq!(raw["message"], "fixture rate limit");
+    assert_eq!(raw["code"], "rate_limit_exceeded");
+    assert_eq!(raw["status"], 429);
+    let diagnostic = snapshot.diagnostic().unwrap();
+    assert_eq!(diagnostic.code(), Some("plugin_upstream_failure"));
+    assert!(!diagnostic.as_str().contains("fixture rate limit"));
+    assert!(!format!("{snapshot:?}").contains("fixture rate limit"));
+    assert!(generation.is_ready(), "上游 429 不能停止插件");
+    assert!(generation.can_serve());
     assert_eq!(account.failures.load(Ordering::SeqCst), 1);
     drop(stream);
     assert_eq!(Arc::strong_count(&account), 1);
@@ -332,7 +412,7 @@ async fn adapter_overrides_auth_headers_and_rejects_stale_continuation() {
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     let mut state = None;
     while let Some(event) = stream.next().await {
         state = event.unwrap().take_session_update().or(state);
@@ -343,7 +423,7 @@ async fn adapter_overrides_auth_headers_and_rejects_stale_continuation() {
         ("key-one", Account::with_identity("acct_other", 1)),
         ("key-one", Account::with_identity("acct_one", 2)),
     ] {
-        let error = execute(&generation, account, key, state.clone())
+        let error = execute(&runtime, &generation, account, key, state.clone())
             .next()
             .await
             .unwrap()
@@ -361,7 +441,7 @@ async fn adapter_overrides_auth_headers_and_rejects_stale_continuation() {
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     while let Some(event) = stream.next().await {
         event.unwrap();
     }
@@ -390,12 +470,24 @@ async fn adapter_does_not_publish_completed_when_rpc_fails_after_terminal_frame(
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     stream.next().await.unwrap().unwrap();
     let error = stream.next().await.unwrap().err().unwrap();
     assert_eq!(error.kind(), ProviderErrorKind::Unavailable);
     assert_eq!(error.send_state(), UpstreamSendState::Sent);
     let mut error = error;
+    let raw: Value = serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+    assert_eq!(raw["source"], "plugin_upstream_adapter");
+    assert_eq!(raw["fault"]["message"], "fixture terminal fault");
+    assert_eq!(error.diagnostic().unwrap().stage(), Some("plugin_rpc"));
+    assert!(
+        !error
+            .diagnostic()
+            .unwrap()
+            .as_str()
+            .contains("fixture terminal fault")
+    );
+    assert!(!format!("{error:?}").contains("fixture terminal fault"));
     let facts = error
         .take_atomic_client_events()
         .into_iter()
@@ -411,8 +503,38 @@ async fn adapter_does_not_publish_completed_when_rpc_fails_after_terminal_frame(
 }
 
 #[tokio::test]
-async fn adapter_registration_rejects_target_escape_and_custom_providers() {
-    for invalid in [
+async fn overlapping_adapter_declarations_keep_first_match_without_blocking_preparation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/adapter/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = configuration(&server.uri(), false);
+    let mut duplicate = config["upstream_registration"]["adapters"][0].clone();
+    duplicate["base_url"] = json!("https://unused.invalid/adapter/");
+    config["upstream_registration"]["adapters"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    let (cache, _, runtime) = setup(config).await;
+    let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
+        .await
+        .unwrap();
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    drop(stream);
+    drop(generation);
+    runtime.shutdown().await;
+    super::wait_until_empty(cache.path()).await;
+}
+
+#[tokio::test]
+async fn adapter_registration_preserves_plugin_targets_with_typed_provider_decoding() {
+    for target in [
         "../responses",
         "https://elsewhere.invalid/responses",
         "responses?other=1",
@@ -420,13 +542,13 @@ async fn adapter_registration_rejects_target_escape_and_custom_providers() {
         "/responses",
     ] {
         let mut config = configuration("https://example.invalid", false);
-        config["upstream_registration"]["adapters"][0]["paths"][0]["path"] = json!(invalid);
+        config["upstream_registration"]["adapters"][0]["paths"][0]["path"] = json!(target);
         let (_, store, runtime) = setup(config).await;
         let snapshot = store.snapshot.lock().unwrap().clone();
         assert!(
             gateway_admin::ports::plugins::PluginPreparation::prepare(&runtime, snapshot)
                 .await
-                .is_err()
+                .is_ok()
         );
         runtime.shutdown().await;
     }
@@ -487,7 +609,7 @@ async fn websocket_continuation_reuses_exact_connection_and_consumes_each_handle
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut first = execute(&generation, Account::new(), "key-one", None);
+    let mut first = execute(&runtime, &generation, Account::new(), "key-one", None);
     let mut state = None;
     while let Some(event) = first.next().await {
         state = event.unwrap().take_session_update().or(state);
@@ -495,24 +617,42 @@ async fn websocket_continuation_reuses_exact_connection_and_consumes_each_handle
     drop(first);
     let state = state.unwrap();
     assert!(state.extension_owner().unwrap().connection_local);
-    let error = execute(&generation, Account::new(), "key-two", Some(state.clone()))
-        .next()
-        .await
-        .unwrap()
-        .err()
-        .unwrap();
+    let error = execute(
+        &runtime,
+        &generation,
+        Account::new(),
+        "key-two",
+        Some(state.clone()),
+    )
+    .next()
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
     assert_eq!(error.send_state(), UpstreamSendState::NotSent);
-    let mut second = execute(&generation, Account::new(), "key-one", Some(state.clone()));
+    let mut second = execute(
+        &runtime,
+        &generation,
+        Account::new(),
+        "key-one",
+        Some(state.clone()),
+    );
     while let Some(event) = second.next().await {
         event.unwrap();
     }
     drop(second);
-    let error = execute(&generation, Account::new(), "key-one", Some(state))
-        .next()
-        .await
-        .unwrap()
-        .err()
-        .unwrap();
+    let error = execute(
+        &runtime,
+        &generation,
+        Account::new(),
+        "key-one",
+        Some(state),
+    )
+    .next()
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
     assert_eq!(error.send_state(), UpstreamSendState::NotSent);
     drop(generation);
     runtime.shutdown().await;
@@ -553,7 +693,7 @@ async fn websocket_adapter_can_send_while_a_read_callback_is_pending() {
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     let mut continuation = None;
     tokio::time::timeout(Duration::from_secs(3), async {
         while let Some(event) = stream.next().await {
@@ -607,7 +747,7 @@ async fn cancelling_adapter_body_closes_pending_websocket_and_releases_selected_
         .await
         .unwrap();
     let account = Account::new();
-    let mut stream = execute(&generation, account.clone(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, account.clone(), "key-one", None);
     let mut reading = Box::pin(stream.next());
     tokio::select! {
         result = &mut reading => panic!("上游等待期间不应提前产生结果：{}", result.is_some()),
@@ -645,7 +785,7 @@ async fn usage_without_response_model_still_uses_native_account_pricing() {
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     let mut costs = 0;
     while let Some(event) = stream.next().await {
         costs += event
@@ -745,7 +885,7 @@ async fn adapter_reconfiguration_disable_and_rollback_keep_inflight_generation_a
         .await
         .unwrap();
     let account = Account::new();
-    let mut old_stream = execute(&old, account.clone(), "key-one", None);
+    let mut old_stream = execute(&runtime, &old, account.clone(), "key-one", None);
     old_stream.next().await.unwrap().unwrap();
     {
         let mut snapshot = store.snapshot.lock().unwrap();
@@ -757,7 +897,7 @@ async fn adapter_reconfiguration_disable_and_rollback_keep_inflight_generation_a
         .await
         .unwrap();
     assert_ne!(old.id(), new.id());
-    let mut new_stream = execute(&new, account.clone(), "key-one", None);
+    let mut new_stream = execute(&runtime, &new, account.clone(), "key-one", None);
     new_stream.next().await.unwrap().unwrap();
     drop(old);
     let old_state = old_stream
@@ -779,7 +919,7 @@ async fn adapter_reconfiguration_disable_and_rollback_keep_inflight_generation_a
         .await
         .unwrap();
     assert!(
-        context(&disabled, "key-one")
+        context(&runtime, &disabled, "key-one")
             .upstream_adapter(
                 &ProviderKind::new("openai").unwrap(),
                 &UpstreamModelId::new("native-model").unwrap()
@@ -813,14 +953,20 @@ async fn adapter_reconfiguration_disable_and_rollback_keep_inflight_generation_a
     let restored = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(4).unwrap())
         .await
         .unwrap();
-    // 恢复同一配置仍是新代次，不能复活旧进程中的续接身份。
-    let error = execute(&restored, account.clone(), "key-one", Some(old_state))
-        .next()
-        .await
-        .unwrap()
-        .unwrap_err();
+    // 恢复同一配置仍是新代次，不能复活旧进程中的续接身份
+    let error = execute(
+        &runtime,
+        &restored,
+        account.clone(),
+        "key-one",
+        Some(old_state),
+    )
+    .next()
+    .await
+    .unwrap()
+    .unwrap_err();
     assert_eq!(error.send_state(), UpstreamSendState::NotSent);
-    let mut fresh = execute(&restored, account.clone(), "key-one", None);
+    let mut fresh = execute(&runtime, &restored, account.clone(), "key-one", None);
     while let Some(event) = fresh.next().await {
         event.unwrap();
     }
@@ -834,15 +980,15 @@ async fn adapter_reconfiguration_disable_and_rollback_keep_inflight_generation_a
 #[tokio::test]
 async fn upstream_adapter_can_dispatch_http_after_its_instance_entered_the_scope() {
     struct Http(Arc<AtomicUsize>);
-    impl gateway_core::middleware::http::Dispatcher for Http {
+    impl gateway_core::engine::middleware::http::Dispatcher for Http {
         fn dispatch(
             &self,
-            context: gateway_core::middleware::http::Context,
-            request: gateway_core::middleware::http::Request,
+            context: gateway_core::engine::middleware::http::Context,
+            request: gateway_core::engine::middleware::http::Request,
         ) -> BoxFuture<
             'static,
             Result<
-                gateway_core::middleware::http::Response,
+                gateway_core::engine::middleware::http::Response,
                 gateway_core::engine::middleware::MiddlewareError,
             >,
         > {
@@ -855,8 +1001,8 @@ async fn upstream_adapter_can_dispatch_http_after_its_instance_entered_the_scope
             assert_eq!(request.uri(), "/api/admin/settings");
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
-                Ok(gateway_core::middleware::http::Response::new(
-                    gateway_core::middleware::http::empty_body(),
+                Ok(gateway_core::engine::middleware::http::Response::new(
+                    gateway_core::engine::middleware::http::empty_body(),
                 ))
             })
         }
@@ -872,13 +1018,13 @@ async fn upstream_adapter_can_dispatch_http_after_its_instance_entered_the_scope
     }));
     let (_cache, _, runtime) = setup(config).await;
     let calls = Arc::new(AtomicUsize::new(0));
-    let dispatcher: Arc<dyn gateway_core::middleware::http::Dispatcher> =
+    let dispatcher: Arc<dyn gateway_core::engine::middleware::http::Dispatcher> =
         Arc::new(Http(calls.clone()));
     runtime.bind_http(&dispatcher).unwrap();
     let generation = ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
         .await
         .unwrap();
-    let mut stream = execute(&generation, Account::new(), "key-one", None);
+    let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
     while let Some(event) = stream.next().await {
         event.unwrap();
     }
@@ -887,4 +1033,58 @@ async fn upstream_adapter_can_dispatch_http_after_its_instance_entered_the_scope
     drop(generation);
     drop(dispatcher);
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_adapter_events_fail_only_the_current_stream() {
+    use gateway_admin::ports::plugins::PluginRuntimeDiagnostics as _;
+    use std::error::Error as _;
+    for (fact, has_sequence_error) in [
+        (
+            json!({"type":"completed","id":"never-started","model":"native-model","reason":"stop"}),
+            false,
+        ),
+        (
+            json!({"type":"text_delta","index":0,"text":"delta before start"}),
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let mut config = configuration(&server.uri(), false);
+        config["upstream_events"] = json!([{"event":{"facts":[fact]}}]);
+        let (cache, store, runtime) = setup(config).await;
+        let generation =
+            ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
+                .await
+                .unwrap();
+        let mut stream = execute(&runtime, &generation, Account::new(), "key-one", None);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        if has_sequence_error {
+            assert!(
+                error
+                    .source()
+                    .unwrap()
+                    .is::<gateway_core::event::EventSequenceError>()
+            );
+        }
+        assert_eq!(error.diagnostic().unwrap().code(), Some("invalid_event"));
+        assert!(generation.is_ready());
+        assert!(generation.can_serve());
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        assert!(snapshot.instances[0].enabled);
+        let diagnostics = runtime
+            .runtime_diagnostics(&snapshot, Some(1), Some(&generation))
+            .await
+            .unwrap();
+        assert!(diagnostics["instance-one"].failure.is_none());
+        drop(stream);
+        drop(generation);
+        runtime.shutdown().await;
+        super::wait_until_empty(cache.path()).await;
+    }
 }

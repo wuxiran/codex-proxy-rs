@@ -1,4 +1,4 @@
-//! 插件只替换业务 wire；账号租约、凭据解释与费用来源仍属于 OpenAI。
+//! 插件只替换业务 wire；账号租约、凭据解释与费用来源仍属于 OpenAI
 
 use super::*;
 use crate::transport::usage::{OpenAiBillingUsage, openai_billing_breakdown_with_override};
@@ -19,7 +19,7 @@ struct SelectedConnection {
 }
 
 impl CodexProvider {
-    // 与原生 terminal 共用一次选号结果，不能为适配器重新获取账号或租约。
+    // 与原生 terminal 共用一次选号结果，不能为适配器重新获取账号或租约
     #[expect(clippy::too_many_arguments)]
     pub(super) fn execute_upstream_adapter(
         self: Arc<Self>,
@@ -59,6 +59,9 @@ impl CodexProvider {
                 provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
             })?,
         )
+        .with_account_snapshot(Some(
+            gateway_core::account::AccountHistorySnapshot::from_account(lease.account()),
+        ))
         .with_selection_observation(ProviderSelectionObservation::new(
             account_selection_wait_ms,
             lease.capacity_snapshot(),
@@ -122,17 +125,17 @@ impl UpstreamAccountConnection for SelectedConnection {
                 bytes::Bytes::copy_from_slice(account_id.as_bytes()),
             ));
         }
-        // 业务目标可能与原生 Responses 不同，不能把原域名的 Cookie 带到新目标。
+        // 业务目标可能与原生 Responses 不同，不能把原域名的 Cookie 带到新目标
         Ok(headers)
     }
 
     fn calculate_cost(&self, _: Option<&str>, usage: &Usage) -> Option<CalculatedCost> {
-        // 与原生路径一样按请求策略计价；响应回显只作观测，不能切换模型或档位。
+        // 与原生路径一样按请求策略计价；响应回显只作观测，不能切换模型或档位
         let usage = gateway_protocol::openai::events::TokenUsage {
             input_tokens: usage.input_tokens?,
             output_tokens: usage.output_tokens?,
-            cached_tokens: usage.cached_tokens.unwrap_or(0),
-            cache_write_tokens: usage.cache_write_tokens.unwrap_or(0),
+            cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+            cache_write_input_tokens: usage.cache_write_input_tokens.unwrap_or(0),
             image_input_tokens: usage.image_input_tokens.unwrap_or(0),
             image_output_tokens: usage.image_output_tokens.unwrap_or(0),
             ..Default::default()

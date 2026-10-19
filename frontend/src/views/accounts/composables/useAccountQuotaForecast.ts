@@ -1,6 +1,6 @@
 import type { Ref } from 'vue'
 import type { Account, AccountQuotaForecastResponse } from '@/api'
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { onScopeDispose, shallowRef, watch } from 'vue'
 import { getAccountQuotaForecast, refreshAccountQuota } from '@/api'
 
@@ -17,11 +17,12 @@ export function useAccountQuotaForecast(
   let controller: AbortController | undefined
   let disposed = false
 
-  function cancelLoad() {
+  function cancelLoad(resetLoading = true) {
     requestVersion += 1
     controller?.abort()
     controller = undefined
-    loading.value = false
+    if (resetLoading)
+      loading.value = false
   }
 
   async function load() {
@@ -65,7 +66,7 @@ export function useAccountQuotaForecast(
         return
       onAccountUpdated(result.account)
       if (accountId.value === targetAccountId && await load())
-        toast.success('额度已刷新')
+        ZNotification.success({ message: '额度已刷新' })
     }
     catch {
       if (!disposed && accountId.value === targetAccountId) {
@@ -79,11 +80,12 @@ export function useAccountQuotaForecast(
   }
 
   watch([open, accountId], ([isOpen]) => {
-    cancelLoad()
+    cancelLoad(isOpen)
+    if (!isOpen)
+      return
     report.value = null
     error.value = false
-    if (isOpen)
-      void load()
+    void load()
   }, { immediate: true })
 
   onScopeDispose(() => {

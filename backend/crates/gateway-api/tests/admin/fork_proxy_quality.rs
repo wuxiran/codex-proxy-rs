@@ -1,4 +1,4 @@
-//! fork：代理质量检测、出口地理与批量增删的管理路由。
+//! fork：代理质量检测、出口地理与批量删除的管理路由；批量添加走上游 /proxies/create 数组请求
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -12,11 +12,11 @@ async fn proxy_quality_check_persists_a_report_and_exposes_exit_geo() {
     let (_, empty) = request(
         &fixture,
         "/api/admin/proxies/create",
-        Some(json!({"name": "Office", "proxyUrl": "http://test-user:private-password@proxy.example:8080"})),
+        Some(json!([{"name": "Office", "proxyUrl": "http://test-user:private-password@proxy.example:8080"}])),
         true,
     )
     .await;
-    assert!(empty["data"]["record"]["quality"].is_null());
+    assert!(empty["data"][0]["data"]["record"]["quality"].is_null());
     let (status, none) = request(
         &fixture,
         "/api/admin/proxies/quality-report?id=proxy_test",
@@ -61,40 +61,29 @@ async fn proxy_quality_check_persists_a_report_and_exposes_exit_geo() {
     let (_, tested) = request(
         &fixture,
         "/api/admin/proxies/test",
-        Some(json!({"id": "proxy_test", "revision": 1})),
+        Some(json!([{"id": "proxy_test", "revision": 1}])),
         true,
     )
     .await;
-    assert_eq!(tested["data"]["lastTest"]["exitGeo"]["countryCode"], "US");
+    assert_eq!(
+        tested["data"][0]["data"]["lastTest"]["exitGeo"]["countryCode"],
+        "US"
+    );
 }
 
 #[tokio::test]
-async fn proxy_batch_routes_report_skips_without_echoing_credentials() {
+async fn proxy_batch_delete_reports_skips_without_echoing_credentials() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     let (status, created) = request(
         &fixture,
-        "/api/admin/proxies/batch-create",
-        Some(json!({"items": [
-            {"proxyUrl": " http://test-user:private-password@proxy.example:8080 "},
-            {"proxyUrl": "http://test-user:private-password@proxy.example:8080"},
-            {"proxyUrl": "ftp://test-user:private-password@proxy.example:21"},
-        ]})),
+        "/api/admin/proxies/create",
+        Some(json!([{"name": "Office", "proxyUrl": "http://test-user:private-password@proxy.example:8080"}])),
         true,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(created["data"]["created"].as_array().unwrap().len(), 1);
-    // 缺省名称取脱敏端点的 host:port。
-    assert_eq!(created["data"]["created"][0]["name"], "proxy.example:8080");
-    assert_eq!(
-        created["data"]["skipped"],
-        json!([
-            {"reference": "第 3 条", "reason": "代理地址不合法"},
-            {"reference": "http://proxy.example:8080/", "reason": "代理地址已存在"},
-        ])
-    );
-    assert_eq!(created["data"]["configRevision"], 1);
+    assert_eq!(created["data"][0]["data"]["record"]["id"], "proxy_test");
 
     let (status, deleted) = request(
         &fixture,
@@ -108,11 +97,10 @@ async fn proxy_batch_routes_report_skips_without_echoing_credentials() {
     assert_eq!(deleted["data"]["skipped"][0]["reference"], "proxy_gone");
 
     for (path, body) in [
-        ("/api/admin/proxies/batch-create", json!({"items": []})),
         ("/api/admin/proxies/batch-delete", json!({"items": []})),
         (
-            "/api/admin/proxies/batch-create",
-            json!({"items": [{"proxyUrl": "http://a:1", "extra": 1}]}),
+            "/api/admin/proxies/batch-delete",
+            json!({"items": [{"id": "proxy_test", "revision": 1, "extra": 1}]}),
         ),
         (
             "/api/admin/proxies/quality-check",
@@ -124,7 +112,6 @@ async fn proxy_batch_routes_report_skips_without_echoing_credentials() {
     }
     for path in [
         "/api/admin/proxies/quality-check",
-        "/api/admin/proxies/batch-create",
         "/api/admin/proxies/batch-delete",
     ] {
         assert_eq!(

@@ -1,4 +1,4 @@
-//! 控制面统一登录、会话恢复与退出；身份由认证用例返回。
+//! 控制面统一登录、会话恢复与退出；身份由认证用例返回
 
 use std::{fmt, net::SocketAddr};
 
@@ -21,7 +21,7 @@ use crate::{
     session_cookie,
 };
 
-/// 控制面 HTTP adapter 消费同一组用例；权限由各入口服务端校验。
+/// 控制面 HTTP adapter 消费同一组用例；权限由各入口服务端校验
 pub trait SessionState {
     fn admin_services(&self) -> &AdminServices;
 
@@ -119,6 +119,7 @@ where
     Router::new()
         .route("/api/auth/login", post(login::<S>))
         .route("/api/auth/status", get(session_status::<S>))
+        .route("/api/auth/refresh", post(refresh_session::<S>))
         .route("/api/auth/logout", post(logout::<S>))
         .route("/api/auth/password", post(change_password::<S>))
         .route("/api/auth", any(not_found))
@@ -142,36 +143,21 @@ where
         .login(
             payload.into(),
             peer.ip(),
-            session_cookie::value(&headers).as_deref(),
+            session_cookie::refresh_value(&headers)
+                .or_else(|| session_cookie::value(&headers))
+                .as_deref(),
         )
         .await
         .map_err(map_login_error)?;
-    let max_age = result
-        .session
-        .expires_at
-        .signed_duration_since(chrono::Utc::now())
-        .num_seconds()
-        .max(1);
-    let expires = result
-        .session
-        .expires_at
-        .format("%a, %d %b %Y %H:%M:%S GMT");
-    let cookie = format!(
-        "{}={}; {}; Max-Age={max_age}; Expires={expires}",
-        session_cookie::NAME,
-        result.session_id,
-        session_cookie::attributes(&headers)
-    );
-    let mut response = AdminResponse::new(
-        StatusCode::OK,
-        AdminEnvelope::ok(SessionData::from(&result.session)),
+    set_session_cookie(
+        AdminResponse::new(
+            StatusCode::OK,
+            AdminEnvelope::ok(SessionData::from(&result.session)),
+        )
+        .into_response(),
+        &headers,
+        &result,
     )
-    .into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(|_| AdminError::internal())?,
-    );
-    Ok(response)
 }
 
 async fn session_status<S>(
@@ -187,20 +173,113 @@ where
         .session(session_cookie::value(&headers).as_deref())
         .await
         .map_err(map_admin_service_error)?;
-    Ok(AdminResponse::new(
+    Ok(session_response(session.as_ref()))
+}
+
+async fn refresh_session<S>(
+    State(state): State<S>,
+    headers: HeaderMap,
+) -> Result<Response, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let grant = state
+        .admin_services()
+        .auth()
+        .renew_session(
+            session_cookie::refresh_value(&headers).as_deref(),
+            session_cookie::value(&headers).as_deref(),
+        )
+        .await
+        .map_err(map_admin_service_error)?;
+    let response = session_response(grant.as_ref().map(|grant| &grant.session));
+    if let Some(grant) = grant {
+        return set_session_cookie(response, &headers, &grant);
+    }
+    // 失效响应不清 Cookie，避免晚到的请求覆盖另一个标签页刚建立的会话
+    Ok(response)
+}
+
+fn session_response(session: Option<&AuthSession>) -> Response {
+    AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(SessionStatusData {
             authenticated: session.is_some(),
-            session: session.as_ref().map(SessionData::from),
+            session: session.map(SessionData::from),
         }),
-    ))
+    )
+    .into_response()
+}
+
+fn set_session_cookie(
+    mut response: Response,
+    headers: &HeaderMap,
+    grant: &gateway_admin::model::auth::SessionGrant,
+) -> Result<Response, AdminError> {
+    append_cookie(
+        &mut response,
+        headers,
+        session_cookie::NAME,
+        &grant.session_id,
+        Some(grant.session.expires_at),
+    )?;
+    append_cookie(
+        &mut response,
+        headers,
+        session_cookie::REFRESH_NAME,
+        grant.refresh_token.as_deref().unwrap_or_default(),
+        grant
+            .session
+            .renewal
+            .as_ref()
+            .map(|renewal| renewal.expires_at),
+    )?;
+    Ok(response)
+}
+
+fn append_cookie(
+    response: &mut Response,
+    headers: &HeaderMap,
+    name: &str,
+    value: &str,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), AdminError> {
+    let attributes = session_cookie::attributes(headers);
+    let path = if name == session_cookie::REFRESH_NAME {
+        "/api/auth"
+    } else {
+        "/"
+    };
+    let lifetime = expires_at.map_or_else(
+        || "Max-Age=0".to_owned(),
+        |expiry| {
+            format!(
+                "Max-Age={}; Expires={}",
+                expiry
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_seconds()
+                    .max(1),
+                expiry.format("%a, %d %b %Y %H:%M:%S GMT")
+            )
+        },
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{name}={value}; Path={path}; {attributes}; {lifetime}"
+        ))
+        .map_err(|_| AdminError::internal())?,
+    );
+    Ok(())
 }
 
 async fn logout<S>(State(state): State<S>, headers: HeaderMap) -> Result<Response, AdminError>
 where
     S: SessionState + Send + Sync,
 {
-    if let Some(session_id) = session_cookie::value(&headers) {
+    if let Some(session_id) =
+        session_cookie::refresh_value(&headers).or_else(|| session_cookie::value(&headers))
+    {
         state
             .admin_services()
             .auth()
@@ -254,15 +333,9 @@ fn clear_session_cookie(
     mut response: Response,
     headers: &HeaderMap,
 ) -> Result<Response, AdminError> {
-    let cookie = format!(
-        "{}=; {}; Max-Age=0",
-        session_cookie::NAME,
-        session_cookie::attributes(headers)
-    );
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(|_| AdminError::internal())?,
-    );
+    for name in [session_cookie::NAME, session_cookie::REFRESH_NAME] {
+        append_cookie(&mut response, headers, name, "", None)?;
+    }
     Ok(response)
 }
 

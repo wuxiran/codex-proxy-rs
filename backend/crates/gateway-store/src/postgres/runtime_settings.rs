@@ -1,4 +1,4 @@
-//! `runtime_settings` 单例与 config revision 的 PostgreSQL owner。
+//! `runtime_settings` 单例与 config revision 的 PostgreSQL owner
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -9,50 +9,24 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use gateway_core::account::RotationStrategy;
-use gateway_core::policy::CodexClientVersion;
 use gateway_core::provider_ports::{
     ProviderFreezePolicy, ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderStoreError,
     ProviderStoreErrorKind, ProviderWarmupPolicy,
 };
 
+use gateway_admin::model::settings::RuntimeSettingsValues;
+
 use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
+    pub values: RuntimeSettingsValues,
     pub request_profiles:
         BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
     pub config_revision: Revision,
     pub admin_api_key: Option<String>,
-    pub refresh_margin_seconds: u64,
-    pub refresh_concurrency: u32,
-    pub max_concurrent_per_account: u32,
-    pub request_interval_ms: u64,
-    pub max_waiting_per_key: u32,
-    pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
-    pub responses_max_decompressed_body_bytes: u64,
-    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
-    pub request_location_enabled: bool,
-    pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: BTreeMap<String, String>,
-    pub min_codex_desktop_version: Option<String>,
-    pub min_codex_cli_version: Option<String>,
-    pub usage_retention_days: u32,
-    pub ops_event_retention_days: u32,
-    pub audit_retention_days: u32,
-    pub account_auto_freeze_enabled: bool,
-    pub account_auto_freeze_threshold: u32,
-    pub account_auto_freeze_window_seconds: u64,
-    pub account_auto_freeze_duration_seconds: u64,
-    pub account_auto_freeze_probe_enabled: bool,
-    pub account_auto_freeze_probe_model: Option<String>,
-    pub account_auto_freeze_adaptive_concurrency: bool,
-    pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
-    pub account_warmup_model: Option<String>,
-    pub request_log_enabled: bool,
-    pub request_log_test_key_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -66,58 +40,9 @@ impl fmt::Debug for RuntimeSettings {
                 "admin_api_key",
                 &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("refresh_margin_seconds", &self.refresh_margin_seconds)
-            .field("refresh_concurrency", &self.refresh_concurrency)
-            .field(
-                "max_concurrent_per_account",
-                &self.max_concurrent_per_account,
-            )
-            .field("request_interval_ms", &self.request_interval_ms)
+            .field("values", &self.values)
             .field("rotation_strategy", &self.rotation_strategy)
-            .field("request_location_enabled", &self.request_location_enabled)
-            .field("request_location", &self.request_location)
             .field("model_mappings", &self.model_mappings)
-            .field("min_codex_desktop_version", &self.min_codex_desktop_version)
-            .field("min_codex_cli_version", &self.min_codex_cli_version)
-            .field("usage_retention_days", &self.usage_retention_days)
-            .field("ops_event_retention_days", &self.ops_event_retention_days)
-            .field("audit_retention_days", &self.audit_retention_days)
-            .field(
-                "account_auto_freeze_enabled",
-                &self.account_auto_freeze_enabled,
-            )
-            .field(
-                "account_auto_freeze_threshold",
-                &self.account_auto_freeze_threshold,
-            )
-            .field(
-                "account_auto_freeze_window_seconds",
-                &self.account_auto_freeze_window_seconds,
-            )
-            .field(
-                "account_auto_freeze_duration_seconds",
-                &self.account_auto_freeze_duration_seconds,
-            )
-            .field(
-                "account_auto_freeze_probe_enabled",
-                &self.account_auto_freeze_probe_enabled,
-            )
-            .field(
-                "account_auto_freeze_probe_model",
-                &self.account_auto_freeze_probe_model,
-            )
-            .field(
-                "account_auto_freeze_adaptive_concurrency",
-                &self.account_auto_freeze_adaptive_concurrency,
-            )
-            .field("account_warmup_enabled", &self.account_warmup_enabled)
-            .field(
-                "account_warmup_schedule_time",
-                &self.account_warmup_schedule_time,
-            )
-            .field("account_warmup_model", &self.account_warmup_model)
-            .field("request_log_enabled", &self.request_log_enabled)
-            .field("request_log_test_key_id", &self.request_log_test_key_id)
             .field("updated_at", &self.updated_at)
             .finish()
     }
@@ -125,40 +50,13 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
+    pub values: RuntimeSettingsValues,
     pub request_profile_updates: BTreeMap<
         gateway_core::routing::ProviderKind,
         Option<gateway_core::account::OpaqueProviderData>,
     >,
-    pub refresh_margin_seconds: u64,
-    pub refresh_concurrency: u32,
-    pub max_concurrent_per_account: u32,
-    pub request_interval_ms: u64,
-    pub max_waiting_per_key: u32,
-    pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
-    pub responses_max_decompressed_body_bytes: u64,
-    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
-    pub request_location_enabled: bool,
-    pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: BTreeMap<String, String>,
-    pub min_codex_desktop_version: Option<String>,
-    pub min_codex_cli_version: Option<String>,
-    pub usage_retention_days: u32,
-    pub ops_event_retention_days: u32,
-    pub audit_retention_days: u32,
-    pub account_auto_freeze_enabled: bool,
-    pub account_auto_freeze_threshold: u32,
-    pub account_auto_freeze_window_seconds: u64,
-    pub account_auto_freeze_duration_seconds: u64,
-    pub account_auto_freeze_probe_enabled: bool,
-    pub account_auto_freeze_probe_model: Option<String>,
-    pub account_auto_freeze_adaptive_concurrency: bool,
-    pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
-    pub account_warmup_model: Option<String>,
-    pub request_log_enabled: bool,
-    pub request_log_test_key_id: Option<String>,
 }
 
 impl fmt::Debug for RuntimeSettingsUpdate {
@@ -166,8 +64,11 @@ impl fmt::Debug for RuntimeSettingsUpdate {
         formatter
             .debug_struct("RuntimeSettingsUpdate")
             .field("rotation_strategy", &self.rotation_strategy)
-            .field("request_location_enabled", &self.request_location_enabled)
-            .field("request_location", &self.request_location)
+            .field(
+                "request_location_enabled",
+                &self.values.request_location_enabled,
+            )
+            .field("request_location", &self.values.request_location)
             .field("model_mappings", &self.model_mappings)
             .finish_non_exhaustive()
     }
@@ -175,29 +76,13 @@ impl fmt::Debug for RuntimeSettingsUpdate {
 
 impl RuntimeSettingsUpdate {
     pub fn validate(&self) -> StoreResult<()> {
-        if self.request_location.validate().is_err()
-            || self.responses_max_decompressed_body_bytes == 0
-            || isize::try_from(self.responses_max_decompressed_body_bytes).is_err()
-            || self.refresh_margin_seconds == 0
-            || self.refresh_concurrency == 0
-            || self.max_waiting_per_key > 1_000
-            || self.max_waiting_per_account > 1_000
-            || !(1..=120).contains(&self.concurrency_wait_timeout_seconds)
-            || self.usage_retention_days < 31
-            || self.ops_event_retention_days == 0
-            || self.audit_retention_days == 0
-            || !(2..=1_000).contains(&self.account_auto_freeze_threshold)
-            || !(60..=3_600).contains(&self.account_auto_freeze_window_seconds)
-            || !(300..=604_800).contains(&self.account_auto_freeze_duration_seconds)
-            || !valid_model_mappings(&self.model_mappings)
-            || !valid_client_version(self.min_codex_desktop_version.as_deref())
-            || !valid_client_version(self.min_codex_cli_version.as_deref())
-            || !valid_probe_model(self.account_auto_freeze_probe_model.as_deref())
-            || !gateway_core::provider_ports::valid_warmup_schedule_time(
-                &self.account_warmup_schedule_time,
+        if self.values.validate().is_err()
+            || gateway_admin::model::settings::validate_model_mappings(
+                self.model_mappings
+                    .iter()
+                    .map(|(requested, upstream)| (requested.as_str(), upstream.as_str())),
             )
-            || !valid_probe_model(self.account_warmup_model.as_deref())
-            || (self.account_warmup_enabled && self.account_warmup_model.is_none())
+            .is_err()
             || RotationStrategy::parse(&self.rotation_strategy).is_none()
             || self.request_profile_updates.len() > 256
             || self
@@ -210,6 +95,7 @@ impl RuntimeSettingsUpdate {
                 })
         {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "runtime settings",
                 message: "settings violate the frozen runtime constraints".to_owned(),
             });
@@ -252,35 +138,36 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
             .pool
             .begin()
             .await
-            .map_err(|_| postgres_unavailable("begin runtime settings update"))?;
+            .map_err(|source| postgres_unavailable("begin runtime settings update", source))?;
         let revision = update_runtime_settings_in_transaction(&mut transaction, &update).await?;
         transaction
             .commit()
             .await
-            .map_err(|_| postgres_unavailable("commit runtime settings update"))?;
+            .map_err(|source| postgres_unavailable("commit runtime settings update", source))?;
         Ok(revision)
     }
 }
 
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-            "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
-                    refresh_concurrency, max_concurrent_per_account, request_interval_ms,
+            "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
+                    refresh_concurrency, max_concurrent_per_account,
                     rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
-                    min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
+                    min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency, openai_account_affinity, max_account_rotations, openai_session_affinity_ttl_hours,
                     account_auto_freeze_enabled, account_auto_freeze_threshold,
                     account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                     account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
                     account_auto_freeze_adaptive_concurrency,
-                    account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
+                    account_warmup_enabled, account_warmup_schedule_time, account_warmup_model, reset_credit_lead_minutes, reset_credit_max_weekly_remaining_percent,
                     request_log_enabled, request_log_test_key_id
              from runtime_settings where id = 1",
         )
     .fetch_optional(pool)
     .await
-    .map_err(|_| postgres_unavailable("load runtime settings"))?
+    .map_err(|source| postgres_unavailable("load runtime settings", source))?
     .ok_or_else(|| StoreError::NotFound {
+        source: None,
         entity: "runtime settings",
         id: "1".to_owned(),
     })?;
@@ -288,6 +175,29 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
 }
 
 impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
+    fn claim_warmup_slot<'a>(
+        &'a self,
+        timezone: gateway_core::time::DeploymentTimeZone,
+        slot: chrono::NaiveDateTime,
+    ) -> futures::future::BoxFuture<'a, Result<bool, ProviderStoreError>> {
+        Box::pin(async move {
+            let slot = timezone.resolve_local(slot).ok_or_else(|| {
+                ProviderStoreError::new(ProviderStoreErrorKind::InvalidData, "resolve warmup slot")
+            })?;
+            // 执行游标只向前推进；设置保存不覆盖它，领取也不发布新的配置版本
+            let claimed = sqlx::query(
+                "update runtime_settings set account_warmup_cursor = $1
+                 where id = 1 and (account_warmup_cursor is null or account_warmup_cursor < $1)",
+            )
+            .bind(slot)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| crate::provider_unavailable("claim warmup slot", source))?
+            .rows_affected()
+                == 1;
+            Ok(claimed)
+        })
+    }
     fn initialize_request_profile<'a>(
         &'a self,
         provider: &'a gateway_core::routing::ProviderKind,
@@ -307,7 +217,7 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
             .bind(provider.as_str())
             .bind(sqlx::types::Json(initial.expose_to_provider()))
             .fetch_one(&self.pool).await
-            .map_err(|_| provider_unavailable("initialize Provider request profile"))?;
+            .map_err(|source| crate::provider_unavailable("initialize Provider request profile", source))?;
             Ok(gateway_core::account::OpaqueProviderData::new(document.0))
         })
     }
@@ -322,7 +232,7 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
     > {
         Box::pin(async move {
             // 单条语句共享一个 MVCC 快照：先核对候选 revision，再只投影配置对象；
-            // Client Key 明文与其它策略字段不会进入插件准备边界。
+            // Client Key 明文与其它策略字段不会进入插件准备边界
             let rows = sqlx::query_as::<_, (i64, Option<sqlx::types::Json<serde_json::Value>>)>(
                 "select settings.config_revision, profiles.profile
                  from runtime_settings settings
@@ -338,7 +248,9 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
             .bind(provider.as_str())
             .fetch_all(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("load Provider request profile configurations"))?;
+            .map_err(|source| {
+                crate::provider_unavailable("load Provider request profile configurations", source)
+            })?;
             let expected_revision = i64::try_from(revision.get())
                 .map_err(|_| provider_invalid("validate Provider request profile revision"))?;
             if rows.is_empty()
@@ -368,11 +280,11 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
         Box::pin(async move {
             let settings = RuntimeSettingsRepository::load_runtime_settings(self)
                 .await
-                .map_err(|_| provider_unavailable("load refresh policy"))?;
-            let concurrency = NonZeroU32::new(settings.refresh_concurrency)
+                .map_err(|source| crate::provider_unavailable("load refresh policy", source))?;
+            let concurrency = NonZeroU32::new(settings.values.refresh_concurrency)
                 .ok_or_else(|| provider_invalid("decode refresh policy"))?;
             ProviderRefreshPolicy::try_new(
-                Duration::from_secs(settings.refresh_margin_seconds),
+                Duration::from_secs(settings.values.refresh_margin_seconds),
                 concurrency,
             )
         })
@@ -384,15 +296,15 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
         Box::pin(async move {
             let settings = RuntimeSettingsRepository::load_runtime_settings(self)
                 .await
-                .map_err(|_| provider_unavailable("load freeze policy"))?;
+                .map_err(|source| crate::provider_unavailable("load freeze policy", source))?;
             ProviderFreezePolicy::try_new(
-                settings.account_auto_freeze_enabled,
-                settings.account_auto_freeze_threshold,
-                settings.account_auto_freeze_window_seconds,
-                settings.account_auto_freeze_duration_seconds,
-                settings.account_auto_freeze_probe_enabled,
-                settings.account_auto_freeze_probe_model,
-                settings.account_auto_freeze_adaptive_concurrency,
+                settings.values.account_auto_freeze_enabled,
+                settings.values.account_auto_freeze_threshold,
+                settings.values.account_auto_freeze_window_seconds,
+                settings.values.account_auto_freeze_duration_seconds,
+                settings.values.account_auto_freeze_probe_enabled,
+                settings.values.account_auto_freeze_probe_model,
+                settings.values.account_auto_freeze_adaptive_concurrency,
             )
         })
     }
@@ -403,11 +315,11 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
         Box::pin(async move {
             let settings = RuntimeSettingsRepository::load_runtime_settings(self)
                 .await
-                .map_err(|_| provider_unavailable("load warmup policy"))?;
+                .map_err(|source| crate::provider_unavailable("load warmup policy", source))?;
             ProviderWarmupPolicy::try_new(
-                settings.account_warmup_enabled,
-                settings.account_warmup_schedule_time,
-                settings.account_warmup_model,
+                settings.values.account_warmup_enabled,
+                settings.values.account_warmup_schedule_time,
+                settings.values.account_warmup_model,
             )
         })
     }
@@ -417,23 +329,24 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-        "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled,
-                refresh_concurrency, max_concurrent_per_account, request_interval_ms,
+        "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, codex_privacy_policy_json,
+                refresh_concurrency, max_concurrent_per_account,
                 rotation_strategy, smart_scheduling_json, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
-                min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds,
+                min_codex_cli_version, updated_at, responses_max_decompressed_body_bytes, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency, openai_account_affinity, max_account_rotations, openai_session_affinity_ttl_hours,
                 account_auto_freeze_enabled, account_auto_freeze_threshold,
                 account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                 account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
                 account_auto_freeze_adaptive_concurrency,
-                account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
-                request_log_enabled, request_log_test_key_id
+                account_warmup_enabled, account_warmup_schedule_time, account_warmup_model, reset_credit_lead_minutes, reset_credit_max_weekly_remaining_percent,
+                    request_log_enabled, request_log_test_key_id
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("load runtime settings in transaction"))?
+    .map_err(|source| postgres_unavailable("load runtime settings in transaction", source))?
     .ok_or_else(|| StoreError::NotFound {
+        source: None,
         entity: "runtime settings",
         id: "1".to_owned(),
     })?;
@@ -445,8 +358,14 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     update: &RuntimeSettingsUpdate,
 ) -> StoreResult<Revision> {
     update.validate()?;
+    let previous_reset_settings: (i32, Option<i32>) = sqlx::query_as(
+        "select reset_credit_lead_minutes, reset_credit_max_weekly_remaining_percent from runtime_settings where id = 1 for update",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|source| postgres_unavailable("load reset-credit settings", source))?;
     let refresh_margin_seconds =
-        i64::try_from(update.refresh_margin_seconds).map_err(|_| invalid_numeric())?;
+        i64::try_from(update.values.refresh_margin_seconds).map_err(|_| invalid_numeric())?;
     let request_profile_updates = update
         .request_profile_updates
         .iter()
@@ -471,89 +390,113 @@ pub(crate) async fn update_runtime_settings_in_transaction(
 	                 refresh_margin_seconds = $1,
 	                 refresh_concurrency = $2,
 	                 max_concurrent_per_account = $3,
-	                 request_interval_ms = $4,
-	                 rotation_strategy = $5,
-	                 model_mappings_json = $6,
-	                 usage_retention_days = $7,
-	                 ops_event_retention_days = $8,
-	                 audit_retention_days = $9,
-	                 min_codex_desktop_version = $10,
-	                 min_codex_cli_version = $11,
-                     max_waiting_per_key = $12,
-                     max_waiting_per_account = $13,
-                     concurrency_wait_timeout_seconds = $14,
-                     account_auto_freeze_enabled = $15,
-                     account_auto_freeze_threshold = $16,
-                     account_auto_freeze_window_seconds = $17,
-                     account_auto_freeze_duration_seconds = $18,
-                     account_auto_freeze_probe_enabled = $19,
-                     account_auto_freeze_probe_model = $20,
-                     account_auto_freeze_adaptive_concurrency = $21,
-                     request_location_json = $22,
-                     request_location_enabled = $23,
-                     responses_max_decompressed_body_bytes = $24,
-	                 provider_request_profiles_json = (provider_request_profiles_json - $25::text[]) || $26::jsonb,
-                     account_warmup_enabled = $27,
-                     account_warmup_schedule_time = $28,
-                     account_warmup_model = $29,
-                     smart_scheduling_json = $30,
-                     request_log_enabled = $31,
-                     request_log_test_key_id = $32,
+	                 rotation_strategy = $4,
+	                 model_mappings_json = $5,
+	                 usage_retention_days = $6,
+	                 ops_event_retention_days = $7,
+	                 audit_retention_days = $8,
+	                 min_codex_desktop_version = $9,
+	                 min_codex_cli_version = $10,
+                     max_waiting_per_key = $11,
+                     max_waiting_per_account = $12,
+                     concurrency_wait_timeout_seconds = $13,
+                     account_auto_freeze_enabled = $14,
+                     account_auto_freeze_threshold = $15,
+                     account_auto_freeze_window_seconds = $16,
+                     account_auto_freeze_duration_seconds = $17,
+                     account_auto_freeze_probe_enabled = $18,
+                     account_auto_freeze_probe_model = $19,
+                     account_auto_freeze_adaptive_concurrency = $20,
+                     request_location_json = $21,
+                     request_location_enabled = $22,
+                     responses_max_decompressed_body_bytes = $23,
+	                 provider_request_profiles_json = (provider_request_profiles_json - $24::text[]) || $25::jsonb,
+                     account_warmup_enabled = $26,
+                     account_warmup_schedule_time = $27,
+                     account_warmup_model = $28,
+                     smart_scheduling_json = $29,
+                     openai_guardian_reserved_concurrency = $30,
+                     openai_account_affinity = $31,
+                     max_account_rotations = $32,
+                     openai_session_affinity_ttl_hours = $33,
+                     codex_privacy_policy_json = $34,
+                     reset_credit_lead_minutes = $35,
+                     reset_credit_max_weekly_remaining_percent = $36,
+                     request_log_enabled = $37,
+                     request_log_test_key_id = $38,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
     )
     .bind(refresh_margin_seconds)
-    .bind(i64::from(update.refresh_concurrency))
-    .bind(i64::from(update.max_concurrent_per_account))
-    .bind(i64::try_from(update.request_interval_ms).map_err(|_| invalid_numeric())?)
+    .bind(i64::from(update.values.refresh_concurrency))
+    .bind(i64::from(update.values.max_concurrent_per_account))
     .bind(&update.rotation_strategy)
     .bind(sqlx::types::Json(&update.model_mappings))
-    .bind(i64::from(update.usage_retention_days))
-    .bind(i64::from(update.ops_event_retention_days))
-    .bind(i64::from(update.audit_retention_days))
-    .bind(update.min_codex_desktop_version.as_deref())
-    .bind(update.min_codex_cli_version.as_deref())
-    .bind(i64::from(update.max_waiting_per_key))
-    .bind(i64::from(update.max_waiting_per_account))
-    .bind(i64::from(update.concurrency_wait_timeout_seconds))
-    .bind(update.account_auto_freeze_enabled)
-    .bind(i64::from(update.account_auto_freeze_threshold))
-    .bind(i64::try_from(update.account_auto_freeze_window_seconds).map_err(|_| invalid_numeric())?)
+    .bind(i64::from(update.values.usage_retention_days))
+    .bind(i64::from(update.values.ops_event_retention_days))
+    .bind(i64::from(update.values.audit_retention_days))
+    .bind(update.values.min_codex_desktop_version.as_deref())
+    .bind(update.values.min_codex_cli_version.as_deref())
+    .bind(i64::from(update.values.max_waiting_per_key))
+    .bind(i64::from(update.values.max_waiting_per_account))
+    .bind(i64::from(update.values.concurrency_wait_timeout_seconds))
+    .bind(update.values.account_auto_freeze_enabled)
+    .bind(i64::from(update.values.account_auto_freeze_threshold))
+    .bind(i64::try_from(update.values.account_auto_freeze_window_seconds).map_err(|_| invalid_numeric())?)
     .bind(
-        i64::try_from(update.account_auto_freeze_duration_seconds)
+        i64::try_from(update.values.account_auto_freeze_duration_seconds)
             .map_err(|_| invalid_numeric())?,
     )
-    .bind(update.account_auto_freeze_probe_enabled)
-    .bind(update.account_auto_freeze_probe_model.as_deref())
-    .bind(update.account_auto_freeze_adaptive_concurrency)
+    .bind(update.values.account_auto_freeze_probe_enabled)
+    .bind(update.values.account_auto_freeze_probe_model.as_deref())
+    .bind(update.values.account_auto_freeze_adaptive_concurrency)
     .bind(sqlx::types::Json(
-        update
-            .request_location
+        update.values.request_location
             .clone()
             .normalized()
             .map_err(|_| invalid_location())?,
     ))
-    .bind(update.request_location_enabled)
+    .bind(update.values.request_location_enabled)
     .bind(
-        i64::try_from(update.responses_max_decompressed_body_bytes)
+        i64::try_from(update.values.responses_max_decompressed_body_bytes)
             .map_err(|_| invalid_numeric())?,
     )
     .bind(request_profile_deletions)
     .bind(sqlx::types::Json(request_profile_updates))
-    .bind(update.account_warmup_enabled)
-    .bind(&update.account_warmup_schedule_time)
-    .bind(update.account_warmup_model.as_deref())
-    .bind(sqlx::types::Json(update.smart_scheduling))
-    .bind(update.request_log_enabled)
-    .bind(update.request_log_test_key_id.as_deref())
+    .bind(update.values.account_warmup_enabled)
+    .bind(&update.values.account_warmup_schedule_time)
+    .bind(update.values.account_warmup_model.as_deref())
+    .bind(sqlx::types::Json(update.values.smart_scheduling))
+    .bind(i64::from(update.values.openai_guardian_reserved_concurrency))
+    .bind(update.values.openai_account_affinity.as_str())
+    .bind(i64::from(update.values.max_account_rotations))
+    .bind(i64::from(update.values.openai_session_affinity_ttl_hours))
+    .bind(sqlx::types::Json(&update.values.codex_privacy_policy))
+    .bind(i64::from(update.values.reset_credit_lead_minutes))
+    .bind(update.values.reset_credit_max_weekly_remaining_percent.map(i64::from))
+    .bind(update.values.request_log_enabled)
+    .bind(update.values.request_log_test_key_id.as_deref())
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
+    .map_err(|source| postgres_unavailable("update runtime settings in transaction", source))?
     .ok_or_else(|| StoreError::NotFound {
+        source: None,
         entity: "runtime settings",
         id: "1".to_owned(),
     })?;
+    // 自动使用配置变化只唤醒本地计划重算，不触发账号全量上游查询
+    if i64::from(previous_reset_settings.0) != i64::from(update.values.reset_credit_lead_minutes)
+        || previous_reset_settings.1.map(i64::from)
+            != update
+                .values
+                .reset_credit_max_weekly_remaining_percent
+                .map(i64::from)
+    {
+        sqlx::query("update provider_accounts set reset_credit_next_run_at = least(reset_credit_next_run_at, now()), reset_credit_automation_json = jsonb_set(reset_credit_automation_json, '{revision}', to_jsonb((reset_credit_automation_json ->> 'revision')::bigint + 1)) where reset_credit_automation_json ->> 'enabled' = 'true' ")
+            .execute(&mut **transaction).await
+            .map_err(|source| postgres_unavailable("reschedule reset-credit automation", source))?;
+    }
     Revision::new(u64::try_from(next).map_err(|_| invalid_numeric())?)
 }
 
@@ -568,15 +511,16 @@ pub(crate) async fn bump_config_revision_in_transaction(
     )
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("bump config revision in transaction"))?
+    .map_err(|source| postgres_unavailable("bump config revision in transaction", source))?
     .ok_or_else(|| StoreError::NotFound {
+        source: None,
         entity: "runtime settings",
         id: "1".to_owned(),
     })?;
     Revision::new(u64::try_from(next).map_err(|_| invalid_numeric())?)
 }
 
-/// 更新 admin_api_key 字段，config revision 由调用方 bump。
+/// 更新 admin_api_key 字段，config revision 由调用方 bump
 pub(crate) async fn update_admin_api_key_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     admin_api_key: Option<String>,
@@ -590,7 +534,7 @@ pub(crate) async fn update_admin_api_key_in_transaction(
     .bind(admin_api_key.as_deref())
     .execute(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("update admin api key in transaction"))?;
+    .map_err(|source| postgres_unavailable("update admin api key in transaction", source))?;
     Ok(())
 }
 
@@ -604,9 +548,10 @@ struct RuntimeSettingsRow {
     refresh_margin_seconds: i64,
     refresh_concurrency: i64,
     max_concurrent_per_account: i64,
-    request_interval_ms: i64,
     smart_scheduling_json: sqlx::types::Json<gateway_core::account::SmartSchedulingConfig>,
     rotation_strategy: String,
+    codex_privacy_policy_json:
+        sqlx::types::Json<gateway_core::settings::privacy::CodexPrivacyPolicy>,
     request_location_enabled: bool,
     request_location_json: sqlx::types::Json<gateway_core::account::RequestLocation>,
     model_mappings_json: sqlx::types::Json<BTreeMap<String, String>>,
@@ -619,6 +564,10 @@ struct RuntimeSettingsRow {
     max_waiting_per_key: i64,
     max_waiting_per_account: i64,
     concurrency_wait_timeout_seconds: i64,
+    openai_guardian_reserved_concurrency: i64,
+    openai_account_affinity: String,
+    max_account_rotations: i64,
+    openai_session_affinity_ttl_hours: i64,
     responses_max_decompressed_body_bytes: i64,
     account_auto_freeze_enabled: bool,
     account_auto_freeze_threshold: i64,
@@ -630,6 +579,9 @@ struct RuntimeSettingsRow {
     account_warmup_enabled: bool,
     account_warmup_schedule_time: String,
     account_warmup_model: Option<String>,
+    reset_credit_lead_minutes: i32,
+    reset_credit_max_weekly_remaining_percent: Option<i32>,
+    // fork: request log capture
     request_log_enabled: bool,
     request_log_test_key_id: Option<String>,
 }
@@ -652,41 +604,63 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
         request_profiles,
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,
-        refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
-        refresh_concurrency: to_u32(row.refresh_concurrency)?,
-        max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
-        request_interval_ms: to_u64(row.request_interval_ms)?,
-        smart_scheduling: row.smart_scheduling_json.0,
         rotation_strategy: row.rotation_strategy,
-        request_location_enabled: row.request_location_enabled,
-        request_location: row
-            .request_location_json
-            .0
-            .normalized()
-            .map_err(|_| invalid_location())?,
         model_mappings: row.model_mappings_json.0,
-        usage_retention_days: to_u32(row.usage_retention_days)?,
-        ops_event_retention_days: to_u32(row.ops_event_retention_days)?,
-        audit_retention_days: to_u32(row.audit_retention_days)?,
-        min_codex_desktop_version: row.min_codex_desktop_version,
-        min_codex_cli_version: row.min_codex_cli_version,
         updated_at: row.updated_at,
-        max_waiting_per_key: to_u32(row.max_waiting_per_key)?,
-        max_waiting_per_account: to_u32(row.max_waiting_per_account)?,
-        concurrency_wait_timeout_seconds: to_u32(row.concurrency_wait_timeout_seconds)?,
-        responses_max_decompressed_body_bytes: to_u64(row.responses_max_decompressed_body_bytes)?,
-        account_auto_freeze_enabled: row.account_auto_freeze_enabled,
-        account_auto_freeze_threshold: to_u32(row.account_auto_freeze_threshold)?,
-        account_auto_freeze_window_seconds: to_u64(row.account_auto_freeze_window_seconds)?,
-        account_auto_freeze_duration_seconds: to_u64(row.account_auto_freeze_duration_seconds)?,
-        account_auto_freeze_probe_enabled: row.account_auto_freeze_probe_enabled,
-        account_auto_freeze_probe_model: row.account_auto_freeze_probe_model,
-        account_auto_freeze_adaptive_concurrency: row.account_auto_freeze_adaptive_concurrency,
-        account_warmup_enabled: row.account_warmup_enabled,
-        account_warmup_schedule_time: row.account_warmup_schedule_time,
-        account_warmup_model: row.account_warmup_model,
-        request_log_enabled: row.request_log_enabled,
-        request_log_test_key_id: row.request_log_test_key_id,
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
+            refresh_concurrency: to_u32(row.refresh_concurrency)?,
+            max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
+            smart_scheduling: row.smart_scheduling_json.0,
+            codex_privacy_policy: row.codex_privacy_policy_json.0,
+            request_location_enabled: row.request_location_enabled,
+            request_location: row
+                .request_location_json
+                .0
+                .normalized()
+                .map_err(|_| invalid_location())?,
+            usage_retention_days: to_u32(row.usage_retention_days)?,
+            ops_event_retention_days: to_u32(row.ops_event_retention_days)?,
+            audit_retention_days: to_u32(row.audit_retention_days)?,
+            min_codex_desktop_version: row.min_codex_desktop_version,
+            min_codex_cli_version: row.min_codex_cli_version,
+            max_waiting_per_key: to_u32(row.max_waiting_per_key)?,
+            max_waiting_per_account: to_u32(row.max_waiting_per_account)?,
+            concurrency_wait_timeout_seconds: to_u32(row.concurrency_wait_timeout_seconds)?,
+            openai_guardian_reserved_concurrency: to_u32(row.openai_guardian_reserved_concurrency)?,
+            openai_account_affinity: gateway_core::account::AccountAffinity::parse(
+                &row.openai_account_affinity,
+            )
+            .ok_or_else(|| StoreError::InvalidData {
+                entity: "runtime settings",
+                message: "invalid account affinity".to_owned(),
+                source: None,
+            })?,
+            max_account_rotations: to_u32(row.max_account_rotations)?,
+            openai_session_affinity_ttl_hours: to_u32(row.openai_session_affinity_ttl_hours)?,
+            responses_max_decompressed_body_bytes: to_u64(
+                row.responses_max_decompressed_body_bytes,
+            )?,
+            account_auto_freeze_enabled: row.account_auto_freeze_enabled,
+            account_auto_freeze_threshold: to_u32(row.account_auto_freeze_threshold)?,
+            account_auto_freeze_window_seconds: to_u64(row.account_auto_freeze_window_seconds)?,
+            account_auto_freeze_duration_seconds: to_u64(row.account_auto_freeze_duration_seconds)?,
+            account_auto_freeze_probe_enabled: row.account_auto_freeze_probe_enabled,
+            account_auto_freeze_probe_model: row.account_auto_freeze_probe_model,
+            account_auto_freeze_adaptive_concurrency: row.account_auto_freeze_adaptive_concurrency,
+            account_warmup_enabled: row.account_warmup_enabled,
+            account_warmup_schedule_time: row.account_warmup_schedule_time,
+            account_warmup_model: row.account_warmup_model,
+            reset_credit_lead_minutes: u32::try_from(row.reset_credit_lead_minutes)
+                .map_err(|_| invalid_numeric())?,
+            reset_credit_max_weekly_remaining_percent: row
+                .reset_credit_max_weekly_remaining_percent
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| invalid_numeric())?,
+            request_log_enabled: row.request_log_enabled,
+            request_log_test_key_id: row.request_log_test_key_id,
+        },
     })
 }
 
@@ -700,6 +674,7 @@ fn to_u32(value: i64) -> StoreResult<u32> {
 
 fn invalid_location() -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "runtime settings",
         message: "request location is invalid".to_owned(),
     }
@@ -707,6 +682,7 @@ fn invalid_location() -> StoreError {
 
 fn invalid_request_profile() -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "runtime settings",
         message: "Provider request profile key is invalid".to_owned(),
     }
@@ -714,13 +690,10 @@ fn invalid_request_profile() -> StoreError {
 
 fn invalid_numeric() -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "runtime settings",
         message: "numeric field is outside its supported range".to_owned(),
     }
-}
-
-fn provider_unavailable(operation: &'static str) -> ProviderStoreError {
-    ProviderStoreError::new(ProviderStoreErrorKind::Unavailable, operation)
 }
 
 fn provider_invalid(operation: &'static str) -> ProviderStoreError {
@@ -729,30 +702,4 @@ fn provider_invalid(operation: &'static str) -> ProviderStoreError {
 
 fn provider_conflict(operation: &'static str) -> ProviderStoreError {
     ProviderStoreError::new(ProviderStoreErrorKind::Conflict, operation)
-}
-
-fn valid_model_mappings(mappings: &BTreeMap<String, String>) -> bool {
-    mappings.len() <= 512
-        && mappings.iter().all(|(requested, upstream)| {
-            valid_model_name(requested, 256) && valid_model_name(upstream, 256)
-        })
-}
-
-fn valid_model_name(value: &str, max_len: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= max_len
-        && !value.bytes().any(|byte| byte.is_ascii_control())
-}
-
-fn valid_client_version(value: Option<&str>) -> bool {
-    value.is_none_or(|value| CodexClientVersion::parse(value).is_ok())
-}
-
-fn valid_probe_model(value: Option<&str>) -> bool {
-    value.is_none_or(|value| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value == value.trim()
-            && !value.bytes().any(|byte| byte.is_ascii_control())
-    })
 }

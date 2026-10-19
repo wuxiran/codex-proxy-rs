@@ -1,3 +1,5 @@
+//! 验证 OpenAI 管理能力、请求画像、Bundle 组装与额度投影
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
@@ -63,6 +65,42 @@ const COMPLETED_SESSION_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 );
+
+#[tokio::test]
+async fn plan_display_should_distinguish_pro_tiers_and_preserve_other_official_names() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let admin = bundle.admin_provider();
+    for (raw, display) in [
+        ("prolite", "ProLite"),
+        ("pro", "Pro"),
+        ("promax", "ProMax"),
+        ("free", "Free"),
+        ("go", "Go"),
+        ("plus", "Plus"),
+        ("team", "Team"),
+        ("self_serve_business_prolite", "Self Serve Business ProLite"),
+        (
+            "self_serve_business_usage_based",
+            "Self Serve Business Usage Based",
+        ),
+        ("business", "Business"),
+        ("ent26", "Enterprise"),
+        ("enterprise", "Enterprise"),
+        ("hc", "Enterprise"),
+        ("enterprise_cbp_automation", "Enterprise (Automation)"),
+        ("enterprise_cbp_usage_based", "Enterprise CBP Usage Based"),
+        ("edu", "Edu"),
+        ("education", "Edu"),
+        ("edu_plus", "Edu Plus"),
+        ("edu_pro", "Edu Pro"),
+        ("future_plan", "future_plan"),
+    ] {
+        assert_eq!(admin.plan_type_display(raw), display);
+    }
+}
 
 #[tokio::test]
 async fn account_capabilities_distinguish_oauth_from_api_key_and_unknown_credentials() {
@@ -303,6 +341,20 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
     .await
     .expect("initialized OpenAI provider");
     let provider = bundle.core_provider();
+    let root = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object("openai", json!({"model":"gpt-5.4","input":"root","session_id":"parent-session","thread_id":"parent-session"}).as_object().unwrap().clone()).unwrap()
+            .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    drop(
+        provider
+            .clone()
+            .execute(
+                initialized_provider_request(root, account_id),
+                initialized_attempt_context("req_initialized_root", account_id),
+            )
+            .await
+            .unwrap(),
+    );
     let thread_spawn = r#"{"subagent_kind":"thread_spawn"}"#;
     let mut conversation_ids = Vec::new();
 
@@ -365,12 +417,31 @@ async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
         "gpt-6-sol",
         "gpt-6-luna",
     ] {
-        let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
-        let inherited = openai_billing_breakdown(model, usage, None).unwrap();
-        let copied =
-            openai_billing_breakdown_with_override(model, usage, None, Some(&prices[model]))
+        let ultrafast_supported = matches!(model, "gpt-6-astra" | "gpt-6.1-sol");
+        for band in ["ultrafast", "long_ultrafast"] {
+            assert_eq!(prices[model].bands.contains_key(band), ultrafast_supported);
+        }
+        for tier in [None, Some("ultrafast")] {
+            if tier.is_some() && !ultrafast_supported {
+                continue;
+            }
+            for input in [100, 272_001] {
+                let usage = OpenAiBillingUsage::new(input, 10, 20, 15);
+                let inherited = openai_billing_breakdown(model, usage, tier).unwrap();
+                let copied = openai_billing_breakdown_with_override(
+                    model,
+                    usage,
+                    tier,
+                    Some(&prices[model]),
+                )
                 .unwrap();
-        assert_eq!(inherited.total_amount(), copied.total_amount(), "{model}");
+                assert_eq!(
+                    inherited.total_amount(),
+                    copied.total_amount(),
+                    "{model} {tier:?} {input}"
+                );
+            }
+        }
     }
 }
 
@@ -417,8 +488,8 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             service_tier: None,
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "2.5".parse().expect("amount"),
@@ -435,8 +506,8 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             service_tier: Some("priority".to_owned()),
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "4.25".parse().expect("fast amount"),
@@ -463,8 +534,8 @@ async fn openai_legacy_billing_should_not_infer_long_context_flag() {
             service_tier: None,
             input_tokens: Some(300_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "1.5".parse().expect("stored total"),
@@ -564,7 +635,7 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
 
     assert_eq!(observation.request_kind.as_deref(), Some("compaction"));
     assert_eq!(observation.subagent_kind.as_deref(), Some("review"));
-    // Codex 当前只在特定多代理预设组合下给出 reasoning_preset；普通 high 保持空值。
+    // Codex 当前只在特定多代理预设组合下给出 reasoning_preset；普通 high 保持空值
     assert_eq!(observation.reasoning_preset, None);
     assert!(observation.compact);
 }
@@ -648,7 +719,7 @@ async fn openai_admin_provider_persists_the_full_pending_envelope_and_binds_owne
                 request_id: "request-complete".to_owned(),
             },
             flow_id: started.flow_id,
-            callback_url: "http://localhost:1455/auth/callback?code=unused&state=unused".to_owned(),
+            callback_url: "http://127.0.0.1:1455/auth/callback?code=unused&state=unused".to_owned(),
         })
         .await
         .expect_err("wrong owner");
@@ -891,6 +962,85 @@ async fn openai_admin_quota_refresh_updates_the_account_plan() {
             store.account("acct_upgraded_plan").unwrap().plan_type(),
             Some("pro")
         );
+    }
+}
+
+#[tokio::test]
+async fn openai_admin_quota_projects_credit_balance_from_refresh_and_cached_observation() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_credit_balance".to_owned(),
+            name: "credit balance".to_owned(),
+            secret: secret("credit-balance-test-token"),
+            verified_account: profile("chatgpt-credit-balance"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_credit_balance").unwrap();
+    let server = MockServer::start().await;
+    let mut config = valid_config();
+    config.config.api.base_url = server.uri();
+    let bundle = provider_openai::initialize(
+        config.config,
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    for (wire, expected) in [
+        (
+            json!({"has_credits": true, "unlimited": false, "balance": "62500"}),
+            Some((true, false, Some("62500"))),
+        ),
+        (
+            json!({"has_credits": false, "unlimited": false, "balance": 0}),
+            Some((false, false, Some("0"))),
+        ),
+        (
+            json!({"has_credits": true, "unlimited": false, "balance": "9007199254740993.1234567890"}),
+            Some((true, false, Some("9007199254740993.1234567890"))),
+        ),
+        (
+            json!({"has_credits": true, "unlimited": false, "balance": null}),
+            Some((true, false, None)),
+        ),
+        (
+            json!({"has_credits": false, "unlimited": true}),
+            Some((false, true, None)),
+        ),
+        (Value::Null, None),
+    ] {
+        let _mock = Mock::given(method("GET"))
+            .and(path("/api/codex/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rate_limit": {"allowed": true, "primary_window": {"used_percent": 28}},
+                "credits": wire,
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        for refresh in [true, false] {
+            let quota = bundle
+                .admin_provider()
+                .quota(ProviderQuotaRequest {
+                    account_id: account.id().clone(),
+                    refresh,
+                    rolling_usage: None,
+                })
+                .await
+                .expect("quota with credits");
+            assert_eq!(
+                quota.credits.as_ref().map(|credits| (
+                    credits.has_credits,
+                    credits.unlimited,
+                    credits.balance.as_deref(),
+                )),
+                expected
+            );
+            assert_eq!(quota.windows[0].used_percent, Some(28.0));
+            assert!(!quota.limit_reached);
+        }
     }
 }
 
@@ -1285,7 +1435,7 @@ async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution(
             .await
             .expect("project quota");
         assert_eq!(projected.limit_reached, exhausted);
-        // 账号接口还会归一化耗尽展示；过期周窗口不能把触顶错误转移到短期窗口。
+        // 账号接口还会归一化耗尽展示；过期周窗口不能把触顶错误转移到短期窗口
         projected.apply_limit_reached_display();
         let primary = projected
             .windows
@@ -1511,7 +1661,7 @@ pub(crate) fn initialized_provider_request(
     let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
+        gateway_core::settings::SettingsValues::new(2, "smart", Default::default(), None, None),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider,
@@ -1561,6 +1711,21 @@ fn initialized_account_scope(account_id: &str) -> Arc<FrozenAccountScope> {
     ))
 }
 
+pub(crate) async fn initialized_test_provider(
+    accounts: Arc<MemoryAccountStore>,
+    base_url: String,
+) -> Arc<dyn gateway_core::engine::provider::Provider> {
+    let mut config = valid_config();
+    config.config.api.base_url = base_url;
+    provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(accounts, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .expect("initialized provider")
+    .core_provider()
+}
+
 fn provider_ports() -> ProviderStorePorts {
     provider_ports_with(
         Arc::new(MemoryAccountStore::default()),
@@ -1591,12 +1756,14 @@ fn provider_ports_with_catalog(
         Arc::new(TestCooldown),
         Arc::new(TestRuntimePolicy),
         pending,
+        Arc::new(RecordingDiagnostics::default()),
     )
 }
 
 pub(crate) fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        outbound_proxy_enabled: true,
         notes: None,
         model_access: Default::default(),
         outbound_proxy: None,
@@ -2315,7 +2482,7 @@ mod errors {
             .prepare_refresh(command())
             .await
             .unwrap_err();
-        // 既有 transport 策略未认定此错误为安全重试，本次不能因展示更详细而放宽重试边界。
+        // 既有 transport 策略未认定此错误为安全重试，本次不能因展示更详细而放宽重试边界
         assert_eq!(error.kind(), Kind::Ambiguous);
         assert_eq!(
             error.public_message(),
@@ -2392,6 +2559,7 @@ mod errors {
             Arc::new(TestCooldown),
             Arc::new(TestRuntimePolicy),
             Arc::new(TestOAuthPending::default()),
+            Arc::new(RecordingDiagnostics::default()),
         )
     }
 
@@ -2405,6 +2573,7 @@ mod errors {
             _: &'a ClientApiKeyId,
             _: &'a ProviderKind,
             _: &'a [ProviderAccountId],
+            _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
         ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
             panic!("manual refresh does not use scheduling leases")
         }
@@ -2459,30 +2628,34 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         Some(&json!("https://first.example/v1"))
     );
     assert!(!configuration.contains_key("api_key"));
-    let prepared = admin
-        .prepare_rotation(PrepareCredentialRotation {
-            account: account_record(&account),
-            provider_material: ProviderDocument::new(OpaqueProviderData::new(
-                json!({"base_url":"https://second.example/root", "transport":"prefer_websocket"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )),
-        })
-        .await
-        .unwrap();
-    let material = prepared
-        .facts()
-        .provider_material
-        .expose_to_provider()
-        .expose_to_provider();
-    assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
-    assert_eq!(
-        material.get("base_url"),
-        Some(&json!("https://second.example/root"))
-    );
-    assert!(!prepared.facts().has_refresh_token);
-    assert_eq!(prepared.facts().account_id, *account.id());
+    for base_url in [
+        "https://second.example/root",
+        "http://10.0.0.7:8080/v1",
+        "http://[fd00::7]:8080/v1",
+        "http://relay:8080/v1",
+    ] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"base_url":base_url, "transport":"prefer_websocket"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let material = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
+        assert_eq!(material.get("base_url"), Some(&json!(base_url)));
+        assert!(!prepared.facts().has_refresh_token);
+        assert_eq!(prepared.facts().account_id, *account.id());
+    }
     assert_eq!(
         admin
             .prepare_refresh(PrepareCredentialRefresh {
@@ -2607,6 +2780,7 @@ async fn oauth_transport_settings_preserve_tokens_refresh_schedule_and_health() 
     );
 }
 
+// fork: cloud-mint 票据发布回归
 mod mint_publication {
     use super::*;
     use sha2::{Digest as _, Sha256};
@@ -3015,4 +3189,54 @@ mod mint_publication {
                 .is_empty()
         );
     }
+}
+
+#[derive(Default)]
+struct RecordingDiagnostics(std::sync::Mutex<Vec<gateway_core::diagnostics::OperationalFailure>>);
+#[async_trait::async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        self.0.lock().unwrap().push(failure);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn usage_quote_reuses_native_override_and_reports_incomplete_input() {
+    use gateway_admin::ports::provider::ProviderUsagePricingInput;
+    use gateway_core::metering::{ModelPriceOverride, Usage};
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let admin = bundle.admin_provider();
+    let mut input = ProviderUsagePricingInput {
+        upstream_model_id: "gpt-6-sol".into(),
+        service_tier: None,
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            cached_input_tokens: Some(200_000),
+            cache_write_input_tokens: Some(0),
+            image_input_tokens: Some(0),
+            image_output_tokens: Some(0),
+            ..Default::default()
+        },
+    };
+    let custom:ModelPriceOverride=serde_json::from_value(json!({"multiplierBps":10000,"bands":{"standard":{"input":"2","output":"10","cacheRead":"0.5","cacheWrite":"2"},"long_standard":{"input":"2","output":"10","cacheRead":"0.5","cacheWrite":"2"}}})).unwrap();
+    let price = admin
+        .evaluate_usage_pricing(&input, Some(&custom))
+        .unwrap()
+        .unwrap();
+    assert_eq!(price.total_amount().amount().canonical(), "2.7");
+    input.usage.cached_input_tokens = None;
+    assert!(
+        admin
+            .evaluate_usage_pricing(&input, Some(&custom))
+            .unwrap()
+            .is_none()
+    );
 }

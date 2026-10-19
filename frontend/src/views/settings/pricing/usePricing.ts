@@ -1,5 +1,5 @@
 import type { PricingCatalog, PricingChange, PricingSyncPreview } from '@/api'
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { getPricing, previewPricingSync, syncPricing, updatePricing } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
@@ -7,7 +7,7 @@ import { errorMessage } from '@/utils/operation'
 import { pricingProviders, pricingRows } from './model'
 
 export function usePricing() {
-  const catalog = shallowRef<PricingCatalog>({ defaults: {}, overrides: {}, synced: {}, syncedAt: null })
+  const catalog = shallowRef<PricingCatalog>({ defaults: {}, overrides: {}, synced: {}, syncedAt: null, syncedAtDisplay: null })
   const provider = ref('openai')
   const search = ref('')
   const source = ref('all')
@@ -19,6 +19,9 @@ export function usePricing() {
   const writeAction = useAsyncAction()
   const previewAction = useAsyncAction()
   const preview = shallowRef<PricingSyncPreview>()
+  const syncOpen = shallowRef(false)
+  // 确认窗口展示查询时的价格对比，保存后的列表刷新不能改变退场中的预览。
+  const syncCatalog = shallowRef(catalog.value)
   const providers = computed(() => pricingProviders(catalog.value))
   const rows = computed(() => pricingRows(catalog.value, provider.value))
   const filtered = computed(() => rows.value.filter(row => row.model.toLowerCase().includes(search.value.trim().toLowerCase())
@@ -45,7 +48,7 @@ export function usePricing() {
   async function save(models: string[], change: PricingChange): Promise<boolean> {
     return await writeAction.run(async () => {
       await updatePricing({ provider: provider.value, models, change })
-      toast.success(change.action === 'delete' ? '模型价目已删除' : change.action === 'reset' ? '已清除人工覆盖' : '模型定价已保存')
+      ZNotification.success({ message: change.action === 'delete' ? '模型价目已删除' : change.action === 'reset' ? '已清除人工覆盖' : '模型定价已保存' })
       selected.value = []
       await load()
       return true
@@ -54,16 +57,18 @@ export function usePricing() {
   async function startSync() {
     await previewAction.run(async () => {
       preview.value = await previewPricingSync()
+      syncCatalog.value = catalog.value
+      syncOpen.value = true
     })
   }
   async function confirmSync(models: Record<string, string[]>) {
-    if (!preview.value || !Object.values(models).some(items => items.length))
+    if (!syncOpen.value || !preview.value || !Object.values(models).some(items => items.length))
       return
     const approved = preview.value
     await writeAction.run(async () => {
       await syncPricing({ preview: approved, models })
-      preview.value = undefined
-      toast.success('来源价目已同步，人工覆盖保持不变')
+      syncOpen.value = false
+      ZNotification.success({ message: '来源价目已同步，人工覆盖保持不变' })
       await load()
     })
   }
@@ -75,5 +80,5 @@ export function usePricing() {
     selected.value = checked ? [...new Set([...selected.value, ...ids])] : selected.value.filter(id => !ids.includes(id))
   }
   onMounted(load)
-  return { catalog, providers, provider, search, source, page, pageSize, selected, error, rows, filtered, visible, pagination, loading: loadAction.loading, saving: writeAction.loading, syncing: previewAction.loading, preview, load, save, startSync, confirmSync, toggle, togglePage }
+  return { catalog, providers, provider, search, source, page, pageSize, selected, error, rows, filtered, visible, pagination, loading: loadAction.loading, saving: writeAction.loading, syncing: previewAction.loading, preview, syncOpen, syncCatalog, load, save, startSync, confirmSync, toggle, togglePage }
 }

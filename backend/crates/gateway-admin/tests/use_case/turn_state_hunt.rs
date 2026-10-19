@@ -20,6 +20,9 @@ use gateway_core::{
     error::{GatewayError, GatewayErrorKind, ProviderErrorKind},
     event::ProviderResponseHeader,
     routing::UpstreamModelId,
+    task::{
+        ScheduledTask, WorkerContribution, WorkerCycleContext, WorkerId, WorkerKind, WorkerRunnable,
+    },
     upstream::UpstreamSendState,
 };
 
@@ -118,6 +121,7 @@ impl AccountProbe for ScriptedProbe {
 fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        enabled: true,
         auto_location: false,
         detected_location: None,
         location: None,
@@ -145,6 +149,8 @@ fn proxy(id: &str, port: u16, usable: bool) -> ProxyRecord {
 
 struct Setup {
     services: gateway_admin::AdminServices,
+    /// attach 登记的 state 续期 Worker（上游不再暴露账号用例句柄，只能从 bundle 取）。
+    renewal: Box<dyn ScheduledTask>,
     provider: Arc<FakeProviderAdmin>,
     store: Arc<FakeAccountStore>,
     proxies: Arc<Mutex<Vec<ProxyRecord>>>,
@@ -167,7 +173,7 @@ async fn setup(
         .map(|record| (record.id.clone(), record.proxy.clone()))
         .collect();
     let proxies = Arc::new(Mutex::new(proxies));
-    let services = super::AdminHarness::new()
+    let bundle = super::AdminHarness::new()
         .accounts(store.clone())
         .provider(provider.clone())
         .probe(probe)
@@ -178,15 +184,38 @@ async fn setup(
             },
             ..Default::default()
         }))
-        .build()
+        .build_bundle()
         .await;
+    let services = bundle.services();
     Setup {
         services,
+        renewal: renewal_worker(bundle),
         provider,
         store,
         proxies,
         log,
     }
+}
+
+fn renewal_worker(mut bundle: gateway_admin::AdminBundle) -> Box<dyn ScheduledTask> {
+    bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find_map(|contribution| {
+            let WorkerContribution::Registration(registration) = contribution else {
+                return None;
+            };
+            if registration.id.owner()
+                != gateway_admin::turn_state_renewal::TURN_STATE_RENEWAL_WORKER_OWNER
+            {
+                return None;
+            }
+            match registration.runnable {
+                WorkerRunnable::Scheduled { task, .. } => Some(task),
+                WorkerRunnable::Daemon { .. } => None,
+            }
+        })
+        .expect("registered turn state renewal worker")
 }
 
 fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
@@ -207,6 +236,7 @@ fn command(attempts: u8, include_direct: bool) -> TurnStateHuntCommand {
 fn proxy_with(id: &str, url: &str, usable: bool, account_count: u64) -> ProxyRecord {
     let now = Utc::now();
     ProxyRecord {
+        enabled: true,
         auto_location: false,
         detected_location: None,
         location: None,
@@ -640,8 +670,7 @@ async fn one_hunt_per_account_and_the_slot_is_released_afterwards() {
     ));
 }
 
-async fn renewal_cycle(task: &gateway_admin::turn_state_renewal::TurnStateRenewalTask) {
-    use gateway_core::task::{ScheduledTask as _, WorkerCycleContext, WorkerId, WorkerKind};
+async fn renewal_cycle(task: &dyn ScheduledTask) {
     let worker = WorkerId::try_new(WorkerKind::AccountFreezeRecovery, "test").expect("worker id");
     task.run_cycle(WorkerCycleContext::new(
         worker,
@@ -675,21 +704,19 @@ async fn renewal_rehunts_due_accounts_and_backs_off_after_a_full_miss() {
             attempts: 1,
             include_direct: false,
         }];
-    let task = gateway_admin::turn_state_renewal::TurnStateRenewalTask::new(
-        setup.services.accounts_handle(),
-    );
+    let task = setup.renewal.as_ref();
 
-    renewal_cycle(&task).await;
+    renewal_cycle(task).await;
     assert_eq!(probe.egresses(), vec![endpoint(8001), endpoint(8002)]);
     let log = recorded(&setup.log);
     assert!(log.contains(&"store.batch_update_accounts"));
     assert!(log.contains(&"provider.hunt_pin"));
 
     // 成功后不退避：账号仍到期时下个周期照常再续。
-    renewal_cycle(&task).await;
+    renewal_cycle(task).await;
     assert_eq!(probe.egresses().len(), 4);
     // 整轮未命中后进入退避，不会每个周期都把所有出口再打一遍。
-    renewal_cycle(&task).await;
+    renewal_cycle(task).await;
     assert_eq!(probe.egresses().len(), 4);
 }
 
@@ -1260,4 +1287,69 @@ async fn renewal_stops_mid_egress_once_the_account_is_disabled() {
             ..
         })
     ));
+}
+
+// fork: 以下为从 src/use_case/turn_state_hunt.rs 搬出的失败分类与一次性出口模板测试，
+// 走 lib.rs 的 doc(hidden) 再导出。
+
+fn probe_provider_error(kind: ProviderErrorKind, code: Option<&'static str>) -> AccountProbeError {
+    let mut gateway = GatewayError::new(GatewayErrorKind::InvalidRequest, "upstream rejected");
+    if let Some(code) = code {
+        gateway = gateway.with_client_code(code);
+    }
+    AccountProbeError::new(gateway, AccountProbeErrorSource::Upstream, None, None)
+        .with_provider_kind(Some(kind))
+}
+
+#[test]
+fn model_not_found_moves_on_instead_of_aborting_the_hunt() {
+    let class = gateway_admin::TurnStateHuntFailureClass::of(&probe_provider_error(
+        ProviderErrorKind::InvalidRequest,
+        Some("model_not_found"),
+    ));
+    assert_eq!(
+        class,
+        gateway_admin::TurnStateHuntFailureClass::ModelUnavailable
+    );
+    assert!(class.abort().is_none());
+}
+
+#[test]
+fn other_invalid_requests_still_abort_the_hunt() {
+    let class = gateway_admin::TurnStateHuntFailureClass::of(&probe_provider_error(
+        ProviderErrorKind::InvalidRequest,
+        None,
+    ));
+    assert_eq!(class, gateway_admin::TurnStateHuntFailureClass::Account);
+    assert!(class.abort().is_some());
+}
+
+#[test]
+fn injects_country_and_session_replacing_existing_tokens() {
+    let url = gateway_admin::ephemeral_proxy_url(
+        "http://user_area-US_life-30_session-old:pass@host.example:3120/",
+        "JP",
+        "abc123",
+    )
+    .expect("valid template");
+    // 旧的 area/session/life 段被剥掉，换成目标国家与一次性 session；base 段与其余部分保留。
+    assert_eq!(
+        url,
+        "http://user_area-JP_session-abc123:pass@host.example:3120/"
+    );
+}
+
+#[test]
+fn appends_tokens_when_username_has_none() {
+    let url = gateway_admin::ephemeral_proxy_url("http://base:pass@host.example:3120/", "DE", "s1")
+        .expect("valid template");
+    assert_eq!(
+        url,
+        "http://base_area-DE_session-s1:pass@host.example:3120/"
+    );
+}
+
+#[test]
+fn rejects_a_template_without_credentials() {
+    assert!(gateway_admin::ephemeral_proxy_url("http://host.example:3120/", "US", "s1").is_none());
 }

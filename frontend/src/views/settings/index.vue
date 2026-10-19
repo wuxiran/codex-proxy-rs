@@ -1,20 +1,23 @@
 <script setup lang="ts">
-import { BaseButton, BaseIconButton, BasePageHeader, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
+import { ZButton, ZIconButton, ZPageHeader, ZSegmented, ZSelect } from '@codex-proxy/ui'
 
 import { Save, Undo2 } from '@lucide/vue'
-import { computed, reactive, shallowRef, watch } from 'vue'
+import { computed, nextTick, reactive, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import AccountAffinityCard from './components/AccountAffinityCard.vue'
 import AccountAutoFreezeCard from './components/AccountAutoFreezeCard.vue'
 import AccountWarmupCard from './components/AccountWarmupCard.vue'
 import SettingsBackupSection from './components/backup/SettingsBackupSection.vue'
 import ClientProfileCard from './components/ClientProfileCard.vue'
+import ConcurrencyPolicyCard from './components/ConcurrencyPolicyCard.vue'
 import ModelAliasesCard from './components/ModelAliasesCard.vue'
+import PrivacyPolicyCard from './components/privacy/PrivacyPolicyCard.vue'
+import RequestHistoryCard from './components/RequestHistoryCard.vue'
 import RequestLocationCard from './components/RequestLocationCard.vue'
-import RequestLogCard from './components/RequestLogCard.vue'
-import RequestQueueCard from './components/RequestQueueCard.vue'
+import RequestLogCard from './components/RequestLogCard.vue' // fork: request-log
+import ResetCreditCard from './components/ResetCreditCard.vue'
 import RotationStrategyCard from './components/RotationStrategyCard.vue'
-import RuntimeSettingsCard from './components/RuntimeSettingsCard.vue'
 import SettingsAccessSection from './components/SettingsAccessSection.vue'
 import TokenRefreshCard from './components/TokenRefreshCard.vue'
 import { useSettingsForm } from './composables/useSettingsForm'
@@ -24,7 +27,7 @@ import PricingSection from './pricing/index.vue'
 const route = useRoute()
 const router = useRouter()
 const sectionOptions = [
-  { label: '网关调度', value: 'runtime' },
+  { label: '运行设置', value: 'runtime' },
   { label: '上游配置', value: 'upstream' },
   { label: '模型定价', value: 'pricing' },
   { label: '安全与访问', value: 'access' },
@@ -43,13 +46,15 @@ const isBasicSection = computed(() => section.value !== 'pricing' && section.val
 const visited = reactive(new Set<string>())
 const settingsVisited = shallowRef(false)
 
-function switchSection(value: string): void {
+function switchSection(value = 'runtime'): void {
   void router.push(value === 'runtime' ? '/settings' : `/settings/${value}`)
 }
 
 const {
   loading,
   saving,
+  detectingLocation,
+  detectLocation,
   hasChanges,
   resetSettings,
   error,
@@ -62,11 +67,16 @@ const {
   refreshMarginSecondsValue,
   refreshConcurrencyValue,
   maxConcurrentPerAccountValue,
-  requestIntervalMsValue,
+  openaiGuardianReservedConcurrencyValue,
+  maxAccountRotationsValue,
+  openaiSessionAffinityTtlHoursValue,
   maxWaitingPerKeyValue,
   maxWaitingPerAccountValue,
   concurrencyWaitTimeoutSecondsValue,
   responsesMaxDecompressedBodyMiBValue,
+  usageRetentionDaysValue,
+  resetCreditLeadMinutesValue,
+  resetCreditMaxWeeklyRemainingPercentValue,
   accountAutoFreezeThresholdValue,
   accountAutoFreezeWindowSecondsValue,
   accountAutoFreezeDurationSecondsValue,
@@ -77,7 +87,14 @@ const {
   loadSettings,
 } = useSettingsForm()
 
-const disabled = computed(() => saving.value || loading.value || !!error.value)
+watch(() => !loading.value && route.hash === '#reset-credits', async (ready) => {
+  if (ready) {
+    await nextTick()
+    document.getElementById('reset-credits')?.scrollIntoView({ block: 'start' })
+  }
+}, { immediate: true })
+
+const disabled = computed(() => saving.value || loading.value || detectingLocation.value || !!error.value)
 
 watch(section, (value) => {
   visited.add(value)
@@ -90,17 +107,17 @@ watch(section, (value) => {
 
 <template>
   <div class="w-full" :class="section === 'pricing' ? 'flex h-[calc(100dvh-2rem)] flex-none! flex-col min-[961px]:h-[calc(100dvh-3rem)]' : undefined">
-    <BasePageHeader title="系统设置" description="管理网关调度、上游配置、模型定价、安全访问与数据备份" />
+    <ZPageHeader title="系统设置" description="配置网关调度、上游与定价，管理访问安全、历史保留与备份" />
 
     <div class="mt-4 flex min-h-cp-control shrink-0 flex-wrap items-center justify-between gap-3">
-      <BaseSegmented
+      <ZSegmented
         :model-value="section"
-        label="设置分区"
+        aria-label="设置分区"
         class="hidden! bg-(--cp-input-bg)! sm:inline-grid!"
         :options="sectionOptions"
         @update:model-value="switchSection"
       />
-      <BaseSelect
+      <ZSelect
         :model-value="section"
         aria-label="设置分区"
         class="w-full sm:hidden"
@@ -109,15 +126,15 @@ watch(section, (value) => {
       />
       <div v-if="isBasicSection || hasChanges" class="ml-auto flex items-center justify-end gap-2">
         <span v-if="hasChanges" class="mr-1 size-1.5 shrink-0 rounded-full bg-cp-warning" aria-hidden="true" />
-        <BaseIconButton v-if="hasChanges" label="撤销全部基础设置更改" variant="secondary" :disabled="saving || loading" @click="resetSettings">
+        <ZIconButton v-if="hasChanges" aria-label="撤销全部基础设置更改" variant="solid" :disabled="saving || loading || detectingLocation" @click="resetSettings">
           <Undo2 class="size-4" />
-        </BaseIconButton>
-        <BaseButton variant="primary" :loading="saving" :disabled="loading || !hasChanges || !!error" @click="saveSettings">
+        </ZIconButton>
+        <ZButton type="primary" :loading="saving" :disabled="disabled || !hasChanges" @click="saveSettings">
           <template #icon>
             <Save class="size-4" />
           </template>
           {{ saving ? '保存中...' : '保存基础设置' }}
-        </BaseButton>
+        </ZButton>
       </div>
     </div>
 
@@ -126,9 +143,9 @@ watch(section, (value) => {
         <p class="m-0 text-cp">
           设置加载失败：{{ error }}
         </p>
-        <BaseButton :loading="loading" @click="loadSettings()">
+        <ZButton :loading="loading" @click="loadSettings()">
           重新加载
-        </BaseButton>
+        </ZButton>
       </div>
 
       <SettingsAccessSection
@@ -145,10 +162,6 @@ watch(section, (value) => {
 
       <fieldset v-show="section !== 'access'" :disabled="disabled" class="m-0 grid min-w-0 gap-5 border-0 p-0" aria-label="基础设置">
         <template v-if="section === 'runtime'">
-          <RuntimeSettingsCard
-            v-model:max-concurrent-per-account="maxConcurrentPerAccountValue"
-            v-model:request-interval-ms="requestIntervalMsValue"
-          />
           <RotationStrategyCard
             v-model="form.rotationStrategy"
             v-model:smart-scheduling="form.smartScheduling"
@@ -156,10 +169,18 @@ watch(section, (value) => {
             :disabled="disabled"
             :options="rotationOptions"
           />
-          <RequestQueueCard
+          <AccountAffinityCard
+            v-model="form.openaiAccountAffinity"
+            v-model:ttl-hours="openaiSessionAffinityTtlHoursValue"
+            v-model:max-account-rotations="maxAccountRotationsValue"
+            :disabled="disabled"
+          />
+          <ConcurrencyPolicyCard
+            v-model:max-concurrent-per-account="maxConcurrentPerAccountValue"
             v-model:max-waiting-per-key="maxWaitingPerKeyValue"
             v-model:max-waiting-per-account="maxWaitingPerAccountValue"
             v-model:concurrency-wait-timeout-seconds="concurrencyWaitTimeoutSecondsValue"
+            v-model:openai-guardian-reserved-concurrency="openaiGuardianReservedConcurrencyValue"
           />
           <AccountAutoFreezeCard
             v-model:enabled="form.accountAutoFreezeEnabled"
@@ -170,6 +191,7 @@ watch(section, (value) => {
             v-model:probe-model="form.accountAutoFreezeProbeModel"
             v-model:adaptive-concurrency="form.accountAutoFreezeAdaptiveConcurrency"
           />
+          <!-- fork: request-log -->
           <RequestLogCard
             v-model:enabled="form.requestLogEnabled"
             v-model:test-key-id="form.requestLogTestKeyId"
@@ -180,6 +202,11 @@ watch(section, (value) => {
             v-model:schedule-time="form.accountWarmupScheduleTime"
             v-model:model="form.accountWarmupModel"
           />
+          <ResetCreditCard
+            v-model="resetCreditLeadMinutesValue"
+            v-model:max-weekly-remaining-percent="resetCreditMaxWeeklyRemainingPercentValue"
+          />
+          <RequestHistoryCard v-model="usageRetentionDaysValue" />
         </template>
 
         <div v-if="visited.has('upstream')" v-show="section === 'upstream'" class="grid min-w-0 gap-5">
@@ -189,7 +216,14 @@ watch(section, (value) => {
             :active="section === 'upstream'"
             :disabled="disabled"
           />
-          <RequestLocationCard v-model="form.requestLocation" v-model:enabled="form.requestLocationEnabled" :disabled="disabled" />
+          <RequestLocationCard
+            v-model="form.requestLocation"
+            v-model:enabled="form.requestLocationEnabled"
+            :disabled="disabled"
+            :detecting-location="detectingLocation"
+            @detect-location="detectLocation"
+          />
+          <PrivacyPolicyCard v-model="form.codexPrivacyPolicy" :disabled="disabled" />
           <ModelAliasesCard
             :mappings="mappings"
             :loading="loading"

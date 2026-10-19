@@ -1,16 +1,17 @@
-//! OpenAI Responses 的透明 wire adapter 与 Core canonical facts 投影。
+//! OpenAI Responses 的透明 wire adapter 与 Core canonical facts 投影
 
 mod error;
 mod http;
+mod keepalive;
 mod request;
 mod response;
 mod validation;
 pub mod websocket;
 
+pub(crate) use crate::request_context::request_client_context;
 pub use error::{ProtocolError, ProtocolErrorBody, RequestDecodeError, ResponseEncodeError};
 pub(crate) use http::{
-    ResponseAuthorization, ResponsesHttpRequest, execute_prepared_responses,
-    request_client_context, responses,
+    ResponseAuthorization, ResponsesHttpRequest, execute_prepared_responses, responses,
 };
 pub use http::{collect_execution_response, stream_execution_response};
 pub(crate) use request::decode_request_with_body;

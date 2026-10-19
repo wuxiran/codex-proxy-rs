@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { PublicImportConfig } from '@/api'
-import { BaseButton, BaseCard, toast } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZNotification } from '@codex-proxy/ui'
 import { Plus } from '@lucide/vue'
 
 import { onMounted, ref, shallowRef } from 'vue'
@@ -35,7 +35,7 @@ async function add() {
       expiresAt: null,
     })
     configs.value = [...configs.value, created]
-    toast.success('已新增号商，填写名称与目标分组后开启')
+    ZNotification.success({ message: '已新增号商，填写名称与目标分组后开启' })
   })
 }
 
@@ -49,17 +49,17 @@ function onDeleted(id: string) {
 </script>
 
 <template>
-  <BaseCard
+  <ZCard
     title="免登录账号导入"
     description="每个上游号商一个独立链接，对方无需账号密码即可导入 sub2api 格式账号；导入的账号会带上号商名，便于在账号列表追溯来源"
   >
     <template #actions>
-      <BaseButton variant="primary" :loading="createAction.loading.value" :disabled="loading" @click="add">
+      <ZButton type="primary" :loading="createAction.loading.value" :disabled="loading" @click="add">
         <template #icon>
           <Plus class="size-4" />
         </template>
         新增号商
-      </BaseButton>
+      </ZButton>
     </template>
 
     <div class="grid gap-4">
@@ -82,5 +82,5 @@ function onDeleted(id: string) {
         @deleted="onDeleted"
       />
     </div>
-  </BaseCard>
+  </ZCard>
 </template>

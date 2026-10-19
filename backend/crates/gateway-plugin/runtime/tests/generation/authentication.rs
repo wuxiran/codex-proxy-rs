@@ -1,3 +1,5 @@
+//! 验证插件认证的身份映射、回退条件与发布后的权限撤销
+
 use gateway_admin::model::client_keys::SetClientKeyEnabled;
 use gateway_core::{
     engine::{authentication::ClientAuthenticationRequest, execution::ClientAuthenticationError},
@@ -46,6 +48,7 @@ fn configuration(result: Value, exclusive: bool, expected_authorization: &str) -
         "frontend_authentication_client_key_id": "key_frontend",
         "frontend_authentication_exclusive": exclusive,
         "expected_frontend_authorization": expected_authorization,
+        "extra_result_fields": true,
     })
 }
 
@@ -110,7 +113,7 @@ async fn delegate_falls_back_only_for_not_matched_while_exclusive_never_falls_ba
 }
 
 #[tokio::test]
-async fn rejection_unmapped_principal_and_plugin_supplied_key_id_fail_closed() {
+async fn authentication_rejects_unmapped_principals_and_ignores_plugin_selected_keys() {
     for result in [
         json!({"outcome":"rejected"}),
         json!({"outcome":"authenticated","principal":"unmapped"}),
@@ -127,6 +130,14 @@ async fn rejection_unmapped_principal_and_plugin_supplied_key_id_fail_closed() {
             authentication,
             Err(ClientAuthenticationError::InvalidKey)
         ));
+        assert!(
+            core.snapshots()
+                .acquire()
+                .unwrap()
+                .extensions()
+                .unwrap()
+                .is_ready()
+        );
         close(environment, runtime, core).await;
     }
 
@@ -146,10 +157,24 @@ async fn rejection_unmapped_principal_and_plugin_supplied_key_id_fail_closed() {
     else {
         return;
     };
-    assert!(matches!(
-        authentication,
-        Err(ClientAuthenticationError::ProviderUnavailable)
-    ));
+    assert_eq!(
+        authentication.unwrap().policy().key_id().as_str(),
+        "key_frontend"
+    );
+    assert!(
+        core.snapshots()
+            .acquire()
+            .unwrap()
+            .extensions()
+            .unwrap()
+            .is_ready()
+    );
+    for probe in core.health_probes() {
+        assert!(matches!(
+            probe.check().await,
+            gateway_core::health::HealthState::Healthy
+        ));
+    }
     close(environment, runtime, core).await;
 }
 

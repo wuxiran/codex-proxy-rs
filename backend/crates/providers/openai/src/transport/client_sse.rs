@@ -1,3 +1,5 @@
+//! Codex Responses 流式传输编排、HTTP SSE 解码与 WebSocket 连接复用
+
 use gateway_core::diagnostics::{StreamCapture, StreamFormat, TraceContext, diagnostic_json};
 
 use std::{sync::Arc, time::Instant};
@@ -25,7 +27,8 @@ use crate::transport::{
     profile::CodexWireProfileState,
     protocol::{
         responses::{
-            CodexResponsesRequest, ResponsesSseFailure, TransportRequirement, transport_requirement,
+            CodexResponsesRequest, TransportRequirement, is_replaceable_response_prelude,
+            transport_requirement,
         },
         websocket::{
             websocket_audit_artifact_from_attempt, websocket_connection_limit_failure,
@@ -35,10 +38,9 @@ use crate::transport::{
     response_meta,
     websocket::{
         CodexWebSocketConnection, CodexWebSocketExchangeError, CodexWebSocketPool,
-        CodexWebSocketPoolKey, CodexWebSocketStreamingExchange, DEFAULT_STREAM_IDLE_TIMEOUT,
-        WEBSOCKET_FAST_PATH_BUDGET, WebSocketFastPath, WebSocketOriginBreaker,
-        execute_prepared_response_create_request_stream, post_send_ambiguous,
-        prepare_response_create_request_with_pool, websocket_audit_dir,
+        CodexWebSocketPoolKey, DEFAULT_STREAM_IDLE_TIMEOUT, WEBSOCKET_FAST_PATH_BUDGET,
+        WebSocketFastPath, WebSocketOriginBreaker, execute_prepared_response_create_request_stream,
+        post_send_ambiguous, prepare_response_create_request_with_pool, websocket_audit_dir,
         write_websocket_audit_artifact_from_env,
     },
 };
@@ -50,13 +52,13 @@ impl CodexBackendClient {
         &self.profile
     }
 
-    /// 请求只持有自己的画像副本；连接池和 HTTP client 继续共享既有资源。
+    /// 请求只持有自己的画像副本；连接池和 HTTP client 继续共享既有资源
     pub fn with_request_profile(mut self, profile: super::profile::CodexWireProfile) -> Self {
         self.profile = CodexWireProfileState::new(profile);
         self
     }
 
-    /// 构造客户端。
+    /// 构造客户端
     pub fn new(
         client: Client,
         base_url: impl Into<String>,
@@ -64,6 +66,8 @@ impl CodexBackendClient {
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
+            privacy: None,
+            timezone: Default::default(),
             connection_budget: None,
             response_control: None,
             direct_client: client.clone(),
@@ -81,13 +85,13 @@ impl CodexBackendClient {
         }
     }
 
-    /// 为 Responses WebSocket 请求启用连接池。
+    /// 为 Responses WebSocket 请求启用连接池
     pub fn with_websocket_pool(mut self, pool: Arc<CodexWebSocketPool>) -> Self {
         self.websocket_pool = Some(pool);
         self
     }
 
-    /// 附加当前 attempt 经 Core 复核的业务请求头。
+    /// 附加当前 attempt 经 Core 复核的业务请求头
     #[must_use]
     pub(crate) fn with_middleware_headers(
         mut self,
@@ -97,27 +101,36 @@ impl CodexBackendClient {
         self
     }
 
-    /// 驱逐指定账号的 Responses WebSocket 池连接。
+    /// 驱逐指定账号的 Responses WebSocket 池连接
     pub async fn evict_websocket_account(&self, account_id: &str) {
         if let Some(pool) = &self.websocket_pool {
             pool.evict_account(account_id).await;
         }
     }
 
-    /// 发送 Responses SSE 请求并返回 live SSE 流（HTTP SSE fallback）。
+    /// 发送 Responses SSE 请求并返回 live SSE 流（HTTP SSE fallback）
     pub(crate) async fn create_response_stream_http_sse(
         &self,
         upstream_request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
-        let headers = self.request_headers_for_http_response(upstream_request, context)?;
+        let profile = self.profile.snapshot();
+        let mut headers =
+            self.request_headers_for_http_response(&profile, upstream_request, context)?;
         let headers_started_at = Instant::now();
-        // OAuth 请求遵循 Codex 压缩合同；API Key 上游使用普通 JSON。
+        // OAuth 请求遵循 Codex 压缩合同；API Key 上游使用普通 JSON
         // Codex 上游只交付 SSE；即使下游请求 `stream: false`，也要上游流式执行，
-        // 再由 API 层收集 canonical events 并返回完整 JSON。不能把下游的传输偏好
-        // 直接透传给 Codex，否则上游会以 400 拒绝非流式请求。
+        // 再由 API 层收集 canonical events 并返回完整 JSON
+        // 不能把下游的传输偏好
+        // 直接透传给 Codex，否则上游会以 400 拒绝非流式请求
         let mut upstream_body = upstream_request.body().clone();
         upstream_body.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        let mut upstream_body = serde_json::Value::Object(upstream_body);
+        if self.protocol == OpenAiUpstreamProtocol::Codex {
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        }
+        profile.apply_context_versions(&mut upstream_body);
+        self.apply_privacy(&mut upstream_body, &mut headers)?;
         let body =
             serde_json::to_vec(&upstream_body).map_err(CodexClientError::RequestBodyEncode)?;
         let endpoint = endpoint_url(&self.base_url, self.protocol.responses_path());
@@ -137,9 +150,8 @@ impl CodexBackendClient {
         );
         trace.capture("upstream.request.body", &body);
         let client = self.http_opening_client()?;
-        let mut outbound = client.post(endpoint).headers(headers);
+        let outbound = client.post(endpoint).headers(headers);
         let body = if self.protocol == OpenAiUpstreamProtocol::Codex {
-            outbound = outbound.header(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
             zstd::stream::encode_all(std::io::Cursor::new(body), 3)
                 .map_err(CodexClientError::RequestCompression)?
         } else {
@@ -248,7 +260,7 @@ impl CodexBackendClient {
             .await
     }
 
-    /// 在发送 payload 前完成 transport 选择和可取消的 WebSocket opening。
+    /// 在发送 payload 前完成 transport 选择和可取消的 WebSocket opening
     #[doc(hidden)]
     pub(crate) async fn prepare_response_transport_with_pool_account(
         &self,
@@ -277,8 +289,20 @@ impl CodexBackendClient {
             });
         }
 
-        let websocket_request = websocket_upstream_request(request);
-        let headers = self.request_headers_for_websocket_response(&websocket_request, context)?;
+        let mut websocket_request = websocket_upstream_request(request);
+        let profile = self.profile.snapshot();
+        let mut headers =
+            self.request_headers_for_websocket_response(&profile, &websocket_request, context)?;
+        let mut body = serde_json::Value::Object(std::mem::take(websocket_request.body_mut()));
+        let original_headers = self.privacy.as_ref().map(|_| headers.clone());
+        profile.apply_context_versions(&mut body);
+        self.apply_privacy(&mut body, &mut headers)?;
+        *websocket_request.body_mut() = body.as_object().cloned().ok_or_else(|| {
+            CodexClientError::Privacy(gateway_core::settings::privacy::PrivacyError {
+                rule_index: 0,
+                reason: "WS 请求正文必须是对象",
+            })
+        })?;
         let mut websocket_create = CodexWebSocketConnection::responses_create_request_for_path(
             &self.base_url,
             self.protocol.responses_path(),
@@ -299,22 +323,28 @@ impl CodexBackendClient {
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
         // 审计未启用时跳过 artifact 构造：payload 快照会深拷贝整个请求 body，
-        // 且位于首字节前的关键路径上。
+        // 且位于首字节前的关键路径上
         if websocket_audit_dir().is_some() {
             let artifact = websocket_audit_artifact_from_attempt(
                 &websocket_request,
                 websocket_create.connection().opening_audit_snapshot(),
                 websocket_payload_audit_snapshot(&websocket_request),
             );
-            if let Err(error) = write_websocket_audit_artifact_from_env(&artifact).await {
+            if let Err(error) =
+                write_websocket_audit_artifact_from_env(&artifact, self.timezone).await
+            {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
-        let connection_profile = websocket_connection_profile(&headers, &self.middleware_headers);
+        let connection_profile = websocket_connection_profile(
+            &headers,
+            &self.middleware_headers,
+            original_headers.as_ref(),
+        );
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
         let pool_log_context = pool_key.as_ref().map(WebSocketPoolLogContext::from_key);
-        let pool = self.websocket_pool.as_deref().zip(pool_key);
+        let pool = self.websocket_pool.as_deref().map(|pool| (pool, pool_key));
         let fast_path_budget = match requirement {
             TransportRequirement::PersistedContinuation | TransportRequirement::NewChain => {
                 Some(WEBSOCKET_FAST_PATH_BUDGET)
@@ -467,25 +497,31 @@ impl CodexBackendClient {
                 .await
                 .map_err(websocket_exchange_error_to_client_error)?;
                 if requirement.allows_connection_restart() {
-                    match await_websocket_delivery_boundary(&mut exchange).await {
-                        Ok(DeliveryBoundary::Ready) => {}
-                        Ok(DeliveryBoundary::ConnectionLimitReached(failure)) => {
-                            return Err(CodexClientError::WebSocket(
-                                CodexWebSocketExchangeError::ConnectionLimitReached(failure),
-                            ));
+                    // 前导帧即时交付；连接寿命拒绝仍沿用原有分类与恢复预算
+                    let mut boundary_reached = false;
+                    exchange.body = Box::pin(exchange.body.map(move |frame| {
+                        let frame = frame?;
+                        if !boundary_reached && !is_websocket_replayable_prelude(&frame) {
+                            boundary_reached = true;
+                            if let Some(failure) = websocket_connection_limit_failure(&frame) {
+                                return Err(CodexWebSocketExchangeError::ConnectionLimitReached(
+                                    Box::new(failure),
+                                ));
+                            }
                         }
-                        Err(error) => {
-                            return Err(websocket_exchange_error_to_client_error(
-                                post_send_ambiguous(error),
-                            ));
-                        }
-                    }
+                        Ok(frame)
+                    }));
                 }
                 Ok(CodexBackendStreamingResponse {
                     body: Box::pin(
                         exchange
                             .body
-                            .map_err(post_send_ambiguous)
+                            .map_err(|error| match error {
+                                error @ CodexWebSocketExchangeError::ConnectionLimitReached(_) => {
+                                    error
+                                }
+                                error => post_send_ambiguous(error),
+                            })
                             .map_err(websocket_exchange_error_to_client_error),
                     ),
                     transport: CodexBackendTransport::WebSocket,
@@ -519,15 +555,16 @@ impl CodexBackendClient {
             .or(request.previous_response_id())?;
         let mut key = CodexWebSocketPoolKey::new(&self.base_url, account_id, conversation_id)
             .with_egress_key(&self.egress_key)
+            .with_outbound_proxy(self.outbound_proxy.as_ref())
             .with_connection_profile(connection_profile)
-            .with_mint_route(request.minted_turn_state_route.as_deref());
+            .with_mint_route(request.minted_turn_state_route.as_deref()); // fork: turn-state-pin
         if let Some(connection_id) = request.downstream_websocket_connection_id.as_deref() {
             key = key.with_downstream_connection_id(connection_id);
         }
         Some(key)
     }
 
-    /// 客户端目录按调用方版本协商；后台目录仍使用经过核验的服务端画像版本。
+    /// 客户端目录按调用方版本协商；后台目录仍使用经过核验的服务端画像版本
     pub async fn fetch_models_with_context(
         &self,
         context: CodexRequestContext<'_>,
@@ -562,7 +599,7 @@ impl CodexBackendClient {
             .flatten();
         let body = read_model_catalog_body(response).await?;
         if !status.is_success() {
-            let body = String::from_utf8_lossy(&body).into_owned();
+            let body = String::from_utf8_lossy_owned(body);
             return Err(CodexClientError::Upstream {
                 status,
                 retry_after_seconds: retry_after_seconds
@@ -586,49 +623,15 @@ impl CodexBackendClient {
     }
 }
 
-/// 首个可投递帧前的交付边界结果。
-enum DeliveryBoundary {
-    /// 已越过边界，可开始向下游投递。
-    Ready,
-    /// 首个可投递帧是上游连接寿命限制错误。
-    ConnectionLimitReached(Box<ResponsesSseFailure>),
-}
-
-async fn await_websocket_delivery_boundary(
-    exchange: &mut CodexWebSocketStreamingExchange,
-) -> Result<DeliveryBoundary, CodexWebSocketExchangeError> {
-    let mut prelude = Vec::new();
-    loop {
-        match exchange.body.next().await {
-            Some(Ok(frame)) if is_websocket_lifecycle_prelude(&frame) => prelude.push(frame),
-            Some(Ok(frame)) => {
-                let connection_limit_failure = websocket_connection_limit_failure(&frame);
-                prelude.push(frame);
-                let remaining =
-                    std::mem::replace(&mut exchange.body, Box::pin(futures::stream::empty()));
-                exchange.body =
-                    Box::pin(futures::stream::iter(prelude.into_iter().map(Ok)).chain(remaining));
-                return Ok(if let Some(failure) = connection_limit_failure {
-                    DeliveryBoundary::ConnectionLimitReached(Box::new(failure))
-                } else {
-                    DeliveryBoundary::Ready
-                });
-            }
-            Some(Err(error)) => return Err(error),
-            None => {
-                return Err(CodexWebSocketExchangeError::StreamEndedBeforeTerminal {
-                    reason: "stream_eof",
-                    timeout: None,
-                    last_event_type: None,
-                });
-            }
-        }
-    }
-}
-
-fn is_websocket_lifecycle_prelude(frame: &[u8]) -> bool {
-    frame.starts_with(b"event: response.created\n")
-        || frame.starts_with(b"event: response.in_progress\n")
+fn is_websocket_replayable_prelude(frame: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|event_type| is_replaceable_response_prelude(event_type, &value))
+        })
 }
 
 async fn read_model_catalog_body(response: ReqwestResponse) -> CodexClientResult<Vec<u8>> {
@@ -656,12 +659,15 @@ async fn read_model_catalog_body(response: ReqwestResponse) -> CodexClientResult
 fn websocket_connection_profile(
     headers: &HeaderMap,
     middleware_headers: &[gateway_core::engine::middleware::MiddlewareHeader],
+    original_headers: Option<&HeaderMap>,
 ) -> String {
     let mut profile = [
         "originator",
         "user-agent",
         "version",
         X_OPENAI_MEMGEN_REQUEST_HEADER,
+        "x-codex-guardian",
+        "x-openai-internal-codex-residency",
     ]
     .map(|name| {
         headers
@@ -682,6 +688,38 @@ fn websocket_connection_profile(
         }
         profile.push('\0');
         profile.push_str(&hex::encode(digest.finalize()));
+    }
+    if let Some(original) = original_headers {
+        use sha2::{Digest, Sha256};
+        let names: std::collections::BTreeSet<_> = original
+            .keys()
+            .chain(headers.keys())
+            .map(|name| name.as_str())
+            .collect();
+        let mut digest = Sha256::new();
+        let mut changed = false;
+        for name in names {
+            if original
+                .get_all(name)
+                .iter()
+                .eq(headers.get_all(name).iter())
+            {
+                continue;
+            }
+            changed = true;
+            digest.update(name.len().to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update(headers.get_all(name).iter().count().to_le_bytes());
+            for value in headers.get_all(name) {
+                digest.update(value.len().to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+        }
+        // 改写后的握手头必须参与池身份，避免复用仍携带旧隐私值的连接
+        if changed {
+            profile.push('\0');
+            profile.push_str(&hex::encode(digest.finalize()));
+        }
     }
     profile
 }

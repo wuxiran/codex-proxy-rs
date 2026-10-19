@@ -1,3 +1,5 @@
+//! 验证插件命令帮助、调用授权、输出与失败取消后的进程回收
+
 mod execution;
 mod parameters;
 
@@ -123,7 +125,10 @@ async fn command_help_does_not_execute_and_stale_authorization_cannot_execute() 
 async fn command_returns_separate_output_and_exit_code_without_saving_on_failure() {
     let mut config = configuration(json!([]));
     config["command_echo"] = json!(false);
-    config["command_result"] = json!({"stdout":"out\n","stderr":"err\n","exit_code":17});
+    config["extra_result_fields"] = json!(true);
+    config["command_registration"]["commands"][0]["plugin_extra"] = json!(true);
+    config["command_result"] =
+        json!({"stdout":"out\n","stderr":"err\n","exit_code":17,"plugin_extra":true});
     let (_directory, _store, runtime) = setup(config).await;
     let commands = runtime.prepare_command_line().await.unwrap();
     let output = commands.execute("commands", "inspect", &[]).await.unwrap();
@@ -167,7 +172,7 @@ async fn failed_or_cancelled_commands_are_not_replayed_and_children_are_reaped()
                 if failure == "cancel" {
                     cancellation.cancel();
                 } else {
-                    // 正常完成注册并确认命令已进入子进程后，只推进执行期限。
+                    // 正常完成注册并确认命令已进入子进程后，只推进执行期限
                     tokio::time::pause();
                     tokio::time::advance(limits.maximum_call_timeout + Duration::from_millis(1))
                         .await;

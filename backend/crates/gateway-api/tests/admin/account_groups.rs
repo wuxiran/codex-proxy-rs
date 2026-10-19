@@ -1,3 +1,5 @@
+//! 验证账号分组 HTTP 接口的请求校验、权限与响应合同
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -48,6 +50,36 @@ async fn list_route_should_keep_camel_case_group_and_page_wire() {
 }
 
 #[tokio::test]
+async fn options_route_should_return_only_lightweight_group_fields() {
+    let fixture = authenticated_fixture().await;
+    let response = request(
+        router(&fixture),
+        Method::GET,
+        "/api/admin/account-groups/options?page=1&pageSize=1&search=alpha&enabled=true",
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(
+        value["data"]["items"][0],
+        json!({
+            "id": PRIMARY_GROUP_ID,
+            "name": "Alpha routing",
+            "color": "#2563EBFF",
+            "enabled": true
+        })
+    );
+    assert_eq!(value["data"]["page"]["page"], 1);
+    assert_eq!(value["data"]["page"]["pageSize"], 1);
+    assert_eq!(value["data"]["page"]["total"], 1);
+    assert_eq!(value["data"]["page"]["totalPages"], 1);
+    assert_eq!(value["data"]["configRevision"], 7);
+}
+
+#[tokio::test]
 async fn create_route_should_create_an_empty_group() {
     let fixture = authenticated_fixture().await;
     let response = request(
@@ -73,6 +105,8 @@ async fn create_route_should_create_an_empty_group() {
     assert_eq!(value["data"]["record"]["name"], "Gamma routing");
     assert_eq!(value["data"]["record"]["memberCount"], 0);
     assert_eq!(value["data"]["record"]["color"], "#A855F780");
+    assert_eq!(value["data"]["record"]["fastMode"], "default");
+    assert_eq!(value["data"]["record"]["allowImageGeneration"], true);
     assert_eq!(value["data"]["configRevision"], 8);
 }
 
@@ -160,6 +194,11 @@ async fn list_route_should_reject_unknown_and_invalid_pagination_fields() {
         "/api/admin/account-groups?page=0",
         "/api/admin/account-groups?pageSize=0",
         "/api/admin/account-groups?pageSize=201",
+        "/api/admin/account-groups/options?other=true",
+        "/api/admin/account-groups/options?page=0",
+        "/api/admin/account-groups/options?pageSize=0",
+        "/api/admin/account-groups/options?pageSize=201",
+        "/api/admin/account-groups/options?search=%00",
     ] {
         let response = request(router(&fixture), Method::GET, uri, None, true).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -216,6 +255,14 @@ async fn account_group_routes_should_require_admin_authentication() {
         false,
     )
     .await;
+    let options_response = request(
+        router(&fixture),
+        Method::GET,
+        "/api/admin/account-groups/options",
+        None,
+        false,
+    )
+    .await;
     let post_response = request(
         router(&fixture),
         Method::POST,
@@ -226,7 +273,27 @@ async fn account_group_routes_should_require_admin_authentication() {
     .await;
 
     assert_eq!(get_response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(options_response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(post_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn options_route_should_reject_client_key_identity() {
+    let fixture = crate::support::key_fixture().await;
+    let response = router(&fixture)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/admin/account-groups/options")
+                .header("x-api-key", crate::support::RAW_KEY)
+                .header("x-request-id", "req_account_group_options_client_key")
+                .body(Body::empty())
+                .expect("client key options request"),
+        )
+        .await
+        .expect("client key options response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 async fn authenticated_fixture() -> AdminTestFixture {
@@ -274,12 +341,19 @@ async fn response_json(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
-async fn disable_fast_group_updates_preserve_omitted_values() {
+async fn fast_mode_group_updates_preserve_omitted_and_null_values() {
     let fixture = authenticated_fixture().await;
-    for (value, expected) in [(Some(true), true), (None, true), (Some(false), false)] {
+    for (value, expected) in [
+        (Some(json!("disabled")), "disabled"),
+        (None, "disabled"),
+        (Some(json!("enabled")), "enabled"),
+        (None, "enabled"),
+        (Some(Value::Null), "enabled"),
+        (Some(json!("default")), "default"),
+    ] {
         let mut body = json!({"id": PRIMARY_GROUP_ID, "name":"Policy", "description":null,"color":"#F43F5ECC"});
         if let Some(value) = value {
-            body["disableFast"] = json!(value);
+            body["fastMode"] = value;
         }
         let response = request(
             router(&fixture),
@@ -291,7 +365,68 @@ async fn disable_fast_group_updates_preserve_omitted_values() {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response_json(response).await["data"]["record"]["disableFast"],
+            response_json(response).await["data"]["record"]["fastMode"],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn fast_mode_rejects_invalid_values_and_creates_groups_in_each_mode() {
+    let fixture = authenticated_fixture().await;
+    for (mode, expected) in [
+        (json!("enabled"), StatusCode::CREATED),
+        (json!("disabled"), StatusCode::CREATED),
+        (json!("default"), StatusCode::CREATED),
+        (json!("force"), StatusCode::UNPROCESSABLE_ENTITY),
+        (json!(true), StatusCode::BAD_REQUEST),
+    ] {
+        let response = request(
+            router(&fixture), Method::POST, "/api/admin/account-groups/create",
+            Some(json!({"name":format!("Fast {mode}"),"description":null,"color":"#F43F5ECC","fastMode":mode})), true,
+        ).await;
+        assert_eq!(response.status(), expected, "mode={mode}");
+        if expected == StatusCode::CREATED {
+            assert_eq!(
+                response_json(response).await["data"]["record"]["fastMode"],
+                mode
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn image_generation_flag_round_trips_and_omitted_updates_preserve_it() {
+    let fixture = authenticated_fixture().await;
+    let created = request(router(&fixture), Method::POST, "/api/admin/account-groups/create", Some(json!({
+        "name":"No images", "description":null, "color":"#2563EBFF", "allowImageGeneration":false
+    })), true).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = response_json(created).await;
+    assert_eq!(created["data"]["record"]["allowImageGeneration"], false);
+    let id = created["data"]["id"].as_str().unwrap();
+    for (value, expected) in [
+        (None, false),
+        (Some(true), true),
+        (Some(false), false),
+        (None, false),
+    ] {
+        let mut body =
+            json!({"id":id,"name":"Image policy","description":null,"color":"#2563EBFF"});
+        if let Some(value) = value {
+            body["allowImageGeneration"] = json!(value);
+        }
+        let response = request(
+            router(&fixture),
+            Method::POST,
+            "/api/admin/account-groups/update",
+            Some(body),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["data"]["record"]["allowImageGeneration"],
             expected
         );
     }

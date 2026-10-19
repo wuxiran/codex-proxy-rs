@@ -267,7 +267,7 @@ fn test_bench_defaults_to_business_and_exposes_observations_without_secrets() {
     let mut invalid = body;
     invalid["mode"] = json!("unknown");
     assert!(serde_json::from_value::<AccountTestBenchRequest>(invalid).is_err());
-    let event = gateway_api::admin::accounts::AccountConnectionTestEvent::from(
+    let event = gateway_api::admin::accounts::AccountConnectionTestEvent::from((
         gateway_admin::model::accounts::AccountConnectionTestEvent::Execution {
             mode: AccountProbeMode::Business,
             details: AccountProbeExecution {
@@ -281,7 +281,8 @@ fn test_bench_defaults_to_business_and_exposes_observations_without_secrets() {
                 ..Default::default()
             },
         },
-    );
+        gateway_api::TimePresenter::new(Default::default()),
+    ));
     assert_eq!(event.data["type"], "execution");
     assert_eq!(event.data["details"]["ticketAttached"], false);
     assert_eq!(event.data["details"]["warmPoolUsed"], true);

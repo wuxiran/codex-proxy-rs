@@ -49,7 +49,8 @@ const NATIVE_ATTEMPT_GAP: Duration = Duration::from_millis(1500);
 const MAX_CONCURRENT_MINTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum MintError {
+#[doc(hidden)]
+pub enum MintError {
     #[error("cloud mint is disabled")]
     Disabled,
     #[error("a dedicated mint proxy is required")]
@@ -324,7 +325,7 @@ impl CloudMintService {
         cookies.retain(|cookie| !is_root_route_cookie(cookie));
         cookies.extend(snapshot.original_cookies.iter().cloned());
         match self.repository.compare_and_swap_data(&current, data).await {
-            Ok(_) | Err(CredentialRepositoryError::RevisionConflict) => Ok(()),
+            Ok(_) | Err(CredentialRepositoryError::RevisionConflict(_)) => Ok(()),
             Err(_) => Err(MintError::Store),
         }
     }
@@ -1180,7 +1181,7 @@ impl CloudMintService {
             let current = self.load_account(account.id().as_str()).await?;
             let mut data = match self.repository.load_complete_data(&current).await {
                 Ok(data) => data,
-                Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => continue,
+                Err(CredentialRepositoryError::RevisionConflict(_)) if attempt == 0 => continue,
                 Err(_) => return Err(MintError::Store),
             };
             let oauth = data.oauth().ok_or(MintError::NotEligible)?;
@@ -1212,7 +1213,7 @@ impl CloudMintService {
             }
             match self.repository.compare_and_swap_data(&current, data).await {
                 Ok(revision) => return Ok((current, Some(revision))),
-                Err(CredentialRepositoryError::RevisionConflict) if attempt == 0 => {}
+                Err(CredentialRepositoryError::RevisionConflict(_)) if attempt == 0 => {}
                 Err(_) => return Err(MintError::Store),
             }
         }
@@ -1482,14 +1483,16 @@ fn same_mint_route(left: Option<&RoutePair>, right: Option<&RoutePair>) -> bool 
 }
 
 /// 只认显式配置的专用出口，账号业务代理和环境代理都不能代替它。
-fn mint_proxy(value: &str) -> Result<gateway_core::account::OutboundProxy, MintError> {
+#[doc(hidden)]
+pub fn mint_proxy(value: &str) -> Result<gateway_core::account::OutboundProxy, MintError> {
     if value.trim().is_empty() {
         return Err(MintError::ProxyRequired);
     }
     gateway_core::account::OutboundProxy::parse(value.trim()).map_err(|_| MintError::InvalidProxy)
 }
 
-fn mint_http_client(
+#[doc(hidden)]
+pub fn mint_http_client(
     proxy: &gateway_core::account::OutboundProxy,
 ) -> Result<reqwest::Client, MintError> {
     let builder = reqwest::Client::builder()
@@ -1500,86 +1503,4 @@ fn mint_http_client(
         .connect_timeout(Duration::from_secs(15));
     crate::transport::tls::build_reqwest_client_with_custom_ca(builder)
         .map_err(|_| MintError::Unreachable)
-}
-
-#[cfg(test)]
-mod dedicated_proxy_tests {
-    use super::{MintError, mint_http_client, mint_proxy};
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    #[test]
-    fn a_missing_or_invalid_mint_proxy_cannot_select_a_business_exit() {
-        assert_eq!(mint_proxy("").unwrap_err(), MintError::ProxyRequired);
-        assert_eq!(
-            mint_proxy("file:///tmp/proxy").unwrap_err(),
-            MintError::InvalidProxy
-        );
-        assert_eq!(
-            mint_proxy("http://user:pass@localhost:0").unwrap_err(),
-            MintError::InvalidProxy
-        );
-        assert!(mint_proxy("socks5h://example-user:example-password@proxy.example:1080").is_ok());
-    }
-
-    #[tokio::test]
-    async fn consecutive_mint_attempts_open_new_connections_to_the_dedicated_proxy() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = mint_proxy(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-        let server = tokio::spawn(async move {
-            let mut connections = Vec::new();
-            for _ in 0..2 {
-                let (mut socket, _) =
-                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                let mut request = Vec::new();
-                let mut part = [0; 1024];
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let n = socket.read(&mut part).await.unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&part[..n]);
-                }
-                assert!(
-                    request.starts_with(b"POST http://mint.invalid/codex/responses HTTP/1.1\r\n")
-                );
-                socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK",
-                    )
-                    .await
-                    .unwrap();
-                connections.push(socket);
-            }
-            connections.len()
-        });
-        for _ in 0..2 {
-            let response = mint_http_client(&proxy)
-                .unwrap()
-                .post("http://mint.invalid/codex/responses")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.text().await.unwrap(), "OK");
-        }
-        assert_eq!(server.await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_failed_dedicated_proxy_does_not_fall_back_to_direct() {
-        let upstream = wiremock::MockServer::start().await;
-        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = mint_proxy(&format!("http://{}", unavailable.local_addr().unwrap())).unwrap();
-        drop(unavailable);
-        let result = mint_http_client(&proxy)
-            .unwrap()
-            .post(upstream.uri())
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await;
-        assert!(result.is_err());
-        assert!(upstream.received_requests().await.unwrap().is_empty());
-    }
 }

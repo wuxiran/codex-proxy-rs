@@ -1,3 +1,5 @@
+//! 验证真实插件 RPC 会话的启动重试、并发调用、关闭与资源回收
+
 use std::{
     sync::{
         Arc, Condvar, Mutex, Weak,
@@ -15,7 +17,7 @@ use serde_json::json;
 use tokio::sync::{Barrier, Notify};
 
 #[derive(Default)]
-struct Callbacks {
+pub(super) struct Callbacks {
     called: AtomicUsize,
     nested: Mutex<Option<Weak<RpcSession>>>,
 }
@@ -27,8 +29,8 @@ struct BlockingCallbacks {
 }
 
 #[derive(Default)]
-struct LifecycleCallbacks {
-    begun: AtomicUsize,
+pub(super) struct LifecycleCallbacks {
+    pub(super) begun: AtomicUsize,
     finished: AtomicUsize,
 }
 
@@ -95,7 +97,7 @@ impl CallbackHandler for BlockingCallbacks {
 }
 
 impl CallbackHandler for LifecycleCallbacks {
-    fn begin(&self, _context: &CallContext) {
+    fn begin(&self, _context: &CallContext, _deadline: &gateway_plugin_sdk::client::CallDeadline) {
         self.begun.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -120,7 +122,7 @@ impl CallbackHandler for LifecycleCallbacks {
 }
 
 impl CallbackHandler for GatedFirstBegin {
-    fn begin(&self, context: &CallContext) {
+    fn begin(&self, context: &CallContext, _deadline: &gateway_plugin_sdk::client::CallDeadline) {
         if context.call_id == 1 {
             self.entered.notify_one();
             let released = self.released.lock().unwrap();
@@ -191,7 +193,7 @@ where
     (cache, Arc::new(session))
 }
 
-fn prepared_session() -> (
+pub(super) fn prepared_session() -> (
     tempfile::TempDir,
     Arc<gateway_plugin_runtime::PreparedPackage>,
     Handshake,
@@ -206,11 +208,7 @@ fn prepared_session() -> (
         )
         .unwrap(),
     );
-    let prepared = Arc::new(
-        package
-            .prepare(cache.path(), &"1.0.0".parse().unwrap())
-            .unwrap(),
-    );
+    let prepared = Arc::new(package.prepare(cache.path()).unwrap());
     let handshake = Handshake {
         protocol_version: gateway_plugin_sdk::PROTOCOL_VERSION,
         artifact_sha256: package.digest().into(),
@@ -327,7 +325,7 @@ async fn shutdown_returns_after_in_flight_callback_future_is_dropped() {
     .await
     .expect("session shutdown");
     assert!(callbacks.dropped.load(Ordering::Acquire));
-    assert!(matches!(calling.await.unwrap(), Err(RpcError::Closed)));
+    assert!(matches!(calling.await.unwrap(), Err(RpcError::Closed(_))));
 }
 
 #[tokio::test]
@@ -378,23 +376,24 @@ async fn slow_management_call_does_not_block_an_independent_call() {
 }
 
 #[tokio::test]
-async fn large_binary_payload_round_trips_through_calls_and_callbacks() {
+async fn large_json_and_binary_payload_round_trip_through_calls_and_callbacks() {
     let callbacks = Arc::new(Callbacks::default());
     let (_cache, session) = session(Arc::clone(&callbacks)).await;
     let payload = (0..4 * 1024 * 1024 + 17)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
+    let params = json!({"large": "x".repeat(256 * 1024)});
     for method in ["echo", "callback"] {
         let reply = session
             .call(
                 method,
                 session.context(Stage::Request, Duration::from_secs(30)),
-                json!({"large": true}),
+                params.clone(),
                 payload.clone(),
             )
             .await
             .unwrap();
-        assert_eq!(reply.result, json!({"large": true}));
+        assert_eq!(reply.result, params);
         assert_eq!(reply.payload, payload);
     }
     assert_eq!(callbacks.called.load(Ordering::Relaxed), 1);
@@ -402,78 +401,83 @@ async fn large_binary_payload_round_trips_through_calls_and_callbacks() {
 }
 
 #[tokio::test]
-async fn oversized_call_frames_do_not_close_the_session_or_begin_callbacks() {
+async fn oversized_control_metadata_does_not_close_the_session_or_begin_callbacks() {
     let callbacks = Arc::new(LifecycleCallbacks::default());
     let (_cache, session) = session(Arc::clone(&callbacks)).await;
-    let cases = [(json!({"text": "x".repeat(64 * 1024)}), vec![])];
-    for (params, payload) in cases {
-        let begun = callbacks.begun.load(Ordering::Relaxed);
-        let error = session
-            .call(
-                "echo",
+    let method = "x".repeat(64 * 1024);
+    let error = session
+        .call(
+            &method,
+            session.context(Stage::Request, Duration::from_secs(2)),
+            json!({}),
+            vec![],
+        )
+        .await
+        .err()
+        .expect("oversized control metadata must fail");
+    assert!(matches!(error, RpcError::Context(_)));
+    assert!(matches!(
+        session
+            .call_stream(
+                &method,
                 session.context(Stage::Request, Duration::from_secs(2)),
-                params.clone(),
-                payload.clone(),
+                json!({}),
+                vec![],
             )
-            .await
-            .err()
-            .expect("oversized call must fail");
-        assert_eq!(error, RpcError::Context);
-        assert!(matches!(
-            session
-                .call_stream(
-                    "stream",
-                    session.context(Stage::Request, Duration::from_secs(2)),
-                    params,
-                    payload,
-                )
-                .await,
-            Err(RpcError::Context)
-        ));
-        assert_eq!(callbacks.begun.load(Ordering::Relaxed), begun);
-        assert!(session.is_ready());
-        let reply = session
-            .call(
-                "echo",
-                session.context(Stage::Request, Duration::from_secs(2)),
-                json!({"still": "ready"}),
-                vec![1, 2, 3],
-            )
-            .await
-            .unwrap();
-        assert_eq!(reply.result, json!({"still": "ready"}));
-        assert_eq!(reply.payload, [1, 2, 3]);
-    }
+            .await,
+        Err(RpcError::Context(_))
+    ));
+    assert_eq!(callbacks.begun.load(Ordering::Relaxed), 0);
+    assert!(session.is_ready());
+    let reply = session
+        .call(
+            "echo",
+            session.context(Stage::Request, Duration::from_secs(2)),
+            json!({"still": "ready"}),
+            vec![1, 2, 3],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.result, json!({"still": "ready"}));
+    assert_eq!(reply.payload, [1, 2, 3]);
     session.shutdown(Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
-async fn oversized_callback_metadata_only_fails_its_parent_call() {
+async fn large_callback_results_succeed_and_oversized_errors_only_fail_the_parent_call() {
     let (_cache, session) = session(Arc::new(OversizedReplyCallbacks)).await;
-    for error in [false, true] {
-        assert!(matches!(
-            session
-                .call(
-                    "callback",
-                    session.context(Stage::Request, Duration::from_secs(2)),
-                    json!({"error": error}),
-                    vec![],
-                )
-                .await,
-            Err(RpcError::Remote(_))
-        ));
-        assert!(session.is_ready());
-        let reply = session
+    let reply = session
+        .call(
+            "callback",
+            session.context(Stage::Request, Duration::from_secs(2)),
+            json!({"error": false}),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.result, json!({"text": "x".repeat(64 * 1024)}));
+    assert!(matches!(
+        session
             .call(
-                "echo",
+                "callback",
                 session.context(Stage::Request, Duration::from_secs(2)),
-                json!({"still": "ready"}),
-                vec![1, 2, 3],
+                json!({"error": true}),
+                vec![],
             )
-            .await
-            .unwrap();
-        assert_eq!(reply.payload, [1, 2, 3]);
-    }
+            .await,
+        Err(RpcError::Remote(_))
+    ));
+    assert!(session.is_ready());
+    let reply = session
+        .call(
+            "echo",
+            session.context(Stage::Request, Duration::from_secs(2)),
+            json!({"still": "ready"}),
+            vec![1, 2, 3],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.payload, [1, 2, 3]);
     session.shutdown(Duration::from_secs(1)).await;
 }
 
@@ -514,11 +518,11 @@ async fn concurrent_calls_keep_their_wire_ids_monotonic() {
     }
     ready.wait().await;
     entered.await;
-    // 旧实现会在 begin 前分配后续 ID；等其他线程进入该窗口后再释放首调用。
+    // 旧实现会在 begin 前分配后续 ID；等其他线程进入该窗口后再释放首调用
     tokio::time::sleep(Duration::from_millis(20)).await;
     callbacks.release();
     for call in calls {
-        assert!(call.await.unwrap().is_ok());
+        call.await.unwrap().unwrap();
     }
     session.shutdown(Duration::from_secs(1)).await;
 }
@@ -655,7 +659,7 @@ async fn unknown_parent_cannot_borrow_another_calls_resources() {
             vec![],
         )
         .await;
-    assert!(matches!(reply, Err(RpcError::Protocol)));
+    assert!(matches!(reply, Err(RpcError::Protocol(_))));
     assert_eq!(callbacks.called.load(Ordering::Relaxed), 0);
 }
 
@@ -714,12 +718,16 @@ async fn child_crash_fails_the_call_without_waiting_for_its_deadline() {
     let result = tokio::time::timeout(Duration::from_secs(2), call)
         .await
         .unwrap();
-    assert!(matches!(result, Err(RpcError::Closed)));
+    assert!(matches!(result, Err(RpcError::Closed(_))));
 }
 
 #[tokio::test]
 async fn malformed_worker_frames_fail_boundedly_and_release_call_resources() {
-    for method in ["malformed_truncated_frame", "malformed_frame_length"] {
+    for method in [
+        "malformed_truncated_frame",
+        "malformed_frame_length",
+        "malformed_metadata",
+    ] {
         let callbacks = Arc::new(LifecycleCallbacks::default());
         let (_cache, session) = session(Arc::clone(&callbacks)).await;
         let result = tokio::time::timeout(
@@ -733,7 +741,29 @@ async fn malformed_worker_frames_fail_boundedly_and_release_call_resources() {
         )
         .await
         .expect("malformed worker output must fail within the process boundary");
-        assert!(matches!(result, Err(RpcError::Closed)));
+        let error = result.err().expect("malformed frame failure");
+        assert!(matches!(error, RpcError::Closed(Some(_))));
+        if method == "malformed_metadata" {
+            use std::error::Error as _;
+            let frame = error
+                .source()
+                .unwrap()
+                .downcast_ref::<gateway_plugin_sdk::FrameError>()
+                .unwrap();
+            assert!(frame.source().unwrap().is::<serde_json::Error>());
+            let provider = gateway_core::error::ProviderError::new(
+                gateway_core::error::ProviderErrorKind::Protocol,
+                gateway_core::upstream::UpstreamSendState::Ambiguous,
+            )
+            .with_source(error);
+            assert!(
+                provider
+                    .error_details()
+                    .unwrap()
+                    .contains("PRIVATE_INVALID_FRAME_KIND")
+            );
+            assert!(!format!("{provider:?} {provider}").contains("PRIVATE_INVALID_FRAME_KIND"));
+        }
         assert!(!session.is_ready());
         assert_eq!(callbacks.begun.load(Ordering::Relaxed), 1);
         assert_eq!(callbacks.finished.load(Ordering::Relaxed), 1);
@@ -754,7 +784,7 @@ async fn slow_stream_consumer_backpressures_the_child_without_blocking_control_c
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    // 消费者停止读取时对端会耗尽窗口；另一个请求仍能通过独立读写循环完成。
+    // 消费者停止读取时对端会耗尽窗口；另一个请求仍能通过独立读写循环完成
     let echo = session
         .call(
             "echo",
@@ -788,7 +818,7 @@ async fn stream_window_and_sequence_violations_fail_closed() {
             )
             .await
             .unwrap();
-        assert!(matches!(stream.next().await, Err(RpcError::Protocol)));
+        assert!(matches!(stream.next().await, Err(RpcError::Protocol(_))));
         session.shutdown(Duration::from_secs(1)).await;
     }
 }
@@ -838,6 +868,56 @@ async fn acknowledged_timeout_does_not_interrupt_another_call() {
     let (first, second) = tokio::join!(first, second);
     assert!(matches!(first, Err(RpcError::Timeout)));
     assert_eq!(second.unwrap().result, json!("survived"));
+    assert!(session.is_ready());
+    session.shutdown(Duration::from_secs(1)).await;
+}
+
+struct SlowNextCallbacks;
+
+impl CallbackHandler for SlowNextCallbacks {
+    fn call(
+        &self,
+        _context: CallContext,
+        method: String,
+        params: serde_json::Value,
+        payload: Vec<u8>,
+    ) -> BoxFuture<'static, Result<RpcReply, PluginFault>> {
+        Box::pin(async move {
+            assert_eq!(method, gateway_plugin_sdk::call::middleware::NEXT_METHOD);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok(RpcReply {
+                result: params,
+                payload,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn managed_next_suspends_only_its_parent_and_not_a_concurrent_call() {
+    let (_cache, session) = session(Arc::new(SlowNextCallbacks)).await;
+    let delegated = session.call(
+        "callback_method",
+        session.context(Stage::Request, Duration::from_millis(200)),
+        json!({"method": gateway_plugin_sdk::call::middleware::NEXT_METHOD}),
+        Vec::new(),
+    );
+    let hanging = session.call(
+        "hang",
+        session.context(Stage::Request, Duration::from_millis(100)),
+        json!({}),
+        Vec::new(),
+    );
+    let (delegated, hanging) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(delegated, hanging)
+    })
+    .await
+    .unwrap();
+    assert!(
+        delegated.is_ok(),
+        "host waiting for next must outlive its processing budget"
+    );
+    assert!(matches!(hanging, Err(RpcError::Timeout)));
     assert!(session.is_ready());
     session.shutdown(Duration::from_secs(1)).await;
 }

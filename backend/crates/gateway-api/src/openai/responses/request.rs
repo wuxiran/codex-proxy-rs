@@ -1,11 +1,13 @@
-//! OpenAI Responses JSON 到 Core 路由事实与不透明 wire payload 的单一解码边界。
+//! OpenAI Responses JSON 到 Core 路由事实与不透明 wire payload 的单一解码边界
 
 use std::{borrow::Cow, fmt, net::IpAddr};
 
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload, ProviderSessionState};
+use gateway_core::operation::{
+    ClientTurn, GenerateRequest, Operation, ProtocolPayload, ProviderSessionState,
+};
 use gateway_protocol::openai::{
     X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER, X_OPENAI_MEMGEN_REQUEST_HEADER,
     is_transport_managed_request_header,
@@ -20,12 +22,12 @@ const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 const PASSTHROUGH_HEADERS_CONTEXT_KEY: &str = "opaque_request_headers";
 const DOWNSTREAM_WEBSOCKET_CONNECTION_ID_CONTEXT_KEY: &str = "downstream_websocket_connection_id";
 
-/// Responses 请求进入共享解码内核时的下游传输来源。
+/// Responses 请求进入共享解码内核时的下游传输来源
 #[derive(Clone, Copy)]
 pub(super) enum RequestDecodeSource {
-    /// 单次 HTTP 请求，请求头与正文属于同一请求。
+    /// 单次 HTTP 请求，请求头与正文属于同一请求
     Http,
-    /// 复用连接上的 WebSocket `response.create` 帧。
+    /// 复用连接上的 WebSocket `response.create` 帧
     WebSocketFrame,
 }
 
@@ -53,7 +55,7 @@ pub struct OpenAiRequestHeaders {
 }
 
 impl OpenAiRequestHeaders {
-    /// 提取 OpenAI/Codex 连接级请求头上下文。
+    /// 提取 OpenAI/Codex 连接级请求头上下文
     #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
         Self {
@@ -79,7 +81,7 @@ impl OpenAiRequestHeaders {
         }
     }
 
-    /// 绑定代理为当前下游 WebSocket 分配的连接身份。
+    /// 绑定代理为当前下游 WebSocket 分配的连接身份
     #[must_use]
     pub(super) fn with_downstream_websocket_connection_id(
         mut self,
@@ -95,13 +97,23 @@ impl OpenAiRequestHeaders {
         }
     }
 
-    /// 独立端点只消费会话身份与 turn metadata，不携带 Responses 的连接状态。
+    /// 独立端点保留业务扩展头与会话身份，不携带 Responses 的连接状态
     pub(crate) fn session_context(&self) -> Map<String, Value> {
         let mut context = Map::new();
         insert_protocol_context(&mut context, "session_id", self.session_id.as_ref());
         insert_protocol_context(&mut context, "thread_id", self.thread_id.as_ref());
         insert_protocol_context(&mut context, "turn_metadata", self.turn_metadata.as_ref());
+        self.insert_passthrough_headers(&mut context);
         context
+    }
+
+    fn insert_passthrough_headers(&self, context: &mut Map<String, Value>) {
+        if !self.passthrough_headers.is_empty() {
+            context.insert(
+                PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
+                Value::Array(self.passthrough_headers.clone()),
+            );
+        }
     }
 
     fn protocol_context(
@@ -153,12 +165,7 @@ impl OpenAiRequestHeaders {
         insert_protocol_context(&mut context, "turn_id", self.turn_id.as_ref());
         insert_protocol_context(&mut context, "responses_lite", self.responses_lite.as_ref());
         insert_protocol_context(&mut context, "memgen_request", self.memgen_request.as_ref());
-        if !self.passthrough_headers.is_empty() {
-            context.insert(
-                PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
-                Value::Array(self.passthrough_headers.clone()),
-            );
-        }
+        self.insert_passthrough_headers(&mut context);
         if let Some(use_websocket) = use_websocket {
             context.insert("use_websocket".to_owned(), Value::Bool(use_websocket));
         }
@@ -172,17 +179,17 @@ fn insert_protocol_context(context: &mut Map<String, Value>, field: &str, value:
     }
 }
 
-/// 客户端声明的 continuation 意图。
+/// 客户端声明的 continuation 意图
 #[derive(Clone, PartialEq, Eq)]
 pub enum ContinuationIntent {
-    /// 不使用先前响应。
+    /// 不使用先前响应
     None,
-    /// 使用当前调用方可见的 OpenAI response ID。
+    /// 使用当前调用方可见的 OpenAI response ID
     PreviousResponseId(String),
 }
 
 impl ContinuationIntent {
-    /// 返回待 history owner 解析的 response ID。
+    /// 返回待 history owner 解析的 response ID
     #[must_use]
     pub fn previous_response_id(&self) -> Option<&str> {
         match self {
@@ -201,7 +208,7 @@ impl fmt::Debug for ContinuationIntent {
     }
 }
 
-/// Handler、Router 和 history owner 使用的请求元数据。
+/// Handler、Router 和 history owner 使用的请求元数据
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResponsesRequestMetadata {
     requested_model: String,
@@ -213,37 +220,37 @@ pub struct ResponsesRequestMetadata {
 }
 
 impl ResponsesRequestMetadata {
-    /// 返回客户端原始模型名。
+    /// 返回客户端原始模型名
     #[must_use]
     pub fn requested_model(&self) -> &str {
         &self.requested_model
     }
 
-    /// 返回客户端是否请求 SSE。
+    /// 返回客户端是否请求 SSE
     #[must_use]
     pub const fn stream(&self) -> bool {
         self.stream
     }
 
-    /// 返回客户端 storage intent。
+    /// 返回客户端 storage intent
     #[must_use]
     pub const fn store(&self) -> bool {
         self.store
     }
 
-    /// 返回 continuation intent。
+    /// 返回 continuation intent
     #[must_use]
     pub const fn continuation(&self) -> &ContinuationIntent {
         &self.continuation
     }
 
-    /// 返回从 HTTP 连接边界解析出的客户端地址。
+    /// 返回从 HTTP 连接边界解析出的客户端地址
     #[must_use]
     pub const fn client_ip(&self) -> Option<IpAddr> {
         self.client_ip
     }
 
-    /// 返回经过 UTF-8 校验和空白归一化的 User-Agent。
+    /// 返回经过 UTF-8 校验和空白归一化的 User-Agent
     #[must_use]
     pub fn user_agent(&self) -> Option<&str> {
         self.user_agent.as_deref()
@@ -264,7 +271,7 @@ impl fmt::Debug for ResponsesRequestMetadata {
     }
 }
 
-/// 一次成功解码的 Responses 请求。
+/// 一次成功解码的 Responses 请求
 #[derive(Clone, PartialEq)]
 pub struct DecodedResponsesRequest {
     operation: Operation,
@@ -280,32 +287,32 @@ impl DecodedResponsesRequest {
         Ok(self)
     }
 
-    /// 附着当前 WebSocket 连接保存的 Provider 私有上一轮状态。
+    /// 附着当前 WebSocket 连接保存的 Provider 私有上一轮状态
     #[must_use]
     pub fn with_provider_session_state(mut self, state: ProviderSessionState) -> Self {
         self.operation = self.operation.with_provider_session_state(state);
         self
     }
 
-    /// 返回协议无关 operation。
+    /// 返回协议无关 operation
     #[must_use]
     pub const fn operation(&self) -> &Operation {
         &self.operation
     }
 
-    /// 返回 handler 元数据。
+    /// 返回 handler 元数据
     #[must_use]
     pub const fn metadata(&self) -> &ResponsesRequestMetadata {
         &self.metadata
     }
 
-    /// 拆分为 operation 与元数据。
+    /// 拆分为 operation 与元数据
     #[must_use]
     pub fn into_parts(self) -> (Operation, ResponsesRequestMetadata) {
         (self.operation, self.metadata)
     }
 
-    /// 附着只由 HTTP/WebSocket 连接边界提供的诊断事实。
+    /// 附着只由 HTTP/WebSocket 连接边界提供的诊断事实
     #[must_use]
     pub fn with_client_context(
         mut self,
@@ -328,11 +335,11 @@ impl fmt::Debug for DecodedResponsesRequest {
     }
 }
 
-/// 使用下游 OpenAI/Codex 请求头解码 `POST /v1/responses`。
+/// 使用下游 OpenAI/Codex 请求头解码 `POST /v1/responses`
 ///
 /// # Errors
 ///
-/// 编码不支持、压缩正文损坏或超限、JSON 非法，或路由字段无效时返回安全错误。
+/// 编码不支持、压缩正文损坏或超限、JSON 非法，或路由字段无效时返回安全错误
 pub fn decode_request_with_headers(
     body: &[u8],
     headers: &HeaderMap,
@@ -342,10 +349,10 @@ pub fn decode_request_with_headers(
     decode_request_inner(&body, &OpenAiRequestHeaders::from_headers(headers))
 }
 
-/// 解码请求并返回已经解除 HTTP content encoding 的中间件正文。
+/// 解码请求并返回已经解除 HTTP content encoding 的中间件正文
 ///
 /// 外层中间件只接收有界的协议正文；terminal 会用中间件返回的正文重新解码，
-/// 因而不能把压缩字节与已经移除的传输编码语义混用。
+/// 因而不能把压缩字节与已经移除的传输编码语义混用
 pub(crate) fn decode_request_with_body(
     body: &[u8],
     headers: &HeaderMap,
@@ -356,13 +363,14 @@ pub(crate) fn decode_request_with_body(
     Ok((decoded, Bytes::copy_from_slice(&body)))
 }
 
-/// zstd 回溯窗口独立于输出上限，调整设置不能放大解码器内部窗口分配。
+/// zstd 回溯窗口独立于输出上限，调整设置不能放大解码器内部窗口分配
 const MAX_ZSTD_WINDOW_LOG: u32 = 26;
 
-/// 按 `Content-Encoding` 解压下游请求体。
+/// 按 `Content-Encoding` 解压下游请求体
 ///
 /// 未压缩与 `identity` 借用原始正文；压缩正文在读取过程中限制展开大小，
-/// 避免先完整分配再检查。只接受单一编码，重复头和叠加编码不能只解释第一项。
+/// 避免先完整分配再检查
+/// 只接受单一编码，重复头和叠加编码不能只解释第一项
 fn decompress_request_body<'a>(
     body: &'a [u8],
     headers: &HeaderMap,
@@ -391,7 +399,7 @@ fn decompress_request_body<'a>(
         "zstd" => {
             let mut decoder = zstd::stream::read::Decoder::with_buffer(body)
                 .map_err(|_| RequestDecodeError::MalformedJson)?;
-            // 输出有界之外，也限制压缩帧声明的回溯窗口，防止解码器内部过量分配。
+            // 输出有界之外，也限制压缩帧声明的回溯窗口，防止解码器内部过量分配
             decoder
                 .window_log_max(MAX_ZSTD_WINDOW_LOG)
                 .map_err(|_| RequestDecodeError::MalformedJson)?;
@@ -424,7 +432,7 @@ fn read_bounded<R: std::io::Read>(
             });
         }
         // 默认 Vec 扩容和 read_to_end 的 EOF 探测可能突破输出上限；
-        // 容量增长也受相同边界约束，越界探测只使用栈上分块缓冲区。
+        // 容量增长也受相同边界约束，越界探测只使用栈上分块缓冲区
         let required = decoded.len() + read;
         if required > decoded.capacity() {
             let capacity = decoded
@@ -450,13 +458,13 @@ pub(super) fn decode_request_inner(
     decode_request_object(object, request_headers, RequestDecodeSource::Http)
 }
 
-/// 解码已解析的顶层 object；按下游传输来源恢复连接级协议上下文。
+/// 解码已解析的顶层 object；按下游传输来源恢复连接级协议上下文
 pub(super) fn decode_request_object(
     mut object: Map<String, Value>,
     request_headers: &OpenAiRequestHeaders,
     source: RequestDecodeSource,
 ) -> Result<DecodedResponsesRequest, RequestDecodeError> {
-    // 仅消费已识别的本地 transport 开关；未知同名值保留给未来上游协议。
+    // 仅消费已识别的本地 transport 开关；未知同名值保留给未来上游协议
     let use_websocket = object.get("use_websocket").and_then(Value::as_bool);
     if use_websocket.is_some() {
         object.remove("use_websocket");
@@ -469,7 +477,7 @@ pub(super) fn decode_request_object(
         });
     }
     let model = model.to_owned();
-    // 缺省值只决定下游交付方式，不补写正文或改变 Provider 的上游流式执行。
+    // 缺省值只决定下游交付方式，不补写正文或改变 Provider 的上游流式执行
     let stream = match object.get("stream") {
         Some(value) => value.as_bool().unwrap_or(true),
         None => matches!(source, RequestDecodeSource::WebSocketFrame),
@@ -491,12 +499,30 @@ pub(super) fn decode_request_object(
     };
     let protocol_context = request_headers.protocol_context(use_websocket, frame_turn_metadata);
 
+    let semantics =
+        gateway_protocol::openai::codex_responses_request_semantics(&object, &protocol_context);
+    let client_turn = if object.get("generate").and_then(Value::as_bool) != Some(false)
+        && semantics.request_kind.as_deref() == Some("turn")
+        && !semantics.compact
+    {
+        gateway_protocol::openai::codex_account_thread_id(&object, &protocol_context)
+            .zip(gateway_protocol::openai::codex_turn_id(
+                &object,
+                &protocol_context,
+            ))
+            .and_then(|(thread, turn)| ClientTurn::new(thread, turn))
+    } else {
+        None
+    };
+
     let payload = ProtocolPayload::json_object(OPENAI_PROTOCOL, object)
         .map_err(|_| RequestDecodeError::CanonicalContract {
             field: "request".to_owned(),
         })?
         .with_context(protocol_context);
-    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+    let operation = Operation::Generate(
+        GenerateRequest::from_protocol_payload(payload).with_client_turn(client_turn),
+    );
     Ok(DecodedResponsesRequest {
         operation,
         metadata: ResponsesRequestMetadata {
@@ -574,10 +600,10 @@ fn passthrough_header_name(name: &str, connection_headers: &[String]) -> bool {
 
     !matches!(
         name,
-        // 下游鉴权和账号 cookie 绝不能成为上游账号身份。
+        // 下游鉴权和账号 cookie 绝不能成为上游账号身份
         "authorization"
             | "x-api-key"
-            // Codex 的服务端托管认证标记只用于客户端能力判断，不代表上游身份。
+            // Codex 的服务端托管认证标记只用于客户端能力判断，不代表上游身份
             | "x-openai-actor-authorization"
             | "cookie"
             | "cookie2"
@@ -588,12 +614,12 @@ fn passthrough_header_name(name: &str, connection_headers: &[String]) -> bool {
             | "x-openai-account-routing-override"
             | "x-openai-fedramp"
             // 上游指纹必须由运行时画像统一生成，客户端 originator/User-Agent/version
-            // 不能作为不透明头透传覆盖，避免不同下游客户端暴露不一致的设备指纹。
+            // 不能作为不透明头透传覆盖，避免不同下游客户端暴露不一致的设备指纹
             | "originator"
             | "user-agent"
             | "version"
             // 设备 attestation/integrity 头只能由官方客户端或网关自身生成，
-            // 客户端注入的 x-oai-attestation / X-OAI-IS 不得透传上游。
+            // 客户端注入的 x-oai-attestation / X-OAI-IS 不得透传上游
             | "x-oai-attestation"
             | "x-oai-is"
             | "x-oai-is-update"

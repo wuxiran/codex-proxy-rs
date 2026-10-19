@@ -1,7 +1,8 @@
-//! 多平台 AI 网关的数据面核心。
+//! 多平台 AI 网关的数据面核心
 //!
-//! 本 crate 只描述协议与 Provider 无关的业务语义。HTTP、数据库、Redis、
-//! 具体客户端协议和具体 Provider 都通过外层 adapter 接入。
+//! 本 crate 只描述协议与 Provider 无关的业务语义
+//! HTTP、数据库、Redis、
+//! 具体客户端协议和具体 Provider 都通过外层 adapter 接入
 
 pub mod account;
 pub mod concurrency;
@@ -12,6 +13,7 @@ pub mod event;
 pub mod health;
 pub mod identity;
 pub mod lifecycle;
+pub mod live;
 pub mod metering;
 pub mod middleware;
 pub mod operation;
@@ -22,6 +24,7 @@ pub mod routing;
 pub mod runtime;
 pub mod settings;
 pub mod task;
+pub mod time;
 pub mod upstream;
 pub mod validation;
 
@@ -47,10 +50,11 @@ use runtime::{
 };
 use task::{WorkerContribution, WorkerDefinitionError};
 
-/// Store 提供给数据面 Core 的封闭能力集合。
+/// Store 提供给数据面 Core 的封闭能力集合
 #[derive(Clone)]
 pub struct CoreStorePorts {
     execution: Arc<dyn ExecutionStore>,
+    diagnostics: Arc<dyn diagnostics::OperationalDiagnostics>,
     admissions: Arc<dyn ClientAdmissionPort>,
     admission_recovery: Arc<dyn ClientAdmissionRecoveryPort>,
     continuation: Arc<dyn NativeContinuationPort>,
@@ -59,6 +63,7 @@ pub struct CoreStorePorts {
     client_api_key_usage: Arc<dyn ClientApiKeyUsageSink>,
     budget: Option<Arc<dyn engine::budget::ClientBudgetPort>>,
     session_affinity: Option<Arc<dyn ProviderSessionAffinityPort>>,
+    client_retry: Option<Arc<dyn engine::client_retry::ClientRetryStore>>,
 }
 
 impl CoreStorePorts {
@@ -75,9 +80,11 @@ impl CoreStorePorts {
             Arc<dyn SnapshotSubscriptionPort>,
         ),
         client_api_key_usage: Arc<dyn ClientApiKeyUsageSink>,
+        diagnostics: Arc<dyn diagnostics::OperationalDiagnostics>,
     ) -> Self {
         Self {
             execution,
+            diagnostics,
             admissions,
             admission_recovery,
             continuation,
@@ -86,12 +93,22 @@ impl CoreStorePorts {
             client_api_key_usage,
             budget: None,
             session_affinity: None,
+            client_retry: None,
         }
     }
 
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<dyn engine::budget::ClientBudgetPort>) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_retry_store(
+        mut self,
+        store: Arc<dyn engine::client_retry::ClientRetryStore>,
+    ) -> Self {
+        self.client_retry = Some(store);
         self
     }
 
@@ -117,13 +134,13 @@ pub struct CoreBundle {
     worker_contributions: Vec<WorkerContribution>,
 }
 
-/// 已构造但尚未恢复准入或发现 Provider 目录的数据面启动对象。
+/// 已构造但尚未恢复准入或发现 Provider 目录的数据面启动对象
 pub struct CoreStartup {
     ports: CoreStorePorts,
     providers: ProviderRegistry,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
     frontend_authentication: Option<engine::authentication::FrontendAuthenticationExtensionIndex>,
     control: CoreControlPlaneStartup,
 }
@@ -139,7 +156,7 @@ impl CoreStartup {
         self.control.snapshot_control()
     }
 
-    /// 绑定组合根依赖后执行 fail-closed 准入恢复与首次目录发现。
+    /// 绑定组合根依赖后执行 fail-closed 准入恢复与首次目录发现
     pub async fn activate(self) -> Result<CoreBundle, CoreError> {
         restore_client_admission_startup(
             self.ports.execution.as_ref(),
@@ -159,7 +176,7 @@ impl CoreStartup {
             self.providers,
             self.request_observers,
             self.request_policies,
-            self.middlewares,
+            self.execution_extensions,
             self.frontend_authentication,
         ));
         let execution: Arc<dyn ExecutionService> = service.clone();
@@ -189,7 +206,7 @@ fn build_execution_service(
     providers: ProviderRegistry,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
     frontend_authentication: Option<engine::authentication::FrontendAuthenticationExtensionIndex>,
 ) -> DefaultExecutionService {
     let mut service = DefaultExecutionService::new(
@@ -199,9 +216,13 @@ fn build_execution_service(
         Arc::clone(&ports.admissions),
         Arc::clone(&ports.continuation),
         Arc::clone(&ports.client_api_key_usage),
+        Arc::clone(&ports.diagnostics),
     );
     if let Some(budget) = &ports.budget {
         service = service.with_budget(Arc::clone(budget));
+    }
+    if let Some(store) = &ports.client_retry {
+        service = service.with_client_retry_store(Arc::clone(store));
     }
     if let Some(request_observers) = request_observers {
         service = service.with_request_observers(request_observers);
@@ -209,8 +230,8 @@ fn build_execution_service(
     if let Some(request_policies) = request_policies {
         service = service.with_request_policies(request_policies);
     }
-    if let Some(middlewares) = middlewares {
-        service = service.with_middlewares(middlewares);
+    if let Some(execution_extensions) = execution_extensions {
+        service = service.with_execution_extensions(execution_extensions);
     }
     if let Some(frontend_authentication) = frontend_authentication {
         service = service.with_frontend_authentication(frontend_authentication);
@@ -266,14 +287,14 @@ impl CoreBundle {
     }
 }
 
-/// 首个快照与准入恢复均为监听前 fail-closed 屏障。
+/// 首个快照与准入恢复均为监听前 fail-closed 屏障
 pub async fn initialize(
     ports: CoreStorePorts,
     providers: ProviderRegistry,
-    extensions: Option<Arc<dyn runtime::extensions::ExtensionPreparationPort>>,
+    extensions: Option<Arc<dyn routing::extensions::ExtensionPreparationPort>>,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
     frontend_authentication: Option<engine::authentication::FrontendAuthenticationExtensionIndex>,
 ) -> Result<CoreBundle, CoreError> {
     prepare(
@@ -282,22 +303,22 @@ pub async fn initialize(
         extensions,
         request_observers,
         request_policies,
-        middlewares,
+        execution_extensions,
         frontend_authentication,
     )
     .activate()
     .await
 }
 
-/// 构造 Core 与快照发布能力；首次 Provider 目录发现延迟到 [`CoreStartup::activate`]。
+/// 构造 Core 与快照发布能力；首次 Provider 目录发现延迟到 [`CoreStartup::activate`]
 #[must_use]
 pub fn prepare(
     ports: CoreStorePorts,
     providers: ProviderRegistry,
-    extensions: Option<Arc<dyn runtime::extensions::ExtensionPreparationPort>>,
+    extensions: Option<Arc<dyn routing::extensions::ExtensionPreparationPort>>,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
     frontend_authentication: Option<engine::authentication::FrontendAuthenticationExtensionIndex>,
 ) -> CoreStartup {
     let control = prepare_control_plane(ports.clone(), providers.clone(), extensions);
@@ -306,19 +327,19 @@ pub fn prepare(
         providers,
         request_observers,
         request_policies,
-        middlewares,
+        execution_extensions,
         frontend_authentication,
         control,
     }
 }
 
-/// 管理命令只持有快照读写能力，不恢复数据面准入，也不启动执行/结算 Worker。
+/// 管理命令只持有快照读写能力，不恢复数据面准入，也不启动执行/结算 Worker
 pub struct CoreControlPlaneBundle {
     snapshots: RuntimeSnapshotHandle,
     publisher: Arc<RuntimeSnapshotPublisher>,
 }
 
-/// CLI/组合根可先绑定回调端口，再激活首次目录发现。
+/// CLI/组合根可先绑定回调端口，再激活首次目录发现
 pub struct CoreControlPlaneStartup {
     snapshots: RuntimeSnapshotHandle,
     publisher: Arc<RuntimeSnapshotPublisher>,
@@ -338,11 +359,8 @@ impl CoreControlPlaneStartup {
     pub async fn activate(self) -> Result<CoreControlPlaneBundle, CoreError> {
         match self.publisher.refresh().await {
             Ok(_) => {}
-            // 故障插件不能封锁管理修复入口；没有可用快照时数据面仍拒绝新请求。
-            Err(
-                routing::snapshot::RuntimeSnapshotCompileError::ExtensionsUnavailable
-                | routing::snapshot::RuntimeSnapshotCompileError::InvalidExtensionModels,
-            ) => {}
+            // 故障插件不能封锁管理修复入口；没有可用快照时数据面仍拒绝新请求
+            Err(routing::snapshot::RuntimeSnapshotCompileError::ExtensionsUnavailable) => {}
             Err(_) => return Err(CoreError::SnapshotUnavailable),
         }
         Ok(CoreControlPlaneBundle {
@@ -365,18 +383,19 @@ impl CoreControlPlaneBundle {
 }
 
 /// CLI 命令按需拥有嵌套模型执行与会话亲和查询端口，但不恢复网关启动时的准入租约，
-/// 也不产生任何后台 Worker 定义。
+/// 也不产生任何后台 Worker 定义
 pub struct CoreCommandPlaneStartup {
     ports: CoreStorePorts,
     providers: ProviderRegistry,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
     control: CoreControlPlaneStartup,
 }
 
 pub struct CoreCommandPlaneBundle {
     control: CoreControlPlaneBundle,
+    account_probe: Arc<dyn AccountProbe>,
     nested_model_execution: Arc<dyn NestedModelExecutionPort>,
     affinity_lookup: Arc<dyn AffinityLookupPort>,
 }
@@ -401,15 +420,17 @@ impl CoreCommandPlaneStartup {
                 self.providers,
                 self.request_observers,
                 self.request_policies,
-                self.middlewares,
+                self.execution_extensions,
                 None,
             )
             .with_snapshot_refresh(Arc::clone(&control.publisher)),
         );
+        let account_probe: Arc<dyn AccountProbe> = service.clone();
         let nested_model_execution: Arc<dyn NestedModelExecutionPort> = service.clone();
         let affinity_lookup: Arc<dyn AffinityLookupPort> = service;
         Ok(CoreCommandPlaneBundle {
             control,
+            account_probe,
             nested_model_execution,
             affinity_lookup,
         })
@@ -417,6 +438,11 @@ impl CoreCommandPlaneStartup {
 }
 
 impl CoreCommandPlaneBundle {
+    #[must_use]
+    pub fn account_probe(&self) -> Arc<dyn AccountProbe> {
+        Arc::clone(&self.account_probe)
+    }
+
     #[must_use]
     pub fn snapshots(&self) -> RuntimeSnapshotHandle {
         self.control.snapshots()
@@ -438,15 +464,15 @@ impl CoreCommandPlaneBundle {
     }
 }
 
-/// 为单次 CLI 命令构造当前快照与窄执行端口；激活时不恢复全局准入状态。
+/// 为单次 CLI 命令构造当前快照与窄执行端口；激活时不恢复全局准入状态
 #[must_use]
 pub fn prepare_command_plane(
     ports: CoreStorePorts,
     providers: ProviderRegistry,
-    extensions: Option<Arc<dyn runtime::extensions::ExtensionPreparationPort>>,
+    extensions: Option<Arc<dyn routing::extensions::ExtensionPreparationPort>>,
     request_observers: Option<engine::observation::RequestObserverExtensionIndex>,
     request_policies: Option<engine::policy::RequestPolicyExtensionIndex>,
-    middlewares: Option<engine::middleware::MiddlewareExtensionIndex>,
+    execution_extensions: Option<engine::extensions::ExecutionExtensionIndex>,
 ) -> CoreCommandPlaneStartup {
     let control = prepare_control_plane(ports.clone(), providers.clone(), extensions);
     CoreCommandPlaneStartup {
@@ -454,29 +480,20 @@ pub fn prepare_command_plane(
         providers,
         request_observers,
         request_policies,
-        middlewares,
+        execution_extensions,
         control,
     }
 }
 
-pub async fn initialize_control_plane(
-    ports: CoreStorePorts,
-    providers: ProviderRegistry,
-    extensions: Option<Arc<dyn runtime::extensions::ExtensionPreparationPort>>,
-) -> Result<CoreControlPlaneBundle, CoreError> {
-    prepare_control_plane(ports, providers, extensions)
-        .activate()
-        .await
-}
-
-/// 仅构造管理命令所需快照能力，不恢复准入、不发现目录且不启动 Worker。
+/// 仅构造管理命令所需快照能力，不恢复准入、不发现目录且不启动 Worker
 #[must_use]
 pub fn prepare_control_plane(
     ports: CoreStorePorts,
     providers: ProviderRegistry,
-    extensions: Option<Arc<dyn runtime::extensions::ExtensionPreparationPort>>,
+    extensions: Option<Arc<dyn routing::extensions::ExtensionPreparationPort>>,
 ) -> CoreControlPlaneStartup {
-    let mut compiler = RuntimeSnapshotCompiler::new(ports.snapshots, Arc::new(providers));
+    let mut compiler = RuntimeSnapshotCompiler::new(ports.snapshots, Arc::new(providers.clone()))
+        .with_privacy_compiler(Arc::new(providers));
     if let Some(extensions) = extensions {
         compiler = compiler.with_extensions(extensions);
     }

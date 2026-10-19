@@ -1,6 +1,6 @@
 import type { BackupRecord, BackupStatus } from '@/api'
 
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { computed, onScopeDispose, shallowRef } from 'vue'
 import {
   createBackup,
@@ -25,6 +25,7 @@ export function useBackupRecords() {
   const refreshing = shallowRef(false)
   const deleting = shallowRef(false)
   const deleteTarget = shallowRef<BackupRecord | null>(null)
+  const showDelete = shallowRef(false)
   const downloadStates = shallowRef<Record<string, boolean>>({})
 
   const paged = usePagedQuery<{
@@ -116,7 +117,7 @@ export function useBackupRecords() {
     creating.value = true
     try {
       await createBackup()
-      toast.success('备份任务已创建')
+      ZNotification.success({ message: '备份任务已创建' })
       await paged.execute({ silent: true })
     }
     catch {}
@@ -141,7 +142,7 @@ export function useBackupRecords() {
     }
     catch (cause) {
       if (!(cause instanceof ApiError))
-        toast.error(errorMessage(cause, '下载备份失败'))
+        ZNotification.error({ message: errorMessage(cause, '下载备份失败') })
     }
     finally {
       downloadStates.value = { ...downloadStates.value, [record.id]: false }
@@ -150,22 +151,23 @@ export function useBackupRecords() {
 
   function requestDelete(record: BackupRecord): void {
     deleteTarget.value = record
+    showDelete.value = true
   }
 
   async function confirmDelete(): Promise<void> {
     const target = deleteTarget.value
-    if (!target || deleting.value)
+    if (!showDelete.value || !target || deleting.value)
       return
     deleting.value = true
     try {
       await deleteBackup({ backupId: target.id })
-      toast.success('已请求删除备份')
+      ZNotification.success({ message: '已请求删除备份' })
       await paged.execute({ silent: true })
     }
     catch {}
     finally {
       deleting.value = false
-      deleteTarget.value = null
+      showDelete.value = false
     }
   }
 
@@ -187,6 +189,7 @@ export function useBackupRecords() {
     refreshing,
     deleting,
     deleteTarget,
+    showDelete,
     downloadStates,
     load,
     refresh,

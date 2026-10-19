@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import type { OutboundProxyRecord, ProxyQualityItem, ProxyQualityReport } from '@/api'
-import { BaseButton, BaseEmpty, BaseModal, BaseSkeleton, BaseTable, defineTableColumns } from '@codex-proxy/ui'
+import { defineTableColumns, ZButton, ZDialog, ZEmpty, ZSkeleton, ZTable } from '@codex-proxy/ui'
 import { ShieldCheck } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import { getProxyQualityReport } from '@/api'
-import { formatDateTime } from '@/utils/format'
-import { exitGeoLabel, qualityItemStatus, qualityStatus, qualityTargetLabel } from '../presenter'
+import { formatDateTime } from '@/utils/format.fork'
+import { exitGeoLabel, qualityItemStatus, qualityStatus, qualityTargetLabel } from '../presenter.fork'
 
 const props = defineProps<{
   proxy: OutboundProxyRecord | null
@@ -67,24 +67,24 @@ watch([open, () => props.proxy?.id], ([isOpen]) => {
 </script>
 
 <template>
-  <BaseModal v-model="open" title="代理质量检测报告" :description="proxy?.name" size="lg" tone="info">
+  <ZDialog v-model="open" title="代理质量检测报告" :description="proxy?.name" width="48rem" type="info">
     <template #icon>
       <ShieldCheck class="size-5 text-cp-primary-text" :stroke-width="1.75" />
     </template>
 
     <div aria-live="polite" :aria-busy="loading || checking">
       <div v-if="loading || checking" class="grid gap-3">
-        <BaseSkeleton class="h-24 w-full" />
-        <BaseSkeleton class="h-40 w-full" />
+        <ZSkeleton class="h-24 w-full" />
+        <ZSkeleton class="h-40 w-full" />
       </div>
-      <BaseEmpty v-else-if="failed" title="报告加载失败" description="暂时无法读取检测报告，请重新加载。" surface="none" class="min-h-64 content-center">
+      <ZEmpty v-else-if="failed" title="报告加载失败" description="暂时无法读取检测报告，请重新加载。" surface="none" class="min-h-64 content-center">
         <template #action>
-          <BaseButton variant="secondary" @click="load">
+          <ZButton @click="load">
             重新加载
-          </BaseButton>
+          </ZButton>
         </template>
-      </BaseEmpty>
-      <BaseEmpty v-else-if="!current" title="还没有检测报告" description="运行一次质量检测，查看该代理访问各上游的情况。" :icon="ShieldCheck" surface="none" class="min-h-64 content-center" />
+      </ZEmpty>
+      <ZEmpty v-else-if="!current" title="还没有检测报告" description="运行一次质量检测，查看该代理访问各上游的情况。" :icon="ShieldCheck" surface="none" class="min-h-64 content-center" />
       <div v-else class="grid gap-4">
         <section class="grid gap-4 rounded-cp-card bg-cp-fill-quaternary p-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center">
           <div class="flex items-baseline gap-2 sm:grid sm:justify-items-center sm:gap-1 sm:px-3">
@@ -136,7 +136,7 @@ watch([open, () => props.proxy?.id], ([isOpen]) => {
           </dl>
         </section>
 
-        <BaseTable :columns="columns" :rows="current.items" row-key="target" density="compact" empty-text="没有检测项">
+        <ZTable :columns="columns" :data="current.items" row-key="target" size="small" empty-text="没有检测项">
           <template #target="{ row }">
             <span class="text-cp-sm font-emphasis text-cp-text">{{ qualityTargetLabel(row.target) }}</span>
           </template>
@@ -156,7 +156,7 @@ watch([open, () => props.proxy?.id], ([isOpen]) => {
               {{ row.message }}<span v-if="row.cfRay" class="font-mono text-cp-text-tertiary">（cf-ray: {{ row.cfRay }}）</span>
             </span>
           </template>
-        </BaseTable>
+        </ZTable>
 
         <p class="m-0 text-cp-xs leading-relaxed text-cp-text-tertiary">
           检测用无凭据请求判断各上游是否可达：返回 401 等预期状态即视为通过；命中 Cloudflare 挑战说明该出口大概率会被上游拦截。
@@ -165,15 +165,15 @@ watch([open, () => props.proxy?.id], ([isOpen]) => {
     </div>
 
     <template #footer>
-      <BaseButton variant="secondary" @click="open = false">
+      <ZButton @click="open = false">
         关闭
-      </BaseButton>
-      <BaseButton v-if="proxy" variant="primary" :loading="checking" :disabled="loading" @click="emit('recheck', proxy)">
+      </ZButton>
+      <ZButton v-if="proxy" type="primary" :loading="checking" :disabled="loading" @click="emit('recheck', proxy)">
         <template #icon>
           <ShieldCheck class="size-4" />
         </template>
         重新检测
-      </BaseButton>
+      </ZButton>
     </template>
-  </BaseModal>
+  </ZDialog>
 </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { SelectOption } from '@codex-proxy/ui'
-import { BaseIconButton, BaseSelect } from '@codex-proxy/ui'
+import { ZIconButton, ZSelect } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
 import { computed } from 'vue'
 
@@ -29,15 +29,15 @@ const selected = computed({
 
 <template>
   <div class="flex items-center gap-2">
-    <BaseSelect
+    <ZSelect
       v-model="selected"
       class="w-40"
       aria-label="自动刷新间隔"
       :options="options"
     />
-    <BaseIconButton
-      label="立即刷新"
-      variant="filled"
+    <ZIconButton
+      aria-label="立即刷新"
+      variant="solid"
       :loading="refreshing"
       @click="emit('refresh')"
     >
@@ -45,6 +45,6 @@ const selected = computed({
         <RefreshCw class="size-4.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
       </template>
       <RefreshCw class="size-4.5" aria-hidden="true" />
-    </BaseIconButton>
+    </ZIconButton>
   </div>
 </template>

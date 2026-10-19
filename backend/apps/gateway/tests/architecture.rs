@@ -1,14 +1,15 @@
-//! docs/architecture.md 依赖 DAG 与生产源码纪律的 workspace 级机器校验。
+//! docs/architecture.md 依赖 DAG 与生产源码纪律的 workspace 级机器校验
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use syn::{Item, visit::Visit};
 
-/// workspace 成员冻结清单;新增 crate 必须同步扩展本文件的依赖规则。
+/// workspace 成员冻结清单;新增 crate 必须同步扩展本文件的依赖规则
 pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
     "apps/gateway",
     "apps/plugin-cli",
@@ -27,22 +28,24 @@ pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
 
 #[test]
 fn workspace_member_list_matches_the_frozen_dag_scope() {
-    let manifest =
-        fs::read_to_string(backend_root().join("Cargo.toml")).expect("read workspace manifest");
-    for member in WORKSPACE_MEMBERS {
-        assert!(
-            manifest.contains(&format!("\"{member}\"")),
-            "workspace must include {member}"
-        );
-    }
-    let member_count = manifest
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("\"apps/") || line.starts_with("\"crates/"))
-        .count();
+    let metadata = cargo_metadata_json();
+    let root = backend_root();
+    let actual: BTreeSet<_> = metadata["packages"]
+        .as_array()
+        .expect("Cargo packages")
+        .iter()
+        .map(|package| {
+            Path::new(package["manifest_path"].as_str().expect("package manifest"))
+                .parent()
+                .expect("package directory")
+                .strip_prefix(&root)
+                .expect("workspace member path")
+                .to_path_buf()
+        })
+        .collect();
     assert_eq!(
-        member_count,
-        WORKSPACE_MEMBERS.len(),
+        actual,
+        WORKSPACE_MEMBERS.iter().map(PathBuf::from).collect(),
         "new workspace members must extend the dependency DAG rules"
     );
 }
@@ -80,18 +83,25 @@ fn core_value_owners_do_not_depend_on_execution_or_routing() {
             path if path.starts_with("policy/") => {
                 Some(&["account", "identity", "policy", "validation"])
             }
-            "settings/values.rs" | "settings/compiled.rs" => {
-                Some(&["account", "concurrency", "identity", "metering", "policy"])
-            }
+            path if path.starts_with("settings/") => Some(&[
+                "account",
+                "concurrency",
+                "identity",
+                "metering",
+                "policy",
+                "settings",
+            ]),
             path if path.starts_with("account/") => Some(&["account", "identity", "validation"]),
             _ => None,
         };
         let Some(allowed) = allowed else { continue };
         let source = fs::read_to_string(root.join(&relative)).expect("read core source");
         let syntax = syn::parse_file(&source).expect("parse core source");
-        let mut references = CrateReferences::default();
+        let mut references = CrateReferences::in_module(&relative);
         references.visit_file(&syntax);
-        for dependency in references.0 {
+        // 相对路径中的 self 指向当前 owner，不是跨 owner 依赖
+        references.owners.remove(&references.module_path[0]);
+        for dependency in references.owners {
             assert!(
                 allowed.contains(&dependency.as_str()),
                 "{} must not depend on crate::{dependency}",
@@ -101,49 +111,155 @@ fn core_value_owners_do_not_depend_on_execution_or_routing() {
     }
 }
 
+#[test]
+fn core_owner_paths_form_a_dag() {
+    let root = backend_root().join("crates/gateway-core/src");
+    let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
+    for relative in super::rust_files(&root) {
+        if relative == Path::new("lib.rs") {
+            continue;
+        }
+        let mut references = CrateReferences::in_module(&relative);
+        let owner = references.module_path[0].clone();
+        let source = fs::read_to_string(root.join(&relative)).expect("read core source");
+        references.visit_file(&syn::parse_file(&source).expect("parse core source"));
+        references.owners.remove(&owner);
+        graph.entry(owner).or_default().extend(references.owners);
+    }
+    for owner in graph.keys() {
+        let mut pending = graph[owner].iter().cloned().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(dependency) = pending.pop() {
+            assert_ne!(
+                &dependency, owner,
+                "Core owner dependency cycle reaches {owner}"
+            );
+            if visited.insert(dependency.clone())
+                && let Some(next) = graph.get(&dependency)
+            {
+                pending.extend(next.iter().cloned());
+            }
+        }
+    }
+}
+
+#[test]
+fn core_reference_scan_resolves_groups_reexports_and_relative_paths() {
+    let syntax = syn::parse_file(
+        r#"
+        pub use crate::{engine::AttemptContext, settings::SettingsValues as Values};
+        use super::super::runtime as publication;
+        use self::compiled::Value;
+        // crate::ignored::Comment
+        const EXAMPLE: &str = "crate::ignored::Literal";
+        "#,
+    )
+    .expect("parse reference fixture");
+    let mut references = CrateReferences::in_module(Path::new("routing/snapshot.rs"));
+    references.visit_file(&syntax);
+    assert_eq!(
+        references.owners,
+        BTreeSet::from([
+            "engine".to_owned(),
+            "settings".to_owned(),
+            "runtime".to_owned(),
+            "routing".to_owned(),
+        ])
+    );
+}
+
 #[derive(Default)]
-struct CrateReferences(BTreeSet<String>);
+struct CrateReferences {
+    owners: BTreeSet<String>,
+    module_path: Vec<String>,
+}
 
 impl<'ast> Visit<'ast> for CrateReferences {
     fn visit_path(&mut self, path: &'ast syn::Path) {
-        let mut segments = path.segments.iter();
-        if segments
-            .next()
-            .is_some_and(|segment| segment.ident == "crate")
-            && let Some(owner) = segments.next()
-        {
-            self.0.insert(owner.ident.to_string());
-        }
+        self.record(
+            &path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string())
+                .collect::<Vec<_>>(),
+        );
         syn::visit::visit_path(self, path);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        self.use_tree(&item.tree, false);
+        self.use_tree(&item.tree, &mut Vec::new());
     }
 }
 
 impl CrateReferences {
-    fn use_tree(&mut self, tree: &syn::UseTree, crate_root: bool) {
+    fn in_module(relative: &Path) -> Self {
+        let mut module = relative
+            .with_extension("")
+            .components()
+            .map(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .expect("UTF-8 module path")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        if module.last().is_some_and(|part| part == "mod") {
+            module.pop();
+        }
+        Self {
+            owners: BTreeSet::new(),
+            module_path: module,
+        }
+    }
+
+    fn record(&mut self, path: &[String]) {
+        let Some(first) = path.first() else { return };
+        let owner = if first == "crate" {
+            path.get(1).cloned()
+        } else if first == "self" || first == "super" {
+            let mut module = self.module_path.clone();
+            let mut rest = path;
+            while rest
+                .first()
+                .is_some_and(|part| part == "super" || part == "self")
+            {
+                if rest[0] == "super" {
+                    module.pop();
+                }
+                rest = &rest[1..];
+            }
+            module.first().or_else(|| rest.first()).cloned()
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
+            self.owners.insert(owner);
+        }
+    }
+
+    fn use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
         match tree {
-            syn::UseTree::Path(path) if crate_root => {
-                self.0.insert(path.ident.to_string());
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.use_tree(&path.tree, prefix);
+                prefix.pop();
             }
-            syn::UseTree::Name(name) if crate_root => {
-                self.0.insert(name.ident.to_string());
+            syn::UseTree::Name(name) => {
+                prefix.push(name.ident.to_string());
+                self.record(prefix);
+                prefix.pop();
             }
-            syn::UseTree::Rename(rename) if crate_root => {
-                self.0.insert(rename.ident.to_string());
+            syn::UseTree::Rename(rename) => {
+                prefix.push(rename.ident.to_string());
+                self.record(prefix);
+                prefix.pop();
             }
-            syn::UseTree::Path(path) => self.use_tree(&path.tree, path.ident == "crate"),
             syn::UseTree::Group(group) => {
                 for item in &group.items {
-                    self.use_tree(item, crate_root);
+                    self.use_tree(item, prefix);
                 }
             }
-            syn::UseTree::Glob(_) if crate_root => {
-                self.0.insert("*".to_owned());
-            }
-            _ => {}
+            syn::UseTree::Glob(_) => self.record(prefix),
         }
     }
 }
@@ -179,7 +295,7 @@ fn gateway_admin_stays_free_of_infrastructure_dependencies() {
     );
 }
 
-/// workspace 包名到冻结成员路径的映射。
+/// workspace 包名到冻结成员路径的映射
 const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("codex-proxy-rs", "apps/gateway"),
     ("codex-proxy-plugin-cli", "apps/plugin-cli"),
@@ -196,7 +312,7 @@ const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("turn-state", "crates/turn-state"),
 ];
 
-/// SDK 与 Adapter/provider 根门面的稳定合同模块；任何增减都必须同步完成边界审计。
+/// SDK 与 Adapter/provider 根门面的稳定合同模块；任何增减都必须同步完成边界审计
 const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
     ("crates/gateway-plugin/sdk", &["call", "client"]),
     ("crates/gateway-plugin/runtime", &[]),
@@ -223,16 +339,16 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
         "crates/providers/openai",
         &["config", "credential", "transport"],
     ),
-    ("crates/providers/xai", &["credential", "transport"]),
+    ("crates/providers/xai", &["transport"]),
 ];
 
-/// 不对应单一生产模块、而是校验 crate/workspace 整体契约的根级测试场景。
+/// 不对应单一生产模块、而是校验 crate/workspace 整体契约的根级测试场景
 const ROOT_TEST_SCENARIOS: &[(&str, &[&str])] = &[
     ("apps/gateway", &["architecture"]),
     ("crates/gateway-api", &["architecture"]),
 ];
 
-/// 冻结的 workspace 内部运行时依赖边；新增/删除任何边都必须同步本表。
+/// 冻结的 workspace 内部运行时依赖边；新增/删除任何边都必须同步本表
 const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("codex-proxy-plugin-cli", "gateway-plugin-sdk"),
     ("codex-proxy-rs", "gateway-admin"),
@@ -269,7 +385,7 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
 #[test]
 fn workspace_internal_dependency_edges_match_frozen_dag() {
     let metadata = cargo_metadata_json();
-    let actual = workspace_runtime_dependency_edges(&metadata);
+    let actual = workspace_runtime_dependency_edges(metadata);
     let mut expected: Vec<(String, String)> = ALLOWED_INTERNAL_EDGES
         .iter()
         .map(|(from, to)| ((*from).to_owned(), (*to).to_owned()))
@@ -362,24 +478,6 @@ fn adapter_public_module_surfaces_match_allowlist() {
             "{} public module surface diverged from its allowlist",
             root.display()
         );
-    }
-}
-
-#[test]
-fn production_sources_do_not_host_tests() {
-    for member in WORKSPACE_MEMBERS {
-        let src = backend_root().join(member).join("src");
-        let sources = super::rust_files(&src);
-        assert!(!sources.is_empty(), "{member} has no production sources");
-        for relative in sources {
-            let path = src.join(relative);
-            let source = fs::read_to_string(&path).expect("read production source");
-            assert!(
-                !source.contains("#[cfg(test)]"),
-                "{} hosts tests in production src",
-                path.display()
-            );
-        }
     }
 }
 
@@ -479,7 +577,7 @@ fn integration_tests_mirror_production_module_tree() {
     }
 }
 
-/// Rust 子进程 fixture 是 Cargo 的独立 crate 根，不能要求它由测试模块再次声明。
+/// Rust 子进程 fixture 是 Cargo 的独立 crate 根，不能要求它由测试模块再次声明
 fn test_source_roots() -> BTreeMap<PathBuf, Vec<String>> {
     let metadata = cargo_metadata_json();
     let mut roots = BTreeMap::<PathBuf, Vec<String>>::new();
@@ -533,7 +631,7 @@ fn root_test_scenario_allowed(member: &str, module: &Path) -> bool {
 
 fn assert_module_tree(root: &Path, crate_roots: &[&str]) {
     let files = super::rust_files(root);
-    // 同一父模块的所有子文件复用一次语法解析，计数仍保留重复声明检查。
+    // 同一父模块的所有子文件复用一次语法解析，计数仍保留重复声明检查
     let mut declarations = BTreeMap::<PathBuf, BTreeMap<String, usize>>::new();
     for relative in &files {
         if crate_roots
@@ -639,40 +737,46 @@ pub(super) fn backend_root() -> PathBuf {
         .expect("backend workspace root")
 }
 
-fn cargo_metadata_json() -> serde_json::Value {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(backend_root())
-        .output()
-        .expect("run cargo metadata");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
+fn cargo_metadata_json() -> &'static serde_json::Value {
+    static METADATA: OnceLock<serde_json::Value> = OnceLock::new();
+    METADATA.get_or_init(|| {
+        let output = std::process::Command::new("cargo")
+            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+            .current_dir(backend_root())
+            .output()
+            .expect("run cargo metadata");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
+    })
 }
 
-/// 提取成员 `[dependencies]` 段内声明的依赖名;段落以下一个 `[` 表头结束。
+/// 复用 Cargo 解析后的实际包名，覆盖重命名依赖与平台条件，排除测试和构建依赖
 fn dependency_names(member: &str) -> Vec<String> {
-    let manifest = fs::read_to_string(backend_root().join(member).join("Cargo.toml"))
-        .expect("read member manifest");
-    let mut in_dependencies = false;
-    let mut names = Vec::new();
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_dependencies = line == "[dependencies]";
-            continue;
-        }
-        if !in_dependencies || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, _)) = line.split_once('=') {
-            names.push(name.trim().to_owned());
-        }
-    }
-    names
+    let manifest = backend_root().join(member).join("Cargo.toml");
+    let package = cargo_metadata_json()["packages"]
+        .as_array()
+        .expect("Cargo packages")
+        .iter()
+        .find(|package| {
+            Path::new(package["manifest_path"].as_str().expect("package manifest")) == manifest
+        })
+        .expect("workspace member");
+    package["dependencies"]
+        .as_array()
+        .expect("package dependencies")
+        .iter()
+        .filter(|dependency| dependency["kind"].is_null())
+        .map(|dependency| {
+            dependency["name"]
+                .as_str()
+                .expect("dependency name")
+                .to_owned()
+        })
+        .collect()
 }
 
 fn assert_no_dependency(member: &str, forbidden: &[&str]) {

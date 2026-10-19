@@ -1,3 +1,5 @@
+//! 验证插件事实查询与额度刷新回调的参数和能力边界
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -13,8 +15,8 @@ use gateway_admin::{
 };
 use gateway_core::{
     account::{AccountWeight, CredentialState, ProviderAccountId, QuotaState},
+    routing::extensions::ExtensionPreparationPort,
     routing::{ConfigRevision, ProviderKind},
-    runtime::extensions::ExtensionPreparationPort,
 };
 use gateway_plugin_sdk::{Capability, Contributions, Stage};
 use serde_json::{Value, json};
@@ -25,6 +27,7 @@ struct Facts(AtomicUsize, AtomicUsize, Option<String>);
 fn account() -> AccountRecord {
     let at = "2026-01-01T00:00:00Z".parse().unwrap();
     AccountRecord {
+        outbound_proxy_enabled: true,
         id: "acct_facts".into(),
         provider_kind: ProviderKind::new("openai").unwrap(),
         groups: vec![gateway_admin::model::account_groups::AccountGroupRef {
@@ -115,6 +118,7 @@ impl PluginAccountAccess for Facts {
         self.0.fetch_add(1, Ordering::SeqCst);
         assert_eq!(account.as_str(), "acct_facts");
         Ok(ProviderQuota {
+            credits: None,
             plan_type: Some("private plan".into()),
             observed_at: None,
             refresh_token_expires_at: None,
@@ -177,7 +181,12 @@ async fn management_facts_validate_queries_without_permission_declarations() {
             ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
                 .await
                 .unwrap();
-        assert!(runtime.middleware_registry().resolve(&generation).is_none());
+        assert!(
+            runtime
+                .execution_registry()
+                .middleware(&generation)
+                .is_none()
+        );
         assert!(runtime.policy_registry().resolve(&generation).is_none());
         let view = runtime.views(&generation).await.unwrap().remove(0);
         let response = runtime
@@ -185,6 +194,7 @@ async fn management_facts_validate_queries_without_permission_declarations() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),
@@ -263,7 +273,12 @@ async fn quota_refresh_is_available_without_permission_declarations() {
             ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())
                 .await
                 .unwrap();
-        assert!(runtime.middleware_registry().resolve(&generation).is_none());
+        assert!(
+            runtime
+                .execution_registry()
+                .middleware(&generation)
+                .is_none()
+        );
         assert!(runtime.policy_registry().resolve(&generation).is_none());
         let view = runtime.views(&generation).await.unwrap().remove(0);
         let response = runtime
@@ -271,6 +286,7 @@ async fn quota_refresh_is_available_without_permission_declarations() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),

@@ -1,6 +1,6 @@
-//! 管理控制面的语义模型、用例与外部能力端口。
+//! 管理控制面的语义模型、用例与外部能力端口
 //!
-//! 本 crate 不包含 HTTP wire、数据库实现或具体 Provider 实现。
+//! 本 crate 不包含 HTTP wire、数据库实现或具体 Provider 实现
 
 use std::{fmt, path::Path, sync::Arc, time::Duration};
 
@@ -20,7 +20,8 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
-pub mod service;
+pub mod public_service;
+mod reset_credit_automation;
 mod use_case;
 pub use use_case::plugins::{PluginDistributionPorts, PluginManagementService, PluginsService};
 
@@ -35,10 +36,11 @@ pub use use_case::{
     client_keys::ClientKeyService,
     credentials::{CredentialsService, ProviderCredentials},
     import_tasks::ImportTasksService,
-    observability::ObservabilityService,
+    observability::{ObservabilityService, ProviderUsageBillingProjector},
     proxies::ProxiesService,
     settings::SettingsService,
     system::SystemService,
+    usage_data::UsageDataService,
 };
 
 // fork: 自有模块与组合根扩展，装配见 fork.rs
@@ -47,8 +49,16 @@ pub mod ops_report;
 pub mod ticket_cipher;
 pub mod ticket_revive;
 pub mod turn_state_renewal;
-pub use fork::ForkRuntimePorts;
+pub use fork::{AccountsDeps as ForkAccountsDeps, ForkRuntimePorts};
 pub use use_case::{openai::OpenAiService, public_import::PublicImportService};
+// fork: 测试缝。生产源文件不再内联测试模块，纯函数按上游 jitter 的做法以 doc(hidden) 再导出给 tests/ 用
+#[doc(hidden)]
+pub use use_case::{
+    turn_state_hunt::{FailureClass as TurnStateHuntFailureClass, ephemeral_proxy_url},
+    usage_projection_cache::{
+        UsageProjection, UsageProjectionCache, dedupe_window_queries, window_key,
+    },
+};
 
 use model::AdminError;
 use ports::{
@@ -79,7 +89,7 @@ const WEAK_ADMIN_PASSWORDS: &[&str] = &[
 const BACKUP_WORKER_OWNER: &str = "backup";
 const DEFAULT_CLIENT_SESSION_TTL_MINUTES: u64 = 24 * 60;
 
-/// 只用于首次幂等创建默认管理员的启动密码。
+/// 只用于首次幂等创建默认管理员的启动密码
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct InitialAdminPassword(SecretString);
@@ -109,15 +119,21 @@ impl fmt::Debug for InitialAdminPassword {
     }
 }
 
-/// 管理控制面的启动配置。
+/// 管理控制面的启动配置
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct AdminConfig {
     pub session_ttl_minutes: u64,
+    #[serde(default = "default_absolute_session_ttl_minutes")]
+    pub session_absolute_ttl_minutes: u64,
     pub default_username: String,
     pub default_password: InitialAdminPassword,
 }
 
-/// Client 登录域的通用启动配置。
+fn default_absolute_session_ttl_minutes() -> u64 {
+    30 * 24 * 60
+}
+
+/// Client 登录域的通用启动配置
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
     pub session_ttl_minutes: u64,
@@ -132,11 +148,11 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// 校验 Client session TTL；当前配置不含相对路径。
+    /// 校验 Client session TTL；当前配置不含相对路径
     ///
     /// # Errors
     ///
-    /// 会话有效期为零或无法安全换算时返回错误。
+    /// 会话有效期为零或无法安全换算时返回错误
     pub fn resolve_and_validate(&mut self, _source_dir: &Path) -> Result<(), AdminConfigError> {
         if self.session_ttl_minutes == 0 || i64::try_from(self.session_ttl_minutes).is_err() {
             return Err(AdminConfigError::InvalidField("client.session_ttl_minutes"));
@@ -146,11 +162,11 @@ impl ClientConfig {
 }
 
 impl AdminConfig {
-    /// 校验 Admin-owned 字段；当前配置不含相对路径。
+    /// 校验 Admin-owned 字段；当前配置不含相对路径
     ///
     /// # Errors
     ///
-    /// 用户名、会话有效期或初始密码不满足安全约束时返回错误。
+    /// 用户名、会话有效期或初始密码不满足安全约束时返回错误
     pub fn resolve_and_validate(&mut self, _source_dir: &Path) -> Result<(), AdminConfigError> {
         if self.default_username.trim().is_empty()
             || self.default_username.chars().any(char::is_control)
@@ -159,6 +175,13 @@ impl AdminConfig {
         }
         if self.session_ttl_minutes == 0 || i64::try_from(self.session_ttl_minutes).is_err() {
             return Err(AdminConfigError::InvalidField("admin.session_ttl_minutes"));
+        }
+        if self.session_absolute_ttl_minutes == 0
+            || i64::try_from(self.session_absolute_ttl_minutes).is_err()
+        {
+            return Err(AdminConfigError::InvalidField(
+                "admin.session_absolute_ttl_minutes",
+            ));
         }
         let password = self.default_password.expose().trim();
         if password.len() < MINIMUM_INITIAL_PASSWORD_BYTES
@@ -176,13 +199,17 @@ impl fmt::Debug for AdminConfig {
         formatter
             .debug_struct("AdminConfig")
             .field("session_ttl_minutes", &self.session_ttl_minutes)
+            .field(
+                "session_absolute_ttl_minutes",
+                &self.session_absolute_ttl_minutes,
+            )
             .field("default_username", &self.default_username)
             .field("default_password", &"[REDACTED]")
             .finish()
     }
 }
 
-/// Admin-owned 启动配置错误；不回显任何配置值。
+/// Admin-owned 启动配置错误；不回显任何配置值
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AdminConfigError {
     #[error("配置字段 `{0}` 不合法")]
@@ -191,12 +218,13 @@ pub enum AdminConfigError {
     WeakInitialPassword,
 }
 
-/// API 持有的管理资源能力集合。
+/// API 持有的管理资源能力集合
 ///
-/// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块。
+/// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块
 #[derive(Clone)]
 pub struct AdminServices {
-    public_services: Arc<service::Registry>,
+    timezone: gateway_core::time::DeploymentTimeZone,
+    public_services: Arc<public_service::Registry>,
     plugins: Arc<PluginsService>,
     plugin_management: Arc<PluginManagementService>,
     proxies: Arc<dyn ProxiesService>,
@@ -208,16 +236,23 @@ pub struct AdminServices {
     client_distribution: Arc<dyn ClientDistributionService>,
     observability: Arc<dyn ObservabilityService>,
     settings: Arc<dyn SettingsService>,
+    usage_data: Arc<dyn UsageDataService>,
     system: Arc<dyn SystemService>,
     credentials: Arc<CredentialsService>,
-    plugin_accounts: Arc<dyn PluginAccountAccess>,
+    // Runtime 只持有 Weak，这个强引用保障账号端口与 Admin 服务同寿命
+    _plugin_accounts: Arc<dyn PluginAccountAccess>,
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
     fork: fork::ForkServices, // fork: services
 }
 
 impl AdminServices {
-    pub fn public_services(&self) -> Arc<service::Registry> {
+    #[must_use]
+    pub const fn timezone(&self) -> gateway_core::time::DeploymentTimeZone {
+        self.timezone
+    }
+
+    pub fn public_services(&self) -> Arc<public_service::Registry> {
         self.public_services.clone()
     }
 
@@ -239,12 +274,6 @@ impl AdminServices {
     #[must_use]
     pub fn key_usage(&self) -> &dyn KeyUsageService {
         self.key_usage.as_ref()
-    }
-
-    /// 取得账号服务的共享句柄；后台编排（冻结恢复 worker）需要持有 Arc。
-    #[must_use]
-    pub fn accounts_handle(&self) -> Arc<dyn AccountsService> {
-        Arc::clone(&self.accounts)
     }
 
     #[must_use]
@@ -278,6 +307,11 @@ impl AdminServices {
     }
 
     #[must_use]
+    pub fn usage_data(&self) -> &dyn UsageDataService {
+        self.usage_data.as_ref()
+    }
+
+    #[must_use]
     pub fn observability(&self) -> &dyn ObservabilityService {
         self.observability.as_ref()
     }
@@ -296,19 +330,13 @@ impl AdminServices {
         self.credentials.as_ref()
     }
 
-    /// Runtime 只持有该窄端口的 Weak；AdminBundle 保持实际生命周期。
-    #[must_use]
-    pub fn plugin_accounts_handle(&self) -> Arc<dyn PluginAccountAccess> {
-        Arc::clone(&self.plugin_accounts)
-    }
-
     #[must_use]
     pub fn backups(&self) -> &dyn BackupService {
         self.backups.as_ref()
     }
 }
 
-/// Admin 初始化完成后的封闭能力包。
+/// Admin 初始化完成后的封闭能力包
 pub struct AdminBundle {
     services: AdminServices,
     worker_contributions: Vec<WorkerContribution>,
@@ -320,15 +348,16 @@ impl AdminBundle {
         self.services.clone()
     }
 
-    /// 取出 Admin Worker 贡献；只能调用一次，与其它 Bundle 的贡献一并交给 Host。
+    /// 取出 Admin Worker 贡献；只能调用一次，与其它 Bundle 的贡献一并交给 Host
     pub fn take_worker_contributions(&mut self) -> Vec<WorkerContribution> {
         std::mem::take(&mut self.worker_contributions)
     }
 }
 
-/// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
+/// 组合根提供给控制面的运行能力；与配置和存储端口分别传入
 pub struct AdminRuntimePorts {
-    pub service_middleware: service::PlanSource,
+    pub timezone: gateway_core::time::DeploymentTimeZone,
+    pub service_middleware: public_service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,
     pub plugin_management: Arc<dyn ports::plugin_management::PluginManagement>,
     pub published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle,
@@ -345,11 +374,11 @@ pub struct AdminRuntimePorts {
     pub fork: ForkRuntimePorts, // fork: runtime dirs
 }
 
-/// 校验配置、接入已组装的 Provider 注册表并完成默认管理员幂等初始化。
+/// 校验配置、接入已组装的 Provider 注册表并完成默认管理员幂等初始化
 ///
 /// # Errors
 ///
-/// 配置非法或默认管理员初始化失败时返回错误。
+/// 配置非法或默认管理员初始化失败时返回错误
 pub async fn initialize(
     config: AdminConfig,
     client_config: ClientConfig,
@@ -359,7 +388,7 @@ pub async fn initialize(
     initialize_inner(config, client_config, store, runtime, None).await
 }
 
-/// 使用组合根已绑定给 Runtime 的同一账号窄端口，避免为完整 Admin 重建第二实例。
+/// 使用组合根已绑定给 Runtime 的同一账号窄端口，避免为完整 Admin 重建第二实例
 pub async fn initialize_with_plugin_accounts(
     config: AdminConfig,
     client_config: ClientConfig,
@@ -378,6 +407,7 @@ async fn initialize_inner(
     plugin_accounts: Option<Arc<dyn PluginAccountAccess>>,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        timezone,
         service_middleware,
         plugin_preparation,
         plugin_management,
@@ -403,8 +433,7 @@ async fn initialize_inner(
     let registry = providers;
 
     let auth = Arc::new(DefaultAuthService::new(
-        config.default_username,
-        config.session_ttl_minutes,
+        &config,
         client_config.session_ttl_minutes,
         store.auth(),
         client_key_verifier.clone(),
@@ -412,38 +441,45 @@ async fn initialize_inner(
     auth.ensure_default_admin(config.default_password.expose())
         .await?;
 
-    let accounts = Arc::new(DefaultAccountsService::new(
+    let accounts = initialize_accounts(
         store.accounts(),
         store.account_runtime(),
+        store.settings(),
+        timezone,
         registry.clone(),
         snapshot.clone(),
         probe.clone(),
         fork::AccountsDeps::new(&store, &fork_ports), // fork: accounts deps
-    ));
+    );
     let backup_ports = store.backup();
     let backups = Arc::new(DefaultBackupService::new(
         backup_ports.repository(),
         backup_ports.object_store(),
         store.auth(),
         snapshot.clone(),
+        timezone,
     ));
     let backup_task = backup::task::BackupTask::new(
         backup_ports.repository(),
         backup_ports.dump(),
         backup_ports.object_store(),
-    );
+    )
+    .with_timezone(timezone);
     let system_preflight = Arc::new(use_case::plugin_update::PluginSystemUpdatePreflight::new(
         store.plugins(),
         plugin_inspector.clone(),
-        snapshot.clone(),
     ));
     let system = Arc::new(DefaultSystemService::new(system, system_preflight));
+    let observations: Arc<dyn ports::store::ObservabilityStore> = Arc::new(
+        use_case::observability::CachedObservabilityStore::new(store.observability()),
+    );
     let key_usage = Arc::new(use_case::key_usage::DefaultKeyUsageService::new(
         auth.clone(),
         client_key_verifier,
         store.client_keys(),
-        store.observability(),
+        observations.clone(),
         system.clone(),
+        timezone,
     ));
     let credentials = Arc::new(CredentialsService::new(
         registry.clone(),
@@ -462,10 +498,14 @@ async fn initialize_inner(
         registry.clone(),
         pricing_source,
     );
-    let mut public_services = service::Registry::new(service_middleware);
+    let usage_data = initialize_usage_data(store.usage_data(), store.settings(), registry.clone());
+    let mut public_services = public_service::Registry::new(service_middleware);
     public_services.register_settings(&settings)?;
+    public_services.register_accounts(&accounts)?;
+    public_services.register_usage_data(&usage_data)?;
     let services = AdminServices {
         fork: fork::ForkServices::default(), // fork: services
+        timezone,
         public_services: Arc::new(public_services),
         plugin_management: Arc::new(PluginManagementService::new(
             plugin_management,
@@ -502,15 +542,18 @@ async fn initialize_inner(
         )),
         client_distribution: Arc::new(DefaultClientDistributionService::new(client_distribution)),
         observability: Arc::new(DefaultObservabilityService::new(
-            store.observability(),
+            observations.clone(),
             store.accounts(),
             store.settings(),
             registry.clone(),
+            timezone,
+            system.clone(),
         )),
         settings,
+        usage_data,
         system,
         credentials,
-        plugin_accounts,
+        _plugin_accounts: plugin_accounts,
         import_tasks,
         backups,
     };
@@ -536,6 +579,33 @@ async fn initialize_inner(
     .map_err(|_| AdminError::internal("导入 Worker 注册信息不合法"))?;
     worker_contributions.push(WorkerContribution::Registration(registration));
     worker_contributions.extend(freeze_recovery_worker_contribution(freeze_recovery)?);
+    let id = WorkerId::try_new(WorkerKind::ResetCreditAutomation, "admin")
+        .map_err(|_| AdminError::internal("重置卡 Worker ID 不合法"))?;
+    let schedule = WorkerSchedule::try_new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Duration::from_secs(90),
+        Duration::from_secs(30),
+    )
+    .map_err(|_| AdminError::internal("重置卡 Worker 调度配置不合法"))?;
+    let lease = WorkerLeaseRequest::try_new(id.clone(), Duration::from_secs(90))
+        .map_err(|_| AdminError::internal("重置卡 Worker 租约配置不合法"))?;
+    worker_contributions.push(WorkerContribution::Registration(
+        WorkerRegistration::try_new(
+            id,
+            WorkerRunnable::Scheduled {
+                schedule,
+                lease: Some(lease),
+                task: Box::new(reset_credit_automation::ResetCreditAutomationTask {
+                    accounts,
+                    store: store.accounts(),
+                    settings: store.settings(),
+                }),
+            },
+        )
+        .map_err(|_| AdminError::internal("重置卡 Worker 注册失败"))?,
+    ));
     // fork: services + workers
     let services = fork::attach(services, &store, fork_ports, &mut worker_contributions)?;
     Ok(AdminBundle {
@@ -544,7 +614,7 @@ async fn initialize_inner(
     })
 }
 
-/// CLI 只组合账号用例，不初始化管理员、管理服务或后台任务；写入仍复用同一事务与审计。
+/// CLI 只组合账号用例，不初始化管理员、管理服务或后台任务；写入仍复用同一事务与审计
 pub fn initialize_plugin_accounts(
     providers: ports::provider::ProviderAdminRegistry,
     accounts: Arc<dyn ports::store::AccountStore>,
@@ -555,7 +625,7 @@ pub fn initialize_plugin_accounts(
     ))
 }
 
-/// 为 Runtime 创建非秘密 Client Key 目录与预算重置的窄端口。
+/// 为 Runtime 创建非秘密 Client Key 目录与预算重置的窄端口
 #[must_use]
 pub fn initialize_plugin_client_keys(
     providers: ports::provider::ProviderAdminRegistry,
@@ -567,7 +637,7 @@ pub fn initialize_plugin_client_keys(
     Arc::new(use_case::plugin_client_keys::DefaultPluginClientKeyAccess::new(service))
 }
 
-/// 为 Runtime 组合实例自有资源写入；权限和归属在同一存储事务复核。
+/// 为 Runtime 组合实例自有资源写入；权限和归属在同一存储事务复核
 #[must_use]
 pub fn initialize_plugin_resources(
     store: Arc<dyn ports::plugin_resources::PluginResourceStore>,
@@ -576,7 +646,7 @@ pub fn initialize_plugin_resources(
     Arc::new(use_case::plugin_resources::DefaultPluginResourceAccess { store, snapshot })
 }
 
-/// Backup Worker 注册：单个可取消 Daemon，owner 固定为 `backup`。
+/// Backup Worker 注册：单个可取消 Daemon，owner 固定为 `backup`
 fn backup_worker_contribution(
     task: backup::task::BackupTask,
 ) -> Result<Vec<WorkerContribution>, AdminError> {
@@ -595,7 +665,7 @@ fn backup_worker_contribution(
     Ok(vec![WorkerContribution::Registration(registration)])
 }
 
-/// 冻结恢复 Worker 注册：按固定周期扫描活跃冻结，owner 固定。
+/// 冻结恢复 Worker 注册：按固定周期扫描活跃冻结，owner 固定
 fn freeze_recovery_worker_contribution(
     task: freeze_recovery::FreezeRecoveryTask,
 ) -> Result<Vec<WorkerContribution>, AdminError> {
@@ -626,7 +696,35 @@ fn freeze_recovery_worker_contribution(
     Ok(vec![WorkerContribution::Registration(registration)])
 }
 
-/// 设置服务不依赖 Web 管理会话，CLI 与服务器通过同一用例执行事务和发布。
+/// 服务端与 CLI 复用账号用例，不随命令启动后台调度
+#[expect(
+    clippy::too_many_arguments,
+    reason = "fork: 账号用例在上游依赖之外还要注入代理目录与票据密钥目录"
+)]
+#[must_use]
+pub fn initialize_accounts(
+    accounts: Arc<dyn ports::store::AccountStore>,
+    account_runtime: Arc<dyn ports::store::AccountRuntimeStore>,
+    settings: Arc<dyn ports::store::SettingsStore>,
+    timezone: gateway_core::time::DeploymentTimeZone,
+    providers: ProviderAdminRegistry,
+    snapshot: Arc<dyn SnapshotControl>,
+    probe: Arc<dyn AccountProbe>,
+    fork: ForkAccountsDeps, // fork: accounts deps
+) -> Arc<dyn AccountsService> {
+    Arc::new(DefaultAccountsService::new(
+        accounts,
+        account_runtime,
+        settings,
+        timezone,
+        providers,
+        snapshot,
+        probe,
+        fork,
+    ))
+}
+
+/// 设置服务不依赖 Web 管理会话，CLI 与服务器通过同一用例执行事务和发布
 pub fn initialize_settings(
     store: Arc<dyn ports::store::SettingsStore>,
     snapshot: Arc<dyn SnapshotControl>,
@@ -638,5 +736,17 @@ pub fn initialize_settings(
         snapshot,
         providers,
         pricing_source,
+    ))
+}
+
+/// HTTP、插件及 CLI 共用的用量领域用例，宿主提供已验证的调用主体
+#[must_use]
+pub fn initialize_usage_data(
+    store: Arc<dyn ports::usage_data::UsageDataStore>,
+    settings: Arc<dyn ports::store::SettingsStore>,
+    providers: ProviderAdminRegistry,
+) -> Arc<dyn UsageDataService> {
+    Arc::new(use_case::usage_data::DefaultUsageDataService::new(
+        store, settings, providers,
     ))
 }

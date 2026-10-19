@@ -1,4 +1,4 @@
-//! 从宿主类型和操作声明生成独立 SDK 合同；普通测试阻止两侧声明漂移。
+//! 从宿主类型和操作声明生成独立 SDK 合同；普通测试阻止两侧声明漂移
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -18,7 +18,7 @@ impl Parse for Operation {
         let method = input.parse()?;
         input.parse::<syn::Token![,]>()?;
         let arguments = input.parse()?;
-        // 后续模式和参数表达式只属于宿主调用，不进入线协议。
+        // 后续模式和参数表达式只属于宿主调用，不进入线协议
         input.parse::<syn::Token![,]>()?;
         let _ = syn::Pat::parse_single(input)?;
         while !input.is_empty() {
@@ -39,7 +39,7 @@ fn source(root: &Path, path: &str) -> syn::File {
     syn::parse_file(&std::fs::read_to_string(root.join(path)).unwrap()).unwrap()
 }
 
-// SDK 保留 wire 值，不依赖宿主的领域构造器、时区库或价格校验实现。
+// SDK 保留 wire 值，不依赖宿主的领域构造器、时区库或价格校验实现
 struct WireTypes;
 impl VisitMut for WireTypes {
     fn visit_type_mut(&mut self, ty: &mut Type) {
@@ -57,8 +57,10 @@ impl VisitMut for WireTypes {
             let last = path.path.segments.last().unwrap().clone();
             *ty = match last.ident.to_string().as_str() {
                 "DateTime" | "Tz" | "TokenPrice" | "AdminApiKey" => parse_quote!(String),
+                "Value" => parse_quote!(serde_json::Value),
                 "OpaqueProviderData" => parse_quote!(serde_json::Map<String, serde_json::Value>),
                 _ => Type::Path(syn::TypePath {
+                    attrs: std::mem::take(&mut path.attrs),
                     qself: None,
                     path: last.into(),
                 }),
@@ -78,6 +80,11 @@ fn contract_type(mut item: Item, name: &str) -> Item {
                     | "ReplaceRuntimeSettings"
                     | "AdminApiKeyMutation"
                     | "RegeneratedAdminApiKey"
+                    | "CodexPrivacyPolicy"
+                    | "PrivacyRule"
+                    | "PrivacyStep"
+                    | "PrivacyPreviewRequest"
+                    | "PrivacyPreviewResult"
             );
             (
                 &mut item.attrs,
@@ -106,8 +113,98 @@ fn contract_type(mut item: Item, name: &str) -> Item {
             field.vis = parse_quote!(pub);
         }
     }
+    if let Item::Enum(item) = &mut item {
+        for variant in &mut item.variants {
+            variant
+                .attrs
+                .retain(|attr| !attr.path().is_ident("default"));
+        }
+    }
     WireTypes.visit_item_mut(&mut item);
     item
+}
+
+fn service_operations(
+    root: &Path,
+    namespace: &str,
+    service_path: &str,
+    service_name: &str,
+) -> (Vec<syn::File>, usize) {
+    let service = source(root, service_path)
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            Item::Trait(item) if item.ident == service_name => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    let outputs: BTreeMap<_, _> = service
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn::TraitItem::Fn(method) => {
+                let syn::ReturnType::Type(_, output) = method.sig.output else {
+                    panic!("服务必须返回 Result")
+                };
+                let Type::Path(result) = *output else {
+                    panic!("服务必须返回 Result")
+                };
+                let segment = result.path.segments.last().unwrap();
+                assert_eq!(segment.ident, "Result");
+                let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                    panic!("Result 缺少类型参数")
+                };
+                let syn::GenericArgument::Type(mut output) = args.args.first().unwrap().clone()
+                else {
+                    panic!("Result 缺少输出类型")
+                };
+                WireTypes.visit_type_mut(&mut output);
+                Some((method.sig.ident.to_string(), output))
+            }
+            _ => None,
+        })
+        .collect();
+    let register = source(root, &format!("src/public_service/{namespace}.rs"))
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            Item::Fn(item) if item.sig.ident == "register" => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    let operations: Vec<syn::File> = register
+        .block
+        .stmts
+        .into_iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Macro(stmt) = stmt else {
+                return None;
+            };
+            if !stmt.mac.path.is_ident("register") {
+                return None;
+            }
+            let Operation {
+                name,
+                method,
+                mut input,
+            } = syn::parse2(stmt.mac.tokens).unwrap();
+            WireTypes.visit_type_mut(&mut input);
+            let output = outputs.get(&method.to_string()).unwrap();
+            let operation = format!("{namespace}.{method}");
+            Some(
+                syn::parse2(quote! {
+                    pub struct #name;
+                    impl Operation for #name {
+                        const NAME: &'static str = #operation;
+                        type Input = #input;
+                        type Output = #output;
+                    }
+                })
+                .unwrap(),
+            )
+        })
+        .collect();
+    (operations, outputs.len())
 }
 
 #[test]
@@ -116,6 +213,20 @@ fn sdk_settings_contract_matches_host_declarations() {
     let mut types = Vec::new();
     let mut replacement_fields = Vec::new();
     for (path, names) in [
+        (
+            "../gateway-core/src/settings/privacy.rs",
+            &[
+                "CodexPrivacyPolicy",
+                "PrivacyFailureMode",
+                "PrivacyScope",
+                "PrivacyAction",
+                "PrivacyRule",
+                "PrivacyStep",
+                "PrivacyRuleOutcome",
+                "PrivacyPreviewRequest",
+                "PrivacyPreviewResult",
+            ][..],
+        ),
         (
             "src/model/settings.rs",
             &[
@@ -162,7 +273,37 @@ fn sdk_settings_contract_matches_host_declarations() {
                     _ => false,
                 })
                 .unwrap_or_else(|| panic!("缺少合同类型 {name}"));
-            if let Item::Struct(item) = item
+            let mut item = item.clone();
+            // SDK 保持独立的平铺合同，不暴露宿主内部的值对象组合
+            if matches!(*name, "RuntimeSettings" | "ReplaceRuntimeSettings") {
+                let values = items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Struct(item) if item.ident == "RuntimeSettingsValues" => {
+                            Some(&item.fields)
+                        }
+                        _ => None,
+                    })
+                    .expect("settings values");
+                let Item::Struct(record) = &mut item else {
+                    unreachable!()
+                };
+                let syn::Fields::Named(fields) = &mut record.fields else {
+                    unreachable!()
+                };
+                fields.named = fields
+                    .named
+                    .iter()
+                    .flat_map(|field| {
+                        if field.ident.as_ref().is_some_and(|ident| ident == "values") {
+                            values.iter().cloned().collect::<Vec<_>>()
+                        } else {
+                            vec![field.clone()]
+                        }
+                    })
+                    .collect();
+            }
+            if let Item::Struct(item) = &item
                 && item.ident == "ReplaceRuntimeSettings"
             {
                 replacement_fields = item
@@ -172,7 +313,7 @@ fn sdk_settings_contract_matches_host_declarations() {
                     .collect();
             }
             types.push(contract_type(
-                item.clone(),
+                item,
                 if *name == "SmartSchedulingValues" {
                     "SmartSchedulingConfig"
                 } else {
@@ -182,84 +323,23 @@ fn sdk_settings_contract_matches_host_declarations() {
         }
     }
 
-    let service = source(root, "src/use_case/settings.rs")
-        .items
-        .into_iter()
-        .find_map(|item| match item {
-            Item::Trait(item) if item.ident == "SettingsService" => Some(item),
-            _ => None,
-        })
-        .unwrap();
-    let outputs: BTreeMap<_, _> = service
-        .items
-        .into_iter()
-        .filter_map(|item| match item {
-            syn::TraitItem::Fn(method) => {
-                let syn::ReturnType::Type(_, output) = method.sig.output else {
-                    panic!("服务必须返回 Result")
-                };
-                let Type::Path(result) = *output else {
-                    panic!("服务必须返回 Result")
-                };
-                let segment = result.path.segments.last().unwrap();
-                assert_eq!(segment.ident, "Result");
-                let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-                    panic!("Result 缺少类型参数")
-                };
-                let syn::GenericArgument::Type(mut output) = args.args.first().unwrap().clone()
-                else {
-                    panic!("Result 缺少输出类型")
-                };
-                WireTypes.visit_type_mut(&mut output);
-                Some((method.sig.ident.to_string(), output))
-            }
-            _ => None,
-        })
-        .collect();
-    let register = source(root, "src/service/settings.rs")
-        .items
-        .into_iter()
-        .find_map(|item| match item {
-            Item::Fn(item) if item.sig.ident == "register" => Some(item),
-            _ => None,
-        })
-        .unwrap();
-    let operations: Vec<_> = register
-        .block
-        .stmts
-        .into_iter()
-        .filter_map(|stmt| {
-            let syn::Stmt::Macro(stmt) = stmt else {
-                return None;
-            };
-            if !stmt.mac.path.is_ident("register") {
-                return None;
-            }
-            let Operation {
-                name,
-                method,
-                mut input,
-            } = syn::parse2(stmt.mac.tokens).unwrap();
-            WireTypes.visit_type_mut(&mut input);
-            let output = outputs.get(&method.to_string()).unwrap();
-            let operation = format!("settings.{method}");
-            Some(quote! {
-                pub struct #name;
-                impl Operation for #name {
-                    const NAME: &'static str = #operation;
-                    type Input = #input;
-                    type Output = #output;
-                }
-            })
-        })
-        .collect();
-    assert_eq!(operations.len(), outputs.len(), "公开服务方法必须完整声明");
+    let (operations, method_count) = service_operations(
+        root,
+        "settings",
+        "src/use_case/settings.rs",
+        "SettingsService",
+    );
+    assert_eq!(operations.len(), method_count, "公开服务方法必须完整声明");
     let assignments = replacement_fields.iter().map(|field| match field.to_string().as_str() {
         "expected_revision" => quote!(expected_revision: settings.config_revision),
         "request_profile_updates" => quote!(request_profile_updates: settings.request_profiles.into_iter().map(|(provider, value)| (provider, Some(value))).collect()),
         _ => quote!(#field: settings.#field),
     });
     let generated = quote! {
+        //! 宿主设置服务的操作标识与请求、响应数据合同
+        //!
+        //! 从宿主设置类型与 public_service/settings.rs 生成；更新命令见 SDK 维护说明
+
         use super::Operation;
         use serde::{Deserialize, Serialize};
         use std::{collections::{BTreeMap, BTreeSet}, num::NonZeroU64};
@@ -268,6 +348,7 @@ fn sdk_settings_contract_matches_host_declarations() {
         pub type ModelMappings = BTreeMap<String, String>;
         pub type Revision = NonZeroU64;
         pub type RotationStrategy = String;
+        pub type AccountAffinity = String;
         pub type PricingOverrides = BTreeMap<String, BTreeMap<String, ModelPriceOverride>>;
         #(#types)*
         #(#operations)*
@@ -277,14 +358,48 @@ fn sdk_settings_contract_matches_host_declarations() {
             }
         }
     };
-    let output = root.join("../gateway-plugin/sdk/src/call/services/settings.rs");
-    let expected = prettyplease::unparse(&syn::parse2::<syn::File>(generated).unwrap());
+    check_contract(root, "settings", syn::parse2(generated).unwrap());
+}
+
+#[test]
+fn sdk_accounts_contract_matches_host_declarations() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let status = source(root, "src/model/reset_credit_automation.rs")
+        .items
+        .into_iter()
+        .find(|item| matches!(item, Item::Struct(item) if item.ident == "ResetCreditAutomationStatus"))
+        .unwrap();
+    let status = contract_type(status, "ResetCreditAutomationStatus");
+    let (operations, _) = service_operations(
+        root,
+        "accounts",
+        "src/use_case/accounts/mod.rs",
+        "AccountsService",
+    );
+    let generated = quote! {
+        //! 账号自动重置的类型化操作与状态合同
+        //!
+        //! 从宿主状态类型与 public_service/accounts.rs 生成；更新命令见 SDK 维护说明
+
+        use super::Operation;
+        use serde::{Deserialize, Serialize};
+        #status
+        #(#operations)*
+    };
+    check_contract(root, "accounts", syn::parse2(generated).unwrap());
+}
+
+fn check_contract(root: &Path, namespace: &str, generated: syn::File) {
+    let output = root.join(format!(
+        "../gateway-plugin/sdk/src/call/services/{namespace}.rs"
+    ));
+    let expected = prettyplease::unparse(&generated);
     if std::env::var_os("CPR_UPDATE_SERVICE_CONTRACT").is_some() {
-        std::fs::write(&output, format!("// 从宿主设置类型与 service/settings.rs 生成；更新命令见 SDK 维护说明。\n{expected}")).unwrap();
+        std::fs::write(&output, &expected).unwrap();
     }
     let actual = syn::parse_file(&std::fs::read_to_string(output).unwrap()).unwrap();
     assert!(
         prettyplease::unparse(&actual) == expected,
-        "SDK 服务合同已过期：CPR_UPDATE_SERVICE_CONTRACT=1 cargo test -p gateway-admin --test main sdk_settings_contract_matches_host_declarations"
+        "SDK 服务合同已过期：CPR_UPDATE_SERVICE_CONTRACT=1 cargo test -p gateway-admin --test main sdk_{namespace}_contract_matches_host_declarations"
     );
 }

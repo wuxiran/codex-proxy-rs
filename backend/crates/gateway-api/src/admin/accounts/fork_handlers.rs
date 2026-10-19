@@ -47,6 +47,7 @@ where
     S: SessionState + Send + Sync,
 {
     let account_id = query.into_id().map_err(map_wire_error)?;
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let ticket = state
         .admin_services()
         .accounts()
@@ -55,7 +56,7 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(account_ticket_view(ticket)),
+        AdminEnvelope::ok(account_ticket_view(ticket, time)),
     ))
 }
 
@@ -70,6 +71,7 @@ where
     let command = request
         .into_command(auth.context().mutation_context())
         .map_err(map_wire_error)?;
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let ticket = state
         .admin_services()
         .accounts()
@@ -78,7 +80,7 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(account_ticket_view(ticket)),
+        AdminEnvelope::ok(account_ticket_view(ticket, time)),
     ))
 }
 
@@ -267,14 +269,15 @@ where
 {
     let (account_id, upstream_model, prompt, effort, mode) =
         request.into_command().map_err(map_wire_error)?;
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let stream = state
         .admin_services()
         .accounts()
         .run_test_bench(account_id, upstream_model, prompt, effort, mode)
         .await
         .map_err(map_service_error)?
-        .map(|event| {
-            let event = AccountConnectionTestEvent::from(event);
+        .map(move |event| {
+            let event = AccountConnectionTestEvent::from((event, time));
             let data = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_owned());
             Ok(Event::default().data(data))
         });

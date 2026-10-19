@@ -1,9 +1,6 @@
-import type { AccountErrorReason, AccountStatus, getAccounts } from '@/api'
+import type { Account, AccountErrorReason, AccountQuotaWindow, AccountStatus } from '@/api'
 import { defineTableColumns } from '@codex-proxy/ui'
 import { formatProviderLabel } from '@/utils/providers'
-
-export type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-export type AccountQuotaWindow = AccountRow['quota']['windows'][number]
 
 export interface AccountQuotaWindowEntry {
   key: string
@@ -17,7 +14,7 @@ const quotaGroupOrder = new Map([
   ['other', 2],
 ])
 
-export const accountColumns = defineTableColumns<AccountRow>([
+export const accountColumns = defineTableColumns<Account>([
   { key: 'expander', kind: 'expander', hideable: false },
   { key: 'selection', kind: 'selection', hideable: false },
   {
@@ -34,7 +31,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     kind: 'meta',
     size: 'md',
     align: 'center',
-    format: value => accountProviderLabel(typeof value === 'string' ? value : null),
+    formatter: value => formatProviderLabel(typeof value === 'string' ? value : null),
   },
   { key: 'status', label: '状态', kind: 'status', size: 'lg', align: 'left', sortable: true },
   { key: 'enabled', label: '调度', kind: 'custom', size: 'sm' },
@@ -54,7 +51,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     label: '令牌过期',
     kind: 'datetime',
     sortable: 'expiresAt',
-    format: value => optionalAccountCell(value),
+    formatter: value => optionalAccountCell(value),
     emptyText: '',
   },
   { key: 'actions', label: '操作', kind: 'actions', size: '2xl', hideable: false },
@@ -95,14 +92,6 @@ export const errorReasonLabels: Record<AccountErrorReason, string> = {
   credential_expired: '凭据已过期',
   credential_invalid: '凭据无效',
   account_banned: '账号不可用或已被封禁',
-}
-
-/**
- * 后端已派生互斥状态（正常 / 配额耗尽 / 限流中 / 已停用 / 错误 / 已过期）；
- * 前端只渲染，不再独立派生。
- */
-export function derivedAccountStatus(row: AccountRow): AccountStatus {
-  return row.status
 }
 
 export function visibleSummaryQuotaWindows(windows: AccountQuotaWindow[]) {
@@ -204,16 +193,12 @@ function quotaLimitLabel(window: AccountQuotaWindow) {
   return window.limitName
 }
 
-function accountProviderLabel(value?: string | null) {
-  return formatProviderLabel(value)
-}
-
 function optionalAccountCell(value: unknown) {
   return value === '—' || value === '-' ? '' : value
 }
 
 /** 报错率后缀：无请求时不显示比例。 */
-export function errorRateDisplay(errors: AccountRow['recentErrors']): string {
+export function errorRateDisplay(errors: Account['recentErrors']): string {
   if (errors.requestCount === 0)
     return ''
   const rate = (errors.errorCount / errors.requestCount) * 100

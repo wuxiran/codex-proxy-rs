@@ -1,10 +1,11 @@
-import type { PluginActionContext } from './usePluginActions'
+import type { PluginRefreshContext } from '../utils/actions'
 import type { PluginArtifact } from '@/api'
-import { toast } from '@codex-proxy/ui'
+import { ZNotification } from '@codex-proxy/ui'
 import { shallowRef } from 'vue'
 import { deletePluginArtifact } from '@/api'
+import { notifyPluginError } from '../utils/actions'
 
-export function usePluginArtifactActions({ refresh, notifyError }: Pick<PluginActionContext, 'refresh' | 'notifyError'>) {
+export function usePluginArtifactActions({ refresh }: PluginRefreshContext) {
   const showArtifactDelete = shallowRef(false)
   const pendingArtifact = shallowRef<PluginArtifact | null>(null)
   const busyDigest = shallowRef('')
@@ -22,12 +23,11 @@ export function usePluginArtifactActions({ refresh, notifyError }: Pick<PluginAc
     try {
       await deletePluginArtifact({ sha256: artifact.metadata.sha256 }, { silent: true })
       showArtifactDelete.value = false
-      pendingArtifact.value = null
-      toast.success('插件制品已删除')
+      ZNotification.success({ message: '插件制品已删除' })
       await refresh(true)
     }
     catch (error) {
-      notifyError('插件制品删除失败', error)
+      notifyPluginError('插件制品删除失败', error)
     }
     finally {
       busyDigest.value = ''

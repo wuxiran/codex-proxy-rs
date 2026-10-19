@@ -1,4 +1,4 @@
-//! 请求级账号资格投影、反馈统计与选择算法。
+//! 请求级账号资格投影、反馈统计与选择算法
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
@@ -13,7 +13,7 @@ use super::{
     AccountConcurrency, AccountStatus, ProviderAccount, ProviderAccountId, SmartSchedulingConfig,
 };
 
-/// `runtime_settings.rotation_strategy` 的稳定值。
+/// `runtime_settings.rotation_strategy` 的稳定值
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RotationStrategy {
@@ -46,14 +46,54 @@ impl RotationStrategy {
     }
 }
 
-/// 从 `runtime_settings` 冻结到一次请求计划的账号调度策略。
+/// 单请求换号预算不能超过路由尝试总数减一
+pub const MAX_ACCOUNT_ROTATIONS: u32 = 31;
+
+/// 会话绑定与轮次关联共用的保留时长上限，单位小时
+pub const MAX_SESSION_AFFINITY_TTL_HOURS: u32 = 720;
+
+/// OpenAI 会话账号亲和；请求身份和模式行为由 Provider 解释
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAffinity {
+    Relaxed,
+    Preferred,
+    #[default]
+    Strict,
+}
+
+impl AccountAffinity {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relaxed => "relaxed",
+            Self::Preferred => "preferred",
+            Self::Strict => "strict",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "relaxed" => Some(Self::Relaxed),
+            "preferred" => Some(Self::Preferred),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+}
+
+/// 从 `runtime_settings` 冻结到一次请求计划的账号调度策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountSelectionPolicy {
     strategy: RotationStrategy,
     smart_scheduling: SmartSchedulingConfig,
     max_concurrent_per_account: AccountConcurrency,
-    request_interval: Duration,
     queue_policy: ConcurrencyQueuePolicy,
+    openai_guardian_reserved_concurrency: u32,
+    openai_account_affinity: AccountAffinity,
+    max_account_rotations: u32,
+    openai_session_affinity_ttl: Duration,
 }
 
 impl AccountSelectionPolicy {
@@ -61,18 +101,65 @@ impl AccountSelectionPolicy {
     pub fn new(
         strategy: RotationStrategy,
         max_concurrent_per_account: impl Into<AccountConcurrency>,
-        request_interval: Duration,
     ) -> Self {
         Self {
             strategy,
             smart_scheduling: SmartSchedulingConfig::default(),
             max_concurrent_per_account: max_concurrent_per_account.into(),
-            request_interval,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: AccountAffinity::default(),
+            max_account_rotations: 3,
+            openai_session_affinity_ttl: Duration::from_secs(24 * 3600),
             queue_policy: ConcurrencyQueuePolicy {
                 max_waiting: 0,
                 timeout: Duration::ZERO,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn with_openai_account_affinity(mut self, affinity: AccountAffinity) -> Self {
+        self.openai_account_affinity = affinity;
+        self
+    }
+
+    #[must_use]
+    pub const fn openai_account_affinity(self) -> AccountAffinity {
+        self.openai_account_affinity
+    }
+
+    #[must_use]
+    pub const fn with_max_account_rotations(mut self, rotations: u32) -> Self {
+        self.max_account_rotations = rotations;
+        self
+    }
+
+    #[must_use]
+    pub const fn max_account_rotations(self) -> u32 {
+        self.max_account_rotations
+    }
+
+    #[must_use]
+    pub const fn with_openai_session_affinity_ttl(mut self, ttl: Duration) -> Self {
+        self.openai_session_affinity_ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub const fn openai_session_affinity_ttl(self) -> Duration {
+        self.openai_session_affinity_ttl
+    }
+
+    /// 只传递冻结的运行设置，Guardian 分类与预留策略由 OpenAI Provider 解释
+    #[must_use]
+    pub const fn with_openai_guardian_reserved_concurrency(mut self, reserved: u32) -> Self {
+        self.openai_guardian_reserved_concurrency = reserved;
+        self
+    }
+
+    #[must_use]
+    pub const fn openai_guardian_reserved_concurrency(self) -> u32 {
+        self.openai_guardian_reserved_concurrency
     }
 
     #[must_use]
@@ -106,20 +193,16 @@ impl AccountSelectionPolicy {
     pub const fn max_concurrent_per_account(self) -> AccountConcurrency {
         self.max_concurrent_per_account
     }
-
-    #[must_use]
-    pub const fn request_interval(self) -> Duration {
-        self.request_interval
-    }
 }
 
-/// Store 提供并发事实，Provider 叠加自己解释的额度事实；全部信号均可重建。
+/// Store 提供并发事实，Provider 叠加自己解释的额度事实；全部信号均可重建
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRuntimeSignals {
+    /// 本次调度容量池的在途数，不合并其他独立池
     pub in_flight: u32,
     pub last_started_at: Option<SystemTime>,
     pub quota_reset_at: Option<SystemTime>,
-    /// Provider 归一化的剩余额度基点：0 耗尽，10_000 全部可用。
+    /// Provider 归一化的剩余额度基点：0 耗尽，10_000 全部可用
     pub quota_remaining_rank: Option<u64>,
     pub cooldown: Option<super::AccountCooldown>,
     pub failure_rate_basis_points: Option<u16>,
@@ -131,7 +214,7 @@ const ACCOUNT_CAPACITY_FAILURE_EWMA_ALPHA: f64 = 0.4;
 const ACCOUNT_FAILURE_RATE_HALF_LIFE: Duration = Duration::from_secs(15 * 60);
 const EMPTY_FEEDBACK_SAMPLE: u64 = f64::NAN.to_bits();
 
-/// 一次真实上游 attempt 对账号级 Smart 调度产生的中立反馈。
+/// 一次真实上游 attempt 对账号级 Smart 调度产生的中立反馈
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountAttemptFeedback {
     Succeeded { first_output_ms: Option<u64> },
@@ -180,7 +263,7 @@ impl DecayingAccountFailureRate {
 impl Default for AccountFeedback {
     fn default() -> Self {
         Self {
-            // 新账号从健康基线开始，首个失败样本按 EWMA 平滑，而不是直接判死。
+            // 新账号从健康基线开始，首个失败样本按 EWMA 平滑，而不是直接判死
             failure_rate: Mutex::new(DecayingAccountFailureRate::default()),
             first_output_ms: AtomicU64::new(EMPTY_FEEDBACK_SAMPLE),
         }
@@ -223,14 +306,14 @@ impl AccountFeedback {
     }
 }
 
-/// 所有 Provider 共享、按 Provider 和账号隔离的进程内 Smart 健康反馈。
+/// 所有 Provider 共享、按 Provider 和账号隔离的进程内 Smart 健康反馈
 #[derive(Debug, Default)]
 pub struct AccountFeedbackStats {
     accounts: RwLock<HashMap<AccountFeedbackKey, AccountFeedback>>,
 }
 
 impl AccountFeedbackStats {
-    /// 读取账号当前的错误率与首个有效输出延迟 EWMA。
+    /// 读取账号当前的错误率与首个有效输出延迟 EWMA
     #[must_use]
     pub fn scheduling_signals(
         &self,
@@ -240,7 +323,7 @@ impl AccountFeedbackStats {
         self.scheduling_signals_at(provider_kind, account_id, Instant::now())
     }
 
-    /// 读取账号在指定单调时刻的错误率与首个有效输出延迟 EWMA。
+    /// 读取账号在指定单调时刻的错误率与首个有效输出延迟 EWMA
     #[doc(hidden)]
     #[must_use]
     pub fn scheduling_signals_at(
@@ -261,7 +344,7 @@ impl AccountFeedbackStats {
             .unwrap_or_default()
     }
 
-    /// 回灌一次已经真实发送的上游 attempt。
+    /// 回灌一次已经真实发送的上游 attempt
     pub fn report(
         &self,
         provider_kind: &ProviderKind,
@@ -271,7 +354,7 @@ impl AccountFeedbackStats {
         self.report_at(provider_kind, account_id, feedback, Instant::now());
     }
 
-    /// 回灌一次在指定单调时刻真实发送的上游 attempt。
+    /// 回灌一次在指定单调时刻真实发送的上游 attempt
     #[doc(hidden)]
     pub fn report_at(
         &self,
@@ -356,7 +439,7 @@ impl AccountRuntimeSignals {
     }
 }
 
-/// Provider 从私有 quota JSON 投影出的中立调度事实。
+/// Provider 从私有 quota JSON 投影出的中立调度事实
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountQuotaSignals {
     reset_at: Option<SystemTime>,
@@ -364,7 +447,7 @@ pub struct AccountQuotaSignals {
 }
 
 impl AccountQuotaSignals {
-    /// `remaining_rank` 使用剩余额度基点，范围为 0..=10_000。
+    /// `remaining_rank` 使用剩余额度基点，范围为 0..=10_000
     #[must_use]
     pub const fn new(reset_at: Option<SystemTime>, remaining_rank: Option<u64>) -> Self {
         Self {
@@ -384,17 +467,17 @@ impl AccountQuotaSignals {
     }
 }
 
-/// 账号持久事实与可重建运行信号的请求级组合。
+/// 账号持久事实与可重建运行信号的请求级组合
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountCandidate {
     pub account: ProviderAccount,
     pub signals: AccountRuntimeSignals,
 }
 
-/// 一次账号选择看到的可调度并发槽快照。
+/// 一次账号选择看到的可调度并发槽快照
 ///
 /// `used_slots` 包含刚刚获取成功的当前请求；快照只覆盖本次请求范围内、
-/// 模型可用且未被显式排除的账号池。
+/// 模型可用且未被显式排除的账号池
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountCapacitySnapshot {
     used_slots: u64,
@@ -421,25 +504,41 @@ impl AccountCapacitySnapshot {
     }
 }
 
-/// 一次账号选择使用的全局策略快照。
+/// 一次账号选择使用的全局策略快照
 #[derive(Debug, Clone)]
 pub struct AccountSelectionContext {
     pub policy: AccountSelectionPolicy,
     pub now: SystemTime,
     pub excluded_accounts: BTreeSet<ProviderAccountId>,
+    /// 租约争用或队列让位只阻止立即选号，不排除等待资格
+    pub busy_accounts: BTreeSet<ProviderAccountId>,
     pub preferred_account: Option<ProviderAccountId>,
-    /// 优先账号可调度时，是否优先于其它账号的持久权重。
+    /// 优先账号可调度时，是否优先于其它账号的持久权重
     pub preferred_account_overrides_weight: bool,
     pub round_robin_cursor: u64,
     pub eligibility: AccountEligibilityPolicy,
     pub account_scope: Option<std::sync::Arc<crate::account::scope::FrozenAccountScope>>,
+    /// 本请求使用的独立预留池上限，由 Provider 按请求类别决定；0 表示使用普通账号池
+    pub reserved_concurrency: u32,
 }
 
-/// 选择账号时是否执行本地调度资格投影。
+impl AccountSelectionContext {
+    /// 本请求在该账号上可使用的并发上限；资格判断、租约与策略投影必须共用这一口径
+    #[must_use]
+    pub fn concurrency_limit(&self, account: &ProviderAccount) -> AccountConcurrency {
+        if self.reserved_concurrency > 0 {
+            AccountConcurrency::new(self.reserved_concurrency)
+        } else {
+            account.effective_concurrency(self.policy.max_concurrent_per_account())
+        }
+    }
+}
+
+/// 选择账号时是否执行本地调度资格投影
 ///
 /// 管理端对指定账号执行诊断时，会直接向上游确认实际状态；该模式跳过
-/// `enabled`、可用性、冷却和 token 到期等本地投影，仍保留租约、并发和
-/// 请求间隔约束，且只能与固定账号约束组合使用。
+/// `enabled`、可用性、冷却和 token 到期等本地投影，仍保留租约和并发
+/// 约束，且只能与固定账号约束组合使用
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountEligibilityPolicy {
     #[default]
@@ -454,18 +553,17 @@ impl AccountEligibilityPolicy {
     }
 }
 
-/// 候选账号未进入调度池的约束。
+/// 候选账号未进入调度池的约束
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountSchedulingBlocker {
     OutsideClientScope,
     LocalAvailability,
     Excluded,
     ConcurrencyLimit,
-    RequestInterval,
     LowerWeight,
 }
 
-/// 优先账号在本次选择中的处理结果。
+/// 优先账号在本次选择中的处理结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferredAccountSelection {
     NotRequested,
@@ -475,7 +573,7 @@ pub enum PreferredAccountSelection {
     Blocked(AccountSchedulingBlocker),
 }
 
-/// 一次完整账号选择；同时保留优先账号决策，供 Provider 记录调度遥测。
+/// 一次完整账号选择；同时保留优先账号决策，供 Provider 记录调度遥测
 #[derive(Debug, Clone, Copy)]
 pub struct AccountSelection<'a> {
     candidate: &'a AccountCandidate,
@@ -494,19 +592,19 @@ impl<'a> AccountSelection<'a> {
         self.preferred
     }
 
-    /// 显式策略选号不受 Provider 的软亲和等待覆盖；委托内置选号不属于显式选择。
+    /// 显式策略选号不受 Provider 的软亲和等待覆盖；委托内置选号不属于显式选择
     #[must_use]
     pub const fn is_policy_choice(self) -> bool {
         self.policy_choice
     }
 }
 
-/// 同一 target 内唯一的账号排序器。
+/// 同一 target 内唯一的账号排序器
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AccountSelector;
 
 impl AccountSelector {
-    /// 返回调度策略可见的全部合格候选；权重层授权由调用策略的宿主适配器裁剪。
+    /// 策略同时约束立即选号与等待，候选保留仅因本地容量受阻的账号
     #[must_use]
     pub(crate) fn policy_candidates<'a>(
         &self,
@@ -515,11 +613,16 @@ impl AccountSelector {
     ) -> Vec<&'a AccountCandidate> {
         candidates
             .iter()
-            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .filter(|candidate| {
+                matches!(
+                    self.scheduling_blocker(candidate, context),
+                    None | Some(AccountSchedulingBlocker::ConcurrencyLimit)
+                )
+            })
             .collect()
     }
 
-    /// 对插件返回的 ID 再执行同一资格判断，并保留原有亲和遥测结果。
+    /// 对插件返回的 ID 再执行同一资格判断，并保留原有亲和遥测结果
     #[must_use]
     pub(crate) fn select_policy_candidate<'a>(
         &self,
@@ -548,7 +651,7 @@ impl AccountSelector {
         })
     }
 
-    /// 汇总与本次调度约束一致的并发容量，供请求级观测使用。
+    /// 汇总与本次调度约束一致的并发容量，供请求级观测使用
     #[must_use]
     pub fn capacity_snapshot(
         &self,
@@ -568,13 +671,8 @@ impl AccountSelector {
                 )
             })
             .try_fold((0_u64, 0_u64), |(used, total), candidate| {
-                let capacity = u64::from(
-                    candidate
-                        .account
-                        .effective_concurrency(context.policy.max_concurrent_per_account())
-                        .limit()?
-                        .get(),
-                );
+                let capacity =
+                    u64::from(context.concurrency_limit(&candidate.account).limit()?.get());
                 Some((
                     used.saturating_add(u64::from(candidate.signals.in_flight)),
                     total.saturating_add(capacity),
@@ -586,7 +684,7 @@ impl AccountSelector {
         })
     }
 
-    /// 从可调度账号中确定一个候选；这里只消费 Provider 已解析的额度投影。
+    /// 从可调度账号中确定一个候选；这里只消费 Provider 已解析的额度投影
     #[must_use]
     pub fn select<'a>(
         &self,
@@ -606,10 +704,7 @@ impl AccountSelector {
             .max()?;
         let (mut preferred, preferred_candidate) = self.preferred_decision(candidates, context);
         if let Some(candidate) = preferred_candidate {
-            // 权重回切只裁决内置策略的软亲和，插件显式选号按实际选择记录结果。
-            let prefer_higher_weight = context.policy.strategy() == RotationStrategy::Smart
-                && context.policy.smart_scheduling().prefer_higher_weight();
-            if (!context.preferred_account_overrides_weight || prefer_higher_weight)
+            if !context.preferred_account_overrides_weight
                 && candidate.account.weight() < highest_weight
             {
                 preferred =
@@ -626,7 +721,6 @@ impl AccountSelector {
 
         let candidate = match context.policy.strategy() {
             RotationStrategy::QuotaResetPriority => {
-                let default_concurrency = context.policy.max_concurrent_per_account();
                 eligible.sort_by(|left, right| {
                     (
                         left.signals.quota_reset_at.is_none(),
@@ -637,8 +731,8 @@ impl AccountSelector {
                             right.signals.quota_reset_at,
                         ))
                         .then_with(|| {
-                            capacity_utilization(left, default_concurrency)
-                                .total_cmp(&capacity_utilization(right, default_concurrency))
+                            capacity_utilization(left, context)
+                                .total_cmp(&capacity_utilization(right, context))
                         })
                         .then_with(|| {
                             left.signals
@@ -654,13 +748,7 @@ impl AccountSelector {
                 let index = context.round_robin_cursor as usize % eligible.len();
                 eligible.get(index).copied()?
             }
-            RotationStrategy::Smart => select_smart_candidate(
-                &eligible,
-                context.policy.max_concurrent_per_account(),
-                context.round_robin_cursor,
-                context.policy.smart_scheduling(),
-                context.now,
-            )?,
+            RotationStrategy::Smart => select_smart_candidate(&eligible, context)?,
             RotationStrategy::Sticky => {
                 eligible.sort_by_key(|candidate| {
                     (
@@ -698,7 +786,7 @@ impl AccountSelector {
         }
     }
 
-    /// 只有本地并发/调度间隔可等待；账号权限、失效、额度与上游冷却仍立即排除。
+    /// 只有本地并发可等待；账号权限、失效、额度与上游冷却仍立即排除
     #[must_use]
     pub fn wait_candidates(
         &self,
@@ -710,10 +798,7 @@ impl AccountSelector {
             .filter(|candidate| {
                 matches!(
                     self.scheduling_blocker(candidate, context),
-                    None | Some(
-                        AccountSchedulingBlocker::ConcurrencyLimit
-                            | AccountSchedulingBlocker::RequestInterval
-                    )
+                    None | Some(AccountSchedulingBlocker::ConcurrencyLimit)
                 )
             })
             .collect::<Vec<_>>();
@@ -730,7 +815,7 @@ impl AccountSelector {
             .collect()
     }
 
-    /// Provider 先投影续写范围与资格，再将等待候选交给共用评分规则选择队列。
+    /// Provider 先投影续写范围与资格，再将等待候选交给共用评分规则选择队列
     pub async fn wait_for_capacity(
         &self,
         waiting: &mut CapacityWait<'_, ProviderAccountId>,
@@ -743,20 +828,10 @@ impl AccountSelector {
         if context.policy.strategy() != RotationStrategy::Smart || queue_weight == 0.0 {
             return waiting.wait(keys).await;
         }
-        // 账号信号在队列锁外评分，锁内只读取实时队长并查表，避免扫描候选阻塞其他等待者。
+        // 账号信号在队列锁外评分，锁内只读取实时队长并查表，避免扫描候选阻塞其他等待者
         let scores = candidates
             .iter()
-            .map(|candidate| {
-                (
-                    candidate.account.id(),
-                    smart_score(
-                        candidate,
-                        context.policy.max_concurrent_per_account(),
-                        config,
-                        context.now,
-                    ),
-                )
-            })
+            .map(|candidate| (candidate.account.id(), smart_score(candidate, context)))
             .collect::<HashMap<_, _>>();
         waiting
             .wait_with_priority(keys, |key, count| {
@@ -789,42 +864,28 @@ impl AccountSelector {
         if context.excluded_accounts.contains(candidate.account.id()) {
             return Some(AccountSchedulingBlocker::Excluded);
         }
-        if candidate
-            .account
-            .effective_concurrency(context.policy.max_concurrent_per_account())
+        if context.busy_accounts.contains(candidate.account.id()) {
+            return Some(AccountSchedulingBlocker::ConcurrencyLimit);
+        }
+        if context
+            .concurrency_limit(&candidate.account)
             .limit()
             .is_some_and(|limit| candidate.signals.in_flight >= limit.get())
         {
             return Some(AccountSchedulingBlocker::ConcurrencyLimit);
         }
-        if candidate
-            .signals
-            .last_started_at
-            .is_some_and(|last_started| {
-                !context
-                    .now
-                    .duration_since(last_started)
-                    .is_ok_and(|elapsed| elapsed >= context.policy.request_interval())
-            })
-        {
-            return Some(AccountSchedulingBlocker::RequestInterval);
-        }
         None
     }
 }
 
-// 首输出 10 秒时延迟得分减半；固定尺度不随其他候选账号变化。
+// 首输出 10 秒时延迟得分减半；固定尺度不随其他候选账号变化
 const SMART_LATENCY_HALF_SCORE_MS: f64 = 10_000.0;
-// 距重置一小时时得分减半；未知和已过期时间不提供重置奖励。
+// 距重置一小时时得分减半；未知和已过期时间不提供重置奖励
 const SMART_RESET_HALF_SCORE_SECONDS: f64 = 3_600.0;
 
-fn capacity_utilization(
-    candidate: &AccountCandidate,
-    default_concurrency: AccountConcurrency,
-) -> f64 {
-    candidate
-        .account
-        .effective_concurrency(default_concurrency)
+fn capacity_utilization(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
+    context
+        .concurrency_limit(&candidate.account)
         .limit()
         .map_or(0.0, |limit| {
             f64::from(candidate.signals.in_flight) / f64::from(limit.get())
@@ -833,38 +894,29 @@ fn capacity_utilization(
 
 fn select_smart_candidate<'a>(
     candidates: &[&'a AccountCandidate],
-    default_concurrency: AccountConcurrency,
-    cursor: u64,
-    config: SmartSchedulingConfig,
-    now: SystemTime,
+    context: &AccountSelectionContext,
 ) -> Option<&'a AccountCandidate> {
     let mut ranked = candidates
         .iter()
-        .map(|candidate| {
-            (
-                *candidate,
-                smart_score(candidate, default_concurrency, config, now),
-            )
-        })
+        .map(|candidate| (*candidate, smart_score(candidate, context)))
         .collect::<Vec<_>>();
     let best_score = ranked
         .iter()
         .map(|(_, score)| *score)
         .max_by(f64::total_cmp)?;
-    ranked.retain(|(_, score)| best_score - score <= config.score_tolerance());
-    // 轮换顺序保持稳定，避免分数轻微交错与 cursor 同步后仍反复命中同一账号。
+    ranked.retain(|(_, score)| {
+        best_score - score <= context.policy.smart_scheduling().score_tolerance()
+    });
+    // 轮换顺序保持稳定，避免分数轻微交错与 cursor 同步后仍反复命中同一账号
     ranked.sort_unstable_by(|(left, _), (right, _)| left.account.id().cmp(right.account.id()));
-    let index = (cursor % ranked.len() as u64) as usize;
+    let index = (context.round_robin_cursor % ranked.len() as u64) as usize;
     Some(ranked[index].0)
 }
 
-pub(crate) fn smart_score(
-    candidate: &AccountCandidate,
-    default_concurrency: AccountConcurrency,
-    config: SmartSchedulingConfig,
-    now: SystemTime,
-) -> f64 {
-    let load = 1.0 - capacity_utilization(candidate, default_concurrency).clamp(0.0, 1.0);
+pub(crate) fn smart_score(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
+    let config = context.policy.smart_scheduling();
+    let now = context.now;
+    let load = 1.0 - capacity_utilization(candidate, context).clamp(0.0, 1.0);
     let quota = candidate
         .signals
         .quota_remaining_rank

@@ -1,3 +1,5 @@
+//! 管理控制面各服务用例的测试入口
+
 mod account_groups;
 mod accounts;
 mod auth;
@@ -13,12 +15,14 @@ mod plugins;
 mod proxies;
 mod settings;
 mod system;
+mod usage_data;
 
 // fork: 以下为 fork 自有测试模块
 mod fork_accounts;
 mod fork_proxies;
 mod public_import;
 mod turn_state_hunt;
+mod usage_projection_cache;
 
 use std::{
     str::FromStr,
@@ -33,8 +37,9 @@ use gateway_admin::{
     model::{
         MutationContext, Revision,
         account_groups::{
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, DeleteAccountGroup, NewAccountGroup,
+            SetAccountGroupEnabled, UpdateAccountGroup,
         },
         accounts::{
             AccountListQuery, AccountPage, AccountRuntimeSnapshot, AccountUpdateResult,
@@ -48,10 +53,10 @@ use gateway_admin::{
             NewClientKey, SetClientKeyEnabled, UpdateClientKey,
         },
         observability::{
-            DashboardDesktopRelease, DashboardObservation, DashboardWireAttribute,
+            DashboardDesktopRelease, DashboardObservation, DashboardQuery, DashboardWireAttribute,
             DashboardWireProfile, DashboardWireTarget, DesktopReleaseStatus, DiagnosticDimension,
-            DiagnosticsObservation, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
-            UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+            DiagnosticsObservation, Granularity, OpsErrorPage, OpsErrorQuery, RequestMetricPoint,
+            TimeRange, UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -98,6 +103,7 @@ pub(super) struct AdminHarness {
     client_session_ttl_minutes: u64,
     accounts: Arc<dyn AccountStore>,
     proxies: Arc<dyn gateway_admin::ports::proxy::ProxyStore>,
+    proxy_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     account_groups: Arc<dyn AccountGroupStore>,
     auth: Arc<dyn AuthStore>,
@@ -107,12 +113,11 @@ pub(super) struct AdminHarness {
     backup: BackupStorePorts,
     providers: Vec<Arc<dyn ProviderAdmin>>,
     probe: Arc<dyn AccountProbe>,
-    proxy_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     system: Arc<dyn SystemOperations>,
     plugin_store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
     plugin_inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
-    service_middleware: gateway_admin::service::PlanSource,
+    service_middleware: gateway_admin::public_service::PlanSource,
 }
 
 impl AdminHarness {
@@ -200,7 +205,10 @@ impl AdminHarness {
         self
     }
 
-    pub(super) fn service_middleware(mut self, source: gateway_admin::service::PlanSource) -> Self {
+    pub(super) fn service_middleware(
+        mut self,
+        source: gateway_admin::public_service::PlanSource,
+    ) -> Self {
         self.service_middleware = source;
         self
     }
@@ -260,6 +268,7 @@ impl AdminHarness {
     pub(super) async fn build_bundle(self) -> gateway_admin::AdminBundle {
         gateway_admin::initialize(
             AdminConfig {
+                session_absolute_ttl_minutes: 30 * 24 * 60,
                 session_ttl_minutes: self.session_ttl_minutes,
                 default_username: "admin".to_owned(),
                 default_password: InitialAdminPassword::new(self.default_password),
@@ -282,8 +291,10 @@ impl AdminHarness {
                 self.plugin_store,
                 Arc::new(plugins::TestPluginPorts),
                 Arc::new(plugins::TestPluginPorts),
+                Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                timezone: Default::default(),
                 service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
                 plugin_management: Arc::new(plugins::TestPluginPorts),
@@ -381,6 +392,15 @@ impl AuthStore for BootstrapAuthStore {
         Err(unavailable("admin session"))
     }
 
+    async fn compare_exchange_session(
+        &self,
+        _: &str,
+        _: &gateway_admin::model::auth::AuthSession,
+        _: Option<&gateway_admin::model::auth::AuthSession>,
+    ) -> AdminStoreResult<Option<gateway_admin::model::auth::AuthSession>> {
+        Ok(None)
+    }
+
     async fn delete_session(&self, _: &str) -> AdminStoreResult<Option<AuthSession>> {
         Err(unavailable("admin session"))
     }
@@ -428,6 +448,13 @@ impl AccountGroupStore for UnavailableAccountGroupStore {
         Err(unavailable("account groups"))
     }
 
+    async fn list_account_group_options(
+        &self,
+        _: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        Err(unavailable("account group options"))
+    }
+
     async fn load_account_group_members(
         &self,
         _: &[gateway_core::routing::AccountGroupId],
@@ -470,6 +497,10 @@ impl AccountGroupStore for UnavailableAccountGroupStore {
 
 #[async_trait]
 impl AccountStore for UnavailableStore {
+    async fn account_exists(&self, _: &str) -> AdminStoreResult<bool> {
+        Err(unavailable("account"))
+    }
+
     async fn list_plugin_accounts(
         &self,
         _: gateway_admin::model::provider_credentials::PluginAccountListQuery,
@@ -639,6 +670,19 @@ impl AccountStore for UnavailableStore {
 
 #[async_trait]
 impl AccountRuntimeStore for UnavailableStore {
+    async fn account_concurrency(
+        &self,
+        _: &str,
+        _: u64,
+        _: u32,
+    ) -> AdminStoreResult<gateway_admin::model::accounts::AccountConcurrencyPage> {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "account concurrency",
+            "not configured in this fixture",
+        ))
+    }
+
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
         Ok(AccountRuntimeSnapshot::default())
     }
@@ -743,15 +787,31 @@ impl ClientKeyStore for UnavailableStore {
 
 #[async_trait]
 impl ObservabilityStore for UnavailableStore {
+    async fn diagnostic_errors(
+        &self,
+        _target: &gateway_admin::model::diagnostics::DiagnosticTarget,
+        _limit: u16,
+    ) -> AdminStoreResult<Vec<gateway_admin::model::observability::OpsError>> {
+        Err(unavailable("diagnostic errors"))
+    }
+
+    fn query_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(10)
+    }
+
     async fn dashboard_summary(
         &self,
-        _: TimeRange,
+        _: DashboardQuery,
         _: DateTime<Utc>,
     ) -> AdminStoreResult<DashboardObservation> {
         Err(unavailable("dashboard"))
     }
 
-    async fn dashboard_trend(&self, _: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>> {
+    async fn dashboard_trend(
+        &self,
+        _: TimeRange,
+        _: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         Err(unavailable("dashboard trend"))
     }
 
@@ -759,18 +819,22 @@ impl ObservabilityStore for UnavailableStore {
         &self,
         _: TimeRange,
         _: UsageFilter,
+        _: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         Err(unavailable("usage trend"))
     }
 
-    fn usage_calculated_billing_facts(
+    async fn analytics_cache_generation(&self) -> AdminStoreResult<u64> {
+        Err(unavailable("analytics generation"))
+    }
+
+    async fn usage_insights_observation(
         &self,
         _: TimeRange,
         _: UsageFilter,
-    ) -> gateway_admin::ports::store::UsageCalculatedBillingStream<'_> {
-        Box::pin(futures::stream::once(async {
-            Err(unavailable("usage billing facts"))
-        }))
+        _: Granularity,
+    ) -> AdminStoreResult<gateway_admin::model::observability::UsageInsightsObservation> {
+        Err(unavailable("usage insights"))
     }
 
     async fn list_usage_records(&self, _: UsageQuery) -> AdminStoreResult<UsagePage> {
@@ -790,6 +854,7 @@ impl ObservabilityStore for UnavailableStore {
         _: TimeRange,
         _: UsageFilter,
         _: DiagnosticDimension,
+        _: u16,
     ) -> AdminStoreResult<DiagnosticsObservation> {
         Err(unavailable("usage diagnostics"))
     }
@@ -1133,3 +1198,31 @@ fn unavailable_system() -> SystemOperationError {
     )
 }
 mod service_contract;
+
+#[async_trait]
+impl gateway_admin::ports::reset_credit_automation::ResetCreditAutomationStore
+    for UnavailableStore
+{
+    async fn reset_credit_automation(
+        &self,
+        _: &str,
+    ) -> AdminStoreResult<
+        Option<gateway_admin::model::reset_credit_automation::ResetCreditAutomation>,
+    > {
+        Ok(None)
+    }
+    async fn due_reset_credit_automations(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: u32,
+    ) -> AdminStoreResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn save_reset_credit_automation(
+        &self,
+        _: &gateway_admin::model::reset_credit_automation::ResetCreditAutomation,
+        _: Option<&gateway_admin::model::MutationContext>,
+    ) -> AdminStoreResult<u64> {
+        Err(unavailable("reset-credit automation"))
+    }
+}

@@ -1,3 +1,5 @@
+//! 验证准入恢复读取精确时间窗口与运行中请求事实
+
 use chrono::{DateTime, Duration, Utc};
 use gateway_store::postgres::{
     ClientAdmissionRecentRequest, ClientAdmissionRecovery, ClientAdmissionRecoveryRepository,
@@ -47,6 +49,18 @@ async fn recovery_loads_precise_window_and_running_request_facts() {
         "running",
     )
     .await;
+    seed_request(
+        &database.pool,
+        "old-missing-lease",
+        now - Duration::seconds(121),
+        now + Duration::seconds(50),
+        "running",
+    )
+    .await;
+    sqlx::query("delete from model_request_leases where request_id = 'old-missing-lease'")
+        .execute(&database.pool)
+        .await
+        .expect("remove missing lease fixture");
 
     let repository = PgClientAdmissionRecoveryRepository::new(database.pool.clone());
     let actual = repository
@@ -68,11 +82,11 @@ async fn recovery_loads_precise_window_and_running_request_facts() {
         running_requests: vec![
             ClientAdmissionRunningRequest {
                 model_request_id: "old-running".to_owned(),
-                deadline_at: now + Duration::seconds(30),
+                lease_expires_at: now + Duration::seconds(30),
             },
             ClientAdmissionRunningRequest {
                 model_request_id: "recent-running".to_owned(),
-                deadline_at: now + Duration::seconds(40),
+                lease_expires_at: now + Duration::seconds(40),
             },
         ],
     }];
@@ -85,28 +99,43 @@ async fn seed_request(
     pool: &PgPool,
     id: &str,
     started_at: DateTime<Utc>,
-    deadline_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
     outcome: &str,
 ) {
     let completed_at = (outcome != "running").then_some(started_at + Duration::seconds(1));
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, outcome,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, outcome, started_at, recovery_lease_expires_at, completed_at, request_observation_json
          ) values (
-           $1, 'key-recovery', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'coding', $2, $3, $4, $5,
-           'all', '{}'::text[], '[]'::jsonb
+           $1, 'key-recovery', 'responses', 'http_sse', 'coding', $2, $3, $4, $5,
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(id)
     .bind(outcome)
     .bind(started_at)
-    .bind(deadline_at)
+    .bind((outcome != "running").then_some(lease_expires_at))
     .bind(completed_at)
     .execute(pool)
     .await
     .expect("seed model request recovery fact");
+    if outcome == "running" {
+        sqlx::query(
+            "insert into model_request_leases (request_id, lease_expires_at) values ($1, $2)",
+        )
+        .bind(id)
+        .bind(lease_expires_at)
+        .execute(pool)
+        .await
+        .expect("seed running lease");
+    }
 }

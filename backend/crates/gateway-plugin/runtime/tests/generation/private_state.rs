@@ -1,3 +1,5 @@
+//! 验证插件观察回调的类型化状态读写与命名空间约束
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -36,8 +38,8 @@ use gateway_core::{
     },
     identity::ProviderKind,
     operation::OperationKind,
+    routing::extensions::ExtensionPreparationPort,
     routing::{ConfigRevision, PublicModelId},
-    runtime::extensions::ExtensionPreparationPort,
     upstream::UpstreamSendState,
 };
 use gateway_plugin_runtime::{

@@ -1,3 +1,5 @@
+//! 验证运行设置的数据库约束、升级保留与快照发布
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -10,39 +12,48 @@ use super::TestDatabase;
 pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
         request_profile_updates: BTreeMap::new(),
-        request_location_enabled: false,
-        request_location: Default::default(),
-        refresh_margin_seconds,
-        refresh_concurrency: 2,
-        max_concurrent_per_account: 3,
-        request_interval_ms: 50,
-        max_waiting_per_key: 0,
-        max_waiting_per_account: 0,
-        concurrency_wait_timeout_seconds: 30,
-        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: "smart".to_owned(),
         model_mappings: BTreeMap::from([
             ("gpt-5.4".to_owned(), "gpt-5.5".to_owned()),
             ("grok-latest".to_owned(), "grok-4.5".to_owned()),
         ]),
-        min_codex_desktop_version: None,
-        min_codex_cli_version: None,
-        usage_retention_days: 31,
-        ops_event_retention_days: 30,
-        audit_retention_days: 90,
-        account_auto_freeze_enabled: true,
-        account_auto_freeze_threshold: 12,
-        account_auto_freeze_window_seconds: 600,
-        account_auto_freeze_duration_seconds: 7_200,
-        account_auto_freeze_probe_enabled: true,
-        account_auto_freeze_probe_model: None,
-        account_auto_freeze_adaptive_concurrency: true,
-        account_warmup_enabled: false,
-        account_warmup_schedule_time: "08:00".to_owned(),
-        account_warmup_model: None,
-        request_log_enabled: true,
-        request_log_test_key_id: None,
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_privacy_policy: Default::default(),
+            request_location_enabled: false,
+            request_location: Default::default(),
+            refresh_margin_seconds,
+            refresh_concurrency: 2,
+            max_concurrent_per_account: 3,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            min_codex_desktop_version: None,
+            min_codex_cli_version: None,
+            usage_retention_days: 31,
+            ops_event_retention_days: 30,
+            audit_retention_days: 90,
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
+            reset_credit_lead_minutes: 10,
+            reset_credit_max_weekly_remaining_percent: None,
+            // fork: request log capture
+            request_log_enabled: true,
+            request_log_test_key_id: None,
+        },
     }
 }
 
@@ -53,43 +64,299 @@ fn runtime_settings_keep_account_rotation_global() {
 }
 
 #[tokio::test]
+async fn removing_request_interval_preserves_settings_and_snapshot() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create_through("drop_interval", 29).await else {
+        return;
+    };
+    sqlx::query("update runtime_settings set request_interval_ms = 60000, max_concurrent_per_account = 7, refresh_concurrency = 12, refresh_margin_seconds = 1234, config_revision = 70 where id = 1")
+        .execute(&database.pool).await.unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let column_exists: bool = sqlx::query_scalar("select exists(select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'runtime_settings' and column_name = 'request_interval_ms')")
+        .fetch_one(&database.pool).await.unwrap();
+    assert!(!column_exists);
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let settings = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(settings.values.max_concurrent_per_account, 7);
+    assert_eq!(settings.values.refresh_concurrency, 12);
+    assert_eq!(settings.values.refresh_margin_seconds, 1234);
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_value(snapshot.settings)
+            .unwrap()
+            .get("request_interval_ms")
+            .is_none()
+    );
+    repository
+        .update_runtime_settings(settings_with_margin(600))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .refresh_margin_seconds,
+        600
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn privacy_policy_upgrade_defaults_off_and_round_trips_in_snapshot() {
+    use gateway_core::settings::privacy::*;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create_through("privacy_policy", 25).await else {
+        return;
+    };
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        before.values.codex_privacy_policy,
+        CodexPrivacyPolicy::default()
+    );
+    let mut update = settings_with_margin(300);
+    update.values.codex_privacy_policy = CodexPrivacyPolicy {
+        enabled: true,
+        on_error: PrivacyFailureMode::RejectRequest,
+        rules: vec![PrivacyRule {
+            id: "remove-auth".into(),
+            name: "配置者控制".into(),
+            enabled: true,
+            steps: vec![PrivacyStep {
+                scope: PrivacyScope::RequestHeader,
+                selector: "authorization".into(),
+                action: PrivacyAction::RemoveField,
+                pattern: None,
+                replacement: String::new(),
+                value: serde_json::Value::Null,
+                replace_all: true,
+                case_insensitive: false,
+                multi_line: false,
+            }],
+        }],
+    };
+    let expected = update.values.codex_privacy_policy.clone();
+    repository.update_runtime_settings(update).await.unwrap();
+    let after = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(after.values.codex_privacy_policy, expected);
+    assert!(after.config_revision > before.config_revision);
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(snapshot.settings).unwrap()["codex_privacy_policy"],
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(
+        before.values.codex_privacy_policy,
+        CodexPrivacyPolicy::default()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn privacy_steps_migration_preserves_rules_and_other_settings() {
+    let Some(database) = TestDatabase::create_through("privacy_steps", 30).await else {
+        return;
+    };
+    let legacy = serde_json::json!({
+        "enabled":true, "onError":"skip_rule", "rules":[
+            {"id":"first","name":"旧规则一","enabled":true,"scope":"request_header","selector":"x-private",
+             "action":"remove_field","pattern":null,"replacement":"","value":null,
+             "replaceAll":true,"caseInsensitive":false,"multiLine":false},
+            {"id":"second","name":"旧规则二","enabled":false,"scope":"request_body","selector":"$.owner",
+             "action":"regex_replace","pattern":"alice","replacement":"user","value":null,
+             "replaceAll":false,"caseInsensitive":true,"multiLine":true}
+        ]
+    });
+    let mut expected = serde_json::json!({
+        "enabled":true, "onError":"skip_rule", "rules":[
+            {"id":"first","name":"旧规则一","enabled":true,"steps":[
+                {"scope":"request_header","selector":"x-private","action":"remove_field",
+                 "pattern":null,"replacement":"","value":null,
+                 "replaceAll":true,"caseInsensitive":false,"multiLine":false}]},
+            {"id":"second","name":"旧规则二","enabled":false,"steps":[
+                {"scope":"request_body","selector":"$.owner","action":"regex_replace",
+                 "pattern":"alice","replacement":"user","value":null,
+                 "replaceAll":false,"caseInsensitive":true,"multiLine":true}]}
+        ]
+    });
+    // 同时包含聚合规则，迁移不能嵌套包装或拆散现有步骤
+    let canonical = serde_json::json!({
+        "id":"aggregate","name":"通用聚合规则","enabled":true,"steps":[
+            {"scope":"request_body","selector":"$.metadata","action":"set_value",
+             "pattern":null,"replacement":"","value":{"owner":"user","items":[1,2]},
+             "replaceAll":true,"caseInsensitive":false,"multiLine":false},
+            {"scope":"request_header","selector":"x-private","action":"remove_field",
+             "pattern":null,"replacement":"","value":null,
+             "replaceAll":true,"caseInsensitive":false,"multiLine":false}
+        ]
+    });
+    let mut mixed = legacy;
+    mixed["rules"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, canonical.clone());
+    expected["rules"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, canonical);
+    sqlx::query("update runtime_settings set codex_privacy_policy_json = $1, config_revision = 70, refresh_margin_seconds = 1234 where id = 1")
+        .bind(&mixed).execute(&database.pool).await.unwrap();
+    let mut expected_row: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(runtime_settings) from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    expected_row["codex_privacy_policy_json"] = expected.clone();
+    expected_row["reset_credit_lead_minutes"] = serde_json::json!(10);
+    expected_row["reset_credit_max_weekly_remaining_percent"] = serde_json::Value::Null;
+    // 完整升级还会清理自动回切字段，其余运行设置必须原样保留
+    expected_row["smart_scheduling_json"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preferHigherWeight");
+
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    // fork: request-log —— 9005 在快照之后给 runtime_settings 补了两列，按迁移默认值并入期望
+    expected_row["request_log_enabled"] = serde_json::json!(true);
+    expected_row["request_log_test_key_id"] = serde_json::Value::Null;
+    let stored: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(runtime_settings) from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, expected_row);
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let loaded = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.values.codex_privacy_policy).unwrap(),
+        expected
+    );
+    // 服务重启后再次检查迁移，不产生写入或额外嵌套
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let stored: serde_json::Value =
+        sqlx::query_scalar("select to_jsonb(runtime_settings) from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, expected_row);
+    let snapshot = gateway_store::postgres::RuntimeSnapshotRepository::load_runtime_snapshot(
+        &gateway_store::postgres::PgRuntimeSnapshotRepository::new(database.pool.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(snapshot.settings).unwrap()["codex_privacy_policy"],
+        expected
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn privacy_steps_migration_rejects_non_object_without_losing_data() {
+    let Some(database) = TestDatabase::create_through("privacy_invalid", 30).await else {
+        return;
+    };
+    let invalid = serde_json::json!({
+        "enabled":false,"onError":"reject_request","rules":[{},42]
+    });
+    sqlx::query("update runtime_settings set codex_privacy_policy_json = $1 where id = 1")
+        .bind(&invalid)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(super::TEST_MIGRATOR.run(&database.pool).await.is_err());
+    let stored: serde_json::Value =
+        sqlx::query_scalar("select codex_privacy_policy_json from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, invalid);
+    let applied: bool =
+        sqlx::query_scalar("select exists(select 1 from _sqlx_migrations where version = 31)")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert!(!applied);
+    sqlx::query("update runtime_settings set codex_privacy_policy_json = jsonb_set(codex_privacy_policy_json, '{rules}', '[]') where id = 1")
+        .execute(&database.pool).await.unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let loaded = PgRuntimeSettingsRepository::new(database.pool.clone())
+        .load_runtime_settings()
+        .await
+        .unwrap();
+    assert!(!loaded.values.codex_privacy_policy.enabled);
+    assert!(loaded.values.codex_privacy_policy.rules.is_empty());
+    assert_eq!(
+        loaded.values.codex_privacy_policy.on_error,
+        gateway_core::settings::privacy::PrivacyFailureMode::RejectRequest
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn smart_settings_upgrade_preserves_selection_and_publishes_custom_config() {
     use gateway_core::account::SmartSchedulingConfig;
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
     let Some(database) = TestDatabase::create_through("smart_config", 18).await else {
         return;
     };
-    // 升级前不能用包含新列的 Repository，直接写入旧版本已有字段。
+    // 升级前不能用包含新列的 Repository，直接写入旧版本已有字段
     sqlx::query("update runtime_settings set rotation_strategy = 'sticky', refresh_margin_seconds = 3600 where id = 1")
         .execute(&database.pool).await.unwrap();
     super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let before = repository.load_runtime_settings().await.unwrap();
     assert_eq!(before.rotation_strategy, "sticky");
-    assert_eq!(before.refresh_margin_seconds, 3600);
-    assert_eq!(before.smart_scheduling, SmartSchedulingConfig::default());
+    // 0022 将仍为旧默认 3600 的行迁移到 300；管理员自定义值才会原样保留。
+    assert_eq!(before.values.refresh_margin_seconds, 300);
+    assert_eq!(
+        before.values.smart_scheduling,
+        SmartSchedulingConfig::default()
+    );
     let mut update = settings_with_margin(3600);
-    update.smart_scheduling =
-        SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3], true).unwrap();
-    let expected = update.smart_scheduling;
+    update.values.smart_scheduling =
+        SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3]).unwrap();
+    let expected = update.values.smart_scheduling;
     repository.update_runtime_settings(update).await.unwrap();
     let reloaded = repository.load_runtime_settings().await.unwrap();
-    assert_eq!(reloaded.smart_scheduling, expected);
+    assert_eq!(reloaded.values.smart_scheduling, expected);
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
-    assert_eq!(snapshot.settings.smart_scheduling, expected);
+    let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
+    assert_eq!(
+        snapshot_values["smart_scheduling"],
+        serde_json::to_value(expected).unwrap()
+    );
     assert!(snapshot.config_revision > before.config_revision);
-    assert_eq!(before.smart_scheduling, SmartSchedulingConfig::default());
+    assert_eq!(
+        before.values.smart_scheduling,
+        SmartSchedulingConfig::default()
+    );
     database.close().await;
 }
 
 #[test]
 fn runtime_settings_require_model_when_warmup_is_enabled() {
-    let settings = RuntimeSettingsUpdate {
-        account_warmup_enabled: true,
-        ..settings_with_margin(3_600)
+    let settings = {
+        let runtime_settings_base = settings_with_margin(3_600);
+        RuntimeSettingsUpdate {
+            values: gateway_admin::model::settings::RuntimeSettingsValues {
+                account_warmup_enabled: true,
+                ..runtime_settings_base.values
+            },
+            ..runtime_settings_base
+        }
     };
     assert!(settings.validate().is_err());
 }
@@ -101,9 +368,9 @@ async fn warmup_settings_round_trip_with_database_constraint() {
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let mut update = settings_with_margin(3_600);
-    update.account_warmup_enabled = true;
-    update.account_warmup_schedule_time = "08:00,13:00".to_owned();
-    update.account_warmup_model = Some("test-model".to_owned());
+    update.values.account_warmup_enabled = true;
+    update.values.account_warmup_schedule_time = "08:00,13:00".to_owned();
+    update.values.account_warmup_model = Some("test-model".to_owned());
     repository
         .update_runtime_settings(update)
         .await
@@ -113,9 +380,12 @@ async fn warmup_settings_round_trip_with_database_constraint() {
         .load_runtime_settings()
         .await
         .expect("load warmup settings");
-    assert!(settings.account_warmup_enabled);
-    assert_eq!(settings.account_warmup_schedule_time, "08:00,13:00");
-    assert_eq!(settings.account_warmup_model.as_deref(), Some("test-model"));
+    assert!(settings.values.account_warmup_enabled);
+    assert_eq!(settings.values.account_warmup_schedule_time, "08:00,13:00");
+    assert_eq!(
+        settings.values.account_warmup_model.as_deref(),
+        Some("test-model")
+    );
 
     let error = sqlx::query("update runtime_settings set account_warmup_model = null where id = 1")
         .execute(&database.pool)
@@ -138,7 +408,7 @@ async fn unlimited_default_account_concurrency_round_trips_without_relaxing_othe
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let mut update = settings_with_margin(3_600);
-    update.max_concurrent_per_account = 0;
+    update.values.max_concurrent_per_account = 0;
     repository
         .update_runtime_settings(update)
         .await
@@ -147,12 +417,11 @@ async fn unlimited_default_account_concurrency_round_trips_without_relaxing_othe
         .load_runtime_settings()
         .await
         .expect("read unlimited default");
-    assert_eq!(settings.max_concurrent_per_account, 0);
+    assert_eq!(settings.values.max_concurrent_per_account, 0);
     for statement in [
         "update runtime_settings set max_concurrent_per_account = -1 where id = 1",
         "update runtime_settings set refresh_concurrency = 0 where id = 1",
         "update runtime_settings set refresh_margin_seconds = 0 where id = 1",
-        "update runtime_settings set request_interval_ms = -1 where id = 1",
     ] {
         let error = sqlx::query(statement)
             .execute(&database.pool)
@@ -170,6 +439,56 @@ async fn unlimited_default_account_concurrency_round_trips_without_relaxing_othe
     database.close().await;
 }
 
+#[tokio::test]
+async fn migrations_should_narrow_the_default_refresh_margin_to_the_codex_baseline() {
+    let Some(database) = TestDatabase::create("refresh_margin_default").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    // 新装实例：0001 种子行携带旧默认 3600，0022 数据迁移统一收敛到 300。
+    let settings = repository
+        .load_runtime_settings()
+        .await
+        .expect("load settings");
+    assert_eq!(settings.values.refresh_margin_seconds, 300);
+    // 列默认值同步收窄，重建行不会回退到旧值；目录查询限定本测试 schema，
+    // 同库并行测试里停留在旧迁移版本的 schema 仍保留 3600 旧默认，不能被读到。
+    let column_default: String = sqlx::query_scalar(
+        "select column_default from information_schema.columns \
+             where table_schema = current_schema() \
+               and table_name = 'runtime_settings' \
+               and column_name = 'refresh_margin_seconds'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("read column default");
+    assert_eq!(column_default, "300");
+    database.close().await;
+}
+
+#[tokio::test]
+async fn refresh_margin_migration_should_preserve_admin_customized_values() {
+    // 升级语义：0021 之前部署的实例经 0022 迁移后，仅旧默认 3600 收敛到 300，
+    // 管理员自定义值原样保留。
+    let Some(database) = TestDatabase::create_through("refresh_margin_custom", 21).await else {
+        return;
+    };
+    sqlx::query("update runtime_settings set refresh_margin_seconds = 1800 where id = 1")
+        .execute(&database.pool)
+        .await
+        .expect("persist customized margin");
+    super::TEST_MIGRATOR
+        .run(&database.pool)
+        .await
+        .expect("apply remaining migrations");
+    let settings = PgRuntimeSettingsRepository::new(database.pool.clone())
+        .load_runtime_settings()
+        .await
+        .expect("load settings");
+    assert_eq!(settings.values.refresh_margin_seconds, 1_800);
+    database.close().await;
+}
+
 #[test]
 fn runtime_settings_reject_invalid_model_mapping() {
     let settings = RuntimeSettingsUpdate {
@@ -183,21 +502,45 @@ fn runtime_settings_reject_invalid_model_mapping() {
 #[test]
 fn runtime_settings_reject_out_of_range_auto_freeze() {
     for update in [
-        RuntimeSettingsUpdate {
-            account_auto_freeze_threshold: 1,
-            ..settings_with_margin(3_600)
+        {
+            let runtime_settings_base = settings_with_margin(3_600);
+            RuntimeSettingsUpdate {
+                values: gateway_admin::model::settings::RuntimeSettingsValues {
+                    account_auto_freeze_threshold: 1,
+                    ..runtime_settings_base.values
+                },
+                ..runtime_settings_base
+            }
         },
-        RuntimeSettingsUpdate {
-            account_auto_freeze_window_seconds: 59,
-            ..settings_with_margin(3_600)
+        {
+            let runtime_settings_base = settings_with_margin(3_600);
+            RuntimeSettingsUpdate {
+                values: gateway_admin::model::settings::RuntimeSettingsValues {
+                    account_auto_freeze_window_seconds: 59,
+                    ..runtime_settings_base.values
+                },
+                ..runtime_settings_base
+            }
         },
-        RuntimeSettingsUpdate {
-            account_auto_freeze_duration_seconds: 299,
-            ..settings_with_margin(3_600)
+        {
+            let runtime_settings_base = settings_with_margin(3_600);
+            RuntimeSettingsUpdate {
+                values: gateway_admin::model::settings::RuntimeSettingsValues {
+                    account_auto_freeze_duration_seconds: 299,
+                    ..runtime_settings_base.values
+                },
+                ..runtime_settings_base
+            }
         },
-        RuntimeSettingsUpdate {
-            account_auto_freeze_probe_model: Some(" pad ".to_owned()),
-            ..settings_with_margin(3_600)
+        {
+            let runtime_settings_base = settings_with_margin(3_600);
+            RuntimeSettingsUpdate {
+                values: gateway_admin::model::settings::RuntimeSettingsValues {
+                    account_auto_freeze_probe_model: Some(" pad ".to_owned()),
+                    ..runtime_settings_base.values
+                },
+                ..runtime_settings_base
+            }
         },
     ] {
         assert!(update.validate().is_err());
@@ -206,9 +549,15 @@ fn runtime_settings_reject_out_of_range_auto_freeze() {
 
 #[test]
 fn runtime_settings_reject_non_semver_client_min() {
-    let settings = RuntimeSettingsUpdate {
-        min_codex_cli_version: Some("v0.40.0".to_owned()),
-        ..settings_with_margin(3_600)
+    let settings = {
+        let runtime_settings_base = settings_with_margin(3_600);
+        RuntimeSettingsUpdate {
+            values: gateway_admin::model::settings::RuntimeSettingsValues {
+                min_codex_cli_version: Some("v0.40.0".to_owned()),
+                ..runtime_settings_base.values
+            },
+            ..runtime_settings_base
+        }
     };
 
     assert!(settings.validate().is_err());
@@ -249,8 +598,8 @@ async fn client_min_versions_should_round_trip_as_nullable_settings() {
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let mut update = settings_with_margin(3_600);
-    update.min_codex_desktop_version = Some("26.825.6671".to_owned());
-    update.min_codex_cli_version = Some("0.40.0".to_owned());
+    update.values.min_codex_desktop_version = Some("26.825.6671".to_owned());
+    update.values.min_codex_cli_version = Some("0.40.0".to_owned());
 
     repository
         .update_runtime_settings(update)
@@ -262,10 +611,13 @@ async fn client_min_versions_should_round_trip_as_nullable_settings() {
         .expect("load client min versions");
 
     assert_eq!(
-        settings.min_codex_desktop_version.as_deref(),
+        settings.values.min_codex_desktop_version.as_deref(),
         Some("26.825.6671")
     );
-    assert_eq!(settings.min_codex_cli_version.as_deref(), Some("0.40.0"));
+    assert_eq!(
+        settings.values.min_codex_cli_version.as_deref(),
+        Some("0.40.0")
+    );
     database.close().await;
 }
 
@@ -361,37 +713,46 @@ async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
     let before = repository.load_runtime_settings().await.unwrap();
     assert_eq!(
         (
-            before.max_waiting_per_key,
-            before.max_waiting_per_account,
-            before.concurrency_wait_timeout_seconds
+            before.values.max_waiting_per_key,
+            before.values.max_waiting_per_account,
+            before.values.concurrency_wait_timeout_seconds,
+            before.values.openai_guardian_reserved_concurrency,
         ),
-        (0, 0, 30)
+        (0, 0, 30, 0)
     );
     let mut update = settings_with_margin(3600);
-    update.max_waiting_per_key = 5;
-    update.max_waiting_per_account = 7;
-    update.concurrency_wait_timeout_seconds = 12;
+    update.values.max_waiting_per_key = 5;
+    update.values.max_waiting_per_account = 7;
+    update.values.concurrency_wait_timeout_seconds = 12;
+    update.values.openai_guardian_reserved_concurrency = 1;
     repository.update_runtime_settings(update).await.unwrap();
     let settings = repository.load_runtime_settings().await.unwrap();
     assert_eq!(
         (
-            settings.max_waiting_per_key,
-            settings.max_waiting_per_account,
-            settings.concurrency_wait_timeout_seconds
+            settings.values.max_waiting_per_key,
+            settings.values.max_waiting_per_account,
+            settings.values.concurrency_wait_timeout_seconds,
+            settings.values.openai_guardian_reserved_concurrency,
         ),
-        (5, 7, 12)
+        (5, 7, 12, 1)
     );
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
+    let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
     assert_eq!(
         (
-            snapshot.settings.max_waiting_per_key,
-            snapshot.settings.max_waiting_per_account,
-            snapshot.settings.concurrency_wait_timeout_seconds
+            snapshot_values["max_waiting_per_key"].as_u64().unwrap(),
+            snapshot_values["max_waiting_per_account"].as_u64().unwrap(),
+            snapshot_values["concurrency_wait_timeout_seconds"]
+                .as_u64()
+                .unwrap(),
+            snapshot_values["openai_guardian_reserved_concurrency"]
+                .as_u64()
+                .unwrap(),
         ),
-        (5, 7, 12)
+        (5, 7, 12, 1)
     );
     assert!(snapshot.config_revision > before.config_revision);
     database.close().await;
@@ -406,53 +767,69 @@ async fn request_location_defaults_and_updates_reach_the_runtime_snapshot() {
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let before = repository.load_runtime_settings().await.unwrap();
-    assert_eq!(before.request_location, RequestLocation::default());
-    assert!(!before.request_location_enabled);
+    assert_eq!(before.values.request_location, RequestLocation::default());
+    assert!(!before.values.request_location_enabled);
     let mut update = settings_with_margin(3600);
-    update.request_location = serde_json::from_value(serde_json::json!({"country":"JP", "region":" Tokyo ", "city":" Tokyo ", "timezone":"Asia/Tokyo"})).unwrap();
-    update.request_location_enabled = true;
-    update.account_auto_freeze_threshold = 17;
-    update.account_auto_freeze_window_seconds = 900;
-    update.account_auto_freeze_duration_seconds = 3_600;
-    update.account_auto_freeze_probe_model = Some("gpt-5.5".to_owned());
-    update.account_auto_freeze_adaptive_concurrency = false;
-    let expected = update.request_location.clone().normalized().unwrap();
+    update.values.request_location = serde_json::from_value(serde_json::json!({"country":"JP", "region":" Tokyo ", "city":" Tokyo ", "timezone":"Asia/Tokyo"})).unwrap();
+    update.values.request_location_enabled = true;
+    update.values.account_auto_freeze_threshold = 17;
+    update.values.account_auto_freeze_window_seconds = 900;
+    update.values.account_auto_freeze_duration_seconds = 3_600;
+    update.values.account_auto_freeze_probe_model = Some("gpt-5.5".to_owned());
+    update.values.account_auto_freeze_adaptive_concurrency = false;
+    let expected = update.values.request_location.clone().normalized().unwrap();
     let mut disabled = update.clone();
-    disabled.request_location = expected.clone();
-    disabled.request_location_enabled = false;
+    disabled.values.request_location = expected.clone();
+    disabled.values.request_location_enabled = false;
     repository.update_runtime_settings(update).await.unwrap();
     let settings = repository.load_runtime_settings().await.unwrap();
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
-    assert_eq!(settings.request_location, expected);
-    assert_eq!(snapshot.settings.request_location, expected);
-    assert!(settings.request_location_enabled);
-    assert!(snapshot.settings.request_location_enabled);
+    let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
+    assert_eq!(settings.values.request_location, expected);
+    assert_eq!(
+        snapshot_values["request_location"],
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert!(settings.values.request_location_enabled);
+    assert!(
+        snapshot_values["request_location_enabled"]
+            .as_bool()
+            .unwrap()
+    );
     assert!(snapshot.config_revision > before.config_revision);
     repository.update_runtime_settings(disabled).await.unwrap();
     let disabled_settings = repository.load_runtime_settings().await.unwrap();
-    assert!(!disabled_settings.request_location_enabled);
-    assert_eq!(disabled_settings.request_location, expected);
+    assert!(!disabled_settings.values.request_location_enabled);
+    assert_eq!(disabled_settings.values.request_location, expected);
     let disabled_snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
-    assert!(!disabled_snapshot.settings.request_location_enabled);
-    assert_eq!(disabled_snapshot.settings.request_location, expected);
-    // 位置开关与自动冻结共用设置写入，切换位置不能覆盖冻结参数。
+    let disabled_snapshot_values = serde_json::to_value(&disabled_snapshot.settings).unwrap();
+    assert!(
+        !disabled_snapshot_values["request_location_enabled"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        disabled_snapshot_values["request_location"],
+        serde_json::to_value(&expected).unwrap()
+    );
+    // 位置开关与自动冻结共用设置写入，切换位置不能覆盖冻结参数
     for saved in [&settings, &disabled_settings] {
-        assert!(saved.account_auto_freeze_enabled);
-        assert_eq!(saved.account_auto_freeze_threshold, 17);
-        assert_eq!(saved.account_auto_freeze_window_seconds, 900);
-        assert_eq!(saved.account_auto_freeze_duration_seconds, 3_600);
-        assert!(saved.account_auto_freeze_probe_enabled);
+        assert!(saved.values.account_auto_freeze_enabled);
+        assert_eq!(saved.values.account_auto_freeze_threshold, 17);
+        assert_eq!(saved.values.account_auto_freeze_window_seconds, 900);
+        assert_eq!(saved.values.account_auto_freeze_duration_seconds, 3_600);
+        assert!(saved.values.account_auto_freeze_probe_enabled);
         assert_eq!(
-            saved.account_auto_freeze_probe_model.as_deref(),
+            saved.values.account_auto_freeze_probe_model.as_deref(),
             Some("gpt-5.5")
         );
-        assert!(!saved.account_auto_freeze_adaptive_concurrency);
+        assert!(!saved.values.account_auto_freeze_adaptive_concurrency);
     }
     assert!(disabled_snapshot.config_revision > snapshot.config_revision);
     for invalid in [
@@ -473,6 +850,7 @@ async fn request_location_defaults_and_updates_reach_the_runtime_snapshot() {
             .load_runtime_settings()
             .await
             .unwrap()
+            .values
             .request_location,
         expected
     );
@@ -490,6 +868,7 @@ async fn auto_freeze_defaults_off_and_explicit_opt_in_round_trips() {
             .load_runtime_settings()
             .await
             .expect("default settings")
+            .values
             .account_auto_freeze_enabled
     );
     repository
@@ -501,6 +880,7 @@ async fn auto_freeze_defaults_off_and_explicit_opt_in_round_trips() {
             .load_runtime_settings()
             .await
             .expect("settings")
+            .values
             .account_auto_freeze_enabled
     );
     database.close().await;
@@ -515,32 +895,33 @@ async fn decompression_setting_should_persist_and_reach_snapshot_facts() {
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let before = repository.load_runtime_settings().await.unwrap();
     assert_eq!(
-        before.responses_max_decompressed_body_bytes,
+        before.values.responses_max_decompressed_body_bytes,
         64 * 1024 * 1024
     );
     let mut update = settings_with_margin(3600);
-    update.responses_max_decompressed_body_bytes = 128 * 1024 * 1024;
+    update.values.responses_max_decompressed_body_bytes = 128 * 1024 * 1024;
     repository.update_runtime_settings(update).await.unwrap();
     let reloaded = PgRuntimeSettingsRepository::new(database.pool.clone())
         .load_runtime_settings()
         .await
         .unwrap();
     assert_eq!(
-        reloaded.responses_max_decompressed_body_bytes,
+        reloaded.values.responses_max_decompressed_body_bytes,
         128 * 1024 * 1024
     );
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
+    let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
     assert_eq!(
-        snapshot.settings.responses_max_decompressed_body_bytes,
-        reloaded.responses_max_decompressed_body_bytes
+        snapshot_values["responses_max_decompressed_body_bytes"],
+        reloaded.values.responses_max_decompressed_body_bytes
     );
     assert!(snapshot.config_revision > before.config_revision);
     for invalid in [0, u64::MAX] {
         let mut update = settings_with_margin(3600);
-        update.responses_max_decompressed_body_bytes = invalid;
+        update.values.responses_max_decompressed_body_bytes = invalid;
         assert!(repository.update_runtime_settings(update).await.is_err());
         assert_eq!(
             repository
@@ -805,97 +1186,348 @@ async fn request_profile_projection_is_revision_consistent_and_includes_key_over
 }
 
 #[tokio::test]
-async fn control_plane_replacement_commits_one_writer_per_revision_and_preserves_newer_settings() {
-    use gateway_store::postgres::{
-        AdminAuditActorKind, AdminAuditEvent, ControlPlaneReplacement, ControlPlaneRepository,
-        PgControlPlaneRepository,
-    };
-    use gateway_store::{ConflictKind, StoreError};
-    let Some(database) = TestDatabase::create("settings_compare_replace").await else {
+async fn warmup_cursor_survives_restart_and_settings_updates_without_rewinding() {
+    use gateway_core::{provider_ports::ProviderRuntimePolicyPort, time::DeploymentTimeZone};
+    let Some(database) = TestDatabase::create("warmup_cursor").await else {
         return;
     };
-    let repository = PgControlPlaneRepository::new(database.pool.clone());
-    let revision = repository
-        .load_control_plane()
-        .await
-        .unwrap()
-        .settings
-        .config_revision;
-    let replacement = |id: &str, margin| ControlPlaneReplacement {
-        expected_revision: revision,
-        settings: settings_with_margin(margin),
-        audit: AdminAuditEvent {
-            id: id.into(),
-            actor_kind: AdminAuditActorKind::System,
-            actor_admin_user_id: None,
-            actor_ref: "system".into(),
-            admin_request_id: Some(id.into()),
-            action: "settings.replace".into(),
-            entity_kind: "runtime_settings".into(),
-            entity_ref: "1".into(),
-            config_revision: None,
-            changed_fields: vec!["refresh_margin_seconds".into()],
-            created_at: Utc::now(),
-        },
-    };
-    let (first, second) = tokio::join!(
-        repository.replace_control_plane(replacement("first", 1800)),
-        repository.replace_control_plane(replacement("second", 7200)),
-    );
-    let (saved, conflict) = match (first, second) {
-        (Ok(saved), Err(error)) | (Err(error), Ok(saved)) => (saved.settings, error),
-        other => panic!("expected exactly one successful transaction: {other:?}"),
-    };
-    assert!(matches!(
-        conflict,
-        StoreError::Conflict {
-            kind: ConflictKind::StaleRevision,
-            ..
-        }
-    ));
-    let current = repository.load_control_plane().await.unwrap().settings;
-    assert_eq!(current.config_revision.get(), revision.get() + 1);
-    assert_eq!(current.refresh_margin_seconds, saved.refresh_margin_seconds);
-    let audit_count: i64 = sqlx::query_scalar(
-        "select count(*) from admin_audit_events where action = 'settings.replace'",
-    )
-    .fetch_one(&database.pool)
-    .await
-    .unwrap();
-    assert_eq!(audit_count, 1);
-    // API Key 更新也推进相同版本，旧设置快照不能复活已经替换的 Key。
-    let mut key_audit = replacement("key", 3600).audit;
-    key_audit.action = "settings.admin_key".into();
-    repository
-        .replace_admin_api_key(Some("new-test-key".into()), key_audit)
-        .await
+    let zone = DeploymentTimeZone::default();
+    let slot = zone
+        .local(Utc::now())
+        .date_naive()
+        .and_hms_opt(8, 0, 0)
         .unwrap();
-    let mut stale = replacement("stale", 3600);
-    stale.expected_revision = saved.config_revision;
-    assert!(matches!(
-        repository.replace_control_plane(stale).await,
-        Err(StoreError::Conflict {
-            kind: ConflictKind::StaleRevision,
-            ..
-        })
-    ));
-    let mut fresh = replacement("fresh", 3600);
-    fresh.expected_revision = repository
-        .load_control_plane()
-        .await
-        .unwrap()
-        .settings
-        .config_revision;
-    repository.replace_control_plane(fresh).await.unwrap();
-    assert_eq!(
-        repository
-            .load_control_plane()
+    let first = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let second = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = first.load_runtime_settings().await.unwrap();
+    let (a, b) = tokio::join!(
+        first.claim_warmup_slot(zone, slot),
+        second.claim_warmup_slot(zone, slot)
+    );
+    assert_ne!(a.unwrap(), b.unwrap(), "the local minute is claimed once");
+    let after = first.load_runtime_settings().await.unwrap();
+    assert_eq!(after.config_revision, before.config_revision);
+    assert_eq!(after.updated_at, before.updated_at);
+    let restarted = PgRuntimeSettingsRepository::new(database.pool.clone());
+    assert!(!restarted.claim_warmup_slot(zone, slot).await.unwrap());
+    assert!(
+        restarted
+            .claim_warmup_slot(zone, slot + TimeDelta::hours(5))
             .await
             .unwrap()
-            .settings
-            .admin_api_key
-            .as_deref(),
-        Some("new-test-key")
     );
+    assert!(
+        !restarted.claim_warmup_slot(zone, slot).await.unwrap(),
+        "another slot cannot erase prior deduplication"
+    );
+    restarted
+        .update_runtime_settings(settings_with_margin(3600))
+        .await
+        .unwrap();
+    assert!(!restarted.claim_warmup_slot(zone, slot).await.unwrap());
+    assert!(
+        !restarted
+            .claim_warmup_slot(zone, slot - TimeDelta::hours(1))
+            .await
+            .unwrap(),
+        "clock rollback cannot replay an earlier time slot"
+    );
+    assert!(
+        restarted
+            .claim_warmup_slot(zone, slot + TimeDelta::days(1))
+            .await
+            .unwrap()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn runtime_scheduling_upgrade_preserves_settings_without_a_warmup_table() {
+    let Some(database) = TestDatabase::create_through("runtime_scheduling_upgrade", 20).await
+    else {
+        return;
+    };
+    sqlx::query(
+        "update runtime_settings set rotation_strategy = 'sticky',
+         account_warmup_enabled = true, account_warmup_schedule_time = '08:00,13:00',
+         account_warmup_model = 'test-model' where id = 1",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let warmup_table: Option<String> =
+        sqlx::query_scalar("select to_regclass('account_warmup_slots')::text")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert!(warmup_table.is_none());
+    let cursor: Option<DateTime<Utc>> =
+        sqlx::query_scalar("select account_warmup_cursor from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert!(cursor.is_none());
+    let settings = PgRuntimeSettingsRepository::new(database.pool.clone())
+        .load_runtime_settings()
+        .await
+        .unwrap();
+    assert_eq!(settings.rotation_strategy, "sticky");
+    assert!(settings.values.account_warmup_enabled);
+    assert_eq!(settings.values.account_warmup_schedule_time, "08:00,13:00");
+    assert_eq!(
+        settings.values.account_warmup_model.as_deref(),
+        Some("test-model")
+    );
+    assert_eq!(settings.values.openai_guardian_reserved_concurrency, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn warmup_cursor_resolves_dst_and_deduplicates_across_timezones() {
+    use gateway_core::{provider_ports::ProviderRuntimePolicyPort, time::DeploymentTimeZone};
+    let Some(database) = TestDatabase::create("warmup_cursor_dst").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let zone: DeploymentTimeZone = "America/New_York".parse().unwrap();
+    let slot = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(1, 30, 0)
+        .unwrap();
+    assert!(repository.claim_warmup_slot(zone, slot).await.unwrap());
+    let cursor: DateTime<Utc> =
+        sqlx::query_scalar("select account_warmup_cursor from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cursor,
+        "2026-11-01T05:30:00Z".parse::<DateTime<Utc>>().unwrap()
+    );
+    assert!(!repository.claim_warmup_slot(zone, slot).await.unwrap());
+    // 回拨中的重复本地时刻取较早一次，不能误挡后一分的正常调度
+    let next = slot + TimeDelta::minutes(1);
+    assert!(repository.claim_warmup_slot(zone, next).await.unwrap());
+    let utc: DeploymentTimeZone = "UTC".parse().unwrap();
+    assert!(
+        !repository
+            .claim_warmup_slot(utc, zone.resolve_local(next).unwrap().naive_utc())
+            .await
+            .unwrap(),
+        "changing the deployment timezone cannot reclaim the same instant"
+    );
+    let missing = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    assert!(repository.claim_warmup_slot(zone, missing).await.is_err());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn account_affinity_upgrade_defaults_and_updates_reach_the_snapshot() {
+    use gateway_core::account::AccountAffinity;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create_through("account_affinity_upgrade", 22).await else {
+        return;
+    };
+    sqlx::query("update runtime_settings set rotation_strategy = 'sticky', config_revision = config_revision + 1 where id = 1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let before = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(before.rotation_strategy, "sticky");
+    assert_eq!(
+        before.values.openai_account_affinity,
+        AccountAffinity::Relaxed
+    );
+    assert_eq!(before.values.max_account_rotations, 3);
+    assert_eq!(before.values.openai_session_affinity_ttl_hours, 24);
+    for (mode, budget, ttl) in [
+        (AccountAffinity::Preferred, 3, 24),
+        (AccountAffinity::Strict, 31, 168),
+        (AccountAffinity::Relaxed, 0, 720),
+    ] {
+        let mut update = settings_with_margin(3600);
+        update.values.openai_account_affinity = mode;
+        update.values.max_account_rotations = budget;
+        update.values.openai_session_affinity_ttl_hours = ttl;
+        repository.update_runtime_settings(update).await.unwrap();
+        let loaded = repository.load_runtime_settings().await.unwrap();
+        assert_eq!(
+            (
+                loaded.values.openai_account_affinity,
+                loaded.values.max_account_rotations
+            ),
+            (mode, budget)
+        );
+        let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+            .load_runtime_snapshot()
+            .await
+            .unwrap();
+        let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
+        assert_eq!(
+            (
+                serde_json::from_value::<AccountAffinity>(
+                    snapshot_values["openai_account_affinity"].clone()
+                )
+                .unwrap(),
+                snapshot_values["max_account_rotations"].as_u64().unwrap()
+            ),
+            (mode, u64::from(budget))
+        );
+        assert!(snapshot.config_revision > before.config_revision);
+        assert_eq!(loaded.values.openai_session_affinity_ttl_hours, ttl);
+        assert_eq!(snapshot_values["openai_session_affinity_ttl_hours"], ttl);
+    }
+    let mut invalid = settings_with_margin(3600);
+    invalid.values.max_account_rotations = 32;
+    assert!(repository.update_runtime_settings(invalid).await.is_err());
+    for sql in [
+        "update runtime_settings set openai_session_affinity_ttl_hours = 0 where id = 1",
+        "update runtime_settings set openai_session_affinity_ttl_hours = 721 where id = 1",
+        "update runtime_settings set max_account_rotations = 32 where id = 1",
+        "update runtime_settings set max_account_rotations = -1 where id = 1",
+        "update runtime_settings set openai_account_affinity = 'unknown' where id = 1",
+    ] {
+        assert!(sqlx::query(sql).execute(&database.pool).await.is_err());
+    }
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .max_account_rotations,
+        0
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn preferred_affinity_migration_defaults_to_strict_and_preserves_saved_modes() {
+    use gateway_core::account::AccountAffinity;
+    let Some(fresh) = TestDatabase::create("affinity_default").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(fresh.pool.clone());
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .openai_account_affinity,
+        AccountAffinity::Strict
+    );
+    fresh.close().await;
+
+    for mode in [AccountAffinity::Relaxed, AccountAffinity::Strict] {
+        let database = TestDatabase::create_through("affinity_preserve", 23)
+            .await
+            .unwrap();
+        let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+        // 升级前只写当时已有列，现行 Repository 依赖完整迁移后的 schema
+        sqlx::query("update runtime_settings set openai_account_affinity = $1, config_revision = config_revision + 1, updated_at = now() where id = 1")
+            .bind(match mode {
+                AccountAffinity::Relaxed => "relaxed",
+                _ => "strict",
+            })
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+        assert_eq!(
+            repository
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .values
+                .openai_account_affinity,
+            mode
+        );
+        database.close().await;
+    }
+}
+
+#[tokio::test]
+async fn removing_switchback_preserves_custom_weights_and_replaces_database_default() {
+    let Some(database) = TestDatabase::create_through("remove_switchback", 31).await else {
+        return;
+    };
+    let expected =
+        gateway_core::account::SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3]).unwrap();
+    let mut legacy = serde_json::to_value(expected).unwrap();
+    legacy["preferHigherWeight"] = serde_json::json!(true);
+    sqlx::query("update runtime_settings set smart_scheduling_json = $1 where id = 1")
+        .bind(legacy)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .smart_scheduling,
+        expected
+    );
+    sqlx::query("update runtime_settings set smart_scheduling_json = default where id = 1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .values
+            .smart_scheduling,
+        gateway_core::account::SmartSchedulingConfig::default()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn reset_credit_weekly_threshold_upgrade_defaults_unset_and_round_trips() {
+    let Some(database) = TestDatabase::create_through("reset_weekly_threshold", 34).await else {
+        return;
+    };
+    sqlx::query("update runtime_settings set reset_credit_lead_minutes = 20 where id = 1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let settings = repository.load_runtime_settings().await.unwrap();
+    assert_eq!(settings.values.reset_credit_lead_minutes, 20);
+    assert_eq!(
+        settings.values.reset_credit_max_weekly_remaining_percent,
+        None
+    );
+    for threshold in [Some(70), Some(0), Some(100), None] {
+        let mut update = settings_with_margin(600);
+        update.values.reset_credit_max_weekly_remaining_percent = threshold;
+        repository.update_runtime_settings(update).await.unwrap();
+        assert_eq!(
+            repository
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .values
+                .reset_credit_max_weekly_remaining_percent,
+            threshold
+        );
+    }
+    for threshold in [-1, 101] {
+        assert!(sqlx::query("update runtime_settings set reset_credit_max_weekly_remaining_percent = $1 where id = 1")
+            .bind(threshold).execute(&database.pool).await.is_err());
+    }
     database.close().await;
 }

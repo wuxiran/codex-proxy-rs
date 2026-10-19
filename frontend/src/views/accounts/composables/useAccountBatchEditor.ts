@@ -1,41 +1,39 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, getAccounts } from '@/api'
+import type { Account, AccountModelAccess } from '@/api'
 
-import { toast } from '@codex-proxy/ui'
-import { computed, ref, shallowRef, watch } from 'vue'
+import { ZNotification } from '@codex-proxy/ui'
+import { ref, shallowRef, watch } from 'vue'
 import { batchUpdateAccounts } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
 
-type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-
 export function useAccountBatchEditor(options: {
-  accounts: Ref<AccountRow[]>
+  accounts: Ref<Account[]>
   selectedIds: Ref<Set<string>>
   reloadAccounts: () => Promise<unknown>
   reloadGroups: () => Promise<unknown>
 }) {
-  const selectedAccountsById = new Map<string, AccountRow>()
+  const selectedAccountsById = new Map<string, Account>()
   const showBatchEditModal = shallowRef(false)
-  const schedulingEnabled = shallowRef(true)
+  const editingCount = shallowRef(0)
+  const schedulingEnabled = shallowRef(false)
   const concurrencyLimit = shallowRef('')
   const weight = shallowRef('1')
   const modelAccess = ref<AccountModelAccess | undefined>()
-  const editedFields = ref(new Set<'enabled' | 'concurrencyLimit' | 'weight' | 'groupIds'>())
+  const editedFields = ref(new Set<'concurrencyLimit' | 'weight' | 'groupIds'>())
   const catalogAccountId = shallowRef<string>()
   const proxyMode = shallowRef('preserve')
   const proxyId = shallowRef('')
   const selectedGroupIds = ref<string[]>([])
   const saveAction = useAsyncAction()
   const saving = saveAction.loading
-  const hasChanges = computed(() => Boolean(modelAccess.value) || editedFields.value.size > 0 || proxyMode.value !== 'preserve')
 
-  // 未操作的字段保持每个账号原值，避免展开表单就覆盖混合设置。
-  watch([schedulingEnabled, concurrencyLimit, weight, selectedGroupIds], (values, previous) => {
+  // 调度按开关值统一更新，其他未操作字段保留每个账号原值
+  watch([concurrencyLimit, weight, selectedGroupIds], (values, previous) => {
     if (!showBatchEditModal.value || saving.value)
       return
-    const fields = ['enabled', 'concurrencyLimit', 'weight', 'groupIds'] as const
+    const fields = ['concurrencyLimit', 'weight', 'groupIds'] as const
     fields.forEach((field, index) => {
       if (values[index] !== previous[index])
         editedFields.value.add(field)
@@ -47,10 +45,11 @@ export function useAccountBatchEditor(options: {
     if (accounts.length === 0)
       return
 
+    editingCount.value = accounts.length
     modelAccess.value = undefined
     editedFields.value.clear()
     catalogAccountId.value = accounts[0]?.id
-    schedulingEnabled.value = accounts.every(account => account.enabled)
+    schedulingEnabled.value = false
     proxyMode.value = 'preserve'
     proxyId.value = ''
     concurrencyLimit.value = sharedConcurrencyLimit(accounts)
@@ -64,20 +63,16 @@ export function useAccountBatchEditor(options: {
       return
     const modelError = accountModelAccessError(modelAccess.value)
     if (modelError) {
-      toast.warning(modelError)
-      return
-    }
-    if (!hasChanges.value) {
-      toast.warning('请选择需要更新的设置')
+      ZNotification.warning({ message: modelError })
       return
     }
     const scheduling = parseAccountSchedulingForm(editedFields.value.has('concurrencyLimit') ? concurrencyLimit.value : '', editedFields.value.has('weight') ? weight.value : '1')
     if (proxyMode.value === 'proxy' && !proxyId.value.trim()) {
-      toast.warning('请选择已通过测试的代理')
+      ZNotification.warning({ message: '请选择已通过测试的代理' })
       return
     }
     if (!scheduling.valid) {
-      toast.warning(scheduling.message)
+      ZNotification.warning({ message: scheduling.message })
       return
     }
 
@@ -87,14 +82,14 @@ export function useAccountBatchEditor(options: {
         accountIds,
         modelAccess: modelAccess.value,
         outboundProxyId: proxyMode.value === 'preserve' ? undefined : proxyMode.value === 'direct' ? '' : proxyId.value.trim(),
-        enabled: editedFields.value.has('enabled') ? schedulingEnabled.value : undefined,
+        enabled: schedulingEnabled.value,
         concurrencyLimit: editedFields.value.has('concurrencyLimit') ? scheduling.values.concurrencyLimit : undefined,
         weight: editedFields.value.has('weight') ? scheduling.values.weight : undefined,
         groupIds: editedFields.value.has('groupIds') ? [...new Set(selectedGroupIds.value)] : undefined,
       })
       showBatchEditModal.value = false
       options.selectedIds.value = new Set()
-      toast.success(`已更新 ${accountIds.length} 个账号`)
+      ZNotification.success({ message: `已更新 ${accountIds.length} 个账号` })
       void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
     }, { onError: () => void options.reloadAccounts() })
   }
@@ -123,24 +118,13 @@ export function useAccountBatchEditor(options: {
     { immediate: true, flush: 'sync' },
   )
 
-  watch([showBatchEditModal, saving], ([open, isSaving]) => {
-    if (open || isSaving)
-      return
-    schedulingEnabled.value = true
-    proxyMode.value = 'preserve'
-    proxyId.value = ''
-    concurrencyLimit.value = ''
-    weight.value = '1'
-    selectedGroupIds.value = []
-  })
-
   return {
     showBatchEditModal,
+    editingCount,
     schedulingEnabled,
     concurrencyLimit,
     weight,
     modelAccess,
-    hasChanges,
     catalogAccountId,
     proxyMode,
     proxyId,
@@ -151,19 +135,19 @@ export function useAccountBatchEditor(options: {
   }
 }
 
-function sharedConcurrencyLimit(accounts: AccountRow[]) {
+function sharedConcurrencyLimit(accounts: Account[]) {
   const first = accounts[0]?.concurrencyLimit ?? null
   return accounts.every(account => account.concurrencyLimit === first)
     ? concurrencyLimitInput(first)
     : ''
 }
 
-function sharedWeight(accounts: AccountRow[]) {
+function sharedWeight(accounts: Account[]) {
   const first = accounts[0]?.weight ?? 1
   return accounts.every(account => account.weight === first) ? String(first) : '1'
 }
 
-function sharedGroupIds(accounts: AccountRow[]) {
+function sharedGroupIds(accounts: Account[]) {
   const [first, ...rest] = accounts
   if (!first)
     return []

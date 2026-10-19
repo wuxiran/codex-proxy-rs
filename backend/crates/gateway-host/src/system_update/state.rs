@@ -1,4 +1,4 @@
-//! 系统操作状态文件、跨进程锁与临时目录。
+//! 系统操作状态文件、跨进程锁与临时目录
 
 use std::fs;
 use std::io::{self, Write};
@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use gateway_admin::model::system::{
     SystemOperationKind, SystemOperationState, SystemOperationStatus, SystemUpdateStatus,
 };
+use gateway_admin::ports::system::SystemOperationErrorKind;
 use serde::{Deserialize, Serialize};
 
 use super::installation::ReleaseFiles;
@@ -160,7 +161,7 @@ impl Drop for UpdateTempDir {
     }
 }
 
-/// 更新任务拥有持久化终态的责任，Future 在取消或 panic 时析构也必须收尾。
+/// 更新任务拥有持久化终态的责任，Future 在取消或 panic 时析构也必须收尾
 pub(crate) struct UpdateOperation {
     path: PathBuf,
     operation_id: String,
@@ -227,7 +228,7 @@ impl Drop for UpdateOperation {
     }
 }
 
-/// 只在拿到进程内锁后调用，旧版本断连遗留且已无执行者的 running 不能永久保留。
+/// 只在拿到进程内锁后调用，旧版本断连遗留且已无执行者的 running 不能永久保留
 pub(crate) fn recover_interrupted(path: &Path, lock_path: &Path) -> Result<(), OperationError> {
     let state = read_persisted(path)?;
     if !matches!(state.operation.status, PersistedStatus::Running) {
@@ -235,7 +236,7 @@ pub(crate) fn recover_interrupted(path: &Path, lock_path: &Path) -> Result<(), O
     }
     let _lock = match OperationFileLock::acquire(lock_path) {
         Ok(lock) => lock,
-        Err(error) if error.kind() == super::SystemOperationErrorKind::Conflict => return Ok(()),
+        Err(error) if error.kind() == SystemOperationErrorKind::Conflict => return Ok(()),
         Err(error) => return Err(error),
     };
     if let (Some(operation_id), Some(kind)) = (state.operation.operation_id, state.operation.kind) {
@@ -348,7 +349,7 @@ pub(crate) fn read_status(
     })
 }
 
-/// 调用方必须持有进程内锁及文件锁，避免将安装中间态当成手动部署。
+/// 调用方必须持有进程内锁及文件锁，避免将安装中间态当成手动部署
 pub(crate) fn reconcile_installation(
     config: &SystemUpdateConfig,
     running: &ReleaseFiles,
@@ -369,7 +370,7 @@ pub(crate) fn reconcile_installation(
         && (state.current_files.as_ref() != Some(&installed)
             || state.current_version.as_deref() != Some(config.version.as_str()))
     {
-        // 保留操作历史，但外部部署的文件不能继续使用旧操作推断版本。
+        // 保留操作历史，但外部部署的文件不能继续使用旧操作推断版本
         state.current_version = Some(config.version.clone());
         state.current_files = Some(installed);
         changed = true;
@@ -381,7 +382,7 @@ pub(crate) fn reconcile_installation(
                 .is_ok_and(|actual| actual == expected)
         });
         if !backup_valid {
-            // 无法证明旧备份完整时撤销回滚资格，不删除用户的备份文件。
+            // 无法证明旧备份完整时撤销回滚资格，不删除用户的备份文件
             state.previous_version = None;
             state.previous_files = None;
             changed = true;
@@ -390,15 +391,8 @@ pub(crate) fn reconcile_installation(
     if changed {
         write_persisted(path, &state)?;
     }
-    // 指纹证明磁盘仍是本进程安装的候选，回滚到旧版本也必须等待重启。
+    // 指纹证明磁盘仍是本进程安装的候选，回滚到旧版本也必须等待重启
     read_status(path, need_restart)
-}
-
-pub(crate) fn default_temp_dir(state_file: &Path) -> PathBuf {
-    state_file
-        .parent()
-        .map(|parent| parent.join("update-tmp"))
-        .unwrap_or_else(|| std::env::temp_dir().join("codex-proxy-rs-update"))
 }
 
 fn stale_lock(path: &Path) -> Result<bool, OperationError> {
